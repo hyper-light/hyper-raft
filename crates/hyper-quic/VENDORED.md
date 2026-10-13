@@ -990,3 +990,31 @@ al., OSDI 2020), has no other word that this side wants more.
 - **Test.** `an_open_at_the_peers_limit_says_so_once_for_each_limit`: one frame for each limit, none
   written once the limit is raised, the frame again at the new limit, and the receiving side
   blocked only at the limit it last sent with none greater on its way.
+
+## 26. A padded acknowledgement draws its acknowledgement (2026-10-13)
+
+A datagram padded to the MTU is in flight whatever it carries (RFC 9002 §2), and an acknowledgement
+elicits nothing (RFC 9000 §13.2.1). Upstream padded every datagram with `pad_to_mtu`, ACK-only ones
+too, and sent nothing to have them acknowledged. They were acknowledged only when the peer had
+another reason to send an ACK frame. A peer whose ack-eliciting packets carry no ACK frame (the
+path's warm-up, §15) never had one. So the padded acknowledgements took the window, the
+endpoint's own sends were blocked, and so was its own warm-up, whose first packet waits for nothing
+in flight. This is the deadlock RFC 9000 §13.2.7 names: "a sender SHOULD ensure that other frames
+are sent periodically in addition to PADDING frames to elicit acknowledgments from the receiver".
+`pad_to_mtu` failed on it in CI one run in forty (macOS, run 38336430871), with ten padded
+acknowledgements outstanding: its whole window. Locally it failed 9 to 10 runs in 400, on this
+branch and on its base alike.
+
+- **The rule.** A packet that would elicit nothing, in a datagram padded to the MTU, carries a PING
+  when padded bytes are in flight and none of them elicits an acknowledgement
+  (`InFlight::ack_eliciting` 0, `InFlight::bytes` above 0). It must also fit in the window, as an
+  ack-eliciting packet must (RFC 9002 §7).
+- **Why it is decided before the datagram begins.** The window and the pacer still let the packet
+  go as the acknowledgement it would have been, so the PING never holds an acknowledgement back.
+- **Why it cannot loop.** At most one such packet is outstanding, so not every packet that would
+  elicit nothing carries one (§13.2.1's MUST NOT). Two endpoints padding to the MTU stop at once:
+  the PING's acknowledgement finds nothing of its sender's in flight.
+- **Test.** `padded_acknowledgements_are_acknowledged` fails 20 of 20 without the rule and passes
+  20 of 20 with it. The server PINGs inside its ACK-bundling deadline, so its packets carry no ACK
+  frame. The client's second padded acknowledgement must carry the PING, and only it. The client
+  can then send two datagrams at once. `pad_to_mtu` passed 400 of 400 runs.

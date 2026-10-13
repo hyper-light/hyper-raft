@@ -770,6 +770,12 @@ impl Connection {
 
         tx.pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
 
+        let elicit = self.padding_wants_an_acknowledgement(
+            space_id,
+            tx.pad_datagram_to_mtu && !close,
+            ack_eliciting,
+        );
+
         // A space that can send has keys to send with (`space_can_send`); one without them has
         // nothing to send, where upstream panicked
         let Some(tag_len) = local_keys(self, space_id).map(|(_, packet)| packet.tag_len()) else {
@@ -816,6 +822,10 @@ impl Connection {
         if let Some(ref mut prev) = self.prev_crypto {
             prev.update_unacked = false;
         }
+        // Decided before the datagram began, so the window and pacer still let it go as the
+        // acknowledgement it would otherwise have been; it is ack-eliciting from here on
+        self.spaces.get_mut(space_id).ping_pending |= elicit;
+        ack_eliciting |= elicit;
 
         let Some(builder) = PacketBuilder::new(
             now,
@@ -945,6 +955,33 @@ impl Connection {
 
         self.allocate_datagram(space_id, room, buf, tx);
         None
+    }
+
+    /// Whether a packet of `space` that would elicit nothing (`ack_eliciting` false), in a datagram
+    /// `padded` to the MTU, should carry a PING. A datagram padded to the MTU is in flight whatever
+    /// it carries (RFC 9002 §2), and one that elicits nothing is acknowledged only when the peer has
+    /// another reason to send an ACK frame (RFC 9000 §13.2.1). Padded acknowledgements alone held
+    /// the window until then, and against a peer whose ack-eliciting packets carry no ACK frame (a
+    /// warm-up's) they held all of it: RFC 9000 §13.2.7's deadlock. So when padded bytes are in
+    /// flight and none of them elicits an acknowledgement, the packet carries a PING, within the
+    /// window as an ack-eliciting packet must be (RFC 9002 §7). At most one such packet is
+    /// outstanding, never every packet that would elicit nothing (§13.2.1).
+    fn padding_wants_an_acknowledgement(
+        &self,
+        space: SpaceId,
+        padded: bool,
+        ack_eliciting: bool,
+    ) -> bool {
+        let in_flight = &self.path.in_flight;
+        space == SpaceId::Data
+            && padded
+            && !ack_eliciting
+            && in_flight.ack_eliciting == 0
+            && in_flight.bytes > 0
+            && in_flight
+                .bytes
+                .saturating_add(u64::from(self.path.current_mtu()))
+                <= self.path.congestion.window()
     }
 
     /// `Some` when congestion control or pacing holds back the next datagram; `unpaced` exempts it

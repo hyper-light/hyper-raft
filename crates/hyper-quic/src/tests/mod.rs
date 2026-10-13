@@ -4318,6 +4318,59 @@ fn pad_to_mtu() {
     );
 }
 
+/// A datagram padded to the MTU is in flight whatever it carries (RFC 9002 §2), and an
+/// acknowledgement elicits nothing (RFC 9000 §13.2.1). A client padding to its MTU answered a
+/// server's warm-up, PINGs that carried no ACK frame, with padded acknowledgements nobody
+/// acknowledged, until they held its whole window: its own sends were blocked, and so was its own
+/// warm-up, whose first packet waits for nothing in flight, the deadlock RFC 9000 §13.2.7 names.
+/// `pad_to_mtu` failed on it in CI one run in forty, with ten padded acknowledgements outstanding,
+/// its whole window. Here the server's packets are PINGs sent before its deadline for bundling an
+/// ACK frame, so none carries one, every time.
+#[test]
+fn padded_acknowledgements_are_acknowledged() {
+    let _guard = subscribe();
+    const MTU: u16 = 1333;
+    let client = {
+        let mut config = client_config();
+        let mut transport = TransportConfig::default();
+        transport.initial_mtu(MTU);
+        transport.mtu_discovery_config(None);
+        transport.pad_to_mtu(true);
+        config.transport_config(transport);
+        config
+    };
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client);
+    // The server PINGs once a millisecond, well inside its deadline for bundling an ACK frame (a
+    // round trip and the client's max_ack_delay past its last one), so its PINGs carry none. Every
+    // second one draws a padded acknowledgement from the client; the second of those finds the
+    // first still in flight, nothing of the client's eliciting its acknowledgement.
+    let pings_before = pair.client_conn_mut(client_ch).stats().frame_tx.ping;
+    for _ in 0..6 {
+        pair.time += Duration::from_millis(1);
+        pair.server_conn_mut(server_ch).ping();
+        pair.drive_server();
+        pair.drive_client();
+    }
+    // So that acknowledgement elicited the server's, as RFC 9000 §13.2.7 asks, and only it did
+    // (§13.2.1: not every packet that would elicit nothing)
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().frame_tx.ping,
+        pings_before + 1
+    );
+    pair.drive();
+
+    // and its window is its own: two datagrams go out at once
+    pair.client_datagrams(client_ch)
+        .send(vec![0; 800].into(), false)
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send(vec![0; 600].into(), false)
+        .unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+    assert_eq!(pair.client.outbound.len(), 2);
+}
+
 /// Verify that a large application datagram is sent successfully when an ACK frame too large to fit
 /// alongside it is also queued, in exactly 2 UDP datagrams.
 #[test]

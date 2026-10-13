@@ -254,11 +254,19 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      `43aec4a` is slates' branch `hr-vendor-43aec4a`, one commit on its main's head that touches only
      `vendor/hyper-raft`, which its session lands on the owner's word.
 3. **The shared crates' open work**, each in its own document:
-   - hyper-durable: §14's measurements.
+   - hyper-durable: §14's measurements. Items 1, 2, 3 and 7 measured on this machine's disk
+     (2026-10-12, `docs/benchmarks.md` from "A group's writes out, depth one to three on
+     hyper-log"): depth earns no place for one group; applying ahead halves a slowest leader's median
+     answer and changes nothing on a shared disk, its p99 at saturation to be traced; a quiet group's
+     commit costs one period and one write, and the bench found its deadline missing (fixed); an
+     `Unbounded` budget costs nothing, a counting one 13–15% of an entry's instructions. Open: items
+     4, 5, 6 and 8, item 1 on Linux and with many groups, item 2's tail.
    - hyper-sim and hyper-check: S-6 (hyper-raft's and hyper-durable's harnesses onto both crates),
      S-7 (the E2E crates' histories checked) and S-8 (the consumers' simulations), `docs/sim.md` §9.
-   - Tails, `docs/tails.md` §7: T-0 (the grid), T-1 (the measurement kit), T-2 (the impairment
-     relay), then each crate class against its industry comparators under the same conditions.
+   - Tails, `docs/tails.md` §7: T-0 (the grid), T-1 (the measurement kit: its open-loop schedule and
+     quantile intervals built in hyper-measure, the per-process accounts of §1a open), T-2 (the
+     impairment relay), then each crate class against its industry comparators under the same
+     conditions.
    - hyper-quic and hyper-tls against slates' and focal's transports (owed in the table above), and
      slates' congestion bake-off.
    - hyper-seal §11: the log sealed by default only once measured.

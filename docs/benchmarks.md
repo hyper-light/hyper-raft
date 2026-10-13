@@ -8005,3 +8005,166 @@ ranges-<arm> <db> 10000000 1 1000000 256 16 1000000 10 --rocks-seed=301 --shard-
   --runtime-record=runtime-record.txt   # 1 2 1 2 128 2703 2703 22 16384 2703
 cargo bench -p hyper-rt --bench echo    # on main and on the change, alternating
 ```
+
+## A group's writes out, depth one to three on hyper-log (2026-10-12)
+
+`docs/durable.md` §14 item 1: what a committed entry costs in flushes and latency at depths one to
+three, closed and open loop, for one group of three voters, each on its own log. `benches/depth.rs`
+drives the group on one thread with hyper-log under it, 64-byte entries, mantle's range group's
+settings; `file` is a scratch file on the machine's disk (APFS, `F_FULLFSYNC`), `sim` hyper-block's
+simulated device (a flush costs nothing). M5 Max, 18 cores, other sessions' builds and benchmarks
+beside it. Two runs: three rounds of 1,230 entries a point (load 14–19), then six rounds of 615 a
+point (load 23–32), whose runs give each depth a noise band (`hyper_measure::stats::band`); a
+difference is one only outside both depths' bands. Latencies pool the rounds, each quantile with its
+95% interval (`docs/tails.md` §3.3); the rest are medians of the rounds.
+
+The six-round run, the file device (entries a second; p50 and p99 in ms; flushes an entry over the
+three logs):
+
+| point | depth 1 | depth 2 | depth 3 |
+|---|---|---|---|
+| closed, 1 client | 43; 21.9 / 65.8; 6.00 | 44; 21.4 / 66.0; 6.00 | 46; 21.2 / 72.6; 5.66 |
+| closed, 4 clients | 190; 21.1 / 34.5; 1.50 | 180; 21.6 / 39.4; 1.50 | 197; 20.4 / 31.8; 1.41 |
+| closed, 16 clients | 600; 23.6 / 70.2; 0.41 | 675; 22.6 / 55.8; 0.37 | 797; 20.2 / 30.9; 0.37 |
+| closed, 64 clients | 1,138; 56.5 / 94.3; 0.23 | 1,165; 58.5 / 104.5; 0.23 | 1,037; 61.1 / 113.5; 0.27 |
+| open, 291 a second | 51.8 / 332.2; 0.98 | 52.2 / 78.3; 0.95 | 58.8 / 255.5; 0.90 |
+| open, 583 a second | 52.4 / 76.6; 0.48 | 50.5 / 185.9; 0.49 | 55.8 / 85.0; 0.48 |
+| open, 874 a second | 53.4 / 78.5; 0.32 | 47.5 / 74.3; 0.32 | 56.1 / 101.3; 0.30 |
+| open, 1,049 a second | 53.0 / 77.7; 0.27 | 48.3 / 78.7; 0.27 | 53.8 / 158.2; 0.26 |
+
+- **Throughput: no depth beyond one earns its place for one group.** Every closed-loop point is within
+  the noise but one: 16 clients, depth 3 at ×1.33 of depth 1's entries a second, outside both bands.
+  The three-round run, at lower load, had the opposite order at that point (693, 652 and 639 entries a
+  second at depths 1, 2 and 3) and at 64 clients (991, 966 and 854): the point does not hold across
+  runs. The open loop carries its arrivals at every depth.
+- **Latency: depth 3 is the slowest at light open load.** Each run's p50 at depth 3 is ×1.14 and
+  ×1.08 of depth 1's at 291 and 583 arrivals a second, outside both bands; depth 2's is ×0.89 and
+  ×0.91 of depth 1's at 874 and 1,049, outside both bands; every other p50 within the noise. The p99s
+  move by whole tens of milliseconds between depths and runs in no order: one long flush in a run
+  sets a point's tail.
+- **Flushes: what depth saves is confirmations.** A lone write costs two flushes on each member's log
+  (its frame and its confirmation): 6.0 an entry at one client, 1.5 at four, 0.4 at sixteen, falling
+  with the batch. Depth 3 confirms some frames by the next frame's record, 5–6% fewer flushes at one
+  and four clients, and writes more, smaller frames as load grows (0.115 → 0.179 frames an entry at
+  64 clients), so at 64 clients it flushed 0.27 an entry against 0.23.
+- **On the simulated device**, where a flush costs nothing and the shell's and the log's own costs
+  show, every point is within the noise but one: depth 3's p50 at the lightest open load, ×1.13 of
+  depth 1's. The core's simulated pipeline bench predicted depth to cut p50 by a third under load on
+  hyper-log's confirmed device ("Readies in flight (R-4)"); on the real log one group's writes queue
+  on one file's flushes, and arrivals that wait for a write to finish batch into the next.
+
+Open: the same on Linux, where a frame's confirmation is a durable write without a flush of the
+device's cache (`LogStats::durable_writes`, FUA where the device has it), and with many groups on one
+log, whose frames gather every group's updates.
+
+```sh
+cargo bench -p hyper-durable --bench depth -- DIR                        # three rounds, file and sim
+cargo bench -p hyper-durable --bench depth -- DIR 1,4,16,64 25,50,75,90 6  # six rounds, with bands
+```
+
+## A leader applying ahead of its own write (2026-10-12)
+
+`docs/durable.md` §4.2 and §14 item 2: commit-to-answer latency with the leader applying its own term's
+committed entries before its own write of them is durable, and without, on a leader whose disk is the
+slowest of its quorum and on a disk the members share. `benches/apply.rs`, the depth bench's group at
+the log's depth: **slowest leader** puts the leader's log on a file and the followers' on the simulated
+device, whose flush costs nothing (a disk per member, the leader's slower by its whole flush: the bound
+of what applying ahead can gain); **shared disk** puts every log on a file on the one disk. Six rounds
+a point, the two ways in turn, load 25–34; bands and intervals as in the depth section. p50 / p99 /
+p99.9 in ms, then entries a second:
+
+| point | leader applies after its write | ahead of its write | ahead against after |
+|---|---|---|---|
+| slowest leader, closed, 1 client | 9.6 / 25.1 / 42.2; 96 | 10.3 / 28.4 / 44.7; 126 | rate ×1.31, outside both bands |
+| slowest leader, closed, 16 clients | 9.7 / 25.7 / 35.3; 1,579 | 8.5 / 26.9 / 36.7; 1,944 | within the noise |
+| slowest leader, open, 972 a second | 27.3 / 57.9 / 73.8 | 12.3 / 40.8 / 50.5 | p50 ×0.45, outside both bands |
+| slowest leader, open, 1,749 a second | 26.4 / 54.3 / 58.9 | 13.9 / 78.8 / 96.9 | p50 ×0.51, outside both bands |
+| shared disk, closed, 1 client | 21.7 / 60.8 / 117.2; 44 | 22.5 / 49.9 / 76.6; 43 | within the noise |
+| shared disk, closed, 16 clients | 22.8 / 38.0 / 43.1; 703 | 26.7 / 87.8 / 95.0; 585 | within the noise |
+| shared disk, open, 351 a second | 67.7 / 120.0 / 149.8 | 62.6 / 112.2 / 126.6 | within the noise |
+| shared disk, open, 633 a second | 74.7 / 146.2 / 155.1 | 70.4 / 126.7 / 138.0 | within the noise |
+
+- **Where the leader's disk is the slowest, applying ahead halves its answers' median** under an open
+  load (×0.45 and ×0.51 of each run's p50, outside both bands): the leader answers at the quorum's pace,
+  as §4.2 has it, and its closed loop of one client commits 31% more entries a second.
+- **Its tail grows near saturation**: at 1,749 arrivals a second (90% of the most either way reached)
+  p99 is 78.8 ms against 54.3 and p99.9 96.9 against 58.9, the intervals apart. Not traced yet. The
+  first suspect is the bound on what it may apply ahead, the core's unstable entries
+  (`Limits::unstable_entries`): a leader whose disk falls behind its arrivals would reach it, and its
+  answers would then wait for its own write again, behind a backlog.
+- **On a shared disk it changes nothing measurable**: every point within the noise. The followers'
+  flushes are as slow as the leader's, so the quorum's pace is its own.
+
+So §4.2 earns its place where a group's disks differ, as a node's do under another tenant's I/O, and
+costs nothing where they do not; its tail at saturation is open, before any owner turns it on by
+default (it is off, raft-rs's default, `Config::apply_unpersisted`).
+
+```sh
+cargo bench -p hyper-durable --bench apply -- DIR 1,16 50,90 6
+```
+
+## A quiet group's commit write (2026-10-12)
+
+`docs/durable.md` §4.1 and §14 item 3: how long a volatile state machine's applied index stands past
+its durable commit under the one-period rule, and what the commit's own write costs a quiet group.
+`benches/quiet.rs`: the depth bench's group at the log's depth, every member's state machine volatile,
+so its durable commit is what its writes stated; the leader takes a burst of proposals at once and the
+group then runs until every member has applied the burst, written its commit and has nothing out and
+nothing timed. 50 bursts a size, at mantle's quiet period (10 ms) and focal's (its owner's tick, 100 ms),
+load 29–53. The bench first found the group never quiet: no member asked to be driven at its period's
+end, so the commit stayed unwritten (`crates/hyper-durable/ORIGIN.md`, "The quiet commit's deadline");
+these numbers are with the fix. Each member's span past its durable commit, a burst's time from the
+leader's last answer to quiet (ms, p50 [95%] / max), and a burst's writes and messages after it:
+
+| device, period, burst | leader past `C_d` | followers past `C_d` | to quiet | quiet writes | flushes | messages |
+|---|---|---|---|---|---|---|
+| file, 10 ms, 1 | 29.7 [27.0–30.8] / 54.1 | 28.8 [27.6–30.3] / 50.7 | 33.0 [31.8–35.4] / 80.1 | 3.00 | 6.34 | 1.8 |
+| file, 10 ms, 8 | 27.6 [25.5–29.3] / 60.2 | 29.2 [28.8–29.9] / 50.7 | 31.6 [30.5–33.8] / 82.9 | 2.96 | 6.14 | 6.2 |
+| file, 10 ms, 64 | 58.8 [55.0–60.6] / 101.3 | 44.4 [42.2–46.0] / 91.6 | 43.2 [42.0–45.3] / 75.7 | 3.00 | 8.88 | 6.7 |
+| file, 100 ms, 1 | 122.4 [120.7–123.6] / 174.4 | 121.8 [120.1–122.7] / 180.1 | 125.8 [123.2–126.9] / 180.2 | 2.98 | 6.46 | 2.2 |
+| file, 100 ms, 8 | 120.5 [119.6–122.0] / 136.6 | 120.6 [119.5–121.5] / 146.1 | 122.8 [121.9–123.7] / 136.6 | 3.00 | 6.30 | 9.6 |
+| file, 100 ms, 64 | 114.8 [113.6–116.5] / 142.9 | 127.0 [121.9–130.5] / 155.4 | 120.6 [119.8–122.0] / 142.2 | 3.00 | 6.86 | 5.1 |
+| sim, 10 ms, 1 | 12.1 [11.4–12.5] / 12.6 | 12.0 [11.5–12.4] / 12.6 | 12.1 [11.5–12.5] / 12.6 | 3.00 | 3.00 | 2.2 |
+| sim, 100 ms, 1 | 103.9 [102.9–104.6] / 108.2 | 103.9 [102.9–104.5] / 108.2 | 103.9 [102.9–104.6] / 108.2 | 3.00 | 3.00 | 2.1 |
+
+- **A member's applied state stands past its logged commit for one period and one write**: at 10 ms,
+  29 ms at the median on the disk (the period, then the write's frame and confirmation flushes) and
+  12 ms on the simulated device; at 100 ms, 121 and 104 ms. A burst of 64 adds its own writes on the
+  leader (59 ms at 10 ms).
+- **The write costs a quiet group one write a member a burst**: three, each a frame and its
+  confirmation, 6.1–6.9 flushes over the three logs on the disk, and 2 to 10 messages; a group
+  committing steadily pays none of it, its commit riding its next entries' writes (§4.1).
+
+```sh
+cargo bench -p hyper-durable --bench quiet -- DIR 50 1,8,64 10,100 file,sim
+```
+
+## What the memory budget costs an entry (2026-10-12)
+
+`docs/durable.md` §6 and §14 item 7: an owner that passes `Unbounded` must pay nothing for the
+replica's reservations, which test `Budget::BOUNDED`, a constant. `benches/budget.rs`: three voters on
+`RamStore` (each write durable as it is submitted: no thread and no device in the count), one owner on
+one thread, 64-byte entries, one or 64 proposals out at the leader, 100,000 entries a run counted
+after 1,000; the process's instructions an entry (`hyper_measure::usage`), three runs a process, the
+median of each. Two builds of the same tree, interleaved six rounds with the order turned each round
+(load 46–51): **with** the reservations (the tree as it is) and **without** them (a scratch copy with
+the twelve `reserve` and `settle` calls deleted from `replica.rs`), each measured with `Unbounded`;
+and the tree with a `Bytes` budget, which counts.
+
+| clients | with the reservations, `Unbounded` | without them | with them, `Bytes` |
+|---|---|---|---|
+| 1 | 35,453–35,475 | 35,722–35,748 | 40,105–40,124 |
+| 64 | 8,473–8,502 | 8,533–8,593 | 9,776–9,805 |
+
+- **`Unbounded` pays nothing.** The build with the reservations ran no more instructions an entry
+  than the build without them; it ran 0.6–0.8% fewer, in every round. Under `Unbounded` the calls
+  compile out, and what is left between the two builds is their code's layout, not work.
+- **A budget that counts costs 13–15% more instructions an entry** (`Bytes`, 40,117 against 35,460 at
+  one client, 9,797 against 8,490 at 64): the reservation of each input and the settling of what the
+  replica holds against it after each call (`held_bytes`, a walk over the messages and reads it
+  keeps). focal's owner counts (`FocalBudget`). Open: whether the settle can follow what changed
+  instead of walking what is held.
+
+```sh
+cargo bench -p hyper-durable --bench budget -- 100000 3 1,64   # in each build, interleaved
+```

@@ -1122,11 +1122,28 @@ directory once, at create.
 
 1. **Depth.** The flushes a committed entry costs, and the latency, at depths 1–3 on hyper-log,
    closed and open loop: whether the third pipeline frame earns its place for one group as it does
-   for the log.
+   for the log. Measured on macOS's APFS (`benches/depth.rs`; `docs/benchmarks.md`, "A group's writes
+   out, depth one to three on hyper-log"): it does not. No depth raised one group's throughput beyond
+   the noise in a way that held across runs, and depth 3 raised each run's p50 by 8–14% at light open
+   load, where arrivals that wait for a write to finish batch into the next; what depth saves is a
+   few confirmation flushes at low concurrency (5–6%), what it costs at high concurrency is smaller
+   frames. Open: Linux, where a confirmation is a durable write without a flush, and many groups on
+   one log.
 2. **Apply before local durability.** p99 commit-to-answer on a leader whose disk is the slowest of
-   its quorum, with and without §4.2, on one disk per member and on a shared disk.
+   its quorum, with and without §4.2, on one disk per member and on a shared disk. Measured
+   (`benches/apply.rs`; `docs/benchmarks.md`, "A leader applying ahead of its own write"): with the
+   leader slower than its followers by a whole flush, applying ahead halves each run's median
+   answer under an open load and lets one client commit 31% more entries a second; on a shared disk
+   it changes nothing measurable. Open: near saturation its p99 grows (78.8 against 54.3 ms at 90% of
+   capacity), not traced yet (the core's bound on unstable entries, which a leader whose disk falls
+   behind would reach, is the first suspect); traced before any owner turns it on.
 3. **The quiet commit write.** How long a volatile state machine's applied state runs ahead of its
-   logged commit under focal's one-period rule, and what the write costs a quiet group.
+   logged commit under focal's one-period rule, and what the write costs a quiet group. Measured
+   (`benches/quiet.rs`; `docs/benchmarks.md`, "A quiet group's commit write"): one period and one
+   write (29 ms at mantle's 10 ms on the disk, 121 ms at focal's 100 ms), and one write a member a
+   burst, its frame and confirmation (6.1–6.9 flushes over three logs). The bench first found a quiet
+   group's commit never written: no member asked to be driven at its period's end (fixed: the
+   period's end is the replica's deadline, §4.1).
 4. **Apply on the owner.** Apply time per `Ready` against the owner's quantum under mantle's metadata
    workload; a split only if it is exceeded.
 5. **Repair.** Bytes and time to repair a marked member by entries (R-5) against a snapshot, and the
@@ -1144,7 +1161,10 @@ directory once, at create.
    when nothing follows it, by PAR's identifiers stored apart, or whether depth makes it rare enough
    (with depth, under load, the next frame confirms).
 7. **Budgets.** The reservation's cost per operation for an owner that passes `Unbounded`, which must
-   be nothing.
+   be nothing. Measured (`benches/budget.rs`; `docs/benchmarks.md`, "What the memory budget costs an
+   entry"): nothing: a build with the reservations deleted ran 0.6–0.8% more instructions an entry,
+   its code's layout, not work. A budget that counts (`Bytes`) costs 13–15% more; open whether its
+   settle can follow what changed instead of walking what the replica holds.
 8. **slates' store.** A transition's publication cost at slates' record sizes through the shell,
    against its own path.
 

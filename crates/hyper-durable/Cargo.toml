@@ -19,5 +19,21 @@ thiserror.workspace = true
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-measure = { path = "../hyper-measure" }
 
+[[bench]]
+name = "depth"
+harness = false
+
+[[bench]]
+name = "budget"
+harness = false
+
+[[bench]]
+name = "apply"
+harness = false
+
+[[bench]]
+name = "quiet"
+harness = false
+
 [lints]
 workspace = true

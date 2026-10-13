@@ -1159,7 +1159,12 @@ directory once, at create.
    rebuild of a marked member of two costs.
 6. **The idle confirmation flush.** Whether hyper-log can drop the confirmation a lone frame needs
    when nothing follows it, by PAR's identifiers stored apart, or whether depth makes it rare enough
-   (with depth, under load, the next frame confirms).
+   (with depth, under load, the next frame confirms). Measured with item 1's runs: depth does not
+   make it rare for one group. At depth 1 every frame paid its own confirmation flush (2.00 flushes a
+   frame at every closed and open point); at depths 2 and 3 about half rode on the next frame's
+   record (1.5–1.9 flushes a frame), but the deeper group wrote more, smaller frames, and its flushes
+   an entry did not fall (0.97, 0.95 and 0.90 at 291 arrivals a second; 0.23, 0.23 and 0.27 at 64
+   clients). Whether PAR's identifiers stored apart can drop the confirmation stays open.
 7. **Budgets.** The reservation's cost per operation for an owner that passes `Unbounded`, which must
    be nothing. Measured (`benches/budget.rs`; `docs/benchmarks.md`, "What the memory budget costs an
    entry"): nothing: a build with the reservations deleted ran 0.6–0.8% more instructions an entry,

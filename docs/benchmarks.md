@@ -8047,6 +8047,9 @@ three logs):
   with the batch. Depth 3 confirms some frames by the next frame's record, 5–6% fewer flushes at one
   and four clients, and writes more, smaller frames as load grows (0.115 → 0.179 frames an entry at
   64 clients), so at 64 clients it flushed 0.27 an entry against 0.23.
+- **The confirmation a lone frame needs** (§14 item 6): at depth 1 every frame paid its own, 2.00
+  flushes a frame at every point; at depths 2 and 3 about half rode on the next frame's record, 1.5–1.9
+  a frame, and the frames were more and smaller, so flushes an entry did not fall.
 - **On the simulated device**, where a flush costs nothing and the shell's and the log's own costs
   show, every point is within the noise but one: depth 3's p50 at the lightest open load, ×1.13 of
   depth 1's. The core's simulated pipeline bench predicted depth to cut p50 by a third under load on

@@ -65,6 +65,9 @@ In hyper-durable, the keep mark's follower half: a leader's store keeps what a m
 to acknowledge of what was sent it, while all of it is in flight, within its window, so a resend reads
 from the handle and a stalled member pins nothing past what it was sent (`docs/durable.md` §8, focal's
 question); the store's two keep methods have no defaults, so a wrapper passes the mark on.
+In hyper-rt, a step's long polls judged at one reading of the thread's clock at its end, not two a poll
+(`4cbea75`): on mantle's ranges bench the reads fell 8–9 times, and `__thread_selfusage` from 2.9 % to
+0.5 % of a seek's shard samples (`docs/benchmarks.md`, "hyper-rt: long polls judged by step").
 
 ## Open defects
 
@@ -104,6 +107,17 @@ held an election back.
 
 ### Closed (2026-10-12)
 
+- **hyper-block `a_segment_written_whole_holds_its_fill_and_takes_no_memory`, ubuntu-24.04-arm
+  (CI run 38348043505; the test is on `main` since `55d923e`).** It read each piece of a segment
+  written past the cache with a resident read to show the piece was not in memory, and on Linux that
+  read is no probe: `preadv2(2)` with `RWF_NOWAIT` on a page not cached starts read-ahead of it and
+  of the window after it before it answers, and reads what that brought in by the time it looks
+  (Linux 6.8 `mm/filemap.c`, `filemap_get_pages` and `filemap_update_page`). In Docker's Linux 6.12
+  under busy loops it failed 1 run in 300, and `mincore(2)` before and after each read showed
+  both ways: a piece not in memory read by its own probe, and the next piece of the same segment in
+  memory before its probe, brought in by the read-ahead of the one before. The test now asks the
+  page cache itself on Linux (`resident/linux.rs`, `mincore(2)` over a mapping, tests only, `1738d0e`):
+  0 failures in 1,500 runs under the same load (hyper-block `ORIGIN.md` change 15).
 - **A link's evidence moved up by a stall's bursts (hyper-liveness; found with the windows-2025 tail).**
   A link refused for want of `τ_int` asked the interval its first qualified Allan level said its
   heartbeats would be independent at, and a stall's burst inside that level read as a correlation of
@@ -201,8 +215,8 @@ held an election back.
 | Consumer | Takes | State |
 |---|---|---|
 | mantle | hyper-raft, hyper-timing, hyper-log, hyper-block, hyper-measure, hyper-durable, hyper-liveness, hyper-seal and hyper-rt vendored (`vendor/`, `SNAPSHOT` `f358210`), hyper-rt and hyper-block with local changes that are on `main` since `17920a7` (mantle `vendor/UPSTREAM.md`); mantle re-vendors from `main` as its own landing | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
-| focal | every crate it takes vendored at `9fdf7ff` (`vendor/*/SNAPSHOT`), the head of `focal-transport-hooks`, whose commits are on `main` since `d1deca1`; focal re-vendors at `aa82ada` as its own landing | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
-| slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `aa82ada` (`vendor/hyper-raft/SNAPSHOT`, slates' `d33795bb`); their sources as at `67f038d`, unchanged on `main` since | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
+| focal | every crate it takes vendored at `9fdf7ff` (`vendor/*/SNAPSHOT`), the head of `focal-transport-hooks`, whose commits are on `main` since `d1deca1`; focal re-vendors at `43aec4a` as its own landing | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
+| slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `aa82ada` (`vendor/hyper-raft/SNAPSHOT`, slates' `d33795bb`); their sources as at `67f038d`, on `main` since but for hyper-timing's `independent_interval`, which `43aec4a` removes and slates calls nowhere | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
 
 ## What remains (2026-10-12)
 
@@ -214,7 +228,7 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
 2. **One revision for every consumer.** Today mantle, focal and slates each build a different one:
    - focal vendors every crate it takes at `9fdf7ff`, the head of `focal-transport-hooks`, whose
      commits are on `main` since `d1deca1`. Its trial re-vendor at `aa82ada` waited on its in-process
-     reopen failing `Compacted`, which `9fd8ead` fixes; focal re-vendors at `4f12cd8`, which carries it,
+     reopen failing `Compacted`, which `9fd8ead` fixes; focal re-vendors at `43aec4a`, which carries it,
      as its own landing under its own rules, its `FloorStore` passing `keep_after` and `kept_bytes` on
      to the store it wraps.
    - mantle vendors every crate at `f358210` with local changes to hyper-rt and hyper-block, which
@@ -228,14 +242,17 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      `SegmentedFile`, the resident `Epoch` shared across a file's segments, `BlockFile::write_whole`,
      `grow`, `grows_by_segments` and `segment_end`, `DeviceFile::write_copies_at` with `gather.rs` for
      Windows); b9104b7 (request threads in the OS's foreground class) is not on mantle's dev and not
-     here. mantle re-vendors every crate at `4f12cd8`, which carries `55d923e`, as its own landing, with
-     no local delta to replay; with it `LogStore::applied` is `LogStore::keep_after`, and it and
+     here. mantle re-vendors every crate at `43aec4a`, which carries `55d923e`, hyper-rt's long polls
+     judged by step (`4cbea75`, the thread-clock reads its ranges bench found) and hyper-block's
+     residency test asking the page cache on Linux (`1738d0e`), as its own landing, with no local delta
+     to replay; with it `LogStore::applied` is `LogStore::keep_after`, and it and
      `kept_bytes` have no defaults, so a store of mantle's own (its range tests' `Synchronous`) states
      both.
    - slates vendors hyper-datagram, hyper-seal, hyper-swim and hyper-timing at `aa82ada` (slates'
-     `d33795bb`, on its main); their sources are `67f038d`'s and unchanged at `4f12cd8`, and the
-     snapshot's move to it waits on slates' branch `hr-vendor-4f12cd8` (`aa11314e`, a fast-forward of
-     its main `a5c9e135`), which its session fast-forwards on the owner's word.
+     `d33795bb`, on its main); their sources are `67f038d`'s but for hyper-timing's
+     `independent_interval`, which `43aec4a` removes and slates calls nowhere. The snapshot's move to
+     `43aec4a` is slates' branch `hr-vendor-43aec4a`, one commit on its main's head that touches only
+     `vendor/hyper-raft`, which its session lands on the owner's word.
 3. **The shared crates' open work**, each in its own document:
    - hyper-durable: §14's measurements.
    - hyper-sim and hyper-check: S-6 (hyper-raft's and hyper-durable's harnesses onto both crates),

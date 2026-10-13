@@ -8091,10 +8091,16 @@ p99.9 in ms, then entries a second:
   load (×0.45 and ×0.51 of each run's p50, outside both bands): the leader answers at the quorum's pace,
   as §4.2 has it, and its closed loop of one client commits 31% more entries a second.
 - **Its tail grows near saturation**: at 1,749 arrivals a second (90% of the most either way reached)
-  p99 is 78.8 ms against 54.3 and p99.9 96.9 against 58.9, the intervals apart. Not traced yet. The
-  first suspect is the bound on what it may apply ahead, the core's unstable entries
-  (`Limits::unstable_entries`): a leader whose disk falls behind its arrivals would reach it, and its
-  answers would then wait for its own write again, behind a backlog.
+  p99 is 78.8 ms against 54.3 and p99.9 96.9 against 58.9, the intervals apart. Traced (each entry's
+  time split at its first leaving the leader, and the leader's writes out as it was proposed, in a
+  second run at load 11–25): the leader's disk keeps its writes at the depth's three nearly all the time
+  under the open load, either way, and an entry proposed then waits for a slot before it leaves. Every
+  entry's median wait to leave is the same either way (3.9 and 4.1 ms at 90%), but the slowest 1% wait
+  30.5 ms to leave when the leader applies ahead against 5.8 ms when it does not, and in the closed
+  loop, where its answers come before its own write, 35.5 ms against none (the clients, answered
+  sooner, propose into a full depth). So the tail is the leader's write queue, not the quorum. It is
+  not the bound on what the leader may apply ahead (`Limits::unstable_entries`, over a hundred
+  thousand entries at the bench's 16 MiB); why its waits grow under apply-ahead is open.
 - **On a shared disk it changes nothing measurable**: every point within the noise. The followers'
   flushes are as slow as the leader's, so the quorum's pace is its own.
 

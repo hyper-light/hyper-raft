@@ -91,7 +91,45 @@ fn point(
         support::verdict(&p50s(&runs[0]), &p50s(&runs[1])),
         support::verdict(&rates(&runs[0]), &rates(&runs[1]))
     );
+    for (at, way) in ["after", "ahead"].iter().enumerate() {
+        println!("- {way}: {}", phases(&runs[at]));
+    }
     most
+}
+
+/// Where an entry's time went, for every entry and for those at or past the pooled p99: the median
+/// time to its first leaving the leader, the median time from then to its answer, and how many
+/// writes the leader had out as it was proposed.
+fn phases(runs: &[Run]) -> String {
+    let all: Vec<(u64, u64, usize)> = runs.iter().flat_map(|r| r.phases.iter().copied()).collect();
+    let mut total: Vec<u64> = all.iter().map(|(a, b, _)| a + b).collect();
+    total.sort_unstable();
+    let p99 = hyper_measure::quantile::quantile(
+        &total,
+        hyper_measure::quantile::Level::P99,
+        support::COVERAGE,
+    )
+    .map_or(u64::MAX, |q| q.estimate);
+    let describe = |picked: Vec<(u64, u64, usize)>| -> String {
+        let ms = |mut v: Vec<f64>| support::median(&mut v) / 1e6;
+        let n = picked.len();
+        let mut out = [0usize; 5];
+        for (_, _, o) in &picked {
+            out[(*o).min(4)] += 1;
+        }
+        format!(
+            "{n} entries, to leave the leader {:.2} ms, then to answer {:.2} ms, writes out at proposal 0/1/2/3/4+: {:?}",
+            ms(picked.iter().map(|p| p.0 as f64).collect()),
+            ms(picked.iter().map(|p| p.1 as f64).collect()),
+            out
+        )
+    };
+    let tail: Vec<(u64, u64, usize)> = all
+        .iter()
+        .copied()
+        .filter(|(a, b, _)| a + b >= p99)
+        .collect();
+    format!("all {}; at or past p99 {}", describe(all), describe(tail))
 }
 
 fn main() {

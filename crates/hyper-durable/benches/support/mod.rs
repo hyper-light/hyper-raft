@@ -377,6 +377,9 @@ impl Mode {
 /// What one run measured.
 pub struct Run {
     pub latencies: Vec<u64>,
+    /// Each measured entry's phases, in the order answered: from its arrival to its first leaving
+    /// the leader, from then to its answer, and the leader's writes out when it was proposed.
+    pub phases: Vec<(u64, u64, usize)>,
     pub entries_per_second: f64,
     pub frames_per_entry: f64,
     /// Flushes of the device's cache an entry: each frame's, and each confirmation's written on its
@@ -402,6 +405,11 @@ pub struct Group<'w> {
     deadlines: Vec<Option<u64>>,
     /// Raft messages the members sent.
     pub messages: u64,
+    /// When the leader first sent each entry from `first_sent` on to a follower, nanoseconds: the
+    /// phase between an entry's proposal and its leaving the leader.
+    sent: VecDeque<u64>,
+    /// The index `sent` starts at.
+    first_sent: u64,
 }
 
 /// What a member holds now: the last entry it applied, its durable commit `C_d`, and the writes of
@@ -457,6 +465,8 @@ impl<'w> Group<'w> {
             wire: VecDeque::new(),
             deadlines: vec![None; MEMBERS as usize],
             messages: 0,
+            sent: VecDeque::new(),
+            first_sent: 0,
         };
         let first = group.handles[0];
         group.owner.get_mut(first).unwrap().campaign().unwrap();
@@ -491,6 +501,24 @@ impl<'w> Group<'w> {
             }
         });
         self.messages += sent;
+        let at = now();
+        for m in &self.wire {
+            if m.from != 1 || m.msg_type != hyper_raft::proto::MessageType::MsgAppend {
+                continue;
+            }
+            for e in &m.entries {
+                // Each index once, in order: an entry sent again is not its first leaving.
+                if e.index >= self.first_sent + self.sent.len() as u64 {
+                    if self.sent.is_empty() {
+                        self.first_sent = e.index;
+                    }
+                    while self.first_sent + (self.sent.len() as u64) < e.index {
+                        self.sent.push_back(at);
+                    }
+                    self.sent.push_back(at);
+                }
+            }
+        }
         while let Some(m) = self.wire.pop_front() {
             let Some(&to) = self.handles.get(usize::try_from(m.to).unwrap() - 1) else {
                 continue;
@@ -549,6 +577,20 @@ impl<'w> Group<'w> {
                 self.owner.schedule(self.handles[i]);
             }
         }
+    }
+
+    /// The leader's last index and its writes out.
+    fn leader_state(&self) -> (u64, usize) {
+        let r = self.owner.get(self.handles[0]).expect("the leader is held");
+        (r.core().raft.log().last_index().unwrap_or(0), r.in_flight())
+    }
+
+    /// When the leader first sent entry `index`, if it has.
+    fn sent_at(&self, index: u64) -> Option<u64> {
+        index
+            .checked_sub(self.first_sent)
+            .and_then(|at| self.sent.get(usize::try_from(at).ok()?))
+            .copied()
     }
 
     /// Proposes an entry at the leader; false when the core refused it for now.
@@ -617,8 +659,10 @@ fn drive(
 ) -> Run {
     let total = WARM + entries;
     let mut waiting: VecDeque<u64> = VecDeque::new();
-    let mut taken: VecDeque<u64> = VecDeque::new();
+    // Each proposal taken: its arrival, its index, the leader's writes out as it was proposed.
+    let mut taken: VecDeque<(u64, u64, usize)> = VecDeque::new();
     let mut latencies = Vec::with_capacity(usize::try_from(entries).unwrap());
+    let mut phases = Vec::with_capacity(usize::try_from(entries).unwrap());
     let mut arrived = 0u64;
     let mut answered = 0u64;
     let mut next = arrive(now());
@@ -636,22 +680,26 @@ fn drive(
         }
         let mut refused = false;
         while let Some(&t) = waiting.front() {
+            let (_, out) = group.leader_state();
             if !group.propose() {
                 refused = true;
                 break;
             }
-            taken.push_back(t);
+            let (index, _) = group.leader_state();
+            taken.push_back((t, index, out));
             waiting.pop_front();
         }
         let answers = group.turn();
         let at = now();
         for _ in 0..answers {
-            let t = taken
+            let (t, index, out) = taken
                 .pop_front()
                 .expect("an answer for each proposal taken");
             answered += 1;
             if answered > WARM {
                 latencies.push(at.saturating_sub(t));
+                let sent = group.sent_at(index).unwrap_or(at);
+                phases.push((sent.saturating_sub(t), at.saturating_sub(sent), out));
             }
             if answered == WARM {
                 mark = Mark {
@@ -679,6 +727,7 @@ fn drive(
     let per_entry = |n: u64, at: u64| n.saturating_sub(at) as f64 / entries as f64;
     Run {
         latencies,
+        phases,
         entries_per_second: entries as f64 / elapsed,
         frames_per_entry: per_entry(end.frames, mark.counts.frames),
         flushes_per_entry: per_entry(end.flushes, mark.counts.flushes),

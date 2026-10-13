@@ -1135,8 +1135,9 @@ directory once, at create.
    leader slower than its followers by a whole flush, applying ahead halves each run's median
    answer under an open load and lets one client commit 31% more entries a second; on a shared disk
    it changes nothing measurable. Open: near saturation its p99 grows (78.8 against 54.3 ms at 90% of
-   capacity), not traced yet (the core's bound on unstable entries, which a leader whose disk falls
-   behind would reach, is the first suspect); traced before any owner turns it on.
+   capacity): its slowest entries wait to leave the leader, whose disk keeps its three writes out,
+   30 ms against 6 without applying ahead; why that wait grows is open, and settled before any owner
+   turns it on.
 3. **The quiet commit write.** How long a volatile state machine's applied state runs ahead of its
    logged commit under focal's one-period rule, and what the write costs a quiet group. Measured
    (`benches/quiet.rs`; `docs/benchmarks.md`, "A quiet group's commit write"): one period and one

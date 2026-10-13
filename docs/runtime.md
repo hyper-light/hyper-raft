@@ -226,7 +226,8 @@ the step goes on to its count. Polls that list nothing leave the reading to the 
 arrives goes behind the tasks already listed either way, and a drain is a read-modify-write on lines
 the wakers write too; read after every long poll, eight clients onto one shard lost 3–6% of their
 throughput to it (`tests/batch_time.rs`). Ending the step at the budget instead put each long poll in a
-step of its own and undid §3.9's judging of long polls by step (`tests/attribution_by_step.rs` failed).
+step of its own and undid the judging of long polls by step (`attribution::Tracker`; `docs/benchmarks.md`,
+"hyper-rt: long polls judged by step"), which `tests/attribution_by_step.rs` failed.
 
 ### 3.4 The loop
 

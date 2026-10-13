@@ -8233,6 +8233,13 @@ The loop before and after, hyper-rt alone, interleaved (six rounds, load 8.8–1
 | one client pausing 200 µs, CPU a request | 19.8 µs | 20.3 µs |
 | a 1 ms sleep, lateness p50 / p99 | 47 / 145 µs | 38 / 133 µs |
 
+Sampling the yield case also found the shard reading its thread's CPU clock at every step's start,
+51 of its 1,563 samples (3.3%, `__thread_selfusage`): one preempted poll had armed the long-poll
+attribution, and only a wait disarms it, which a shard with work at every step never makes. A step's
+start now reads only where no window is open or, judging one poll at a time, after a step that ran a
+long poll, so a shard reads at most twice a long poll (`tests/thread_account_reads.rs`: before, 2,000
+readings in 2,000 steps after its one long poll).
+
 The yield's price is a reading of the inputs a round of yields: 469–475 instructions a yield against
 423–436 with sixteen tasks, 680–686 against 425–445 with one. Ending the step at each round instead
 cost 500–523 and 1,032–1,269. hyper-rt-transport's driver wakes itself after a budget of turns, and so

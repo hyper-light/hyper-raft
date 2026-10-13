@@ -1038,8 +1038,7 @@ time and lateness past `σ_k`, and the flush proof. A sender behind its schedule
 heartbeat due; those it skipped are never sent, and the receiver takes them as that heartbeat's
 lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
 - **The interval** is the receiver's: its configurator's best (`Configuration::best`), asked in its
-  own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor, nor below the
-  interval its own evidence needs (below, "The interval the evidence needs"), nor, while its node's
+  own heartbeats (Chen et al.'s adaptive scheme), never below the sender's floor, nor, while its node's
   evidence judges the link and its margin at the link's interval promises nothing, below the best
   interval that evidence gives ("Judged before its own evidence"). Where the floor binds
   (before the receiver asks, or past what it asked) the interval is the floor, followed up at once
@@ -1063,31 +1062,31 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   estimator configures only once it has measured `τ_int` (§2.6, item 3), at Madras and Sokal's
   self-consistent window `m ≥ 6·τ̂(m)` among Allan levels of at least seven windows; heartbeats so
   correlated at their interval that no level the history holds reaches that window are refused
-  (`Refusal::CorrelationUnmeasured`) for as long as the correlation outgrows the levels, and the
-  receiver, which asked for a longer interval only once configured, never asked. Now the estimator
-  says where its heartbeats would be independent (`LinkEstimator::independent_interval`): `τ_int`
-  heartbeats at `η` carry what one independent one does (an `m`-mean's variance is `V·τ_int/m`,
-  Sokal 1997 §3), so at `η·τ̂` consecutive heartbeats are independent and the window is met at the
-  first level that can hold it, eight windows of eight, 56 heartbeats. `τ̂` is the longest qualified
-  level's, which sees the most of the correlation and is low, never high, where it is shorter than
-  the correlation; it is taken at the low end of its uncertainty (the level's Allan variance to
-  within `(1 + 1/√(2(K−1)))²` for `K` windows, the tolerance `n_A` takes), and a refusal within that
-  uncertainty waits for longer levels instead of moving. A significant refusal has `τ̂` past `8/6`
-  there, so each move lengthens the interval by more than a third, and a link still too correlated
-  at the interval given moves again: the moves end at the first interval its history can tell apart.
-  The receiver asks at least that interval until the link configures (`max(best, evidence)`); from
-  the first configuration on it asks the best alone, and a refusal of a configured link moves
-  nothing: the configuration in force judges the link while its levels at the interval grow until
-  they measure `τ_int` again. Held past the first configuration, the interval asked was the longest
-  estimate every later refusal drew, a maximum of noisy estimates that grows with the refusals
-  sampled: in the simulation's world whose host freezes begin once its links configure it held a
-  link at 31 s against its configuration's best of 0.57 s, its pairs took a heartbeat every 5.6 s
-  on average against 0.32 s without it, and survivors noticed a killed peer up to 23.8 s after the
-  kill against 1.9 s (`docs/benchmarks.md`, "The detector model, at its causes"). On an AR(1) delay of correlation time 199 ms with heartbeats at 1 ms, which
-  refuses at that interval past a thousand heartbeats, 64 seeds configured within 576 heartbeats, at
-  a final interval of 166 ms at the median and 1.26 s at the most (`link::tests`). The measured
-  `T_c` is the evidence's floor and nothing else: the margin's bound asks no independence of the
-  heartbeats it holds (§2.2), and the unseen share counts the window's arrivals in `τ_int`'s units.
+  (`Refusal::CorrelationUnmeasured`), and the link waits at its interval for a longer level, judged
+  by its node's evidence meanwhile ("Judged before its own evidence"). A correlation of `τ_int`
+  heartbeats is measured once a level of `6·τ_int` has its seven windows, about `42·T_c` of time at
+  any interval, `T_c = η·τ_int`: a longer interval sends fewer heartbeats for the same evidence and
+  gets it no sooner. It once asked a longer interval instead, the one the longest qualified level said
+  its heartbeats would be independent at, and each move started the levels again. A stall's burst
+  inside the first level read as a correlation of the whole history: on a windows-2025 runner a link
+  at 874 ms took 56 heartbeats with one six-second burst among them (8 heartbeats 80 to 820 ms late,
+  the rest 1 to 20 ms), moved to 4.8 s, there met bursts of 15 to 35 s and moved to 9.4 s, where no
+  heartbeat was late by more than 17 ms, and its next 56 heartbeats would have taken 9 minutes (diag
+  run 38317208076, round 6; replayed through the estimator, a stalled-disk link's moves 2,175 →
+  2,991 → 4,513 ms recur exactly, each at its 56th heartbeat). In the simulation's worlds (4 worlds,
+  32 seeds, 384 links each, `tests/sim.rs`'s `measure_evidence_moves` on branch
+  `burst-evidence-arms`), waiting configured every link as moving did, at the same median (0.78,
+  2.0, 0.30 and 2.3 s), and its slowest sooner: 1.9 s against 5.1 s on macOS, 1.4 s against 5.7 s
+  on Linux, 8.5 s against 24.5 s on Windows, 6.3 s against 6.3 s with macOS's log busy, where 138
+  of its links had moved; mistakes against the allowance as before (85 of 604 against 90 of 609 on
+  macOS, 0 on Windows), and no link unresolved. On an AR(1) delay of correlation time 199 ms with
+  heartbeats at 1 ms, 64 seeds configure at that interval within 63 to 1,201 heartbeats, 1.2 s at
+  the most, where moved they took up to 576 heartbeats at intervals up to 1.26 s (`link::tests`).
+  The record law the unseen share uses counts the window's arrivals in `τ_int`'s units; under
+  clustered lateness the chance that the next heartbeat is a record depends on how a cluster rises
+  (1/n for a max-autoregressive chain whatever its extremal index, near `1/(θn)` for clusters that
+  climb to their peak), so `τ_int` stays its count: the measured `T_c` is the evidence's floor and
+  nothing else, and the margin's bound asks no independence of the heartbeats it holds (§2.2).
 - **A moved interval.** A receiver that asks for a longer interval expects the next heartbeat that
   much later (`LinkEstimator::expect_interval`): until a heartbeat at the new interval comes, each
   freshness point is put back by the difference, and the stated bound counts it. Before, the
@@ -1253,7 +1252,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   live link's configuration or its pool's measure), every freshness point long passed.
 
   What remains is the live link's own evidence, which no rule can lend it: in the slow worlds it is
-  the link's correlation, which the moves of "The interval the evidence needs" resolve.
+  the link's correlation, which a longer Allan level at the link's interval resolves ("The interval
+  the evidence needs").
 
   A peer from which no heartbeat has come is judged from the node's first poll with the pair
   attached: one interval at the node's own floor (the pool's premise is that the stalls, and the
@@ -1598,9 +1598,11 @@ What the first form of this wiring found of the stream, each closed in hyper-liv
   link was refused for as long as either lasted. In this test, seed 0, one node's link to another
   took 3,000,000 heartbeats unconfigured; in hyper-durable-e2e's processes on this machine, both
   followers' links to one member took 2,700 each. Closed at both causes: the floor is followed up
-  and not down, and a link that refuses for want of `τ_int` asks the interval its own levels say its
-  heartbeats would be independent at (§2.8, "The interval the evidence needs"); meanwhile it is
-  judged by its node's pool, and a peer never heard from is judged from the attach.
+  at once and down only once its flushes have doubled, and a link that refuses for want of `τ_int`
+  waits at its interval for a longer level (§2.8, "The interval the evidence needs"; it once asked
+  the interval its levels said its heartbeats would be independent at, which a stall's burst drove
+  to seconds); meanwhile it is judged by its node's pool, and a peer never heard from is judged from
+  the attach.
 - **A new run was not surfaced.** Now `Change::Restarted`, to the core's `restarted`.
 - **The pool** of item 10: built (§2.8).
 - **A false suspicion at every move the receiver asked.** Found once the intervals moved: a
@@ -2041,8 +2043,8 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     live link has no peer to elect with. A crash in a link's first heartbeats is so suspected
     within the later of its node's first evidence and the link's freshness point, both measured.
     That evidence is itself bounded by the interval the evidence needs (§2.8): a live link too
-    correlated at its floor moves to where its heartbeats are independent instead of refusing, and
-    configures there. Held in hyper-liveness's simulation
+    correlated at its floor for a short level waits there for a longer one, and configures there.
+    Held in hyper-liveness's simulation
     (`every_link_configures_or_suspects_a_crash_within_its_bound`,
     `a_peer_never_heard_from_is_suspected`,
     `a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`), its real
@@ -2153,7 +2155,7 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   round trips. A heartbeat allocates nothing once configured and costs 0.7 to 1.0 µs of the crate's
   work; per node, the stream's cost does not grow with the groups (`docs/benchmarks.md`,
   "hyper-liveness"). Its follow-ups (§2.9) done: every link configures or is judged by its node's
-  pool, the interval its evidence needs measured online, a moved interval expected, a restart
+  pool, its correlation measured online at its interval, a moved interval expected, a restart
   reported (`Change::Restarted`).
 - **L-4** the E2E member and harness on L-1–L-3 (§2.5), done: hyper-durable-e2e's and
   hyper-raft-e2e's members run on their own detectors, and neither test computes a period, a tick, a

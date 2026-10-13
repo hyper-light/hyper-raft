@@ -39,12 +39,43 @@ where
     connected_on(pair, limits, budget, hyper_sim::Source::Seed(0))
 }
 
+/// Node 1 and node 2 connected, node 2's stream pool sized to `pool` before node 1 dials it.
+fn connected_sizing<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    pool: u32,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    connected_from(pair, limits, budget, hyper_sim::Source::Seed(0), |b| {
+        b.set_stream_pool(pool).unwrap();
+    })
+}
+
 /// Node 1 and node 2 connected on a network whose world draws from `source`.
 fn connected_on<A, B>(
     pair: &Pair,
     limits: Limits,
     budget: u64,
     source: hyper_sim::Source,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    connected_from(pair, limits, budget, source, |_| {})
+}
+
+/// [`connected_on`], node 2 prepared by `prepare` before node 1 dials it.
+fn connected_from<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    source: hyper_sim::Source,
+    prepare: impl FnOnce(&mut Node<B>),
 ) -> Net<Node<A>, Node<B>>
 where
     A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
@@ -72,6 +103,7 @@ where
     let (mut a, mut b) = (a, b);
     a.set_oracle(true);
     b.set_oracle(true);
+    prepare(&mut b);
     let mut net = Net::of(now, a, b, source);
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
@@ -566,6 +598,158 @@ fn exchanges_past_the_stream_limit_wait_their_turn_and_the_table_is_bounded() {
             .all(|asked| asked.refused.is_none() && asked.read == 1_000)
     );
     assert_eq!(server.answered, 6);
+}
+
+/// A pooled server holds its peer to the pool it sizes (docs/transport.md §4g): of ten exchanges
+/// asked at once on a connection that may hold sixteen, no more than the pool's three are open at
+/// the server at once; the others wait at the asker and go as streams come back, and every one
+/// completes. The asker said it was blocked (STREAMS_BLOCKED) and was granted streams for it.
+#[test]
+fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
+    let pair = Pair::new();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 3);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.think = Duration::from_millis(5);
+    for seed in 0..10 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(1_000),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    // The server answers a request whole after its think time: the clock moves in steps no
+    // longer than a millisecond, so it is asked again within one of it.
+    let mut most = 0;
+    for _ in 0..TURNS {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.now = Some(net.now);
+        server.serve(&mut net.b);
+        most = most.max(net.b.stats().exchanges);
+        if asker.finished() {
+            break;
+        }
+        net.exchange();
+        net.advance_within(Duration::from_millis(1));
+    }
+    assert!(asker.finished());
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == 1_000)
+    );
+    assert_eq!(server.answered, 10);
+    assert!(most <= 3, "{most} exchanges open at once past a pool of 3");
+    let pool = net.b.stats().pool;
+    assert!(pool.grants > 0, "{pool:?}");
+    assert!(pool.granted <= 3, "{pool:?}");
+}
+
+/// An asker that bounds its queue by its credit (`AskQueue::Credit`) refuses an exchange `Unsent`
+/// at once, nothing sent, when its connection already waits for as many streams as its peer grants
+/// it: asked ten at once of a pooled peer that granted it two, it holds two, queues two, and refuses
+/// the other six at `open`, and the four it took are all answered.
+#[test]
+fn an_asker_bounded_by_its_credit_refuses_past_a_round_of_it() {
+    let pair = Pair::new();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    pooled.ask_queue = hyper_transport::AskQueue::Credit;
+    let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 2);
+    // The pool's welcome, a grant of both its streams, reaches the asker.
+    for _ in 0..64 {
+        net.exchange();
+        net.advance_within(Duration::from_millis(1));
+    }
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    let mut refused = 0;
+    for seed in 0..10 {
+        match asker.ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            seed,
+            Some(1_000),
+            PERIOD,
+        ) {
+            Ok(_) => {}
+            Err(Refusal::Unsent) => refused += 1,
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(refused, 6, "two held and two queued of a credit of two");
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.drive(&mut net.a);
+        asker.finished()
+    });
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == 1_000)
+    );
+    assert_eq!(server.answered, 4);
+}
+
+/// A pool sized to nothing grants no stream past the handshake's: what the asker sends past it
+/// waits, and goes once the owner sizes the pool again.
+#[test]
+fn a_pool_sized_to_nothing_holds_its_peer_until_sized_again() {
+    let pair = Pair::new();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 0);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    for seed in 0..4 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(1_000),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    // The handshake's one stream carries one exchange; it ends, and its stream is the pool's.
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.drive(&mut net.a);
+        server.answered == 1
+    });
+    // Half a progress period: time for any stream to have gone out, and short of the period
+    // after which the asker judges its queue stalled.
+    let quiet = net.now + PERIOD / 2;
+    while net.now < quiet {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        net.advance_within(PERIOD / 16);
+    }
+    assert_eq!(server.answered, 1, "nothing past the handshake's stream");
+    net.b.set_stream_pool(4).unwrap();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.drive(&mut net.a);
+        asker.finished()
+    });
+    assert_eq!(server.answered, 4);
 }
 
 /// A peer that stops answering ends its exchanges within their progress deadline (T39), and the
@@ -2140,7 +2324,7 @@ fn exchanges_queued_behind_steady_credit_all_complete_past_several_periods() {
 /// Policy C's other half: a peer that stops granting credit stops the queue, and every exchange queued behind it is
 /// refused, typed, within one progress period of the queue's last advance. Do: one stream a connection, four exchanges;
 /// the server answers the first and trickles its reply (twice the least progress every half period, so the first is
-/// never itself stalled and never frees its stream). Expect: the three queued refused `Stalled` within two periods of
+/// never itself stalled and never frees its stream). Expect: the three queued refused `Unsent` within two periods of
 /// the first being given its stream (one period, and the judgement that finds it), while the first is still alive.
 #[test]
 fn exchanges_queued_behind_withheld_credit_are_refused_within_a_period_of_the_last_advance() {
@@ -2231,8 +2415,8 @@ fn exchanges_queued_behind_withheld_credit_are_refused_within_a_period_of_the_la
     for (at, asked) in asker.asked.iter().enumerate().skip(1) {
         assert_eq!(
             asked.refused.map(|(refusal, _)| refusal),
-            Some(Refusal::Stalled),
-            "exchange {at}"
+            Some(Refusal::Unsent),
+            "exchange {at}: refused unsent, as it never had a stream"
         );
         let after = refused_at[at].unwrap().duration_since(last_advance);
         assert!(

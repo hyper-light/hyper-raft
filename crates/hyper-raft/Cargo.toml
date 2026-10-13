@@ -35,6 +35,9 @@ raft-proto.workspace = true
 slog.workspace = true
 # The counting allocator: what a proposal allocates at any backlog (`tests/backlog.rs`).
 hyper-measure = { path = "../hyper-measure" }
+# The typed write queue a member's lagged persistence runs on (`tests/support/lagged.rs`,
+# docs/sim.md §3.5).
+hyper-sim = { path = "../hyper-sim" }
 
 [[bench]]
 name = "replicate"

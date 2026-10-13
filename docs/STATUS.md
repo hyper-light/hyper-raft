@@ -268,11 +268,12 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      with its log where a transition through the shell does not. Open: item 1 on Linux and with many
      groups; a leader sending its appends before its own write has a slot (item 2); the shell choosing
      an image by the measured crossover (item 5); item 6's question of PAR's identifiers.
-   - hyper-sim and hyper-check: S-6's first half is built (`docs/sim.md` §17): hyper-durable's
-     schedules in the world, on its network and on the typed write queue, judged by hyper-check's
-     oracles, their crashes forked, every floor at the same seed counts, 60–69% fewer allocations a
-     step. Open: hyper-raft's half of S-6 (its schedule tests' mixes as swarm configurations, §15.11),
-     hyper-durable's `support/device.rs` with hyper-log under the world (§11 item 6), the rest of S-3
+   - hyper-sim and hyper-check: S-6 is built (`docs/sim.md` §17, §18): hyper-durable's schedules in
+     the world, on its network and on the typed write queue, judged by hyper-check's oracles, their
+     crashes forked, every floor at the same seed counts, 60–69% fewer allocations a step; hyper-raft's
+     judged schedules under swarm configurations, `Lagged` on the write queue, its draws kept for S-5's
+     tapes. Open: the world's chooser playing a tape (§18), hyper-durable's `support/device.rs` with
+     hyper-log under the world (§11 item 6), the rest of S-3
      (the block device in the world, its completions' latency and its handles; the namespace model;
      the fault envelope), the network cancelling a dropped message's arrival (§17, the capacity), S-7
      (the E2E crates' histories checked) and S-8 (the consumers' simulations), `docs/sim.md` §9.

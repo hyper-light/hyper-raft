@@ -836,6 +836,7 @@ dependencies = [
  "hyper-check",
  "hyper-measure",
  "hyper-raft",
+ "hyper-sim",
  "hyper-timing",
  "raft",
  "raft-proto",

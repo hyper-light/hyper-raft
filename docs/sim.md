@@ -17,7 +17,8 @@
 > its completions events of the world. **S-6's first half built** (§17): hyper-durable's schedules
 > in the world, on its network and its write queue, judged by hyper-check's oracles, their crashes
 > enumerated by fork. The block device in the world (latency, handles), the namespace model, the
-> fault envelope, hyper-raft's half of S-6, S-7 and S-8 are designed, not built. Sources and
+> fault envelope, S-7 and S-8 are designed, not built. **S-6's second half** (§18): hyper-raft's
+> judged schedules under swarm configurations, `Lagged` on the write queue. Sources and
 > what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
 > §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
 > below shows a piece falls short.
@@ -1824,4 +1825,42 @@ the old harness's range (7–9% less in two shapes, 16% more in the control grou
 more, all of it a run's setup (equal at 20,000 steps). The world's own cost a step is its exact draws and
 the trace, which S-1 measured and which at 20,000 steps leave the new harness 9–25% slower a step:
 open with S-1's.
+
+## 18. S-6 as built: hyper-raft's schedules (2026-10-13)
+
+§8 and §15.11 give hyper-raft's half of S-6: its schedules' mixes become swarm configurations, its
+oracle hyper-check's, its crashes forks, `Lagged`'s steps the typed write queue's, and its draws and
+network the world's.
+
+- **Swarm configurations.** `tests/check.rs`'s judged schedules of the three harnesses (the group of
+  five with three voters, the fast track's five voters, the members whose writes lag) now draw each
+  seed's configuration within the harness's ranges (`support::swarm`, moved from the strategies'
+  campaigns: each rule and each kind of step on or off with even odds, each rate over the range the
+  schedule tests run, the group's size from the sizes they run), each held to every oracle of §4.1,
+  its clients' history to both linearizability checkers, its liveness phase to its bound. The schedule
+  tests (`tests/group.rs`, `fast.rs`, `pipeline.rs`) keep their fixed mixes under the harness's own
+  checks, so the gate runs both: each seed fixed, and each seed its own. The floors were set again from
+  the swarm's counts over the same seed counts (96, 96 and 48), by §4.4's rule; every path the fixed
+  mixes floored is floored, the rarer at once a campaign (a group's write failed by its term ending
+  38 times in 96 seeds, the lagging members' reads served 46 in 48).
+- **The oracle** is hyper-check's for these schedules since S-4 (`support::judge`); the harness's
+  own checks stay for the fixed mixes and for the differential against raft-rs, which compares the
+  two cores' words.
+- **Crash at every step** forks since S-5 (§15.6).
+- **`Lagged`'s persistence** is hyper-sim's typed write queue (§16): a write a member takes is
+  submitted, made durable at the schedule's `Persist(Durable)` step and heard of at `Notify`, the
+  queue's bound the member's depth.
+- **The world's streams and network: not taken, by S-5's tapes.** hyper-raft's harness draws every
+  decision through `Draws`, which S-5's tapes play, mutate and shrink by step (§15.7, Gulcan et al.'s
+  feasible mutation): a tape's word is reduced to whatever bound the state then asks, and its steps
+  carry their kinds. The world's trace has neither: a replayed word past its bound diverges the run
+  (`SimError::Diverged`), and it records decisions, not steps. Under the free discipline the world's
+  network adds nothing the harness's indexed one lacks (any message next, lost, repeated, cut; no
+  time). So the harness keeps its draws until the world's chooser can play a tape (a step's words and
+  kind, each reduced to its bound), which would give hyper-durable's schedules, now in the world, the
+  same mutation and shrinking; open.
+- **The gate**: every oracle and every floor at the same seed counts, the differential unchanged, and
+  the defects of seeds 9,843 and 54,104 caught as planted mutants (`tests/check.rs`,
+  `the_fast_track_without_its_first_rule_is_caught` and `_second_rule_`), their seeds' directed
+  regressions kept at the fixed mix that found them.
 

@@ -21,6 +21,9 @@ use hyper_log::{
 };
 use proptest::prelude::*;
 
+mod common;
+use common::held;
+
 const ID: u128 = 0x0067_726f_7570;
 const BLOCK: usize = 4096;
 
@@ -274,6 +277,175 @@ fn a_handle_holds_its_group() {
     log.write(1, u()).unwrap();
     let h = log.group(1).unwrap();
     assert_eq!(h.bounds().unwrap(), (Start::default(), 1));
+}
+
+/// Two claims of `group` race while a flush is held: the first the log hears takes the group,
+/// the second is refused `Claimed`, and only then does `then` run (it lets the flush through), so
+/// whichever claim was first was heard with the flush held. The handle of the claim that took it.
+fn claim_while_held(
+    log: &Log<common::Held>,
+    group: u128,
+    then: impl FnOnce(),
+) -> GroupLog<common::Held> {
+    let (refused, heard) = std::sync::mpsc::sync_channel(2);
+    let mut claimed: Vec<GroupLog<common::Held>> = std::thread::scope(|s| {
+        let claims: Vec<_> = (0..2)
+            .map(|_| {
+                let refused = refused.clone();
+                s.spawn(move || match log.group(group) {
+                    Ok(h) => Some(h),
+                    Err(LogError::Claimed(g)) if g == group => {
+                        refused.send(()).unwrap();
+                        None
+                    }
+                    Err(e) => panic!("{e:?}"),
+                })
+            })
+            .collect();
+        heard.recv().unwrap();
+        then();
+        claims
+            .into_iter()
+            .filter_map(|c| c.join().unwrap())
+            .collect()
+    });
+    assert_eq!(claimed.len(), 1, "one claim holds the group");
+    claimed.pop().unwrap()
+}
+
+/// A claim takes its group as the writes admitted before it leave it. A handle let go with its
+/// compaction still on the device (focal's replica stopping with a write out) leaves that write to
+/// the log, and the next claim's handle starts at the compaction's start. Answered at once, the
+/// claim's handle said the group started where it had, and the entries the log no longer held were
+/// refused `Compacted` when it asked for them (focal's in-process reopen).
+#[test]
+fn a_claim_takes_its_group_as_the_writes_admitted_before_it_leave_it() {
+    let (device, gated) = held(sim(6));
+    let log = Log::create(device, config(1 << 20), ID).unwrap();
+    let mut h = log.group(1).unwrap();
+    h.write(Update {
+        entries: Some(entries(1, 4, 1, 16)),
+        hard_state: Some(HardState {
+            term: 1,
+            vote: 0,
+            commit: 4,
+        }),
+        ..Update::default()
+    })
+    .unwrap();
+    gated.hold();
+    let shut = gated.released();
+    let start = Start { index: 4, term: 1 };
+    h.submit(Update {
+        start: Some(start),
+        ..Update::default()
+    })
+    .unwrap();
+    gated.held();
+    drop(h);
+    let h = claim_while_held(&log, 1, || drop(shut));
+    assert_eq!(h.bounds().unwrap(), (start, 4));
+    assert!(
+        matches!(
+            h.fetch(1, 5, u64::MAX, Fetched::new()),
+            Err(LogError::Compacted { first: 5, .. })
+        ),
+        "the handle refuses what the compaction took, as the log does"
+    );
+    assert_eq!(h.view().unwrap(), log.view(1).unwrap());
+}
+
+/// Entries a handle let go with on the device are the next handle's: its last is theirs, and it
+/// reads them, where a handle answered at once would end before them and write over them.
+#[test]
+fn a_claim_takes_the_entries_its_group_had_on_the_device() {
+    let (device, gated) = held(sim(7));
+    let log = Log::create(device, config(1 << 20), ID).unwrap();
+    let mut h = log.group(1).unwrap();
+    gated.hold();
+    let shut = gated.released();
+    h.submit(Update {
+        entries: Some(entries(1, 3, 1, 16)),
+        ..Update::default()
+    })
+    .unwrap();
+    gated.held();
+    drop(h);
+    let h = claim_while_held(&log, 1, || drop(shut));
+    assert_eq!(h.bounds().unwrap(), (Start::default(), 3));
+    assert_eq!(h.fetch(1, 4, u64::MAX, Fetched::new()).unwrap().len(), 3);
+    assert_eq!(h.view().unwrap(), log.view(1).unwrap());
+}
+
+/// A write the log refuses after the next claim of its group is no refusal of the new handle's:
+/// the new handle's first write, of its own first epoch, is taken. The old handle's write past a
+/// gap waits behind its held frame, so it is refused once the claim waits; were the refusal kept,
+/// the new handle's writes would be refused `Behind` until its epoch passed the old one's.
+#[test]
+fn a_refusal_of_a_released_handles_write_is_not_the_next_handles() {
+    let (device, gated) = held(sim(8));
+    let log = Log::create(device, config(1 << 20), ID).unwrap();
+    let mut h = log.group(1).unwrap();
+    gated.hold();
+    let shut = gated.released();
+    h.submit(Update {
+        entries: Some(entries(1, 1, 1, 16)),
+        ..Update::default()
+    })
+    .unwrap();
+    gated.held();
+    h.submit(Update {
+        entries: Some(entries(5, 1, 1, 16)),
+        ..Update::default()
+    })
+    .unwrap();
+    drop(h);
+    let mut h = claim_while_held(&log, 1, || drop(shut));
+    assert_eq!(h.bounds().unwrap(), (Start::default(), 1));
+    h.write(Update {
+        entries: Some(entries(2, 1, 1, 16)),
+        ..Update::default()
+    })
+    .unwrap();
+    assert_eq!(h.bounds().unwrap(), (Start::default(), 2));
+}
+
+/// A write that fails on the device under a waiting claim fences the log and is refused, and the
+/// claim is answered with the group as the log holds it, without that write.
+#[test]
+fn a_claim_waiting_on_a_failed_write_is_answered_as_the_log_stands() {
+    let (device, gated) = held(sim(9));
+    let log = Log::create(device, config(1 << 20), ID).unwrap();
+    let mut h = log.group(1).unwrap();
+    h.write(Update {
+        entries: Some(entries(1, 2, 1, 16)),
+        ..Update::default()
+    })
+    .unwrap();
+    gated.hold();
+    let shut = gated.released();
+    h.submit(Update {
+        entries: Some(entries(3, 1, 1, 16)),
+        ..Update::default()
+    })
+    .unwrap();
+    gated.held();
+    drop(h);
+    let h = claim_while_held(&log, 1, || {
+        gated.inject(Fault::SyncError);
+        drop(shut);
+    });
+    assert_eq!(h.bounds().unwrap(), (Start::default(), 2));
+    assert!(matches!(
+        log.write(
+            2,
+            Update {
+                entries: Some(entries(1, 1, 1, 16)),
+                ..Update::default()
+            }
+        ),
+        Err(LogError::Fenced)
+    ));
 }
 
 /// A handle answers reads of what it holds itself, and asks the log only for entries older

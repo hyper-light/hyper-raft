@@ -802,6 +802,17 @@ another handle holds the group, and every call answers `Closed` once the log has
 `GroupStore::claim` and `remove` take either, through `LogGroups` (focal 27 §15.8, where focal's
 owners move onto hyper-log).
 
+A claim takes the group as the writes admitted before it leave it. A handle may be let go with a
+write still on the device: a replica stopped with its compaction out, or a handle dropped by an
+unwind. The log answers such a claim only once it has answered every write of the group that it
+had admitted or held waiting for room. The group is claimed meanwhile, so nothing else writes it;
+the owner is woken by the device for it as for its other waiting work; and a refusal heard of those
+writes is cleared, as the new handle's writes are of epochs of their own. Answered at once, the
+claim handed out the group as it stood before the write. The write was then applied with no word to
+the new handle, which read below a start the log had moved and was refused `Compacted` (focal's
+in-process reopen of a shell group, 2026-10-13). Its later writes were also refused `Behind` for
+the old handle's refusal.
+
 Every call into the core and the state machine runs inside an unwind boundary (focal's
 `guarded_in`): an unwind fences the replica and is reported, never propagated (mantle `CLAUDE.md`
 §1). The core does not unwind; the state machine is an application's.

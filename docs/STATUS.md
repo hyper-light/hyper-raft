@@ -67,7 +67,11 @@ from the handle and a stalled member pins nothing past what it was sent (`docs/d
 question); the store's two keep methods have no defaults, so a wrapper passes the mark on.
 In hyper-rt, a step's long polls judged at one reading of the thread's clock at its end, not two a poll
 (`4cbea75`): on mantle's ranges bench the reads fell 8–9 times, and `__thread_selfusage` from 2.9 % to
-0.5 % of a seek's shard samples (`docs/benchmarks.md`, "hyper-rt: long polls judged by step").
+0.5 % of a seek's shard samples (`docs/benchmarks.md`, "hyper-rt: long polls judged by step"); on
+mantle's newest fill (2026-10-13), its fill 3.3 % faster at 10M against mantle's vendored `f358210`, ahead
+in every one of six rounds. A poll's end and a task's live reading carried from the step's reading of the
+clock by the counter, read without synchronization: `mach_continuous_time` from 2.5 % of the fill's shard
+samples to 0.1 % (`docs/runtime.md` §3.9).
 
 ## Open defects
 

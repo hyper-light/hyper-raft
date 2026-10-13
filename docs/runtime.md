@@ -492,6 +492,22 @@ case, and the loop's costs must not grow with the load.
   `CLOCK_MONOTONIC` `2 + 2p` times; a poll that yields cost 47.5 ns and costs 15.9 ns (note 42 §7).
   `SCALE_BITS` (32) is format: the 64×64-bit product cannot overflow 128 bits and the rounding error stays
   under 10⁻¹¹ of a tick (`machine::clock`'s tests).
+- **A poll's end from the counter.** The loop reads the driver's clock once a step and carries that reading
+  to the step's polls by the generic timer's counter, CNTVCT_EL0, read without synchronization
+  (`machine::clock::Carried`; aarch64 under macOS and Linux, and elsewhere the clock takes every reading);
+  a task's `ShardContext::now_ns` is carried the same way, never earlier than a reading before it. The OS
+  clocks read the counter ordered behind the instructions before them (an `isb`, or a register that
+  orders itself), so a poll's end read that way waited for the poll's outstanding work. On mantle's fill
+  (its newest tree, 2026-10-13, 100M keys, one frozen runtime record for both arms) `mach_continuous_time`
+  held 2.5% of the shard thread's samples (113 and 111 of about 4,425 in two runs) and, carried, 0.1% (4
+  and 4), with `poll_slot`'s own samples up 0.5%. The fill's rate moved within the noise of a host at load
+  22: carried over not, round by round, 0.95 to 1.11, median 1.01, eight rounds of 10M
+  (`benchmark-results/hyper-rt-clock-20261013`). The counter's scale is its frequency register,
+  CNTFRQ_EL0: on this machine CNTVCT_EL0 counts at 1 GHz while the timebase macOS's clocks count in is
+  24 MHz, and a first trial that scaled the counter by the timebase read every poll 41.67 times too long;
+  `machine::clock`'s test now holds the counter to its stated scale on each aarch64 host it runs on. Each
+  step reads the clock afresh, so a scale off by a fraction would move a reading by that fraction of the
+  time since its step's own, never more.
 - **Channels hand values over with no lock (D4).** The bounded channel and the one-shot carry their values
   through a lock-free bounded ring (`sync/ring.rs`, Vyukov's queue with std's lap-encoded positions), wake
   a waiting receiver, task or parked thread, through its cell's waiter word (`handoff.rs`), and hold

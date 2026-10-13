@@ -334,6 +334,13 @@ pub struct ShardContext {
     pub(crate) is_sim: bool,
     /// The driver's clock, read live.
     pub(crate) clock: crate::driver::Clock,
+    /// The loop's last reading of the driver's clock with the counter's ticks then, which a live reading
+    /// carries forward (`machine::clock::Carried`); `None` where the shard reads no counter, and the driver's
+    /// clock takes every reading.
+    pub(crate) carried: Cell<Option<crate::machine::clock::Carried>>,
+    /// The latest live reading handed out, so none is earlier than one before it: each step reads the
+    /// driver's clock afresh, and a scale off by a fraction could carry a reading past the next step's.
+    latest_ns: Cell<u64>,
     pub(crate) entry: Option<&'static Entry>,
     pub(crate) incarnation: Option<SlotHolder>,
     pub(crate) kept: KeptValues,
@@ -442,6 +449,8 @@ impl ShardContext {
             timer_waits: Cell::new(0),
             is_sim,
             clock,
+            carried: Cell::new(None),
+            latest_ns: Cell::new(0),
             entry: registry::entry(id),
             incarnation: registry::entry(id).map(Entry::holder),
             kept: KeptValues::default(),
@@ -503,14 +512,24 @@ impl ShardContext {
 
     // ------------------------------------------------------------------ what tasks read
 
-    /// The shard's clock in nanoseconds, read live from its driver's clock (the time the loop last published
-    /// where the driver has none).
+    /// The shard's clock in nanoseconds, read live: from the counter carrying the loop's last reading of
+    /// its driver's clock forward where the shard reads one (`machine::clock::counter_ticks`), else from the
+    /// driver's clock (the time the loop last published where the driver has none). Never earlier than a
+    /// reading before it.
     pub fn now_ns(&self) -> u64 {
-        match self.clock {
-            crate::driver::Clock::Since(epoch) => crate::driver::nanos_since(epoch),
-            crate::driver::Clock::Sim(shared) => shared.now_ns(),
-            crate::driver::Clock::Published => self.now_ns.get(),
-        }
+        let now = match self.clock {
+            crate::driver::Clock::Since(epoch) => {
+                match (self.carried.get(), crate::machine::clock::counter_ticks()) {
+                    (Some(carried), Some(ticks)) => carried.now_ns(ticks),
+                    _ => crate::driver::nanos_since(epoch),
+                }
+            }
+            crate::driver::Clock::Sim(shared) => return shared.now_ns(),
+            crate::driver::Clock::Published => return self.now_ns.get(),
+        };
+        let now = now.max(self.latest_ns.get());
+        self.latest_ns.set(now);
+        now
     }
 
     /// The task being polled on this shard right now.

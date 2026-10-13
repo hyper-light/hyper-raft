@@ -229,6 +229,9 @@ struct Core {
     idle_ratio: u64,
     fixed_quantum_ns: u64,
     fixed_spin_ns: u64,
+    /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
+    /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
+    counter_scale: Option<u64>,
     /// The published time of the last driver retrieval: busy native turns share one quantum.
     last_driver_ns: u64,
     /// Whether the driver's clock is real time (the simulation's is not).
@@ -373,6 +376,11 @@ impl Shard {
                 .map_or(1, |tracking| tracking.idle_ratio),
             fixed_quantum_ns: config.step_budget_ns,
             fixed_spin_ns: config.spin_ns,
+            // Only the OS's clock is carried: a simulated or published clock is the driver's to keep.
+            counter_scale: match desk.clock {
+                crate::driver::Clock::Since(_) => crate::machine::clock::counter_scale(),
+                crate::driver::Clock::Sim(_) | crate::driver::Clock::Published => None,
+            },
             last_driver_ns: now_ns,
             real_time: !is_sim,
             attribution: Tracker::default(),
@@ -506,6 +514,32 @@ impl Shard {
 
     fn publish_clock(&self) {
         self.desk.now_ns.set(self.now_ns());
+    }
+
+    /// The step's reading of the driver's clock, published, and the counter's ticks beside it, which carry it
+    /// forward to the step's later readings (docs/runtime.md §3.9, "a poll's end from the counter"); none
+    /// once the driver is lost, or where the shard reads no counter.
+    fn publish_and_carry_clock(&self) {
+        self.publish_clock();
+        let carried = match (self.core.counter_scale, self.core.driver_lost) {
+            (Some(scale), false) => crate::machine::clock::counter_ticks().map(|ticks| {
+                crate::machine::clock::Carried::new(self.desk.now_ns.get(), ticks, scale)
+            }),
+            _ => None,
+        };
+        self.desk.carried.set(carried);
+    }
+
+    /// The driver's clock now within a step: its step's reading carried forward by the counter where the
+    /// shard reads one, else read again.
+    fn carried_now_ns(&self) -> u64 {
+        match (
+            self.desk.carried.get(),
+            crate::machine::clock::counter_ticks(),
+        ) {
+            (Some(carried), Some(ticks)) => carried.now_ns(ticks),
+            _ => self.now_ns(),
+        }
     }
 
     // ------------------------------------------------------------------ admission
@@ -960,8 +994,8 @@ impl Shard {
             };
         }
         // The step's one reading of the clock: the overrun of a wait just ended, the attribution window, the
-        // timers and the harvest's quantum all take it.
-        self.publish_clock();
+        // timers and the harvest's quantum all take it, and the counter carries it to the step's polls.
+        self.publish_and_carry_clock();
         // Only where the step's start opens a window: the account is a system call, and every step paid it
         // before the tracker threw an unarmed read away; judging by step, the last step's reading is open.
         if self.core.real_time && self.core.attribution.reads_at_step_start() {
@@ -1007,7 +1041,7 @@ impl Shard {
             did_work = true;
             let start = match mark {
                 Some(start) => start,
-                None => self.now_ns(),
+                None => self.carried_now_ns(),
             };
             mark = Some(self.poll_slot(slot, start));
             self.apply();
@@ -1569,7 +1603,7 @@ impl Shard {
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
         drop(entered);
-        let ended = self.now_ns();
+        let ended = self.carried_now_ns().max(start);
         self.desk.current_task.set(None);
         // A request served in this poll opens the idle window from where the poll ended, not where it began:
         // the spin covers the moments after the shard goes idle, however long the serving took.

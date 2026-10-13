@@ -46,13 +46,20 @@ pub struct RangeMachine {
     configuration: ConfState,
     applied: Point,
     persisted: Point,
+    /// Time spent in `apply`, nanoseconds, and the entries applied: what a drive's apply costs is
+    /// read from (`docs/durable.md` §14 item 4).
+    pub apply_ns: u64,
+    pub applied_entries: u64,
 }
 
-impl StateMachine for RangeMachine {
-    /// The answers an entry made: the run waits for its own entry's.
-    type Answer = usize;
-
-    fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<usize>) -> Result<(), Fatal> {
+impl RangeMachine {
+    /// Applies an entry: mantle's `apply_entry` for a command's batch, the engine's index alone for
+    /// an empty entry.
+    fn apply_untimed(
+        &mut self,
+        entry: &EntryRef<'_>,
+        answers: &mut Vec<usize>,
+    ) -> Result<(), Fatal> {
         if entry.data.is_empty() {
             self.engine
                 .apply(entry.index, &[])
@@ -69,6 +76,19 @@ impl StateMachine for RangeMachine {
             term: entry.term,
         };
         Ok(())
+    }
+}
+
+impl StateMachine for RangeMachine {
+    /// The answers an entry made: the run waits for its own entry's.
+    type Answer = usize;
+
+    fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<usize>) -> Result<(), Fatal> {
+        let started = Instant::now();
+        let applied = self.apply_untimed(entry, answers);
+        self.apply_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.applied_entries += 1;
+        applied
     }
     fn apply_change(
         &mut self,
@@ -198,6 +218,11 @@ pub struct Group<F: BlockFile + 'static> {
     answered: bool,
     /// How long each of the leader's writes took, its submission to the drive that took its answer.
     writes: Vec<Duration>,
+    /// Each leader drive that applied entries: the time its applies took, nanoseconds, and their
+    /// count (`docs/durable.md` §14 item 4).
+    applies: Vec<(u64, u64)>,
+    /// The leader's answers a turn gave, for a loop with several proposals out.
+    answers: usize,
 }
 
 /// mantle's group test's settings, as the core takes them, for a member of a group of `members`:
@@ -260,6 +285,8 @@ impl<F: BlockFile + 'static> Group<F> {
                 },
                 applied: Point::default(),
                 persisted: Point::default(),
+                apply_ns: 0,
+                applied_entries: 0,
             };
             let replica: Member<F> =
                 Replica::open(&settings(id, members), store, machine, Unbounded).unwrap();
@@ -277,6 +304,8 @@ impl<F: BlockFile + 'static> Group<F> {
             rounds: std::env::var_os("HYPER_DURABLE_ROUNDS").is_some(),
             answered: false,
             writes: Vec::new(),
+            applies: Vec::new(),
+            answers: 0,
         };
         let first = group.handles[0];
         group.owner.get_mut(first).unwrap().campaign().unwrap();
@@ -295,8 +324,13 @@ impl<F: BlockFile + 'static> Group<F> {
     /// One turn of the owner and the messages it gave out delivered.
     fn turn(&mut self, answered: &mut dyn FnMut(bool)) {
         let leader = self.handles[0];
+        let before = self
+            .owner
+            .get(leader)
+            .map(|r| (r.machine().apply_ns, r.machine().applied_entries));
         let wire = &mut self.wire;
         let writes = &mut self.writes;
+        let answers = &mut self.answers;
         self.owner.turn(now(), &mut self.out, |h, driven, out| {
             let driven = driven.unwrap();
             wire.extend(out.messages.drain(..));
@@ -304,9 +338,18 @@ impl<F: BlockFile + 'static> Group<F> {
                 if let Some((submitted, taken)) = driven.flushed {
                     writes.push(Duration::from_nanos(taken.saturating_sub(submitted)));
                 }
+                *answers += out.answers.len();
                 answered(!out.answers.is_empty());
             }
         });
+        // The leader is driven once a turn at most: what its machine applied since is that drive's.
+        if let (Some((ns, n)), Some(r)) = (before, self.owner.get(leader)) {
+            let m = r.machine();
+            if m.applied_entries > n {
+                self.applies
+                    .push((m.apply_ns - ns, m.applied_entries - n));
+            }
+        }
         while let Some(m) = self.wire.pop_front() {
             let Some(&to) = self.handles.get(usize::try_from(m.to).unwrap() - 1) else {
                 continue;
@@ -370,6 +413,54 @@ impl<F: BlockFile + 'static> Group<F> {
             }
         }
         panic!("the group never applied an entry");
+    }
+
+    /// Commits `entries` with `clients` proposals out at the leader at once, each proposed again as
+    /// the leader answers one; each latency is its proposal to its answer.
+    pub fn commit_many(&mut self, entries: &[Entry], clients: usize) -> Vec<Duration> {
+        let leader = self.handles[0];
+        let mut out_since: VecDeque<Instant> = VecDeque::new();
+        let mut next = 0usize;
+        let mut latencies = Vec::with_capacity(entries.len());
+        let mut propose = |g: &mut Self, out_since: &mut VecDeque<Instant>, next: &mut usize| {
+            let data = entries[*next].encode().unwrap();
+            g.owner
+                .get_mut(leader)
+                .unwrap()
+                .propose(Vec::new(), data)
+                .unwrap();
+            g.owner.schedule(leader);
+            out_since.push_back(Instant::now());
+            *next += 1;
+        };
+        while next < entries.len().min(clients) {
+            propose(self, &mut out_since, &mut next);
+        }
+        // A counted bound on turns: a run that stopped committing ends here, loudly.
+        for _ in 0..10_000_000u64 {
+            if latencies.len() == entries.len() {
+                return latencies;
+            }
+            self.answers = 0;
+            self.turn(&mut |_| {});
+            let answered = std::mem::take(&mut self.answers);
+            for _ in 0..answered {
+                let at = out_since.pop_front().expect("an answer for each proposal");
+                latencies.push(at.elapsed());
+                if next < entries.len() {
+                    propose(self, &mut out_since, &mut next);
+                }
+            }
+            if answered == 0 {
+                self.wait();
+            }
+        }
+        panic!("the group stopped committing");
+    }
+
+    /// The leader's drives that applied, since the last call: each one's apply time and entries.
+    pub fn take_applies(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.applies)
     }
 
     /// The leader's writes' times since the last call.

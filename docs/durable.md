@@ -1146,7 +1146,14 @@ directory once, at create.
    group's commit never written: no member asked to be driven at its period's end (fixed: the
    period's end is the replica's deadline, §4.1).
 4. **Apply on the owner.** Apply time per `Ready` against the owner's quantum under mantle's metadata
-   workload; a split only if it is exceeded.
+   workload; a split only if it is exceeded. Measured (`hyper-durable-compare apply`;
+   `docs/benchmarks.md`, "What applying costs the owner a drive, under mantle's metadata"): linear in
+   the entries a drive applies, 0.35–1.5 µs an entry warm (7 µs for a lone entry after the disk's
+   wait), 200–350 µs for a drive that applies a burst of 250, against a step quantum of 2–4 µs on
+   this machine. It is exceeded whenever a drive applies more than an entry or two; the page bounds
+   it, not a split: an owner sizes its page (`max_committed_size_per_ready`) from its latency budget
+   and the cost an entry, where moving application off the owner would need shared ownership of the
+   state machine (§7).
 5. **Repair.** Bytes and time to repair a marked member by entries (R-5) against a snapshot, and the
    simulation's unavailable runs before and after R-7. Measured for R-5 (`docs/benchmarks.md`,
    "Repair by entries (R-5)"): one lost entry of 30,000 repaired in 1.8 KB and 32 µs in process

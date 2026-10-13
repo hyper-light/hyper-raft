@@ -8177,3 +8177,46 @@ and the tree with a `Bytes` budget, which counts.
 ```sh
 cargo bench -p hyper-durable --bench budget -- 100000 3 1,64   # in each build, interleaved
 ```
+
+## What applying costs the owner a drive, under mantle's metadata (2026-10-13)
+
+`docs/durable.md` §7 and §14 item 4: apply time a `Ready` under mantle's metadata workload, against the
+owner's quantum. `hyper-durable-compare apply`: this repository's shell (the comparison's
+`hyper-durable` side) with mantle's engine and layer as the state machine (`mantle_meta`'s
+`apply_entry` on its `Model` at `1c179e8`; mantle's range at its `dev` head `bc9e910` applies with
+`Model` too, at a later revision), three members on hyper-log, the leader's machine timing each `apply` and every drive of
+the leader that applied counted; mantle's two entry shapes (a session's registration, tens of bytes;
+an object version's put, 1 KiB), `--clients` proposals out at once, three rounds of 3,000 entries
+after 300, load 4.7–17.4:
+
+| device, shape | clients | entries a drive, p50 / max | apply µs a drive, p50 / p99 / max | ns an entry, p50 |
+|---|---|---|---|---|
+| sim, register | 1 | 1 / 1 | 1.3 / 3.5 / 45.5 | 1,292 |
+| sim, register | 16 | 16 / 16 | 13.2 / 18.9 / 27.5 | 828 |
+| sim, register | 64 | 15 / 60 | 12.1 / 50.3 / 128.8 | 794 |
+| sim, register | 256 | 13 / 251 | 10.6 / 195.8 / 203.6 | 811 |
+| sim, put-1KiB | 1 | 1 / 1 | 0.7 / 1.8 / 17.5 | 708 |
+| sim, put-1KiB | 256 | 55 / 246 | 18.7 / 83.6 / 85.8 | 348 |
+| file, register | 1 | 1 / 1 | 7.6 / 18.0 / 231.9 | 7,583 |
+| file, register | 256 | 13 / 253 | 14.4 / 277.4 / 309.3 | 1,333 |
+| file, put-1KiB | 1 | 1 / 1 | 7.1 / 24.5 / 84.0 | 7,083 |
+| file, put-1KiB | 256 | 60 / 256 | 26.4 / 299.8 / 347.6 | 559 |
+
+- **A drive's apply is linear in what it applies**: 0.35–1.5 µs an entry once warm, about 7 µs for a
+  lone entry after the disk's 20 ms between commits (a cold cache and core, the same code). A drive
+  that takes a whole burst applies it whole: 200–350 µs at 250 entries.
+- **Against the owner's quantum**: hyper-rt's step quantum on this machine is its measured cost of
+  parking, 2.1–4.0 µs (`docs/benchmarks.md`, "hyper-rt: long polls judged by step"). A drive applies
+  within it only one or two warm entries; a batched drive overruns it ten to a hundred times, and a
+  page at mantle's bound (`max_committed_size_per_ready`, 4 MiB: four thousand 1 KiB entries) would
+  hold the owner for milliseconds.
+- **So the owner's page, not a split, bounds it.** What a drive applies is one page of the core's
+  committed entries (`docs/durable.md` §7): an owner that states its latency budget for a drive can size
+  the page from it and the measured cost an entry, `budget / ns an entry`, where moving application
+  to another thread would need shared ownership of the state machine.
+
+```sh
+cd crates/hyper-durable-compare && cargo build --release
+./target/release/hyper-durable-compare apply --clients 1,16,64,256 --shapes register,put \
+  --devices sim,file --rounds 3 --entries 3000 --warm 300
+```

@@ -450,12 +450,133 @@ fn list<T>(args: &[String], name: &str, default: &str, parse: impl Fn(&str) -> T
     value.split(',').map(parse).collect()
 }
 
+/// `docs/durable.md` §14 item 4: what applying costs the owner a drive, under mantle's metadata
+/// workload on this repository's shell (the `hyper-durable` side): three members, `--clients`
+/// proposals out at the leader at once, each drive of the leader that applied timed in `apply`
+/// (mantle's `apply_entry` on its engine) and counted.
+///
+/// ```text
+/// hyper-durable-compare apply [--clients 1,16,64,256] [--shapes register,put] [--devices sim,file]
+///                             [--rounds R] [--entries N] [--warm W]
+/// ```
+fn apply_per_drive(args: &[String]) {
+    let clients = list(args, "--clients", "1,16,64,256", |c| c.parse::<usize>().unwrap());
+    let shapes = list(args, "--shapes", "register,put", |s| match s {
+        "register" => Shape::Register,
+        "put" => Shape::Put1k,
+        other => panic!("a shape {other}"),
+    });
+    let devices = list(args, "--devices", "sim,file", |d| match d {
+        "file" => Device::File,
+        "sim" => Device::Sim,
+        other => panic!("a device {other}"),
+    });
+    let one = |name: &str, default: u64| {
+        list(args, name, &default.to_string(), |v| v.parse::<u64>().unwrap())[0]
+    };
+    let rounds = one("--rounds", 3);
+    let entries = one("--entries", 3_000);
+    let warm = one("--warm", 300);
+    println!(
+        "| device | shape | clients | load | drives | entries a drive, p50 / max | apply µs a drive, p50 / p99 / max | apply ns an entry, p50 |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for device in devices {
+        for &shape in &shapes {
+            for &c in &clients {
+                let before = load();
+                let mut applies: Vec<(u64, u64)> = Vec::new();
+                for round in 0..rounds {
+                    let batch: Vec<mantle_meta::wire::Entry> =
+                        (0..warm + entries).map(|n| shape.entry(n + 1)).collect();
+                    let run = |g: &mut dyn FnMut(&[mantle_meta::wire::Entry]) -> Vec<(u64, u64)>| {
+                        g(&batch)
+                    };
+                    let path = |id: u64| dir().join(format!("apply-{round}-{id}.log"));
+                    let mut measured = match device {
+                        Device::Sim => {
+                            let mut g = durable::Group::open(3, |id| {
+                                hyper_block::sim::SimFile::new(
+                                    hyper_block::buf::Alignment::new(4096).unwrap(),
+                                    hyper_block::buf::Alignment::new(512).unwrap(),
+                                    id,
+                                )
+                                .unwrap()
+                            });
+                            run(&mut |b| {
+                                g.commit_many(&b[..warm as usize], c);
+                                drop(g.take_applies());
+                                g.commit_many(&b[warm as usize..], c);
+                                g.take_applies()
+                            })
+                        }
+                        Device::File => {
+                            (1..=3).for_each(|id| {
+                                let _ = std::fs::remove_file(path(id));
+                            });
+                            let mut g = durable::Group::open(3, |id| {
+                                hyper_block::file::DeviceFile::open(
+                                    &path(id),
+                                    true,
+                                    hyper_block::file::CachingRequest::PreferDirect,
+                                    hyper_block::buf::Alignment::new(4096).unwrap(),
+                                )
+                                .unwrap()
+                            });
+                            let m = run(&mut |b| {
+                                g.commit_many(&b[..warm as usize], c);
+                                drop(g.take_applies());
+                                g.commit_many(&b[warm as usize..], c);
+                                g.take_applies()
+                            });
+                            drop(g);
+                            (1..=3).for_each(|id| {
+                                let _ = std::fs::remove_file(path(id));
+                            });
+                            m
+                        }
+                    };
+                    applies.append(&mut measured);
+                }
+                let mut times: Vec<u64> = applies.iter().map(|a| a.0).collect();
+                times.sort_unstable();
+                let mut counts: Vec<u64> = applies.iter().map(|a| a.1).collect();
+                counts.sort_unstable();
+                let mut per_entry: Vec<f64> =
+                    applies.iter().map(|a| a.0 as f64 / a.1 as f64).collect();
+                per_entry.sort_by(f64::total_cmp);
+                let at = |v: &[u64], q: f64| {
+                    v.get(((v.len() as f64 * q).ceil() as usize).clamp(1, v.len().max(1)) - 1)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let us = |ns: u64| ns as f64 / 1e3;
+                println!(
+                    "| {device:?} | {} | {c} | {before} | {} | {} / {} | {:.1} / {:.1} / {:.1} | {:.0} |",
+                    shape.name(),
+                    applies.len(),
+                    at(&counts, 0.5),
+                    counts.last().copied().unwrap_or(0),
+                    us(at(&times, 0.5)),
+                    us(at(&times, 0.99)),
+                    us(times.last().copied().unwrap_or(0)),
+                    per_entry.get(per_entry.len() / 2).copied().unwrap_or(0.0)
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     assert!(
         alloc::installed(),
         "the counting allocator is not installed"
     );
+    if args.get(1).map(String::as_str) == Some("apply") {
+        apply_per_drive(&args);
+        return;
+    }
     let members = list(&args, "--members", "1,3,5", |m| m.parse::<u64>().unwrap());
     let shapes = list(&args, "--shapes", "register,put", |s| match s {
         "register" => Shape::Register,

@@ -129,7 +129,8 @@ held an election back.
   0x2, 12 clock intervals; a sleeping thread woken 105 to 107 ms late at the median beside 16 spinners,
   diag runs 38305342723 and 38306001723) slows a member's wakes, and is not this tail's cause.
 - **hyper-quic `tests::pad_to_mtu`, windows-2025 CI (run 38316593172, the client sent nothing,
-  "blocked by congestion control").** With `pad_to_mtu`, a packet of acknowledgments alone was padded:
+  "blocked by congestion control"), and on `main`'s own runs: `e513477` on macos-15 (run 38314019362),
+  `aa82ada` on ubuntu-24.04-arm and windows-11-arm (run 38316408813), each green on its branch's run.** With `pad_to_mtu`, a packet of acknowledgments alone was padded:
   in flight against the window (RFC 9002 §2, §3), never checked against it, and acknowledged by the peer
   only along with an ack-eliciting packet (RFC 9000 §13.2.1). The server's warm-up drew twelve of them,
   and the client's datagrams waited behind them; how many depended on the packet numbers the server
@@ -211,7 +212,7 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
 2. **One revision for every consumer.** Today mantle, focal and slates each build a different one:
    - focal vendors every crate it takes at `9fdf7ff`, the head of `focal-transport-hooks`, whose
      commits are on `main` since `d1deca1`. Its trial re-vendor at `aa82ada` waited on its in-process
-     reopen failing `Compacted`, which `9fd8ead` fixes; focal re-vendors at the `main` that carries it,
+     reopen failing `Compacted`, which `9fd8ead` fixes; focal re-vendors at `4f12cd8`, which carries it,
      as its own landing under its own rules, its `FloorStore` passing `keep_after` and `kept_bytes` on
      to the store it wraps.
    - mantle vendors every crate at `f358210` with local changes to hyper-rt and hyper-block, which
@@ -225,13 +226,14 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      `SegmentedFile`, the resident `Epoch` shared across a file's segments, `BlockFile::write_whole`,
      `grow`, `grows_by_segments` and `segment_end`, `DeviceFile::write_copies_at` with `gather.rs` for
      Windows); b9104b7 (request threads in the OS's foreground class) is not on mantle's dev and not
-     here. mantle re-vendors every crate at the `main` that carries `55d923e`, as its own landing, with
+     here. mantle re-vendors every crate at `4f12cd8`, which carries `55d923e`, as its own landing, with
      no local delta to replay; with it `LogStore::applied` is `LogStore::keep_after`, and it and
      `kept_bytes` have no defaults, so a store of mantle's own (its range tests' `Synchronous`) states
      both.
    - slates vendors hyper-datagram, hyper-seal, hyper-swim and hyper-timing at `aa82ada` (slates'
-     `d33795bb`, the snapshot moved with no change to their sources, which are `67f038d`'s); its
-     session fast-forwards its main to it.
+     `d33795bb`, on its main); their sources are `67f038d`'s and unchanged at `4f12cd8`, and the
+     snapshot's move to it waits on slates' branch `hr-vendor-4f12cd8` (`aa11314e`, a fast-forward of
+     its main `a5c9e135`), which its session fast-forwards on the owner's word.
 3. **The shared crates' open work**, each in its own document:
    - hyper-durable: §14's measurements.
    - hyper-sim and hyper-check: S-6 (hyper-raft's and hyper-durable's harnesses onto both crates),

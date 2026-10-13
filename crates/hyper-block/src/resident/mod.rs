@@ -24,7 +24,55 @@ use std::io;
 mod macos;
 
 #[cfg(target_vendor = "apple")]
-pub(crate) use macos::Resident;
+pub(crate) use macos::{Epoch, Resident};
+
+/// What a handle's reads from memory did ([`crate::block::BlockFile::residency`]): probes made,
+/// reads made on an earlier probe's answer instead (macOS, mantle `docs/research/46-reclaim-epochs.md`),
+/// epochs read and the changes among them that forgot every answer, and, in shadow mode, the
+/// answers a probe made anyway found wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Residency {
+    /// Reads that asked the kernel which of their pages it holds (`mincore(2)`).
+    pub probes: u64,
+    /// Reads made on an earlier probe's answer, kept while the kernel reclaimed nothing.
+    pub skips: u64,
+    /// Times the kernel's reclaim counters were read.
+    pub epochs: u64,
+    /// Readings of them that had moved, each forgetting every kept answer.
+    pub changes: u64,
+    /// In shadow mode, kept answers a probe made anyway found wrong.
+    pub wrong: u64,
+}
+
+impl Residency {
+    /// Both handles' counts summed: one file kept as several (`crate::segmented`).
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            probes: self.probes.saturating_add(other.probes),
+            skips: self.skips.saturating_add(other.skips),
+            epochs: self.epochs.saturating_add(other.epochs),
+            changes: self.changes.saturating_add(other.changes),
+            wrong: self.wrong.saturating_add(other.wrong),
+        }
+    }
+}
+
+/// No answer is kept off macOS, so there is no epoch for one to hold in.
+#[cfg(not(target_vendor = "apple"))]
+#[derive(Debug)]
+pub(crate) struct Epoch;
+
+#[cfg(not(target_vendor = "apple"))]
+impl Epoch {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn residency(&self) -> Residency {
+        Residency::default()
+    }
+}
 
 /// A handle's state for reads made only from memory: whether the kernel refused `RWF_NOWAIT`.
 #[cfg(target_os = "linux")]
@@ -44,7 +92,13 @@ impl Resident {
 
     /// Fills `buf` from `offset` if every byte of it is in memory now: true when it did; false
     /// when the read would wait, the file ends first, or the kernel takes no `RWF_NOWAIT`.
-    pub(crate) fn read(&mut self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<bool> {
+    pub(crate) fn read(
+        &mut self,
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        _epoch: &mut Epoch,
+    ) -> io::Result<bool> {
         use rustix::io::{Errno, ReadWriteFlags, preadv2};
         if self.refused {
             return Ok(false);
@@ -76,6 +130,14 @@ impl Resident {
     pub(crate) fn refused(&self) -> bool {
         self.refused
     }
+
+    /// Nothing is counted here: `RWF_NOWAIT` asks and reads in one call, so no answer is kept.
+    pub(crate) fn residency(&self) -> Residency {
+        Residency::default()
+    }
+
+    /// No answers to check.
+    pub(crate) fn set_shadow(&mut self, _on: bool) {}
 }
 
 /// No platform interface: no read is made from memory.
@@ -90,9 +152,21 @@ impl Resident {
     }
 
     /// Never reads: every read goes to the thread that may wait.
-    pub(crate) fn read(&mut self, _file: &File, _buf: &mut [u8], _offset: u64) -> io::Result<bool> {
+    pub(crate) fn read(
+        &mut self,
+        _file: &File,
+        _buf: &mut [u8],
+        _offset: u64,
+        _epoch: &mut Epoch,
+    ) -> io::Result<bool> {
         Ok(false)
     }
+
+    pub(crate) fn residency(&self) -> Residency {
+        Residency::default()
+    }
+
+    pub(crate) fn set_shadow(&mut self, _on: bool) {}
 
     #[cfg(test)]
     pub(crate) fn refused(&self) -> bool {

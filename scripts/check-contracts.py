@@ -105,6 +105,10 @@ UNSAFE_ALLOWED = {
     "crates/hyper-measure/src/wait_windows.rs":
         "WSAPoll (the wait for a datagram every real-socket test and E2E member makes, on Windows, "
         "with no operation in flight past its return; tests and harnesses only)",
+    "crates/hyper-block/src/gather.rs":
+        "WriteFileGather on a handle opened past the cache for overlapped I/O, its page-aligned "
+        "FILE_SEGMENT_ELEMENT array and OVERLAPPED block, GetOverlappedResult, and GetSystemInfo's "
+        "page size, through windows-sys (a segment written whole on Windows)",
     "crates/hyper-block/src/node/windows.rs":
         "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity) and GetFileInformationByHandleEx's "
         "FileStorageInfo (the sector sizes of a file's volume)",

@@ -133,6 +133,40 @@ caller hands in the alignment, queue and measured depth it found.
     that unwinds again costs that drop alone, and the worker lives on
     (`tests/attachment_watch_native.rs`).
 
+13. **A probe's answer kept while the kernel reclaims nothing** (`resident`, `file.rs`,
+    `block.rs`, `issuer.rs`): on macOS a read from memory keeps, one bit an OS page, that
+    `mincore(2)` found its pages resident, and reads them again without probing while the pageout
+    scan's file-backed reclamation counts (`vm.pageout_freed_*`) stay unchanged; they are read
+    again before free memory could reach the kernel's free target at the fastest fill a Mac has.
+    `Residency` counts probes, reads on kept answers, epochs and changes, and in shadow mode the
+    kept answers a probe found wrong (`BlockFile::residency`, `BlockFile::set_residency_shadow`,
+    `Attached::residency`, `Attached::set_residency_shadow`). Mantle
+    `docs/research/46-reclaim-epochs.md`. Made in mantle's copy (`a5f5cf3`) and taken here
+    (2026-10-12).
+
+14. **A file kept as segments** (`segmented.rs`, `gather.rs`, `block.rs`, `file.rs`, `resident`): a
+    base file and `<base>.1`, `<base>.2` and on, read and written at offsets into their
+    concatenation (`SegmentedFile`). A segment is created whole at its final length, allocated and
+    its name made durable, and never changes length, so every handle finds the layout from names
+    and lengths alone; a duplicate made before a segment was added opens it when a transfer first
+    reaches it, and a handle holds slots for the segments it has, found by a binary search over the
+    filled ones, not for its bound. A transfer lies within one segment; a flush covers the segments
+    written since the last; the segments are at most a bound given at open.
+    `BlockFile::grows_by_segments`, `BlockFile::grow` and `BlockFile::segment_end` let a store add
+    one and find where one ends (a plain file grows by its writes, as before), and
+    `BlockFile::write_whole` writes a new segment's blocks once, through a handle past the OS's
+    cache (from a buffer aligned to the VM page, which macOS's cluster layer needs to write past its
+    cache), so its zeros take no memory a read wants: in as few calls as the kernel takes, by
+    vectored writes of one buffer (`DeviceFile::write_copies_at`, pwritev(2) on Linux and macOS) and
+    by gather writes on Windows (`WriteFileGather`, `gather.rs`). Reads made from memory keep one
+    reclaim epoch for the whole file (`resident::Epoch`, split from `Resident`, its generation 64
+    bits so it never comes round again), and `Residency::plus` sums segments' counts. A file's own
+    first writes hold up its other reads and writes, another file's do not: mantle
+    `docs/research/48-first-writes.md`. Made in mantle's copy (`0d9dfb4`, `0906dfe`, `8dcf196`,
+    `e44d9e5`, `f2f6a57`, `abe99c8`, `8384354`; mantle's `ORIGIN.md` change 14) and taken here
+    (2026-10-12), with `gather.rs` listed among the files whose `unsafe` binds an OS interface
+    (`scripts/check-contracts.py`).
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

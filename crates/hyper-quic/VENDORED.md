@@ -1060,3 +1060,29 @@ time put the cost on the copies.
 - **Tests.** `tests::the_copies_look_at_the_handshakes_flights_alone`: after the handshake, a client
   with a window of packets of a bulk stream in flight has no flight left to scan. The copies' own
   tests (`tests/geo.rs`, `connection::copies`) pass unchanged.
+
+## 28. STREAMS_BLOCKED sent when the peer's stream limit stops an open, and kept when heard (2026-10-13)
+
+Upstream never sent STREAMS_BLOCKED. `Streams::open` returned `None` at the peer's limit and left a
+`TODO: Queue STREAM_ID_BLOCKED if this fails`. A received STREAMS_BLOCKED was logged and dropped.
+RFC 9000 §4.6 says a sender SHOULD send STREAMS_BLOCKED when it wishes to open a stream but cannot
+because of the peer's maximum stream limit. A peer that grants streams as they are wanted, holding
+back what it cannot take (hyper-transport's stream pool, admission credit as Breakwater's, Cho et
+al., OSDI 2020), has no other word that this side wants more.
+
+- **Sent.** An open refused at the peer's limit queues the frame once for that limit
+  (`StreamsState::streams_blocked_limit`), as DATA_BLOCKED is queued once for each connection
+  limit. It is written while the limit stands (`can_send_streams_blocked`), with the limit the
+  peer last sent, and retransmitted on loss like any control frame (`Retransmits::streams_blocked`)
+  unless the peer has raised the limit since. `Streams` now carries the data space's pending
+  frames, as `SendStream` does, so `open` can queue it.
+- **Heard.** The limit the peer reports is kept per direction. `Connection::peer_streams_blocked`
+  says whether the peer is blocked with no more streams on their way: it reported the limit it was
+  last sent, and no greater limit is sent or waiting to be (a raise not yet sent is on its way, so a
+  side granting streams does not grant twice for one report).
+- **What is left to open.** `Streams::remaining` says the streams this side may still open in a
+  direction, its peer's limit less those opened: with the streams it holds, what its peer grants
+  it, by which an asker bounds what it queues for streams (hyper-transport's `AskQueue::Credit`).
+- **Test.** `an_open_at_the_peers_limit_says_so_once_for_each_limit`: one frame for each limit, none
+  written once the limit is raised, the frame again at the new limit, and the receiving side
+  blocked only at the limit it last sent with none greater on its way.

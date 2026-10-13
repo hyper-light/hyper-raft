@@ -216,6 +216,34 @@ impl Classes for Lax {
     }
 }
 
+/// [`Mantle`] whose every role shares the stream pool ([`hyper_transport::StreamCredit::Pooled`]).
+pub struct Pooled;
+
+impl Classes for Pooled {
+    type Class = Class;
+    type Kind = Kind;
+    type Role = Role;
+    const RANKS: u8 = 3;
+    fn rank(class: Class) -> u8 {
+        rank(class)
+    }
+    fn class_of(kind: Kind, role: Role) -> Option<Class> {
+        mantle_class(kind, role)
+    }
+    fn frame_bound(class: Class) -> u64 {
+        Mantle::frame_bound(class)
+    }
+    fn kind_code(kind: Kind) -> u16 {
+        kind_code(kind)
+    }
+    fn kind_of(code: u16) -> Option<Kind> {
+        kind_of(code)
+    }
+    fn pooled(_role: Role) -> bool {
+        true
+    }
+}
+
 /// Which certificate is which peer.
 #[derive(Default)]
 pub struct Book {
@@ -257,6 +285,8 @@ pub fn limits() -> Limits {
             per_identity: 2,
         },
         streams_per_connection: 16,
+        stream_credit: hyper_transport::StreamCredit::Fixed,
+        ask_queue: hyper_transport::AskQueue::Table,
         exchanges: 64,
         lanes_per_peer: 4,
         lane_window: 128,

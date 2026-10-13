@@ -389,6 +389,11 @@ impl<'a> SendStream<'a> {
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
         }
+        // A response finished after its request was read whole gives its stream's credit back
+        // now, so the raised limit goes out with the response (`VENDORED.md` §27).
+        if self.state.return_credit_early(self.id) {
+            self.state.queue_max_stream_id(self.pending);
+        }
 
         Ok(())
     }

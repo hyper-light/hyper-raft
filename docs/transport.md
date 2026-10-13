@@ -749,6 +749,14 @@ RFC 9000 §4.6), and an exchange is a stream.
   it only to clients with requests to send. A connection's own wait is no other's, so a lone one
   keeps its grant; giving it back to grant it to itself again would leave it short until QUIC freed
   the streams it held.
+- **When it goes back.** A served exchange settles its stream with the pool as its reply is
+  finished, before the finish (`Endpoint::settle_credit`): QUIC gives the stream back to its peer
+  once the request is read and the reply finished, not once the reply is acknowledged
+  (`crates/hyper-quic/VENDORED.md` §27), so the raised limit goes out in the reply's datagrams, as
+  Breakwater issues credit in its responses. Settled after, QUIC would have given the stream back
+  within the connection's old grant, past a pool that shrank. Through a pool of one, twenty
+  exchanges asked in turn take 40 datagrams of each side where the stream that went back once the
+  reply was acknowledged, alone, took 59 (`a_pooled_servers_stream_goes_back_with_the_reply`).
 - **Taking back from the idle.** QUIC takes back no stream it announced, so a connection holding
   credit that opens nothing would keep it from every other: it gives back only as its exchanges
   end. A connection with none of its peer's exchanges open is queued as idle, once: as it joins,

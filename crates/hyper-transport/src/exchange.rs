@@ -297,4 +297,7 @@ pub(crate) struct Exchange<K> {
     /// the owner, until the trailer is sent, and then goes; refused by its owner it goes at once.
     /// Either way the owner hears nothing more of it.
     pub(crate) ended: bool,
+    /// A peer's exchange whose stream's credit its connection settled with the pool as its reply
+    /// was finished (`Endpoint::settle_credit`): its end settles nothing again.
+    pub(crate) credit_settled: bool,
 }

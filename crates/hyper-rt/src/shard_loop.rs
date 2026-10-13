@@ -23,7 +23,7 @@ use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
 use crate::interests::{self, Interests, Readiness};
-use crate::machine::wake::WakeEstimate;
+use crate::machine::wake::WakeTrack;
 use crate::mem::Encoded;
 use crate::park_cost::ParkCost;
 use crate::parking::{Parked, Woken};
@@ -219,7 +219,7 @@ struct Core {
     /// The absolute deadline the shard last waited for and has not stepped since.
     waited_for_ns: Option<u64>,
     /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
-    wake: Option<WakeEstimate>,
+    wake: Option<WakeTrack>,
     /// The CPU a park costs this shard's thread, and a kick its senders' (`crate::park_cost`): a tracking
     /// shard's idle spin. Learned only while the wake is tracked on a real clock.
     park_cost: ParkCost,
@@ -359,9 +359,12 @@ impl Shard {
             driver_lost: false,
             generation_high: generation_base,
             waited_for_ns: None,
-            wake: config
-                .wake_tracking
-                .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
+            wake: config.wake_tracking.map(|tracking| {
+                WakeTrack::new(
+                    tracking.prior_ns,
+                    1u64.checked_shl(tracking.shift).unwrap_or(u64::MAX),
+                )
+            }),
             park_cost: ParkCost::new(),
             kick_cost: ParkCost::new(),
             kicks_seen: (0, 0),
@@ -475,7 +478,8 @@ impl Shard {
     pub fn quantum_ns(&self) -> u64 {
         self.core
             .wake
-            .map_or(self.core.fixed_quantum_ns, |estimate| estimate.mean_ns())
+            .as_ref()
+            .map_or(self.core.fixed_quantum_ns, WakeTrack::mean_ns)
             .max(1)
     }
 
@@ -1164,10 +1168,7 @@ impl Shard {
 
     /// Folds a park's measured wake into the online estimate (slates §4.3).
     fn note_wake(&mut self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
-        let Some(mut estimate) = self.core.wake else {
-            return;
-        };
-        if !self.core.real_time {
+        if self.core.wake.is_none() || !self.core.real_time {
             return;
         }
         if woken.stale() {
@@ -1187,8 +1188,10 @@ impl Shard {
             self.core.counters.wake_unslept = self.core.counters.wake_unslept.saturating_add(1);
             return;
         }
+        let Some(estimate) = self.core.wake.as_mut() else {
+            return;
+        };
         estimate.record(latency);
-        self.core.wake = Some(estimate);
         let mean = estimate.mean_ns();
         self.core.counters.wake_samples = self.core.counters.wake_samples.saturating_add(1);
         self.core.counters.wake_cost_ns = mean;

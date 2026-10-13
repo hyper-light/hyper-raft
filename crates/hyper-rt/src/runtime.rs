@@ -94,13 +94,15 @@ pub struct RuntimeConfig {
 
 /// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
 /// slowly under a heavy tail — a virtual machine's needs 38,000–75,000 wakes where the probe's budget buys
-/// a few thousand — so the estimate a shard sizes its spin and its quantum by keeps learning from the
-/// wakes it actually pays).
+/// a few thousand — and is one sample of a few tens of milliseconds of a host whose load moves, so the
+/// estimate a shard sizes its quantum by keeps learning from the wakes it actually pays,
+/// [`crate::machine::wake::WakeTrack`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeTracking {
-    /// The boot probe's mean wake, nanoseconds: the estimate's seed.
+    /// The boot probe's mean wake (the median of its rounds' means), nanoseconds: the estimate's seed.
     pub prior_ns: u64,
-    /// The estimate's weighting shift, about `2^shift` wakes ([`crate::machine::wake::WakeLatency::estimate_shift`]).
+    /// The estimate's window, `2^shift` wakes: what its blocks hold between them once grown
+    /// ([`crate::machine::wake::WakeLatency::estimate_shift`]).
     pub shift: u32,
     /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
     /// daemon's idle window sets its ratio).

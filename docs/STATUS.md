@@ -105,6 +105,21 @@ held an election back.
   every write is that slow makes a pair re-elect past the law (each new leader's first write
   suspected in turn); the reports now state each member's core suspicions and campaign.
 
+### Closed (2026-10-13)
+
+- **hyper-rt's calibration took one burst for the whole run, and refused on a loaded host.** One of
+  mantle's benchmark calibrations read a 227,774 ns mean wake where the host's others read 1,444–5,904 ns
+  (`benchmark-results/mantle-contig-20261013`, `n10000000-r111-mcs`). That one reading set the quantum's
+  prior, the tick, the batch and the control depth, and a window of 2¹⁴ wakes that left the shard's
+  quantum at 228 µs for the run. Separately, a 40 ms probe on windows-2025 refused `MeasurementTimeout`
+  short of the stopping rule's floor (CI run 38376252976, the record test). The run's 3.5-times slower
+  fill was not these values' doing: with them frozen in the same binary, it filled at 2.26–2.29 M puts/s
+  against 2.27–2.44 M (`benchmark-results/hyper-rt-calibration-20261013`); the host's merges took 5.27 s
+  against 1.7–2.6 s. The probe now reports the median of its rounds' means, the shard's spread is the
+  rounds' median coefficient of variation, and a shard tracks the median of its last five blocks' means,
+  so its own wakes outvote the boot's after 36. A probe short of the floor reports what it measured,
+  `quick` (`docs/runtime.md` §10.4; `machine::wake`'s tests).
+
 ### Closed (2026-10-12)
 
 - **hyper-block `a_segment_written_whole_holds_its_fill_and_takes_no_memory`, ubuntu-24.04-arm

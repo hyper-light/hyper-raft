@@ -33,6 +33,7 @@ before the part that rests on them is built.
 | LITTLE | J. D. C. Little. "A Proof for the Queuing Formula: L = λW." Operations Research 9(3), 1961 | peer-reviewed |
 | WILKS | S. S. Wilks. "Determination of Sample Sizes for Setting Tolerance Limits." Ann. Math. Statist. 12(1), 1941 | peer-reviewed |
 | KJ | T. Kalibera, R. Jones. "Rigorous Benchmarking in Reasonable Time." ISMM '13 | peer-reviewed |
+| MOM | G. Lugosi, S. Mendelson. "Mean Estimation and Regression Under Heavy-Tailed Distributions: A Survey." Foundations of Computational Mathematics 19, 2019 (arXiv:1906.04280, read there), §2.1 and Theorem 2; the median of means after Nemirovsky and Yudin 1983, Jerrum, Valiant and Vazirani 1986, Alon, Matias and Szegedy 1996 (through MOM) | peer-reviewed |
 | LEMON | J. Lemon. "Kqueue: A generic and scalable event notification facility." USENIX ATC '01, FREENIX track | peer-reviewed |
 | URING | J. Axboe, "Efficient IO with io_uring", 2019 (through NOTE26 §2.2) | NON-PEER-REVIEWED |
 | SBITMAP | Linux `lib/sbitmap.c`, `include/linux/sbitmap.h` (blk-mq's scalable bitmap of tags) | primary (source), UNVERIFIED revision |
@@ -931,7 +932,7 @@ bounded at 1 KiB, wall time an input; every one-byte corruption and every trunca
 
 | Constant | Formula (slates' derivations, kept) |
 |---|---|
-| step quantum | the mean wake, each tracking shard's own estimate with the boot probe's mean its prior |
+| step quantum | the mean wake: the boot probe's median of its rounds' means, then each tracking shard's own median of its last five blocks' means, the probe's estimate their seed (§10.4) |
 | spin before parking | the CPU one park/wake cycle costs, measured on each tracking shard's own parks (§3.9, D2) [KARLIN]; slates' rule, the mean wake, is the fixed `spin_ns` of a configuration that does not track |
 | timer tick | the mean wake, refused if `tick + wake p99` exceeds the consumer's stated lateness tolerance (§3.6) |
 | control-queue depth | `wake p99 / system call` rounded up to a power of two (Little's law at the overflow target: a producer sending one message per system call for as long as the consumer's wake takes at its p99) |
@@ -956,6 +957,63 @@ refusals as before. A ring of `usize::MAX` entries used to reach the allocator a
 overflow (`tests/extreme_ring_refusal.rs`), and an empty simulation built nothing and so checked nothing
 (`tests/sim_shape_refusal.rs`). The check is the representation's bound only: a count that fits and is
 still more than the machine can allocate is the allocator's refusal, as before.
+
+### 10.4 One probe samples a host that moves
+
+The boot probe times wakes for a few tens of milliseconds, and a wake is mostly the host's run queue and
+its cores' idle states, both of which move. On 2026-10-13 one of mantle's benchmark calibrations read a
+mean of 227,774 ns where the same host's other calibrations that day read 1,444–5,904 ns
+(`benchmark-results/mantle-contig-20261013`, `n10000000-r111-mcs`; in §3.9, boot calibrations a minute
+apart sized slates' old spin from 1.9 µs to 577 µs). Everything §10.3 derives from the mean took that one
+sample. The step quantum's prior, the tick and the loop's batch (1,397 polls, against 17–25 in the other
+runs) all came from it, and through the p99 so did the control depth (32,768 against 512). The window
+the shard's estimate weighted (2¹⁴ wakes) came from it too, so the shard's quantum was still 228 µs when
+the run ended.
+
+**What those values cost, measured.** That run's fill was 3.5 times slower than its neighbours', but the
+values did not cause it. The same binary was given them as a frozen record, one at a time and all four
+together, beside the run's normal values, in two rounds interleaved on the same host. With all four it
+filled 10 M keys at 2.29 M and 2.26 M puts/s, against 2.27 M and 2.44 M with the normal values, and
+each value alone stayed within the spread of its own two rounds (the widest pair was the batch's, 1.69 M
+and 2.47 M; `benchmark-results/hyper-rt-calibration-20261013`, `arms-1`). The 228 µs quantum moved only the fill's latency tail. Mantle's client yields once a quantum,
+so its gaps came rarer and longer: p99.9 went from about 27 µs to 1.5–8.5 µs, and p99.99 from about
+52 µs to 150–345 µs. The slow run was the host's state, which also produced the probe: its merges took 5.27 s,
+against 1.7–2.6 s in the other runs. A burst of CPU-bound processes at boot does not reproduce such a
+probe here. Fifty-four of them held through the calibration gave 1.4–2.1 µs (`boot-1`), because
+saturated cores do not idle. What a burst's values do cost by construction falls on the consumers that
+read the quantum as a latency. A busy shard asks its driver for readiness once a quantum (§3.4), a timer
+fires on the tick after its deadline, and a woken task waits behind up to a batch of polls.
+
+**The estimate now outlasts a burst.** The probe reports the mean as the median of its five rounds'
+means [MOM], where it used the mean of every wake pooled. A burst confined to fewer than half the rounds
+cannot move that median outside the other rounds' means (DERIVED). Under any finite variance its error
+is sub-Gaussian: with `k` blocks of `m` wakes, it exceeds `σ·√(4/m)` with probability at most `e^(−k/8)`
+[MOM Theorem 2]. Its interval is the bootstrap resampled within each round. Three hundred 40 ms probes on
+this host, half a second apart, show the event it removes. In one probe, a round's waiter woke once in
+its share, after 7.1 ms. That single wake raised the pooled mean to 9,474 ns, while the median of the
+round means read 6,307 ns. Over all 300, the pooled mean's p50, p99 and largest value were 2,983,
+5,852 and 9,474 ns, and the median's were 2,919, 5,881 and 6,341 (`spread-1.txt`). The spread that sizes
+the online window (`WakeLatency::sd_ns`) is the median of the rounds' coefficients of variation, for
+the same reason: one round's held wake widened the pooled spread, and the windows of one host's probes
+ranged from 2⁸ to 2²¹ wakes. A probe whose rounds kept fewer wakes than the stopping rule's floor
+reports them `quick`, and is refused only when it kept none. The refusal had stopped the runtime from
+starting on a loaded host (windows-2025, CI run 38376252976).
+
+**A shard's own wakes replace the boot's.** A tracking shard keeps the median of its last five blocks'
+means (`WakeTrack`), with the probe's estimate seeding every block. The first blocks hold twelve wakes,
+the stopping rule's floor over five, so the boot's value is outvoted after 36 measured wakes. At the
+rate mantle's fill shard parked (123 times in 13.8 s), that is about four seconds of parks. The weighted
+mean it replaces had moved under one percent of the way by the run's end. Every five blocks the next ones
+are twice as long, until the five hold the window the probe's precision asks for. After that a lasting
+change is followed once it fills three blocks, and one wake held a quarter of a second moves one
+block's mean and not the estimate. `machine::wake`'s tests hold each of these exactly, and
+`tests/wake_estimate.rs` holds a shard seeded with a one-second prior that leaves it for its measured
+wakes.
+
+**What is left.** The tick, the batch and the control depth are fixed when a shard is built. A burst
+over all five rounds is the host's state at boot, not a burst in it, and it still sets them; only the
+quantum recovers. A shard that never parks keeps the boot's estimate, since it has no wake to learn
+from.
 
 ## 11. Simulation
 

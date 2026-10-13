@@ -11,8 +11,11 @@
 > (§15): the exhaustive model search with slates' models at slates' class counts (463,715 and the
 > rest) and every rejected variant refused; the swarm, PCT, coverage over the TLA+ abstraction with
 > its conformance check, the round search of the real core, crash enumeration by fork and
-> shrinking, with each strategy's runs to catch each planted defect. S-3 and S-6 to S-8 are
-> designed, not built. Sources and
+> shrinking, with each strategy's runs to catch each planted defect. **S-3's block device built**
+> (§16): hyper-block's simulated file moved here, with lost and misdirected writes, blocks read as
+> zeros or junk, and the crash states within a persistence point; its form in the world
+> (completions as events, latency, handles), the typed write queue, the namespace model and the
+> fault envelope, and S-6 to S-8, are designed, not built. Sources and
 > what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
 > §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
 > below shows a piece falls short.
@@ -274,9 +277,9 @@ adds:
 | At a crash each unflushed sector survives independently (torn writes, later writes without earlier) | Pillai et al. §2.2 | yes |
 | A failed flush leaves sectors either way and the cache returning new data | Rebello et al. §3.3 | yes |
 | Read EIO, bit flipped in transit or on the medium, write EIO, ENOSPC | Ganesan et al. Table 1 | yes |
-| **Lost write**: acknowledged, never written | Ganesan et al. Table 1; `docs/durable.md` §12 | new |
-| **Misdirected write**: written to another offset of the same zone, leaving the target stale and the other corrupt | Ganesan et al. Table 1; TigerBeetle `storage.zig` | new |
-| **A block read as zeros or junk** | Ganesan et al. §3.1 | new (a flip is one bit) |
+| **Lost write**: acknowledged, never written | Ganesan et al. Table 1; `docs/durable.md` §12 | yes (S-3, §16) |
+| **Misdirected write**: written to another offset of the same zone, leaving the target stale and the other corrupt | Ganesan et al. Table 1; TigerBeetle `storage.zig` | yes (S-3, §16; the offset the test's) |
+| **A block read as zeros or junk** | Ganesan et al. §3.1 | yes (S-3, §16) |
 | **Latency** per read, write and flush: a floor and a distribution the swarm draws | TigerBeetle `storage.zig`; hyper-liveness's flush times | new |
 | **Asynchronous completion**: submit now, complete as an event, depth bounded | hyper-block's issuer; the readies of R-4 | new (synchronous) |
 | **Several handles** on one device without `Arc`: in the world, the device is in the world's arena and a handle is a generational index; for threads that each own a handle, `hyper_block::sim::SimDevice`, one thread owning the device and serving each `Send` handle over bounded channels (an arena borrowed across threads would need a lock) | mantle `chunk/tests/common/device.rs` | yes, for threads (2026-10-08); the world's form with S-3 |
@@ -1693,4 +1696,44 @@ oracle refuses the vote at I1 (`a_lagged_round_catches_a_vote_sent_before_it_is_
 
 **Still outside it**: the fast track's two rules, which need fast proposals, holdings and a change
 of configuration in one scope; and symmetry (§15.5's departure stands).
+
+## 16. S-3 as built: the block device (2026-10-13)
+
+`hyper_sim::storage` holds the block device of §3.5 as a value with one owner (`Device`), no `RefCell`,
+no lock and no dependency: hyper-block's simulated file's model (`SimFile`'s `Disk`) moved here, the
+same rule for every byte, so hyper-block's `sim::SimFile` and its threaded `SimDevice` are adapters over
+it that add a direct-I/O file's refusals (alignment, the largest file) and map its refusals, typed
+(`StorageError`), onto hyper-block's (`DiskError`). Every crash draw is SplitMix64 of the seed itself in
+the order the old model drew it, so a seed's bytes are unchanged: hyper-log's equivalence hashes, 24
+seeds of crashes, torn writes and power cuts, are identical through the adapter, and hyper-block's 14
+tests of the simulated file pass through it.
+
+**The new faults** (Ganesan et al., FAST 2017, Table 1 and §3.1), each armed as the old ones are:
+- `LostWrite`: the next write is acknowledged and never reaches the medium. Reads return it from the
+  cache until a crash; no flush makes it durable; a crash takes it back, whatever was flushed since.
+- `Misdirected { to }`: the next write lands at `to`, aligned as the write was; its own offset keeps
+  what it held. The test names the offset (TigerBeetle misdirects within a zone; a zone is the
+  harness's to state).
+- `ReadZeros` and `ReadJunk`: reads of a range return zeros, or bytes drawn afresh at each read, there;
+  the stored bytes are intact. Junk comes from a stream of its own (`storage.junk`), so a test that
+  reads junk changes no crash.
+
+**Detected by hyper-log's checks** (§9's gate; `crates/hyper-log/tests/log.rs`): a block of each of a
+log's first five, read as zeros or as junk, is refused as damaged at open, or, for the last frame,
+restored from its persist record with its entries marked; a lost write of the next frame after each of
+the first four, once the machine restarts with the device's cache gone, the same; a write misdirected to
+each of the first five blocks after each of the first four frames is refused as damaged wherever it is
+not the write's own block. In every case an entry read back is the one written.
+
+**Crash states within a persistence point** (ALICE, Pillai et al., OSDI 2014, §3.3): a device asked to
+record its writes since the last flush, up to a number of bytes (`Device::record`; a write past them
+refused, typed, with nothing changed), makes the images a crash there may leave one at a time
+(`Device::states_since_flush`): the durable image with each prefix of those writes applied, then with
+each omitted from the whole. A crash after every persistence point (CrashMonkey's B3) is a harness's
+crash with `Crash::LoseAll` at each flush.
+
+**Not yet built**, with §3.5: the device in the world (completions as events with latency drawn from a
+stream, handles as generational indices in the world's arena), the typed write queue that `Lagged` and
+hyper-durable's `SimStore` become (S-6), the namespace model, and the fault envelope's type. mantle's
+chunk device without `Arc` is mantle's own step (§8).
 

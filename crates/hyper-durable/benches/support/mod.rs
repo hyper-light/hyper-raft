@@ -133,7 +133,7 @@ pub enum Device {
 /// A member's device, either kind, so one group may hold both.
 pub enum Member {
     File(Box<DeviceFile>),
-    Sim(SimFile),
+    Sim(Box<SimFile>),
 }
 
 macro_rules! each {
@@ -197,7 +197,7 @@ impl BlockFile for Member {
     fn try_clone(&self) -> Result<Self, DiskError> {
         match self {
             Self::File(f) => f.try_clone().map(|f| Self::File(Box::new(f))),
-            Self::Sim(f) => f.try_clone().map(Self::Sim),
+            Self::Sim(f) => f.try_clone().map(|f| Self::Sim(Box::new(f))),
         }
     }
 }
@@ -752,14 +752,14 @@ pub fn device(kind: Device, id: u64, dir: &Path, seed: u64, scratch: &mut Vec<Sc
             scratch.push(s);
             Member::File(Box::new(file))
         }
-        Device::Sim => Member::Sim(
+        Device::Sim => Member::Sim(Box::new(
             SimFile::new(
                 Alignment::new(4096).unwrap(),
                 Alignment::new(512).unwrap(),
                 seed ^ id,
             )
             .unwrap(),
-        ),
+        )),
     }
 }
 

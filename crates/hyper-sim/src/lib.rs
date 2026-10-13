@@ -11,6 +11,9 @@
 //! - **The network** ([`net`], step S-2): messages and datagrams on focal's path model, each draw
 //!   from its flow's stream and each arrival an event of the world; partitions, duplication and a
 //!   stated capacity, its oldest message lost past it.
+//! - **Storage** ([`storage`], step S-3): the block device, hyper-block's simulated file moved
+//!   here with the lost, misdirected, zeroed and junk faults and the crash states within a
+//!   persistence point.
 //! - **The trace** ([`Trace`]) and the **digest** ([`Digest`]): every choice recorded, so a run
 //!   replays from its seed or from its trace; and [`twice`], which runs a seed twice and its
 //!   trace once and refuses a run whose digests differ.
@@ -36,6 +39,7 @@ mod error;
 pub mod net;
 mod queue;
 pub mod rng;
+pub mod storage;
 mod trace;
 mod twice;
 mod wakes;

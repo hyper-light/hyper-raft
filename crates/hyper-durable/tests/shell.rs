@@ -254,6 +254,83 @@ fn a_change_waits_behind_the_fence_and_what_waits_is_bounded() {
     assert!(r.durable_commit() >= r.applied().index);
 }
 
+/// A member whose applied index ran past its durable commit asks its owner to drive it when its
+/// quiet period ends (`Replica::deadline`, `Driven::wake`), and that drive writes the commit
+/// (`docs/durable.md` §4.1). A follower's commit moves alone, with no write of its own, and electing
+/// by suspicion it has no timer of the core's: before, nothing drove it again, and a group that went
+/// quiet stayed past what its logs state (found by `benches/quiet.rs`).
+#[test]
+fn a_follower_past_its_durable_commit_asks_to_be_driven_when_its_quiet_period_ends() {
+    let s = settings(1, 7);
+    let quiet = u64::try_from(s.quiet.as_nanos()).unwrap();
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(3),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    // Member 2 leads term 1.
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    let last = r.core().raft.log().last_index().unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    // An entry, then its commit alone.
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        commit: last,
+        entries: vec![Entry {
+            index: last + 1,
+            term: 1,
+            data: b"entry".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        commit: last + 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    assert_eq!(r.applied().index, last + 1);
+    assert!(
+        r.durable_commit() < last + 1,
+        "the commit moved alone: no write states it"
+    );
+    let due = r
+        .deadline()
+        .expect("a deadline while a commit is applied and unwritten");
+    let at = now();
+    assert!(due > at && due <= at + quiet, "due {due} at {at}");
+    let mut out = Output::default();
+    r.drive(due, waker(), &mut out).unwrap();
+    while r.log_mut().make_durable() {}
+    out.clear();
+    r.drive(due + 1, waker(), &mut out).unwrap();
+    assert!(r.durable_commit() >= r.applied().index);
+    assert_eq!(r.writes().quiet, 1);
+    assert_eq!(r.deadline(), None, "nothing left to drive it for");
+}
+
 /// A write refused for room stalls the replica: inputs are refused `Stalled`, its campaigns held
 /// whatever its detectors say, snapshot reports kept (one a member, members only), and the
 /// refused writes are made again, in order, once the log has room; nothing was lost.

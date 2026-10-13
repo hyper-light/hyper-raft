@@ -318,7 +318,11 @@ voter of a configuration that is not joint, the entries are of its term) states 
 the very write that holds the entries, which is true exactly when that write is durable, and the
 core's commit is checked against it after; and a commit no write has carried while the applied index
 ran past `C_d` for a whole owner period is written then, one such write out at a time, waited for by
-no one, so a member that stops reopens with what it applied. Here `C_d`'s state-machine part is what
+no one, so a member that stops reopens with what it applied. The period's end is the replica's
+deadline (`Replica::deadline`, `Driven::wake`) while its log has room, so an owner that drives a
+replica only at its deadlines, its log's answers and its messages writes the commit on time; before,
+a group that went quiet with every member's applied index past its `C_d` and no timer of the core's
+was driven by nothing again (found by `benches/quiet.rs`, §14 item 3). Here `C_d`'s state-machine part is what
 saves the write: mantle's engine, durable on its own schedule, covers what it applied, and the quiet
 write is due only when the engine has not persisted for a whole period; focal's state machine is the
 log, and the rule is exactly focal's.

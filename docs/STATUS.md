@@ -113,6 +113,17 @@ held an election back.
 
 ### Closed (2026-10-13)
 
+- **A hyper-rt task that woke itself held its shard.** The loop's bench against slates' runtime and tokio
+  (`crates/hyper-rt-compare`) put eight clients' wait beside a task computing in 50 µs slices at 0.5–1.0
+  ms at the median, where slates' waited 70 µs and tokio's 18 µs. Yielding or waking itself, the task
+  was listed again at once and polled again until the step's count ran out, while the clients' wakes
+  from other threads waited in the bitmap. Now such a task waits for the loop's next reading of its inputs, and a
+  batch whose local handoffs have run the step's budget reads them again mid-step
+  (`docs/runtime.md` §3.3). Beside a yielding task the clients wait 60 µs, and 56 µs beside one that wakes
+  itself (tokio's own wait there is 11.8 ms). Every other case is level with before except a yield,
+  469–475 instructions against 423–436. A shard that never parks no longer reads its thread's clock at
+  every step after one long poll armed it (3.3% of a yielding shard's samples): at most two readings a
+  long poll (`attribution::Tracker`, `tests/thread_account_reads.rs`).
 - **hyper-rt's calibration took one burst for the whole run, and refused on a loaded host.** One of
   mantle's benchmark calibrations read a 227,774 ns mean wake where the host's others read 1,444–5,904 ns
   (`benchmark-results/mantle-contig-20261013`, `n10000000-r111-mcs`). That one reading set the quantum's
@@ -334,8 +345,10 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      files on Linux (ext4 and XFS on NVMe). The log is sealed by default since §11's group commit was
      measured (`docs/benchmarks.md`, "Group commit in an open loop, sealed against plain"); each
      consumer opens its log sealed with its own key source (`docs/seal.md` §3.2).
-   - hyper-rt §15's open items, and the bench of its loop under load here: mantle's cases, PR #16's
-     same-shard request and reply among them, against slates' runtime and tokio on one host.
+   - hyper-rt §15's open items. Item 8 is now measured against slates' runtime and tokio: a client that
+     pauses 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the spin before a
+     park paid in full every time (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates'
+     runtime and tokio").
    - This table's rows for hyper-rt, hyper-seal, hyper-measure and hyper-rt-transport, each with the law's
      four columns as measured.
    - The fast track: note 32 §3.8's tests decide it; no owner enables it until then.

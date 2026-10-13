@@ -181,7 +181,9 @@ impl Future for Join {
     }
 }
 
-/// Yields once: the task is re-queued and resumes after the rest of the batch.
+/// Yields once: the task wakes itself, and so resumes after the loop has next read its inputs (its
+/// control, wakes from other threads, timers, pollers and the driver's completions) and polled what they
+/// made ready ([`crate::queue`]).
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }

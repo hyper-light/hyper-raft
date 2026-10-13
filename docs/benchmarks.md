@@ -8181,8 +8181,96 @@ producer 46.8 M against std's 20.7 M and sixteen 1.25 M against 677 k. The CPU c
 learning shard (`bd7c0fd`): a simulated shard's loop item 119 ns against 110 at its base and 231 with
 the reading after every park, every shard's calibrated batch back from 17 to 35 (`runs/item-r2`).
 
-These are mantle's measurements of the same sources; the hyper-rt bench that runs them here, against
-slates' runtime and tokio on the same host, is owed (`docs/STATUS.md`, "What remains").
+These are mantle's measurements of the same sources; the bench that runs them here, with slates'
+runtime beside tokio, follows.
+
+## hyper-rt: the loop under load, against slates' runtime and tokio (2026-10-13)
+
+`crates/hyper-rt-compare` runs mantle's cases (its note 42 §7–§8) on one host with slates' runtime
+beside tokio. It is a workspace of its own, outside the gates': slates' runtime and machine profile come
+from slates' repository at `8a18d90`, tokio is 1.53.1, focal's. Each (case, arm) runs in a fresh process,
+so each runtime starts as its consumer starts it: hyper-rt calibrated (`Calibration::measure`,
+`RuntimeConfig::from_calibration`, mantle's path), slates' runtime from a measured machine profile with
+its daemon's 50 µs latency budget, tokio with its defaults, current-thread (`tokio-ct`) and multi-thread
+(`tokio-mt`). slates' runtime has no channel, so its arm carries values on tokio's `mpsc`, and
+`hyper-mpsc` runs hyper-rt on the same channel. Every round visits the arms in an order rotated by one,
+the load average read before each process (`compare.sh`). Apple M5 Max, macOS 26.4.
+
+The cases: sixteen tasks yielding a million times in all; spawn and join; a request and reply between
+two shards (threads), on one (`local=1`), and on one with a microsecond computed at each end
+(`work_ns=1000`); eight client threads onto one shard, each with its server task, and the same beside a
+task computing in 50 µs slices, yielding between them by its runtime's `yield_now` or by a plain
+self-wake (`yield=wake`), its share of the shard counted so a runtime that starves it does not read as one
+that serves sooner; one client pausing 200 µs between requests; one client in a closed loop; a 1 ms
+sleep's lateness.
+
+**Found: a task that woke itself held the shard.** The first panels (load 6.6–22.1, five rounds) put
+hyper-rt's one-way wait beside the computing task at 508 µs at the median and 639 µs at p99.9, where
+slates' runtime waited 70 µs and tokio's 18 µs; in the runs below that count it, the task held 97–98%
+of the shard. Its yield re-listed it
+in the step's queue at once, so a step polled it again and again, a 50 µs slice each time, until the
+step's count ran out (the shard's counters: 1,805 steps for 50,465 polls in a second, 28 a step), and
+the clients' wakes waited in the bitmap for the step to end. The count is a latency budget over a
+trivial poll's cost, and every poll here ran past it. Fixed in `docs/runtime.md` §3.3: a task that wakes
+itself waits for the loop's next reading of its inputs, which happens mid-step once local handoffs have
+spent the budget. tokio defers its own `yield_now` past its driver's poll for the same reason, and a
+plain self-wake starves its shard as the earlier hyper-rt loop did: the same clients waited 11.8 ms
+there.
+
+The loop before and after, hyper-rt alone, interleaved (six rounds, load 8.8–12.0; the fan-in at
+400,000 requests, six rounds, load 10.2–10.6):
+
+| Case | Before | After |
+|---|---|---|
+| yield, polls a second | 60.4 M | 49.5 M |
+| spawn and join, tasks a second | 20.8 M | 22.0 M |
+| two-shard request and reply, round trips a second (p99.9) | 1.01 M (19.7 µs) | 1.00 M (18.6 µs) |
+| one-shard request and reply, round trips a second | 9.11 M | 8.95 M |
+| the same with 1 µs at each end (p99.9) | 452 k (13.7 µs) | 458 k (10.2 µs) |
+| eight clients onto one shard, requests a second (one-way p50 / p99 / p99.9) | 447 k (7.2 / 26.9 / 36.9 µs) | 436 k (7.3 / 28.7 / 39.4 µs) |
+| the same beside a task that yields (the task's share) | 10.1 k (754 / 844 / 991 µs; 0.97) | 115 k (60 / 77 / 94 µs; 0.73) |
+| the same beside a task that wakes itself (the task's share) | 8.0 k (975 / 1,040 / 1,212 µs; 0.98) | 122 k (56 / 72 / 84 µs; 0.77) |
+| one client pausing 200 µs, CPU a request | 19.8 µs | 20.3 µs |
+| a 1 ms sleep, lateness p50 / p99 | 47 / 145 µs | 38 / 133 µs |
+
+The yield's price is a reading of the inputs a round of yields: 469–475 instructions a yield against
+423–436 with sixteen tasks, 680–686 against 425–445 with one. Ending the step at each round instead
+cost 500–523 and 1,032–1,269.
+
+The panel after the fix (five rounds, load 6.6–10.1; medians, one-way waits):
+
+| Case | hyper-rt | hyper-rt on tokio's mpsc | slates' runtime | tokio current-thread | tokio multi-thread |
+|---|---|---|---|---|---|
+| yield, polls a second | 52.5 M | 53.3 M | 1.18 M | 51.5 M | 38.2 M |
+| spawn and join, tasks a second | 25.1 M | 25.3 M | 5.96 M | 16.0 M | 12.3 M |
+| two-shard request and reply, round trips a second (p99.9) | 1.14 M (7.4 µs) | 909 k (10.2 µs) | 159 k (49.2 µs) | 187 k (43.0 µs) | 5.57 M (3.8 µs), its two tasks not bound to two threads |
+| one-shard request and reply, round trips a second | 10.1 M | 8.83 M | 37.1 k | 5.20 M | 8.71 M |
+| the same with 1 µs at each end | 465 k | 461 k | 33.9 k | 449 k | 466 k |
+| eight clients, requests a second (p50 / p99 / p99.9 µs) | 490 k (7.3 / 24.1 / 31.7) | 455 k (7.6 / 29.2 / 37.9) | 305 k (18.4 / 36.9 / 58.4) | 422 k (11.5 / 32.8 / 49.2) | 450 k (11.3 / 28.7 / 43.0) |
+| the same beside a task that yields (share) | 130 k (53 / 68 / 82; 0.81) | 126 k (55 / 66 / 78; 0.79) | 101 k (70 / 115 / 135; 0.65) | 281 k (12 / 68 / 84; 0.36) | 264 k (12 / 72 / 102; 0.43) |
+| the same beside a task that wakes itself (share) | 116 k (59 / 76 / 96; 0.74) | 123 k (55 / 72 / 78; 0.78) | 101 k (70 / 100 / 131; 0.64) | 663 (11,797 / 12,321 / 14,156; 0.99) | 6.57 k (1,180 / 1,245 / 1,278; 0.98) |
+| one client pausing 200 µs, CPU a request (p50) | 18.7 µs (4.4 µs) | 18.3 µs (4.2 µs) | 12.0 µs (3.5 µs) | 12.2 µs (3.8 µs) | 13.7 µs (4.0 µs) |
+| one client, requests a second (p50 / p99) | 423 k (0.5 / 5.2) | 350 k (0.5 / 8.4) | 79.5 k (10.8 / 23.6) | 193 k (1.8 / 12.8) | 185 k (2.4 / 13.8) |
+| a 1 ms sleep, lateness p50 / p99 | 152 / 250 µs | 143 / 242 µs | 254 / 279 µs | 1,999 / 1,999 µs | 1,999 / 1,999 µs |
+
+**Where hyper-rt does not win, and why.** Beside the task that yields, tokio's clients wait 12 µs at the
+median against 53 µs here, and its p99 is the same (68 µs): tokio runs a task that yielded only once it
+has nothing else ready, or every 61 polls (`EVENT_INTERVAL`, `src/runtime/builder.rs`), so the
+computing task got 0.36–0.43 of the shard there and
+0.81 here. hyper-rt's yield is one turn of a round, so a computing task keeps its share and a client
+waits at most a slice. A client pausing 200 µs costs hyper-rt 18.7 µs of CPU a request against
+12.0–13.7 µs: the shard spins for as long as blocking costs it before it parks, the 2-competitive rule
+(§3.9), and a client that comes back after 200 µs outlasts every spin, so the spin is paid every time
+and saved never (`docs/runtime.md` §15, item 8).
+
+```sh
+# the panel, five rounds (slates' runtime is fetched at 8a18d90 on the first build)
+cd crates/hyper-rt-compare && CARGO_TARGET_DIR=<dir> bash compare.sh 5
+# one process
+hyper-rt-compare hyper rtt n=8000 warm=800 clients=8 busy_us=50 yield=wake
+# before and after: the crate built against each hyper-rt tree, its binaries run interleaved,
+# each round rotating which goes first
+```
 
 ## hyper-rt: long polls judged by step (2026-10-12)
 

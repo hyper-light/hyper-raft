@@ -1,0 +1,26 @@
+[package]
+name = "hyper-rt-compare"
+description = "hyper-rt's loop under load against the runtimes it replaces, on one host: slates' runtime (slates-rt) and tokio, current-thread and multi-thread, on mantle's cases."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+publish = false
+
+# A workspace of its own: slates-rt is built from slates' repository at a pinned revision, which
+# the gates of this workspace do not fetch (docs/benchmarks.md).
+[workspace]
+
+[dependencies]
+hyper-rt = { path = "../hyper-rt" }
+hyper-measure = { path = "../hyper-measure" }
+# slates' runtime and the machine profile its daemon configures it from, at slates `8a18d90` (main).
+slates-rt = { git = "https://github.com/hyper-light/slates", rev = "8a18d907fa9594909a571d8aeaefed81f8433bec" }
+slates-machine = { git = "https://github.com/hyper-light/slates", rev = "8a18d907fa9594909a571d8aeaefed81f8433bec" }
+# focal's runtime, at the version focal's lock resolves; its `mpsc` is also the channel of the arms
+# whose runtime has none of its own (slates') or runs another's (`hyper-mpsc`).
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+lto = true
+debug = "line-tables-only"

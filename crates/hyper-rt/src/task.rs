@@ -200,6 +200,7 @@ mod tests {
             page_bytes: 4096,
             spin_ns: 0,
             wake_tracking: None,
+            latency_objective_ns: None,
         };
         let mut runtime = crate::runtime::LocalRuntime::new(&config).unwrap();
         let (pending_result, ready_result, pending, ready) = runtime

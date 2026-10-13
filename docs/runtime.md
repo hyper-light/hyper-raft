@@ -199,12 +199,40 @@ polls per step. `batch` is a latency budget over the measured cost of one loop i
 before the loop next reads its wakes, and a waker on another shard would otherwise have paid a park's
 wake to reach it, so the batch may delay it by at most the expected wake: budget = the mean wake, the
 same quantum as §3.4's step (DERIVED from §3.4's spin-then-park rule). A consumer with a stricter latency
-objective states it, and the smaller of the two applies.
+objective states it, and the smaller of the two applies (`RuntimeConfig::latency_objective_ns`).
+
+**A task that wakes itself waits for the inputs.** A step's polls take the wakes their polls make (PR
+#16: a local request and reply need not repeat the loop for each end), and a task that woke itself
+in its own poll, by `futures::yield_now` or as any future with more to do, was listed again at once
+and polled again until the step's count ran out, while every wake from another thread waited in the
+bitmap: eight clients onto a shard beside a task computing in 50 µs slices waited 0.75–0.97 ms at the
+median, the task holding 96–98% of the shard (`docs/benchmarks.md`, "hyper-rt: the loop under load,
+against slates' runtime and tokio"). Such a task is now listed apart (`queue::LocalQueue::defer`) and
+joins the ring only once the loop has read its inputs again (control, wakes, timers, pollers, the
+driver's completions), behind what they made ready: those clients wait 0.06 ms, about one slice. tokio
+defers its `yield_now` the same way: "Don't wake the task immediately, as that would push it right back
+onto the run queue and it could be polled again before other tasks or the IO/timer driver get a chance
+to run" (tokio 1.53.1, `src/task/yield_now.rs`; since 1.23, PR #5223); a plain self-wake it lists again
+at once, and the same clients waited 11.8 ms there. When only such tasks remain, the batch reads its
+inputs and goes on rather than ending the step, so a round of yields costs a reading of the inputs, not
+a step: one task yielding costs 680–686 instructions a yield, against 1,032–1,269 when each yield ended
+its step and 425–445 when it read nothing between, and sixteen 469–475 against 500–523 and 423–436
+(`tests/yield_defers.rs`).
+
+**The budget is a time; the count is it over a trivial item's cost.** Once the polls since the inputs
+were last read have run the budget and listed tasks of their own (a wake of the shard's, a spawn),
+which go ahead of every wake still unread, the batch reads the inputs again before its next poll, and
+the step goes on to its count. Polls that list nothing leave the reading to the step's end: what
+arrives goes behind the tasks already listed either way, and a drain is a read-modify-write on lines
+the wakers write too; read after every long poll, eight clients onto one shard lost 3–6% of their
+throughput to it (`tests/batch_time.rs`). Ending the step at the budget instead put each long poll in a
+step of its own and undid §3.9's judging of long polls by step (`tests/attribution_by_step.rs` failed).
 
 ### 3.4 The loop
 
 Each step: drain the control queue (spawns, cancels, shutdown), drain the wake bitmap, take the driver's
-completions, expire timers, poll up to `batch` ready tasks. When nothing is ready the shard spins for what
+completions, expire timers, list the tasks that woke themselves behind them, poll up to `batch` ready
+tasks, reading those inputs again within the step as §3.3 says. When nothing is ready the shard spins for what
 blocking costs it and then parks in its driver until a kick, a completion or the next deadline: the
 2-competitive spin-then-block rule [KARLIN], with the threshold the CPU one park/wake cycle costs,
 measured on the shard's own parks (§3.9, D2; it was the measured mean wake, slates' rule). slates'
@@ -891,8 +919,11 @@ concerns every waiter (a shutdown) completes each waiter's cell once (NOTE26 §5
 
 **Measured** (mantle's note 42 §8, `docs/benchmarks.md` "hyper-rt: the loop under load"): with plain
 threads the ring moves 144 million values a second from one producer at capacity 1,024, where std's
-`sync_channel` moved 102 million and tokio's `mpsc` 8 million; the run against slates' runtime and tokio
-on this repository's bench is owed (`docs/STATUS.md`).
+`sync_channel` moved 102 million and tokio's `mpsc` 8 million. Under the shard's own loop against tokio's
+`mpsc` on hyper-rt (`hyper-rt-compare`'s `hyper-mpsc` arm, `docs/benchmarks.md` "hyper-rt: the loop
+under load, against slates' runtime and tokio"): a request and reply between two shards 1.14 M round
+trips a second against 0.91 M, on one shard 10.1 M against 8.8 M, eight client threads onto one shard
+490 k requests a second against 455 k.
 
 ## 9. Blocking work
 
@@ -1125,9 +1156,13 @@ thread. §12's row runs both drivers the same way.
 1. Whether `IOCTL_AFD_POLL` reports readiness on Windows `AF_UNIX` sockets (§5.3). Measured on the Windows
    runners first; the named-pipe fallback is designed if not.
 2. macOS `TCP_NOTSENT_LOWAT` semantics against Linux's (§5.2), read against `xnu` source.
-3. The wake bitmap against slates' rings on the cross-shard and foreign-wake rows (§3.2), before the rings
-   go.
-4. std's `sync_channel` against tokio's `mpsc` and a ring of hyper-rt's own (§8).
+3. Measured 2026-10-13 (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates' runtime
+   and tokio"): the wake bitmap against slates' rings on the cross-shard and foreign-wake rows (§3.2),
+   both runtimes carrying values on tokio's `mpsc`: a request and reply between two shards 909 k round
+   trips a second on hyper-rt against 159 k on slates' runtime, eight client threads onto one shard 455 k
+   requests a second against 305 k, the one-way p99 29.2 µs against 36.9.
+4. Measured: std's `sync_channel` against tokio's `mpsc` and a ring of hyper-rt's own (§8), with plain
+   threads (mantle's note 42 §8) and under the shard's loop (`hyper-rt-compare`'s `hyper-mpsc` arm).
 5. `SBITMAP` and `AFUNIX` read at a named revision.
 6. A plain `Release` store of the wake bitmap's pending flag failed loom 0.7.2's parking model: the sender's
    own later load read the flag's earlier value, which coherence forbids. The flag is published with a swap
@@ -1136,7 +1171,11 @@ thread. §12's row runs both drivers the same way.
    (§3.2), measured on §12's rows.
 8. The spin window from the startup wake probe rarely hit in slates' bench configuration (§3.2), though it
    is not the kick result's cause: measure the startup mean against an online p50/p90 on its own merits
-   (spin hits, CPU, p99 under load).
+   (spin hits, CPU, p99 under load). Measured beside slates' runtime and tokio (2026-10-13): a client
+   pausing 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the deterministic
+   spin-then-block rule at its worst case, a spin as long as blocking costs paid in full before every park
+   [KARLIN]. A rule that learns the idle gaps it sees, or a randomized threshold (Karlin et al.'s
+   e/(e−1)), is what to measure against it.
    And why a shard that makes no system call while spinning sees 10–13 µs scheduling gaps that a kick's
    syscall seems to close (slates, inferred): the mechanism, measured, before kick-if-parked is kept.
 9. Closed 2026-10-06 (mantle's review): `Runtime`'s `stop` retried a full control channel with

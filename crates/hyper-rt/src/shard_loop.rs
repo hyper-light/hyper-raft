@@ -2,10 +2,13 @@
 //! loop that ties them (slates §4.3, "Loop"; docs/runtime.md §3.4).
 //!
 //! Each step: drain the control queue and the wake bitmap (spawns, cancels, shutdown, wakes from other
-//! threads) and the driver's completions into the run queue; expire timers; poll ready tasks, at most a
-//! batch of them, applying what each poll asked of the desk before the next; then, if nothing is ready,
-//! spin out the idle window that client activity opened, and park in the driver until a kick, a completion
-//! or the next deadline. Cancellation guarantees a terminal completion: the future is dropped at the next
+//! threads) and the driver's completions into the run queue; expire timers; list the tasks that woke
+//! themselves behind all of it; poll ready tasks, at most a batch of them, applying what each poll asked of
+//! the desk before the next, and reading those inputs again once the polls have run the latency budget
+//! since they were last read and listed tasks of their own, or when only tasks that woke themselves
+//! remain; then, if nothing is ready, spin out the idle
+//! window that client activity opened, and park in the driver until a kick, a completion or the next
+//! deadline. Cancellation guarantees a terminal completion: the future is dropped at the next
 //! poll boundary, the task's children are cancelled and joined, and whoever joins it sees `Cancelled`.
 //! The watchdog counts polls that exceed the step quantum (the expected wake) and attributes each to its
 //! task or to the host ([`crate::attribution`]).
@@ -45,6 +48,17 @@ pub struct StepOutcome {
     pub next_deadline_ns: Option<u64>,
     /// Whether the shard finished its shutdown and left the loop.
     pub exit: bool,
+}
+
+/// Where a step's batch stands between two polls.
+struct BatchMark {
+    /// The last poll's end, the next one's start; `None` where the inputs did work since, so the next start
+    /// is read afresh.
+    mark: Option<u64>,
+    /// When the batch last read its inputs: the step's start, until it reads them again.
+    inputs_read_ns: Option<u64>,
+    /// The run queue's listings then ([`crate::queue::LocalQueue::listed`]).
+    listed_at_read: u64,
 }
 
 /// The shard's counters (slates' GAPS §7 tripwires read them).
@@ -489,6 +503,16 @@ impl Shard {
             .as_ref()
             .map_or(self.core.fixed_quantum_ns, WakeTrack::mean_ns)
             .max(1)
+    }
+
+    /// The budget after which a step's batch reads its inputs again (docs/runtime.md §3.3): the step
+    /// quantum, or the consumer's latency objective where that is tighter.
+    fn batch_budget_ns(&self) -> u64 {
+        let quantum = self.quantum_ns();
+        self.core
+            .config
+            .latency_objective_ns
+            .map_or(quantum, |objective| objective.min(quantum).max(1))
     }
 
     /// The idle spin window now: while the shard tracks its costs, what blocking costs it times the idle
@@ -1019,33 +1043,13 @@ impl Shard {
         }
         self.desk.counters.set(self.counters());
         let harvests = self.core.counters.harvests;
-        let mut did_work = self.drain_control();
-        did_work |= self.drain_wakes();
-        did_work |= self.expire_timers();
-        did_work |= self.wake_ready_pollers();
-        self.apply();
-        did_work |= self.harvest_turn();
-        // The configured poll budget bounds this phase, including wakes produced by
-        // earlier polls. The FIFO keeps already-ready tasks ahead of those wakes;
-        // a local request/reply handoff need not repeat the whole loop for each end.
-        let batch = self.core.config.batch.max(1);
+        let mut did_work = self.read_inputs();
         // One clock read a poll: each poll's end is the next one's start, so the bookkeeping between two polls
         // is counted to the second. The first poll starts from the step's reading when the step's drains,
         // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
-        let mut mark =
+        let mark =
             (!did_work && self.core.counters.harvests == harvests).then(|| self.desk.now_ns.get());
-        for _ in 0..batch {
-            let Some(slot) = self.desk.local.pop() else {
-                break;
-            };
-            did_work = true;
-            let start = match mark {
-                Some(start) => start,
-                None => self.carried_now_ns(),
-            };
-            mark = Some(self.poll_slot(slot, start));
-            self.apply();
-        }
+        did_work |= self.poll_batch(mark);
         self.judge_deferred();
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
@@ -1060,6 +1064,92 @@ impl Shard {
             },
             exit,
         }
+    }
+
+    /// The step's polls, from `mark`, the clock its first poll starts from where the step read nothing
+    /// since; whether it polled any.
+    ///
+    /// The configured poll budget bounds this phase, including wakes produced by earlier polls. The FIFO
+    /// keeps already-ready tasks ahead of those wakes; a local request/reply handoff need not repeat the
+    /// whole loop for each end. The latency budget is a time (docs/runtime.md §3.3), and the count is it
+    /// over a trivial poll's cost: once the polls since the inputs were last read have run the budget and
+    /// listed tasks of their own (a wake of this shard's, a spawn), which go ahead of every wake still
+    /// unread, the batch reads the inputs again before its next poll, and the step goes on to its count.
+    /// Polls that list nothing leave the order as reading would: what arrives goes behind the tasks
+    /// already listed either way.
+    fn poll_batch(&mut self, mark: Option<u64>) -> bool {
+        let batch = self.core.config.batch.max(1);
+        let budget_ns = self.batch_budget_ns();
+        let mut at = BatchMark {
+            mark,
+            inputs_read_ns: None,
+            listed_at_read: self.desk.local.listed(),
+        };
+        let mut polled_any = false;
+        for polled in 1..=batch {
+            let Some(slot) = self.next_in_batch(&mut at) else {
+                break;
+            };
+            polled_any = true;
+            let start = match at.mark {
+                Some(start) => start,
+                None => self.carried_now_ns(),
+            };
+            let since = *at.inputs_read_ns.get_or_insert(start);
+            let ended = self.poll_slot(slot, start);
+            at.mark = Some(ended);
+            self.apply();
+            if polled < batch
+                && ended.saturating_sub(since) >= budget_ns
+                && self.desk.local.listed() != at.listed_at_read
+            {
+                self.read_inputs_within(&mut at, ended);
+            }
+        }
+        polled_any
+    }
+
+    /// The batch's next task: the ring's oldest, or, where only tasks that woke themselves remain, the
+    /// first after the inputs are read again, which lists them behind what those made ready.
+    fn next_in_batch(&mut self, at: &mut BatchMark) -> Option<u32> {
+        if let Some(slot) = self.desk.local.pop() {
+            return Some(slot);
+        }
+        if !self.desk.local.has_yielded() {
+            return None;
+        }
+        let now = match at.mark {
+            Some(now) => now,
+            None => self.carried_now_ns(),
+        };
+        self.read_inputs_within(at, now);
+        self.desk.local.pop()
+    }
+
+    /// The inputs read again within the batch at `now_ns`, the step's time from here; where they did work,
+    /// the next poll's start is read afresh.
+    fn read_inputs_within(&mut self, at: &mut BatchMark, now_ns: u64) {
+        self.desk.now_ns.set(now_ns);
+        let harvests = self.core.counters.harvests;
+        if self.read_inputs() || self.core.counters.harvests != harvests {
+            at.mark = None;
+        }
+        at.inputs_read_ns = Some(now_ns);
+        at.listed_at_read = self.desk.local.listed();
+    }
+
+    /// The loop's inputs onto the run queue: control, wakes from other threads, timers due, ready pollers and
+    /// the driver's completions; then the tasks that woke themselves, behind all of them (`crate::queue`).
+    /// Whether any input did work.
+    fn read_inputs(&mut self) -> bool {
+        let mut did_work = self.drain_control();
+        did_work |= self.drain_wakes();
+        did_work |= self.expire_timers();
+        did_work |= self.wake_ready_pollers();
+        self.apply();
+        did_work |= self.harvest_turn();
+        self.desk.local.release_yielded();
+        did_work
     }
 
     /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement comes first

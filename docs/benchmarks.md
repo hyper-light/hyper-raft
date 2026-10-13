@@ -7963,3 +7963,45 @@ the reading after every park, every shard's calibrated batch back from 17 to 35 
 
 These are mantle's measurements of the same sources; the hyper-rt bench that runs them here, against
 slates' runtime and tokio on the same host, is owed (`docs/STATUS.md`, "What remains").
+
+## hyper-rt: long polls judged by step (2026-10-12)
+
+mantle's ranges bench at 10M (one shard, its same-shard async client): `sample` of the shard thread put
+`__thread_selfusage`, the thread CPU clock's read, at 2.9% of a seek's shard time (120 of 4,077
+samples) and 1.6% of a get's (66 of 4,123), from `Shard::poll_slot` and `Shard::step`. Counted per
+phase (a scratch build of mantle `bc9e910` printing the shard's steps, polls, long polls and thread
+account reads at each phase's end): reads were exactly long polls plus steps in every phase. Each poll
+past the wall-clock quantum read the clock at its end, and the shard, armed by them, read again at every
+step's start. A seek's poll ran 4–7 µs against a quantum of 2.1–4.0 µs (calibrated per run), so a
+third to half of all polls were long: 727,739 reads in 1M seeks, 167,494 in 1M gets.
+
+From a long poll judged a run on the CPU, a step's long polls now wait for one reading at its end
+(`attribution::Tracker::by_step`, `judge_in_window`): a window's off-CPU time bounds each poll's, so an
+overrun past it was spent on the CPU, the per-poll rule's own verdict. A window that leaves a poll
+undecided leaves it unattributed and judges one at a time again.
+
+mantle's ranges bench, `bc9e910`'s tree with its vendored hyper-rt (base) and with the change applied
+to it (fix), one runtime record for both (the coordinator's profiled run's calibration: step 2,703 ns,
+batch 22), 10M fill, 1M gets, 1M seeks of 10, 9 rounds interleaved with the order alternated, load 8.6
+to 26.9 (other sessions' benchmarks):
+
+| phase | reads base | reads fix | instructions/op, fix/base | elapsed, fix/base (median, range) |
+|---|---|---|---|---|
+| seeks | 805,196–923,210 | 95,294–103,421 | −0.1% to −2.1%, every round | −2.4% (−7.4% to +15.6%) |
+| gets | 167,724–221,076 | 18,147–25,125 | −1.3% to −2.4%, every round | +2.6% (−3.4% to +49.2%) |
+
+The fix's reads are its steps (90,909 in the seek phase) and 4–14% more, the steps whose window left a
+poll undecided under that load. The slower rounds are the first three, at load 25; in rounds 4 to 9 the
+fix ran seeks faster in every round, by 1.3% to 7.4%, and gets within −3.4% to +5.3%. Profiled with
+`sample` over 5 s of each phase (2M seeks, 5M gets, one run an arm): `__thread_selfusage` 120 of 4,106
+shard samples (2.9%) base, 21 of 4,157 (0.5%) fix; that run's 2M seeks took 4.450 s base and 4.098 s
+fix. hyper-rt's `echo` bench (no long polls), 3 rounds interleaved at load 6: spinning p50 0.58–0.71 µs
+base and 0.54–0.71 µs fix, parked p50 4.58–4.75 µs and 4.54–4.79 µs, no allocation either way.
+
+```sh
+# mantle bc9e910's tree (git archive) twice, the change applied to one's vendor/hyper-rt, each built
+# with per-phase counts (scratchpad rt-attr/{base,fix}); then rt-attr/ab-rec.sh and ab-more.sh:
+ranges-<arm> <db> 10000000 1 1000000 256 16 1000000 10 --rocks-seed=301 --shard-client --segments \
+  --runtime-record=runtime-record.txt   # 1 2 1 2 128 2703 2703 22 16384 2703
+cargo bench -p hyper-rt --bench echo    # on main and on the change, alternating
+```

@@ -132,7 +132,51 @@ No value of the grid is chosen. Each is one of:
   `docs/benchmarks.md`, "Heartbeat traces"); or
 - a sweep's breaking point, found by the sweep and reported as such.
 
-Step T-0 (§7) derives the grid and records each value's source before any comparator is run.
+Step T-0 (§7) derives the grid and records each value's source before any comparator is run. Derived
+2026-10-13; each source's reading is in `docs/research/tails.md`.
+
+**The host (§2.1).**
+
+| Condition | Values | From |
+|---|---|---|
+| CPU saturated | runnable threads beside the run at this host's recorded loads: the median, p90, p99 and highest load average at the start of the 3,841 benchmark runs on this Mac since 2026-10-01 (18 cores): 11.6, 32.8, 92.4 and 103.3, so 0.6, 1.8, 5.1 and 5.7 times its cores; past the highest, swept to the breaking point | recorded (`benchmark-results/*/host.txt`); sweep |
+| CPU throttled | cgroup v2 `cpu.max` at the default period, 100 ms, and at its bounds, 1 ms and 1 s; the quota from the run's own measured CPU down to the least allowed, 1 ms, swept to the breaking point | the kernel's `sched-bwc` and `cgroup-v2` documents |
+| Stopped processes | a member held by `SIGSTOP` until the rest of its group has moved on, as the end-to-end kill tests stop one now, and stops of swept length up to the breaking point; no study read gives a stopped process's span | recorded (`hyper-liveness`, `hyper-durable-e2e`); sweep |
+| Memory pressure | cgroup v2 `memory.high` at the run's measured peak footprint, then lowered to the breaking point (above `memory.high` the group is throttled and reclaimed, never killed) | `cgroup-v2`; recorded; sweep |
+| Device fail-slow | each write held in multiples of 250 µs up to 3 ms; stalls of seconds; throughput down three orders of magnitude (to 100 KB/s); a device that stops for a span and comes back | Gunawi et al. §1, §3.3, §4.1 |
+
+**The network (§2.2).**
+
+| Condition | Values | From |
+|---|---|---|
+| Delay | mean one-way delay at each class's bound, 100 ms (classes 0 and 2), 400 ms (1 and 3) and 1 s (4); a geostationary hop, about 239 ms one way and 477 ms a round trip (DERIVED: the 35,786 km altitude twice at the speed of light) | ITU-T Y.1541 Table 1 |
+| Jitter | 50 ms of delay variation (the 1 − 10⁻³ quantile above the minimum, classes 0 and 1); the classes that leave it unbounded, swept | Y.1541 Table 1 |
+| Loss, independent | 10⁻³ (every bounded class's objective); 1–50% (a failing NIC's loss and corruption) | Y.1541 Table 1; Gunawi et al. §3.2 |
+| Loss, bursty | the Gilbert–Elliott chain at its fitted correlations, τ 35.0 ms and 78.7 ms | `docs/research/burst-loss.md` §3–§4 |
+| Microbursts | a link's busy state as a two-state chain stepped every 25 µs, from idle and from busy: 0.003 and 0.359 (web), 0.016 and 0.721 (cache), 0.042 and 0.655 (Hadoop); 90% of bursts at most 200 µs | Zhang et al. §5.1, Table 2 |
+| Reordering | from the delay variation: packets sent closer together than the jitter's 50 ms arrive out of order (DERIVED); Bennett et al.'s measured reordering is unread | Y.1541 |
+| Queues | CoDel at its defaults, TARGET 5 ms and INTERVAL 100 ms; drop-tail queues of a home gateway's depth, 74 ms to 400 ms of queuing under load | RFC 8289 §4.2–§4.3; Hätönen et al. TCP-3 |
+| NAT rebinding | binding timeouts of 30 s (the least for one packet out), 54 s (the least with traffic both ways), 90 s and 180 s (the two medians); RFC 4787's floor is 120 s, which more than half of the gateways measured did not meet | Hätönen et al. §4.1, §4.4; RFC 4787 REQ-5 |
+| MTU | 1280 octets (IPv6's least link MTU) and paths below the datagram size (a black hole) | RFC 8200 §5 |
+| Partitions | complete, partial and simplex (one-way), isolating one node (88% of the failures studied need no more); lasting 5 minutes (most data-centre link failures), 10 to 100 minutes (80% of Google's high-impact failures), 10 h and 71 h (Facebook's backbone edge nodes' repairs, median and p90) | Alquraan et al. §2.1; Gill et al. §4.5.1; Govindan et al. §1; Meza et al. §6.1 |
+| Gray failure | a link or process that answers some peers and not others, or late | Huang et al. |
+
+**At fleet scale (§2.3).** The background condition's rates, per component, from production studies,
+at the fleet sizes they report (Facebook's of hundreds of thousands of machines, Dixit et al.):
+
+| Component | Failure rate | Repair | From |
+|---|---|---|---|
+| Network devices in a data centre | mean time between incidents in 2017 from 39,495 device-hours (core) to 9,958,828 (rack switches) | p75 incident resolution near 300 h (2017) | Meza et al. §5.5 |
+| Commodity switches, load balancers | a ToR fails in a year with probability about 5%, an aggregation switch 10%, a load balancer 20% | most link failures resolved within about 5 minutes; load balancers' median 3.7–4.5 minutes | Gill et al. §1.1, §4.3, §4.5.1 |
+| Backbone edge nodes | MTBF over the nodes, 462.88·e^(2.3408p) h (median 1,710 h, p90 3,521 h) | MTTR 1.513·e^(4.256p) h (median 10 h, p90 71 h) | Meza et al. §6.1, Table 4 |
+| Backbone links, by fiber vendor | MTBF 336.51·e^(3.4371p) h (median 2,326 h, p90 5,709 h) | MTTR 1.1345·e^(4.7709p) h (median 13 h, p90 60 h) | Meza et al. §6.2, Table 4 |
+| High-impact network failures | over 100 in two years across Google's networks | 80% last 10 to 100 minutes | Govindan et al. §1 |
+| CPUs that compute wrongly | hundreds of CPUs in hundreds of thousands of machines, of the order of 10⁻³ (DERIVED from those counts) | none: found by tests, not repaired in place | Dixit et al., abstract |
+
+The rates the per-percentile models give (Meza et al.'s `p` runs over the nodes or vendors) are drawn per
+component, and failures arrive at each component as it fails and is repaired, so a run at a fleet's
+size holds the background a fleet that size always has. The simulation draws them first (§4.1); the
+real-socket relay replays a drawn schedule (§4.2).
 
 ## 3. The measurement
 
@@ -248,6 +292,9 @@ Each step is gated commits, results in `docs/benchmarks.md` with hardware, date,
 and command.
 
 - **T-0 The grid**: `docs/research/tails.md` verified; each condition's values derived (§2.3, §2.4).
+  Built (2026-10-13): every source read at its primary text but three, which are marked UNVERIFIED
+  with what stands in for each (David and Nagaraja's book, Bennett et al.'s reordering, the φ-accrual
+  paper); §2.4's tables give each condition's values and where each comes from.
 - **T-1 The measurement kit**: an open-loop driver and the quantile intervals of §3.3 in
   hyper-measure, with exact tests of the interval arithmetic; the per-process resource accounts of
   §1a on the six targets, at rest and per operation. Built (2026-10-12): the Poisson schedule an

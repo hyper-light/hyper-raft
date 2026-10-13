@@ -300,10 +300,10 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      S-8 (the consumers' simulations), `docs/sim.md` §9. S-7 is built (§19): every end-to-end
      scenario's clients' history held linearizable by hyper-check's search, a planted stale read
      refused.
-   - Tails, `docs/tails.md` §7: T-0 (the grid), T-1 (the measurement kit: its open-loop schedule and
-     quantile intervals built in hyper-measure, the per-process accounts of §1a open), T-2 (the
-     impairment relay), then each crate class against its industry comparators under the same
-     conditions.
+   - Tails, `docs/tails.md` §7: T-0 (the grid) is built, its sources read and its conditions' values
+     derived (§2.4); T-1 (the measurement kit: its open-loop schedule and quantile intervals built in
+     hyper-measure, the per-process accounts of §1a open), T-2 (the impairment relay), then each crate
+     class against its industry comparators under the same conditions.
    - hyper-quic and hyper-tls against slates' and focal's transports (owed in the table above), and
      slates' congestion bake-off.
    - hyper-seal §11: the log sealed by default only once measured.

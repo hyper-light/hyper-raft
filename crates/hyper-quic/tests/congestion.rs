@@ -145,11 +145,16 @@ impl Scenario {
         })
     }
 
-    /// The most bytes one direction holds: its propagation at the peak rate and its full queue.
+    /// The most bytes one direction holds: its full queue, the datagram on the wire among them, and
+    /// what has left the link and propagates. Datagrams leave the link one after another at its
+    /// rate, so those that left within a propagation's longest time (half the round trip and the
+    /// jitter) hold that time at the peak rate and the first of them whole: a datagram is in flight
+    /// until it arrives, and on a thin path its propagation carries a fraction of one (80 bytes at
+    /// 64 kbit/s and 20 ms, against a 1,200-byte datagram).
     fn bytes_one_way(&self) -> u64 {
         let bits = u128::from(self.peak_rate()) * u128::from(self.rtt_ns + 2 * self.jitter_ns)
             / 1_000_000_000;
-        u64::try_from(bits / 16).unwrap() + self.queue_bytes()
+        u64::try_from(bits / 16).unwrap() + DATAGRAM + self.queue_bytes()
     }
 
     /// Measured from a quarter of the run unless stated: slow start and the first oscillations
@@ -178,6 +183,17 @@ impl Scenario {
         u64::try_from(bits / 8).unwrap()
     }
 
+    /// The bottleneck's rate and the round trip: "64k 20ms", "10M 100ms".
+    fn link_name(&self) -> String {
+        let rate = self.rate_bits_per_second;
+        let rate = if rate >= 1_000_000 {
+            format!("{}M", rate / 1_000_000)
+        } else {
+            format!("{}k", rate / 1_000)
+        };
+        format!("{rate} {}ms", self.rtt_ns / MS)
+    }
+
     fn name(&self) -> String {
         let marking = match self.marking {
             Marking::Off => String::new(),
@@ -189,12 +205,7 @@ impl Scenario {
                 interval_ns,
             } => format!(" codel {}/{}ms", target_ns / MS, interval_ns / MS),
         };
-        format!(
-            "{}M {}ms seed {}{marking}",
-            self.rate_bits_per_second / 1_000_000,
-            self.rtt_ns / MS,
-            self.seed
-        )
+        format!("{} seed {}{marking}", self.link_name(), self.seed)
     }
 }
 
@@ -278,13 +289,16 @@ enum Ev {
 
 /// One connection of a run: its law, when its client stops handing its transfer more, whether it
 /// is a ping flow (a request of [`PING_BYTES`] every gap, each answered by as many) rather than a
-/// bulk transfer, and its round trip where it differs from the scenario's.
+/// bulk transfer, and its round trip where it differs from the scenario's. A ping flow's server
+/// lets every ping the run sends be open at once unless `streams` states a limit: the law's queue,
+/// not the stream limit (RFC 9000 §4.6), is what holds a ping back, as slates' bake-off had it.
 #[derive(Clone, Copy, Debug)]
 struct FlowSpec {
     law: Law,
     stop_at: Option<u64>,
     ping_gap_ns: Option<u64>,
     rtt_ns: Option<u64>,
+    streams: Option<u64>,
 }
 
 impl FlowSpec {
@@ -294,6 +308,7 @@ impl FlowSpec {
             stop_at: None,
             ping_gap_ns: None,
             rtt_ns: None,
+            streams: None,
         }
     }
 }
@@ -334,6 +349,9 @@ struct State {
     /// A ping flow's gap between requests, and when the next is due.
     ping_gap: Option<u64>,
     next_ping: u64,
+    /// Whether the stream limit held the next ping back: it waits for the peer's credit, which a
+    /// datagram brings, and not for a timer.
+    ping_blocked: bool,
     /// The client's pings awaiting their replies: each stream, when it was due, the bytes back.
     pings: Vec<(StreamId, u64, usize)>,
     /// Each ping's latency, due to answered, for those due after the warm-up.
@@ -353,7 +371,7 @@ struct Flow {
 }
 
 impl Flow {
-    fn new(index: u32, law: Law, scenario: &Scenario, pki: &Pki) -> Self {
+    fn new(index: u32, spec: &FlowSpec, scenario: &Scenario, pki: &Pki) -> Self {
         let rng = |node: NodeId| {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&scenario.seed.to_le_bytes());
@@ -363,10 +381,15 @@ impl Flow {
         let mut server_config =
             ServerConfig::with_single_cert(vec![pki.certificate.clone()], pki.key.clone_key())
                 .unwrap();
-        server_config.transport_config(transport(law, scenario));
+        let mut transport = transport(spec.law, scenario);
+        if let Some(gap) = spec.ping_gap_ns {
+            let streams = spec.streams.unwrap_or(scenario.end() / gap + 1);
+            transport.max_concurrent_bidi_streams(VarInt::from_u64(streams).unwrap());
+        }
+        server_config.transport_config(transport);
         let (client, server) = (NodeId(2 * index), NodeId(2 * index + 1));
         Self {
-            law,
+            law: spec.law,
             client: Side {
                 node: client,
                 address: format!("10.0.{index}.1:4433").parse().unwrap(),
@@ -394,10 +417,12 @@ impl Flow {
 /// A ping client's application: a request each gap on a stream of its own, each reply's latency
 /// from when its request was due.
 fn ping_client(connection: &mut Connection, state: &mut State, now: u64, gap: u64) {
+    state.ping_blocked = false;
     while state.next_ping <= now {
         let Some(id) = connection.streams().open(Dir::Bi) else {
-            // The stream limit holds it back: it goes when credit returns, its latency from when
-            // it was due
+            // The stream limit holds it back: it goes when the peer's credit arrives, its latency
+            // from when it was due
+            state.ping_blocked = true;
             break;
         };
         let mut send = connection.send_stream(id);
@@ -560,7 +585,9 @@ impl Run {
         // Every message either direction holds, at the smallest datagram's size.
         let messages = usize::try_from(2 * scenario.bytes_one_way() / SMALLEST_DATAGRAM).unwrap();
         let limits = Limits {
-            events: messages + 3,
+            // Each message in flight's arrival, and the run's own marks: the warm-up, the end, the
+            // next sample and the step
+            events: messages + 4,
             nodes,
             // The run's own, and each direction of each flow its loss and its delay draws
             streams: 3 * nodes + 1,
@@ -590,7 +617,7 @@ impl Run {
             .iter()
             .enumerate()
             .map(|(index, spec)| {
-                let mut flow = Flow::new(u32::try_from(index).unwrap(), spec.law, &scenario, pki);
+                let mut flow = Flow::new(u32::try_from(index).unwrap(), spec, &scenario, pki);
                 flow.state.stop_at = spec.stop_at;
                 flow.state.ping_gap = spec.ping_gap_ns;
                 flow.state.warm = scenario.warm();
@@ -645,8 +672,8 @@ impl Run {
     }
 
     /// What `node` does after it was told something: its connection's events to its endpoint, its
-    /// application, what it has to send onto the network, and its timer.
-    fn serve(&mut self, node: NodeId) -> Result<(), SimError> {
+    /// application, what it has to send onto the network, and its timer, which it returns.
+    fn serve(&mut self, node: NodeId) -> Result<Option<u64>, SimError> {
         let now = self.world.now();
         let at = self.at(now);
         let Self {
@@ -672,7 +699,7 @@ impl Run {
         };
         let state = &mut flow.state;
         let Some((handle, connection)) = &mut side.connection else {
-            return Ok(());
+            return Ok(None);
         };
         while let Some(event) = connection.poll_endpoint_events() {
             if let Some(event) = side.endpoint.handle_event(*handle, event) {
@@ -734,14 +761,17 @@ impl Run {
         let timer = connection
             .poll_timeout()
             .map(|due| u64::try_from(due.saturating_duration_since(*epoch).as_nanos()).unwrap());
-        // A ping client wakes for its next request too
-        let ping = (is_client && state.connected && state.ping_gap.is_some())
-            .then_some(state.next_ping.max(now));
+        // A ping client wakes for its next request too, unless the stream limit holds that back:
+        // the credit's arrival serves it then
+        let ping =
+            (is_client && state.connected && state.ping_gap.is_some() && !state.ping_blocked)
+                .then_some(state.next_ping.max(now));
         let deadline = match (timer, ping) {
             (Some(t), Some(p)) => Some(t.min(p)),
             (t, p) => t.or(p),
         };
-        world.wake(node, deadline)
+        world.wake(node, deadline)?;
+        Ok(deadline)
     }
 
     /// A datagram arrives at `node`.
@@ -798,12 +828,14 @@ impl Run {
             }
             None => {}
         }
-        self.serve(node)
+        self.serve(node).map(drop)
     }
 
-    /// `node`'s timer fired.
+    /// `node`'s timer fired. A wake does what is due at its time: a node that asked to wake again
+    /// at the same time would be woken there again and again, and the run's clock would stop.
     fn fire(&mut self, node: NodeId) -> Result<(), SimError> {
-        let at = self.at(self.world.now());
+        let now = self.world.now();
+        let at = self.at(now);
         let flow = &mut self.flows[usize::try_from(node.0 / 2).unwrap()];
         let side = if node.0.is_multiple_of(2) {
             &mut flow.client
@@ -813,7 +845,14 @@ impl Run {
         if let Some((_, connection)) = &mut side.connection {
             connection.handle_timeout(at);
         }
-        self.serve(node)
+        let deadline = self.serve(node)?;
+        assert!(
+            deadline.is_none_or(|due| due > now),
+            "{}: node {} woke at {now} ns and asked to wake then again",
+            self.scenario.name(),
+            node.0
+        );
+        Ok(())
     }
 
     /// Each Copa client's mode, read off its controller.
@@ -1293,9 +1332,9 @@ const FAIRNESS_FLOOR: f64 = 0.9;
 
 /// One scenario of the bake-off: its path, and the second bulk flow beside the first if any (its
 /// round trip, and its law where it is not the law under test).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Trial {
-    name: &'static str,
+    name: String,
     path: Scenario,
     second: Option<(u64, Option<Law>)>,
 }
@@ -1308,7 +1347,7 @@ fn bakeoff_trials() -> Vec<Trial> {
         for rtt in [20, 100, 300] {
             for loss_ppm in [0, 1_000, 10_000, 50_000] {
                 trials.push(Trial {
-                    name: "grid",
+                    name: format!("loss {}%", percent(u64::from(loss_ppm))),
                     path: Scenario {
                         loss: Loss::random(loss_ppm),
                         ..scenario(rate, rtt, 0)
@@ -1367,7 +1406,11 @@ fn bakeoff_trials() -> Vec<Trial> {
         ("RTT fairness 20/100 ms", base, Some((20 * MS, None))),
         ("beside CUBIC", base, Some((100 * MS, Some(Law::Cubic)))),
     ] {
-        trials.push(Trial { name, path, second });
+        trials.push(Trial {
+            name: name.to_owned(),
+            path,
+            second,
+        });
     }
     trials
 }
@@ -1427,6 +1470,62 @@ fn bakeoff_cell(trial: &Trial, law: Law, seed: u64, pki: &Pki) -> Cell {
     }
 }
 
+/// The bake-off's thinnest path, 64 kbit/s and 20 ms, runs within the bounds the harness derives
+/// for its network, with its bulk flow and its ping flow. A datagram there is on the wire for 150 ms
+/// and then in flight whole for the 10 ms of its propagation, where the rate carries 80 bytes, and
+/// the handshake fills both directions' queues at once.
+#[test]
+fn the_thinnest_path_runs_within_the_networks_bounds() {
+    let pki = Pki::new();
+    let path = scenario(64_000, 20, 10);
+    let gap =
+        PING_WIRE_BYTES * 8 * SECOND * 1_000 / (path.rate_bits_per_second * PING_LOAD_PERMILLE);
+    for law in Law::BAKEOFF {
+        let specs = [
+            FlowSpec::bulk(law),
+            FlowSpec {
+                ping_gap_ns: Some(gap),
+                ..FlowSpec::bulk(law)
+            },
+        ];
+        run_flows(path, &specs, &pki, Source::Seed(1)).unwrap();
+    }
+}
+
+/// A ping the stream limit holds back waits for the peer's credit (RFC 9000 §4.6), and the run's
+/// clock moves on. The ping client once asked to wake at the present for its overdue ping while the
+/// limit refused it, and the world woke it there again and again: the bake-off stopped at 10 Mbit/s
+/// and 300 ms, where pings answered but not yet credited back held QUIC's default hundred streams.
+/// Two streams at once hold a ping a millisecond back for most of the run; more than two pings
+/// answered or waiting is the credit coming back and the held pings going on it.
+#[test]
+fn a_ping_held_by_the_stream_limit_waits_for_credit() {
+    let pki = Pki::new();
+    let path = Scenario {
+        warm_ns: Some(0),
+        ..scenario(10_000_000, 20, 2)
+    };
+    let specs = [FlowSpec {
+        ping_gap_ns: Some(MS),
+        streams: Some(2),
+        ..FlowSpec::bulk(Law::Cubic)
+    }];
+    let measured = run_flows(path, &specs, &pki, Source::Seed(1)).unwrap().0;
+    assert!(measured[0].pings > 2, "{:?}", measured[0]);
+}
+
+/// A slow start's overshoot at 100 Mbit/s and 100 ms keeps its connection. With a window of four
+/// times the path and its queue, the drop-tail queue loses every other datagram of the overshoot's
+/// last round trip, and the receiver held 1,025 spans of its stream when upstream's fixed bound
+/// refused the next and closed the connection with "too many gaps in stream buffer"
+/// (`crates/hyper-quic/VENDORED.md` §26).
+#[test]
+fn a_slow_starts_overshoot_at_a_large_window_keeps_its_connection() {
+    let pki = Pki::new();
+    let m = measure(scenario(100_000_000, 100, 2), Law::NewReno, &pki);
+    assert!(m.closed.is_none(), "{m:?}");
+}
+
 fn geomean(ratios: &[f64]) -> f64 {
     (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len().max(1) as f64).exp()
 }
@@ -1462,7 +1561,7 @@ fn the_congestion_bakeoff_over_slates_grid() {
                 println!(
                     "{},{},{seed},{law:?},{:.3},{:.2},{},{}",
                     trial.name,
-                    trial.path.name(),
+                    trial.path.link_name(),
                     millis(cell.ping_p99_ns),
                     percent(cell.carried_ppm),
                     cell.stalled,
@@ -1472,7 +1571,7 @@ fn the_congestion_bakeoff_over_slates_grid() {
                     out.entry(*law).or_default().push(format!(
                         "stalled: {} {} seed {seed}",
                         trial.name,
-                        trial.path.name()
+                        trial.path.link_name()
                     ));
                 }
                 if let Some(jain) = cell.jain
@@ -1504,7 +1603,7 @@ fn the_congestion_bakeoff_over_slates_grid() {
                 if p99 > w.0 {
                     *w = (
                         p99,
-                        format!("{} {} seed {seed}", trial.name, trial.path.name()),
+                        format!("{} {} seed {seed}", trial.name, trial.path.link_name()),
                     );
                 }
             }

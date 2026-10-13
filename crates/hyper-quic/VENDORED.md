@@ -992,3 +992,71 @@ rows.
   padding to its MTU acknowledges more server pings than its window holds padded datagrams; every
   acknowledgment is an ACK frame alone and nothing of the client is left in flight. It fails before
   the patch, 1,333 bytes in flight. `tests::pad_to_mtu` and the unit and integration suites pass.
+
+## 26. A stream holds the spans its window pays for (2026-10-13)
+
+- **Patch Q15: the assembler's span bound follows the peer's window** (`connection/assembler.rs`,
+  `max_spans`).
+  - Upstream bounds the spans a stream holds out of order at a fixed 1,024
+    (`MAX_CHUNKS`: "ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?"),
+    and closes the connection with INTERNAL_ERROR, "too many gaps in stream buffer", past it. A
+    legitimate sender reaches it: a window of frames of `d` bytes with every other frame lost
+    holds `window / (2d)` spans, so any stream window past `2 · 1,024 · d`, 2.3 MB at the smallest
+    datagram, can be closed by its own sender's losses. slates' congestion bake-off found it on
+    hyper-quic's harness (`docs/benchmarks.md`, "slates' congestion bake-off on hyper-quic"):
+    at 100 Mbit/s and 100 ms with no random loss, a slow start overshot the drop-tail queue, which
+    then lost every other datagram of the round trip, and the receiver refused its 1,025th span
+    1.36 s in, 2.4 MB buffered in a 4.8 MB reach. NewReno and CUBIC carried nothing after that at
+    100 and 300 ms, BBR nothing at 300 ms. focal met the same limit with a 10 MiB window, and
+    hyper-transport capped its stream window at `2 · 1,024 · d` for it (patch Q5). Upstream's
+    issue #2809 is its contiguous form, closed by PR #2814, which this crate carries.
+  - The bound is now the spans whose own memory, a `Buffer` each, fits in the window the peer
+    holds at their most (twice the bound, the compaction's slack), and never under the 1,024
+    upstream kept. The window is what the peer may send past what the application has read: the
+    stream's `sent_max_stream_data` for a stream, the crypto buffer for CRYPTO frames (where the
+    floor stays the bound: 16 KiB pays for under 1,024). So what a peer makes the receiver hold
+    for disorder stays within the memory the window already grants, Linux's budget for a receive
+    buffer's overhead (`tcp_adv_win_scale` = 1, Documentation/networking/ip-sysctl.rst), and a
+    sender whose frames carry at least a `Buffer`'s size is never refused for its losses. A peer
+    of one-byte frames past gaps is refused once its spans pass the bound, as before.
+  - `MAX_STREAM_CHUNKS` stays exported, now the floor: hyper-transport's stream window ceiling,
+    derived from it, is still never refused, and is no longer what keeps the connection open.
+- **Tests.**
+  - `assembler::test::a_window_with_every_other_frame_lost_is_held`: 10 MiB of 1,134-byte frames,
+    every other one lost, held and read back byte for byte once the lost ones come. It fails
+    under the fixed bound at its 1,025th span.
+  - `assembler::test::spans_past_what_the_window_pays_for_are_refused`: one-byte frames past
+    gaps are refused once past the bound, the spans held never costing more than the window.
+  - `tests/congestion.rs`, `a_slow_starts_overshoot_at_a_large_window_keeps_its_connection`:
+    NewReno at 100 Mbit/s and 100 ms for 2 s with a window of four times the path and its queue
+    keeps its connection; under the fixed bound the server closed it at 1.36 s.
+  - The assembler's earlier tests keep upstream's bound through a limit at the floor.
+
+## 27. The copies' scan looks at the handshake's flights alone (2026-10-13)
+
+Measured by `benches/vs_upstream.rs` (hyper-quic against upstream quinn-proto 0.11.18 in one process,
+the same TLS on both sides; `docs/benchmarks.md`, "hyper-quic against upstream quinn-proto"). With its
+defaults, hyper-quic took 1.58 times upstream's instructions a mebibyte of bulk transfer and 1.30
+times an exchange of 64 bytes each way; with the handshake's copies and Careful Resume off, 1.07 and
+1.18. A profile of the bulk transfer (`sample`) put 41% of hyper-quic's samples in
+`Connection::poll_transmit`'s own code against 8% with both off, and turning the features off one at a
+time put the cost on the copies.
+
+- **`PacketSpace::queue_copies` visited every packet in flight at every transmission.** Only packets
+  of the handshake's flights are ever copied (§13, §17), all sent while the handshake runs or in the
+  application's first round trip, but the scan walked the whole `sent_packets` map: a window of
+  thousands of packets was walked for each datagram sent. A space now keeps `flights_end`, one past
+  the largest packet number it sent as one of the flights, and the scan walks `..flights_end`.
+  `Connection::queue_copies` returns before working out the copies' spacing (the burst estimate and
+  its fixed-point logarithm) when no space holds a flight in flight (`PacketSpace::holds_flights`).
+- **`Connection::after_fill` read every space's pending frames at every transmission**, to stop a
+  space sending copies once its queue had emptied. It now reads them only for a space that is sending
+  copies.
+- After the change (three rounds at load 10–12), instructions against upstream's: a mebibyte 1.068
+  (copies and Careful Resume off, 1.059), an exchange of 64 bytes each way 1.121 (1.089), of 4 KiB
+  1.072, of 64 KiB 1.060; a full handshake 0.805, a resumed one 0.738. What remains is spread over the
+  patches' per-packet work (`finish_and_track`, the receive side's reads, `initial_window`), no one
+  site above a few percent of the samples.
+- **Tests.** `tests::the_copies_look_at_the_handshakes_flights_alone`: after the handshake, a client
+  with a window of packets of a bulk stream in flight has no flight left to scan. The copies' own
+  tests (`tests/geo.rs`, `connection::copies`) pass unchanged.

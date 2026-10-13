@@ -6162,6 +6162,156 @@ cargo test -p hyper-quic --test congestion --locked copa_stops_competing_over_fo
 cargo test -p hyper-quic --test congestion --locked copa_shares_a_bottleneck_over_focals_grid -- --ignored --nocapture
 ```
 
+## slates' congestion bake-off on hyper-quic (2026-10-13)
+
+slates chose its session plane's congestion controller by a bake-off whose rule was fixed before any
+run (slates `docs/wip/BENCHMARKS.md`, 2026-09-28): 57 scenarios, five laws, three seeds, Copa
+selected. hyper-quic's harness runs its port of that grid on the four laws hyper-quic ships
+(`the_congestion_bakeoff_over_slates_grid`, `crates/hyper-quic/tests/congestion.rs`):
+
+- 48 paths: rate {64 kbit/s, 1, 10, 100 Mbit/s} × round trip {20, 100, 300 ms} × random loss {0,
+  0.1, 1, 5%};
+- 8 more at 10 Mbit/s and 100 ms: a quarter of a bandwidth-delay product of buffer and four, ±10 ms
+  of reordering, Gilbert burst loss at a mean of 1%, a step to 2 Mbit/s halfway through what is
+  measured, two flows of one law at one round trip and at 20 and 100 ms, and one beside CUBIC;
+- three seeds, so 672 runs. Each is a bulk flow and a ping flow (64 bytes each way, its requests 1%
+  of the link) through one bottleneck each way, measured over 1,000 pings after a warm-up of 20
+  round trips and 5 s at least.
+
+**The rule** (slates', in the test's documentation): a law is disqualified by any run that stalls (its
+bulk flow under 1% of the link, a connection lost, or no ping answered) or by two flows of the law
+scoring Jain's index below 0.9; the primary measure is the ping's p99 under load, the geometric mean
+over every trial and seed of the law's p99 over the best law's there; the secondary is the bulk
+goodput's shortfall from the best law's, likewise.
+
+**What differs from slates' harness**, so the numbers are a ranking of their own and not slates':
+the bottleneck is both ways (slates' carried the client's direction alone); the queue's floor is four
+datagrams (slates', two); the ping's load counts its request alone; the extras keep slates' kinds but
+not all its paths (no 16-product buffer, the reordering at 100 ms rather than 8 ms at 20 ms, the
+fairness pairs at 100 ms rather than 50, the step stays at 2 Mbit/s).
+
+Every run is a deterministic simulation of its seed, so the host's load moves no number: 2 min 13 s
+of wall clock at load 15–22 (2026-10-13 11:21–11:23 PDT), the same rows byte for byte as a run before
+the send path's changes of hyper-quic's VENDORED.md §27.
+
+| Law | Ping p99 against the best (geomean) | Worst | Goodput shortfall (geomean) | Disqualified by |
+|---|---|---|---|---|
+| NewReno | 1.398 | 17.41 (5% loss, 100 Mbit/s, 20 ms) | 3.081 | stalls in 11 runs: 100 Mbit/s at 100 and 300 ms with 1% and 5% loss |
+| CUBIC | 1.338 | 9.64 (5% loss, 100 Mbit/s, 100 ms) | 2.718 | stalls in 11 runs, the same paths |
+| BBR | 1.485 | 2.77 (four products of buffer) | 1.071 | Jain 0.714 at 20 and 100 ms (3 runs) |
+| **Copa** | **1.044** | 3.12 (the step to 2 Mbit/s) | 1.245 | — |
+
+Copa is the one law the rule admits, as in slates' run (its Copa: 1.268, worst 3.05, shortfall 1.068;
+NewReno and CUBIC stalled at 100 Mbit/s with loss there too, BBRv3 stalled at 100 Mbit/s, 300 ms and
+5%). The loss-based laws' stalls are their law: a sender halving at each loss carries
+`(MSS/RTT)·√(3/(2p))` (Mathis, Semke, Mahdavi and Ott, CCR 27(3), 1997), 0.18 Mbit/s at 300 ms and
+5%. BBR
+keeps its rate under random loss (84% or more of 100 Mbit/s at 5%) but keeps about a product of queue
+standing, its ping p99 twice the round trip on the drop-tail paths, and two of its flows at 20 and
+100 ms shared 0.714 by Jain's index.
+
+The median over the seeds of each law's ping p99 and the bulk flow's share of the link after the
+warm-up (a share can pass 100% by what the path and its queue held when the warm-up ended); slates'
+Copa beside, from its raw rows (`docs/wip/research/data/2026-09-28-congestion-grid-0def3b4.csv`):
+
+| Trial | Path | NewReno: ping p99 ms (carried %) | CUBIC | BBR | Copa | slates' Copa, ping p99 ms |
+|---|---|---|---|---|---|---|
+| loss 0% | 64k 20ms | 616 (95.8) | 619 (95.1) | 614 (94.7) | 615 (95.7) | 628 |
+| loss 0.1% | 64k 20ms | 615 (95.7) | 618 (95.1) | 617 (94.9) | 610 (95.7) | 778 |
+| loss 1% | 64k 20ms | 1195 (94.7) | 1187 (94.4) | 991 (94.5) | 1072 (94.3) | 770 |
+| loss 5% | 64k 20ms | 1294 (88.8) | 1294 (90.2) | 1276 (89.3) | 1230 (87.7) | 4398 |
+| loss 0% | 64k 100ms | 616 (95.7) | 659 (92.2) | 713 (76.9) | 602 (95.7) | 360 |
+| loss 0.1% | 64k 100ms | 617 (95.7) | 669 (92.3) | 766 (77.0) | 612 (95.6) | 394 |
+| loss 1% | 64k 100ms | 1210 (94.5) | 1169 (92.4) | 1197 (77.1) | 1178 (94.1) | 788 |
+| loss 5% | 64k 100ms | 1327 (87.8) | 1323 (89.5) | 1338 (81.9) | 1299 (88.1) | 2816 |
+| loss 0% | 64k 300ms | 900 (92.2) | 907 (86.2) | 910 (62.5) | 903 (87.7) | 483 |
+| loss 0.1% | 64k 300ms | 910 (91.9) | 910 (87.6) | 1121 (62.6) | 903 (87.6) | 1050 |
+| loss 1% | 64k 300ms | 1545 (90.6) | 1751 (88.4) | 1647 (72.9) | 1606 (87.0) | 1508 |
+| loss 5% | 64k 300ms | 1755 (80.9) | 1871 (86.1) | 1875 (69.2) | 1921 (83.6) | 1984 |
+| loss 0% | 1M 20ms | 59 (85.0) | 59 (94.0) | 59 (82.8) | 59 (84.4) | 33 |
+| loss 0.1% | 1M 20ms | 59 (85.0) | 59 (93.1) | 59 (62.1) | 59 (84.2) | 40 |
+| loss 1% | 1M 20ms | 123 (87.4) | 128 (93.7) | 127 (68.8) | 109 (80.4) | 84 |
+| loss 5% | 1M 20ms | 143 (72.0) | 166 (84.0) | 155 (66.5) | 159 (73.3) | 790 |
+| loss 0% | 1M 100ms | 194 (94.0) | 194 (96.2) | 200 (86.6) | 156 (94.8) | 143 |
+| loss 0.1% | 1M 100ms | 194 (93.2) | 194 (95.8) | 199 (86.3) | 169 (94.0) | 191 |
+| loss 1% | 1M 100ms | 338 (79.6) | 333 (86.8) | 456 (85.8) | 365 (91.0) | 327 |
+| loss 5% | 1M 100ms | 417 (35.0) | 399 (41.3) | 483 (80.7) | 482 (84.9) | 381 |
+| loss 0% | 1M 300ms | 590 (95.7) | 592 (96.2) | 593 (94.7) | 374 (92.7) | 392 |
+| loss 0.1% | 1M 300ms | 589 (91.1) | 592 (95.8) | 593 (94.6) | 375 (92.7) | 402 |
+| loss 1% | 1M 300ms | 696 (38.3) | 712 (53.7) | 1257 (90.8) | 745 (92.2) | 734 |
+| loss 5% | 1M 300ms | 814 (13.7) | 790 (15.5) | 1310 (84.8) | 856 (87.5) | 869 |
+| loss 0% | 10M 20ms | 40 (95.7) | 40 (96.4) | 40 (95.7) | 25 (95.2) | 27 |
+| loss 0.1% | 10M 20ms | 40 (93.0) | 40 (96.2) | 40 (95.7) | 25 (95.1) | 30 |
+| loss 1% | 10M 20ms | 51 (50.5) | 52 (52.8) | 87 (94.5) | 56 (93.2) | 51 |
+| loss 5% | 10M 20ms | 62 (17.1) | 60 (23.9) | 97 (90.0) | 70 (87.2) | 77 |
+| loss 0% | 10M 100ms | 188 (96.3) | 199 (96.3) | 200 (94.9) | 108 (95.5) | 150 |
+| loss 0.1% | 10M 100ms | 103 (47.4) | 103 (54.5) | 200 (95.3) | 107 (95.8) | 150 |
+| loss 1% | 10M 100ms | 213 (12.7) | 213 (13.1) | 423 (93.1) | 222 (94.1) | 214 |
+| loss 5% | 10M 100ms | 230 (3.8) | 229 (4.7) | 429 (91.6) | 239 (89.5) | 426 |
+| loss 0% | 10M 300ms | 335 (96.3) | 544 (100.0) | 600 (98.5) | 309 (95.9) | 364 |
+| loss 0.1% | 10M 300ms | 459 (25.1) | 444 (59.0) | 600 (98.7) | 308 (93.7) | 386 |
+| loss 1% | 10M 300ms | 681 (3.7) | 634 (5.3) | 1226 (96.2) | 638 (92.5) | 649 |
+| loss 5% | 10M 300ms | 1572 (1.7) | 848 (1.8) | 1235 (87.1) | 651 (88.9) | 1052 |
+| loss 0% | 100M 20ms | 39 (96.3) | 34 (96.3) | 40 (92.9) | 21 (95.9) | 40 |
+| loss 0.1% | 100M 20ms | 30 (21.1) | 24 (14.8) | 40 (96.4) | 21 (95.8) | 104 |
+| loss 1% | 100M 20ms | 70 (5.5) | 43 (5.4) | 83 (95.4) | 43 (94.8) | 42 |
+| loss 5% | 100M 20ms | 566 (1.8) | 54 (2.5) | 84 (91.9) | 45 (88.3) | 65 |
+| loss 0% | 100M 100ms | 106 (96.3) | 162 (96.3) | 200 (96.5) | 101 (96.2) | 125 |
+| loss 0.1% | 100M 100ms | 196 (3.8) | 138 (7.6) | 200 (96.6) | 101 (92.3) | 200 |
+| loss 1% | 100M 100ms | 1742 (1.2) | 1072 (1.6) stalled | 403 (94.4) | 204 (93.6) | 219 |
+| loss 5% | 100M 100ms | 1980 (0.4) stalled | 1980 (0.6) stalled | 435 (88.4) | 208 (90.0) | 238 |
+| loss 0% | 100M 300ms | 345 (104.8) | 600 (109.5) | 600 (112.1) | 300 (7.6) | 500 |
+| loss 0.1% | 100M 300ms | 1201 (3.5) | 417 (8.7) | 600 (84.5) | 300 (5.8) | 539 |
+| loss 1% | 100M 300ms | 1980 (0.3) stalled | 1980 (0.6) stalled | 859 (45.3) | 603 (19.1) | 604 |
+| loss 5% | 100M 300ms | 1980 (0.2) stalled | 1980 (0.2) stalled | 1161 (103.5) | 676 (37.8) | 901 |
+| buffer 1/4 BDP | 10M 100ms | 124 (87.7) | 125 (94.0) | 125 (92.9) | 108 (95.8) |  |
+| buffer 4 BDP | 10M 100ms | 292 (96.3) | 468 (96.3) | 295 (95.1) | 109 (95.6) |  |
+| reordering ±10 ms | 10M 100ms | 126 (4.3) | 123 (5.3) | 212 (44.7) | 118 (6.8) |  |
+| burst loss 1% | 10M 100ms | 119 (25.0) | 107 (25.6) | 200 (94.0) | 133 (93.2) |  |
+| step to 2M | 10M 100ms | 598 (97.2) | 598 (97.5) | 599 (96.5) | 1837 (96.0) |  |
+| same-RTT fairness | 10M 100ms | 199 (40.8) | 199 (47.6) | 200 (47.8) | 111 (48.4) |  |
+| RTT fairness 20/100 ms | 10M 100ms | 198 (31.8) | 199 (22.9) | 200 (76.4) | 196 (57.2) |  |
+| beside CUBIC | 10M 100ms | 199 (24.0) | 199 (47.6) | 200 (90.8) | 199 (21.4) |  |
+
+**Found and fixed on the way**, each with a test that failed before:
+
+- **hyper-quic closed a stream's connection under its own sender's losses** (patch Q15,
+  `crates/hyper-quic/VENDORED.md` §26). At 100 Mbit/s with 100 or 300 ms and no random loss, NewReno,
+  CUBIC and (at 300 ms) BBR carried nothing after their warm-up: a slow start overshot the drop-tail
+  queue, which lost every other datagram of a round trip, and the receiver refused its 1,025th
+  out-of-order span with "too many gaps in stream buffer" at 1.36 s. The span bound now follows the
+  window; those runs carry 96–112%.
+- **The harness's network bound missed a datagram in propagation.** At 64 kbit/s and 20 ms a
+  1,200-byte datagram is in flight whole for the 10 ms of its propagation, where the rate carries 80
+  bytes, and the handshake fills both queues at once: the run refused a datagram for the network's
+  capacity (`the_thinnest_path_runs_within_the_networks_bounds`).
+- **A ping held by the stream limit stopped the run's clock.** The ping client asked to wake at the
+  present for an overdue ping the limit refused, and the world woke it there again and again: at
+  10 Mbit/s and 300 ms the pings answered but not yet credited back held QUIC's default hundred
+  streams (`a_ping_held_by_the_stream_limit_waits_for_credit`; a wake that asks to wake at its own
+  time again now fails the run). The ping flow's server now allows every ping the run sends open at
+  once, so the law's queue, not the stream limit, holds a ping, as slates' bench (thousands of
+  streams) had it.
+
+**Open, from the grid** (`docs/STATUS.md`):
+
+- **Copa at 100 Mbit/s and 300 ms carries 5.5–7.6%** with no loss, where slates' Copa carried 49.6%. A
+  trace of Copa alone there for 8 s: slow start doubles once every two round trips (focal's F39
+  change, a doubling judged by what was sent after the last), ends at 192 kB with no loss and no
+  queue, and the window then grows about 2.3 kB a round trip, its velocity starting over at one.
+- **Reordering of ±10 ms at 10 Mbit/s and 100 ms**: every law but BBR carries 4–7% (BBR 45%). RFC
+  9002's fixed packet threshold reads the reordering as loss; slates' adaptive reordering tolerance
+  (`docs/transport.md` §2) is not yet ported.
+- **Copa's step from 10 to 2 Mbit/s**: its ping p99 1.8 s, against 0.6 s for the others.
+- On the thinnest paths every law's ping p99 is the full queue's (four datagrams, 600 ms at
+  64 kbit/s). hyper-quic's pacer allows a burst of ten datagrams at least, a second and a half of
+  that link, where slates' floor is two: the port of slates' 1 ms quantum with its two-datagram
+  floor is open.
+
+```sh
+cargo test -p hyper-quic --release --test congestion --locked -- --ignored the_congestion_bakeoff_over_slates_grid --exact --nocapture
+```
+
 ## hyper-check's checkers (S-4, 2026-10-04)
 
 What judging a history costs (`docs/sim.md` §14.8, `docs/tails.md` §1a): CPU time, instructions and
@@ -8395,4 +8545,53 @@ the building.
 
 ```sh
 cargo bench -p hyper-tls --bench vs_upstream -- 10
+```
+
+## hyper-quic against upstream quinn-proto: focal's QUIC (2026-10-13)
+
+`STATUS.md`'s owed bench for hyper-quic against focal's transport: focal-node and focal-wire run quinn
+0.11, whose protocol is quinn-proto, 0.11.18 in focal's lock, so upstream quinn-proto 0.11.18,
+unmodified, is the comparison (`crates/hyper-quic/benches/vs_upstream.rs`). One process drives each
+implementation through the same calls over memory: a datagram crosses at once and the connections'
+clock is virtual, moving only to the earliest timer once nothing moves, so both see the same times for
+the same events and only the host's clock times an operation. Both run the same TLS (hyper-tls and
+upstream rustls 0.23.45, at parity above) on aws-lc-rs restricted to X25519MLKEM768 and the two 256-bit
+suites. hyper-quic runs twice: with its defaults, and with the two that change what it sends off (the
+handshake's copies and Careful Resume), its wire then upstream's. Ten rounds, the order rotated each
+round; 370 handshakes of each shape an arm, 20,000 exchanges of each size, a 64 MiB transfer a round.
+Instructions and CPU come from the process's own account (`hyper_measure::usage`), allocations from
+the counting allocator with the in-memory network's copies set aside. Two runs, load 15–18:
+
+| Workload | Instructions, hyper-quic / upstream (its wire upstream's) | CPU | Wall p50 | Allocations, hyper-quic / upstream | Datagrams |
+|---|---|---|---|---|---|
+| handshake, full | 0.805, 0.804 (0.798, 0.797): 4,267,680 / 5,298,754 | 0.814, 0.822 | 0.775, 0.821 | 477.1 / 472.2 (469.1) | 24 / 23 (23) |
+| handshake, resumed by ticket | 0.738, 0.739 (0.732, 0.733) | 0.759, 0.779 | 0.744, 0.777 | 480.1 / 483.2 (476.1) | 24 / 23 (23) |
+| exchange, 64 B each way | 1.131, 1.131 (1.102, 1.101): 42,274 / 37,375 | 1.107, 1.109 | 1.071, 1.133 | 10.3 / 10.3 | 2.2 / 2.2 |
+| exchange, 4 KiB each way | 1.074, 1.073 (1.058, 1.057) | 1.021, 1.038 | 0.962, 1.054 | 16.3 / 16.3 | 8.1 / 8.1 |
+| exchange, 64 KiB each way | 1.060, 1.061 (1.053, 1.053) | 1.030, 1.029 | 1.027, 1.023 | 118.3 / 118.3 | 96.1 / 96.1 |
+| bulk, a MiB | 1.068, 1.069 (1.060, 1.059): 15,874,304 / 14,858,657 | 1.047, 1.027 | 1.056, 1.047 | 884.4 / 884.5 | 740.8 / 740.9 |
+
+A handshake's account includes closing the connection and draining it on both sides. Reallocations are
+the same on both sides in every row (55.2 a handshake, none an exchange of up to 4 KiB, 0.21 at 64 KiB,
+4.45 a MiB).
+
+**Where hyper-quic wins: the handshake**, 0.80 of upstream's instructions full and 0.74 resumed, the
+same in either arm, so not its copies or Careful Resume; hyper-tls costs what rustls does, so the
+saving is in the QUIC layer, its sites not yet traced.
+
+**Found and fixed: the copies' scan** (`crates/hyper-quic/VENDORED.md` §27). The first runs had
+hyper-quic with its defaults at 1.58 times upstream's instructions a MiB and 1.30 an exchange of 64
+bytes (one round, then three, before the change), against 1.07 and 1.18 with its copies and Careful
+Resume off. A profile put 41% of its bulk transfer's samples in `poll_transmit`'s own code (8% with
+both off), and turning the features off one at a time put the cost on the copies: every transmission
+walked every packet in flight looking for the handshake's flights. The scan now walks those alone, and
+the defaults arm is within 1–3% of the other.
+
+**Where hyper-quic does not win: per packet**, 6–13% more instructions an exchange or a MiB, 2–11% more
+CPU. The difference is spread over the patches' per-packet work (a profile of the 64-byte exchange:
+`finish_and_track` 4.3% of the samples against upstream's 2.3%, the receive path's reads 2.2% against
+0.9%, `initial_window` 0.7%, each site a few percent at most); not yet taken apart.
+
+```sh
+cargo bench -p hyper-quic --bench vs_upstream -- 10
 ```

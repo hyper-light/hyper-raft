@@ -269,7 +269,8 @@ quinn's send-order priority alone does not give). The receive window
 starts at RFC 9002's initial window plus the reserve and doubles when consumed within two round
 trips (Chromium's rule; a round trip under the owner's measured timer granularity `G` counts as
 `G`, RFC 9002's 1 ms `kGranularity` until the owner reports one through `set_granularity`), each growth
-reserved from the budget; the stream window is quinn's assembler limit made explicit (patch Q5).
+reserved from the budget; the stream window is upstream quinn's assembler limit made explicit (patch Q5),
+which hyper-quic's own bound, following the window since its patch Q15, no longer needs.
 Exchanges are judged by progress-charged deadlines (T39), and never sooner than the path's probe
 timeout (hyper-quic's `probe_timeout`, patch Q7: the round trip is what the peer's acknowledgements and
 answers take to come). While a request is being sent a period is charged what was sent or what the peer
@@ -609,8 +610,17 @@ Open:
 - **Finding 4, as a behaviour.** Under CoDel at 100 ms the cut finds no backlog beyond its allowance
   and Copa does not compete; the incumbents still carry 1.04 of their bar or more, the marks answered
   as a classic sender answers them.
-- **Still to come.** slates' bake-off on the harness, and slates' 1 ms pacing quantum and
-  two-datagram floor.
+- **slates' bake-off, run (2026-10-13).** Over slates' grid as the harness ports it (56 paths, the
+  four laws, three seeds), Copa is the one law slates' rule admits: its ping p99 1.044 of the best's
+  (geometric mean), its worst 3.12 at the step to 2 Mbit/s, its goodput 1.245 short of the best's.
+  NewReno and CUBIC stall on the 100 Mbit/s paths with loss, and BBR misses the fairness floor at
+  20 and 100 ms (`docs/benchmarks.md`, "slates' congestion bake-off on hyper-quic"). The run found
+  hyper-quic's assembler closing a connection under its own sender's losses
+  (`crates/hyper-quic/VENDORED.md` §26).
+- **Still to come**, from the grid: Copa's slow start at 100 Mbit/s and 300 ms, which leaves it at
+  5.5–7.6% of the link; tolerance of reordering (RFC 9002's fixed packet threshold reads ±10 ms of it
+  as loss, slates' adaptive tolerance is not ported); Copa's answer to a step down; and slates' 1 ms
+  pacing quantum with its two-datagram floor.
 
 ## 4e. The handshake at a geographic distance (2026-10-04)
 

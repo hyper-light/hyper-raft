@@ -56,5 +56,10 @@ name = "e2e"
 # for one scenario, the client (CLAUDE.md §1a), one peer process at a time.
 harness = false
 
+[[bench]]
+name = "vs_upstream"
+# A measurement printed as a table, not a criterion run.
+harness = false
+
 [lints]
 workspace = true

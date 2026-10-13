@@ -8235,7 +8235,11 @@ The loop before and after, hyper-rt alone, interleaved (six rounds, load 8.8–1
 
 The yield's price is a reading of the inputs a round of yields: 469–475 instructions a yield against
 423–436 with sixteen tasks, 680–686 against 425–445 with one. Ending the step at each round instead
-cost 500–523 and 1,032–1,269.
+cost 500–523 and 1,032–1,269. hyper-rt-transport's driver wakes itself after a budget of turns, and so
+now waits for the loop's inputs there: its exchange by the server's connections held
+(`benches/connections.rs`, interleaved under load 13–17) moved within the host's spread, 41.5–110.3 µs
+at 512 held against 41.9–225.7 before, 52.1–79.9 µs against 64.3–93.2 at 1 and 64, 23.5–23.7
+allocations an exchange either way.
 
 The panel after the fix (five rounds, load 6.6–10.1; medians, one-way waits):
 

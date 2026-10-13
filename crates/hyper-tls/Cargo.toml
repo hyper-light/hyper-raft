@@ -95,3 +95,8 @@ path = "tests/runners/server_cert_verifier.rs"
 [[test]]
 name = "unbuffered"
 path = "tests/runners/unbuffered.rs"
+
+[[bench]]
+name = "vs_upstream"
+# A measurement printed as a table, not a criterion run.
+harness = false

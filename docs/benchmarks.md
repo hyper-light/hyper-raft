@@ -8362,3 +8362,37 @@ cargo test --release -p hyper-durable --test sim -- random_schedules_keep_every_
 # with HYPER_DURABLE_SEEDS and HYPER_DURABLE_STEPS for the lengths; the allocator patch adds the COST lines
 ```
 
+
+## hyper-tls against upstream rustls: a handshake's time and instructions (2026-10-13)
+
+`STATUS.md`'s owed bench for hyper-tls: slates' and focal's transports both run upstream rustls, so
+upstream rustls 0.23.45, unmodified, is the comparison (`crates/hyper-tls/benches/vs_upstream.rs`).
+One process, the same certificates (ECDSA P-256, `test-ca`) and provider (aws-lc-rs, X25519MLKEM768
+first), client and server together over memory. Each side runs in turn, ten rounds, the order turned
+each round, 370 handshakes of each shape a side (the run length a p99 needs for an upper end at 95%
+coverage, `docs/tails.md` §3.3), each timed on its own. The process's own account, `hyper_measure::usage`,
+gives each handshake's CPU and instructions, which the host's load (17–25 during these runs) does not
+move as it moves the wall clock between the two sides' turns. Two runs:
+
+| shape | instructions a handshake, hyper-tls / upstream | CPU | wall p50 |
+|---|---|---|---|
+| TLS 1.3 full | 3,746,226 / 3,739,330 (1.002); 3,751,913 / 3,746,853 (1.001) | 1.014; 0.981 | 1.006; 0.978 |
+| TLS 1.3 resumed by ticket | 1,850,404 / 1,849,249 (1.001); 1,855,190 / 1,853,975 (1.001) | 0.962; 1.030 | 1.003; 1.036 |
+| TLS 1.2 full | 2,790,732 / 2,787,433 (1.001); 2,796,058 / 2,792,086 (1.001) | 1.000; 1.033 | 1.006; 1.072 |
+
+Building a client and a server configuration: about 400,000 instructions on either side (hyper-tls
+395,363–404,784, upstream 401,622–406,440). A TLS 1.3 bulk transfer client to server in 16 KiB records:
+0.404 and 0.425 ms a MiB against upstream's 0.387 and 0.428 (1.044, 0.993). So the conformance (no
+`Arc`, configurations lent to each call, no panic, VENDORED.md) costs a handshake 0.1–0.2% more
+instructions and nothing the clocks resolve (every median's 95% interval overlaps upstream's), beside
+the fewer allocations `tests/alloc_per_handshake.rs` holds it to.
+
+A first pass charged the first configuration built in the process with the cryptography library's
+one-time start, about 21 ms of CPU and 390 million instructions, which made hyper-tls, always built
+first in that round, look 1.22 times upstream's instructions in the TLS 1.3 full shape. The bench now
+builds one configuration on each side before its rounds, and accounts the timed handshakes apart from
+the building.
+
+```sh
+cargo bench -p hyper-tls --bench vs_upstream -- 10
+```

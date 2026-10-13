@@ -33,6 +33,7 @@
 //! would take on each layer's own wire (hyper-raft's `Message::encode`, slates' `RaftMessage::encode`).
 use std::time::{Duration, Instant};
 
+use hyper_measure::quantile::{self, Level};
 use hyper_measure::{alloc, faults, usage};
 
 use crate::core::splitmix;
@@ -626,47 +627,11 @@ pub fn run(layer: &str, spec: &Spec, seed: u64, counting: bool) -> Measured {
     measured
 }
 
-/// The 1-based ranks of the order statistics that bracket the `q`-quantile of `n` samples with at
-/// least `coverage` (David and Nagaraja, *Order Statistics*, §7.1): the count of samples below the
-/// quantile is Binomial(`n`, `q`), so `[X(l), X(u)]` covers it with probability
-/// `P(l <= B < u)`. `None` for the upper rank when it would pass the largest sample: too few
-/// samples to bound the quantile from above.
-pub fn ranks(n: usize, q: f64, coverage: f64) -> (usize, Option<usize>) {
-    let tail = (1.0 - coverage) / 2.0;
-    // The binomial's cumulative distribution, in log space for the pmf so no term underflows
-    // before it is added.
-    let (lq, lp) = (q.ln(), (1.0 - q).ln());
-    let mut ln_pmf = n as f64 * lp;
-    let mut cdf = Vec::with_capacity(n + 1);
-    let mut sum = 0.0;
-    for k in 0..=n {
-        sum += ln_pmf.exp();
-        cdf.push(sum.min(1.0));
-        if k < n {
-            ln_pmf += ((n - k) as f64).ln() - ((k + 1) as f64).ln() + lq - lp;
-        }
-    }
-    // l: the largest rank with P(B < l) <= tail; u: the smallest with P(B < u) >= 1 - tail.
-    let below = |rank: usize| if rank == 0 { 0.0 } else { cdf[rank - 1] };
-    let mut lower = 1;
-    while lower < n && below(lower + 1) <= tail {
-        lower += 1;
-    }
-    let upper = (lower..=n).find(|rank| below(*rank) >= 1.0 - tail);
-    (lower, upper)
-}
-
-/// The coverage of every reported quantile's interval.
-pub const COVERAGE: f64 = 0.95;
-
-/// `q`'s estimate (the order statistic at rank ceil(n·q)) and its interval in `sorted`, or the
-/// estimate with an unresolved upper end.
-pub fn quantile(sorted: &[u64], q: f64) -> (u64, u64, Option<u64>) {
-    let n = sorted.len();
-    let at = ((n as f64 * q).ceil() as usize).clamp(1, n);
-    let (lower, upper) = ranks(n, q, COVERAGE);
-    (sorted[at - 1], sorted[lower - 1], upper.map(|rank| sorted[rank - 1]))
-}
+/// The coverage of every reported quantile's interval (`docs/tails.md` §3.3).
+const COVERAGE: Level = match Level::new(95, 100) {
+    Ok(level) => level,
+    Err(_) => panic!("95/100 is a probability"),
+};
 
 /// One measurement's line, as `one-multilog` prints it: the counts, then every round's time.
 pub fn print(measured: &Measured) -> String {
@@ -792,21 +757,15 @@ pub fn table(runs: usize, rounds: usize) {
             all.sort_unstable();
             let ops: f64 = timed[at].iter().map(|line| line.ops).sum();
             let sum = |lines: &[Line], field: fn(&Line) -> f64| lines.iter().map(field).sum::<f64>();
-            let cell = |q: f64| {
-                let (estimate, lower, upper) = quantile(&all, q);
-                match upper {
-                    Some(upper) => format!("{} [{}–{}]", ms(estimate), ms(lower), ms(upper)),
-                    None => format!("{} [{}–unresolved]", ms(estimate), ms(lower)),
-                }
-            };
+            let cell = |q: Level| quantile::cell(&all, q, COVERAGE, ms);
             let counted_ops: f64 = sum(&counted[at], |line| line.ops);
             let peak = timed[at].iter().map(|line| line.peak).fold(0.0, f64::max);
             println!(
                 "| {logs} logs b{batch} 64B | {layer} | {} | {} | {} | {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.2} | {:.2} | {:.3} | {:.0} | {:.2} | {:.0} | {:.1} |",
                 loads[at],
-                cell(0.5),
-                cell(0.99),
-                cell(0.999),
+                cell(Level::P50),
+                cell(Level::P99),
+                cell(Level::P999),
                 ms(*all.last().unwrap()),
                 (sum(&timed[at], |l| l.user) + sum(&timed[at], |l| l.system)) / ops,
                 sum(&timed[at], |l| l.instructions) / ops,
@@ -821,18 +780,5 @@ pub fn table(runs: usize, rounds: usize) {
                 peak / (1u64 << 20) as f64,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// The ranks bracketing the median of 100 samples at 95%, and those of the 99th percentile of
-    /// 2,000, as the exact binomial gives them (computed apart in exact rationals: coverage 0.9648
-    /// and 0.9578); the 99.9th of 2,000 has no upper rank within 2,000 at 95%: unresolved.
-    #[test]
-    fn the_ranks_are_the_binomials() {
-        assert_eq!(super::ranks(100, 0.5, 0.95), (40, Some(61)));
-        assert_eq!(super::ranks(2_000, 0.99, 0.95), (1971, Some(1989)));
-        assert_eq!(super::ranks(2_000, 0.999, 0.95), (1995, None));
     }
 }

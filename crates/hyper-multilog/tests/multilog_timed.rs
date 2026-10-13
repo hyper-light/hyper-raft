@@ -43,6 +43,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use hyper_measure::quantile::{self, Level};
 use hyper_multilog::{Limits, Route};
 use hyper_raft::Timing;
 use hyper_raft::proto::Message;
@@ -55,6 +56,11 @@ use support::Member;
 
 /// A millisecond, in the world's nanoseconds.
 const MS: u64 = 1_000_000;
+/// The coverage of every quantile's interval (`docs/tails.md` §3.3).
+const COVERAGE: Level = match Level::new(95, 100) {
+    Ok(level) => level,
+    Err(_) => panic!("95/100 is a probability"),
+};
 /// Format: five Azure regions, in the order of [`ROUND_TRIPS_MS`] (slates `support/azure.rs`).
 const REGIONS: usize = 5;
 /// Microsoft's published P50 round trips among the five regions (East US, West Europe, Japan East,
@@ -1034,52 +1040,12 @@ fn multi_log_on_the_failure_path() {
     }
 }
 
-/// The 1-based ranks of the order statistics bracketing the `q`-quantile of `n` samples with at
-/// least 95% coverage (David and Nagaraja, *Order Statistics*): the count below the quantile is
-/// Binomial(`n`, `q`). `None` above when the upper rank would pass the largest sample.
-fn ranks(n: usize, q: f64) -> (usize, Option<usize>) {
-    let tail = 0.025;
-    let (lq, lp) = (q.ln(), (1.0 - q).ln());
-    let mut ln_pmf = n as f64 * lp;
-    let mut cdf = Vec::with_capacity(n + 1);
-    let mut sum = 0.0;
-    for k in 0..=n {
-        sum += ln_pmf.exp();
-        cdf.push(f64::min(sum, 1.0));
-        if k < n {
-            ln_pmf += ((n - k) as f64).ln() - ((k + 1) as f64).ln() + lq - lp;
-        }
-    }
-    let below = |rank: usize| if rank == 0 { 0.0 } else { cdf[rank - 1] };
-    let mut lower = 1;
-    while lower < n && below(lower + 1) <= tail {
-        lower += 1;
-    }
-    (lower, (lower..=n).find(|rank| below(*rank) >= 1.0 - tail))
-}
-
-/// `q`'s estimate and interval among `sorted`, in milliseconds, as a table cell.
-fn cell(sorted: &[u64], q: f64) -> String {
-    let n = sorted.len();
-    if n == 0 {
-        return "none".into();
-    }
-    let at = ((n as f64 * q).ceil() as usize).clamp(1, n);
-    let (lower, upper) = ranks(n, q);
-    let ms = |ns: u64| ns as f64 / MS as f64;
-    match upper {
-        Some(upper) => format!(
-            "{:.0} [{:.0}–{:.0}]",
-            ms(sorted[at - 1]),
-            ms(sorted[lower - 1]),
-            ms(sorted[upper - 1])
-        ),
-        None => format!(
-            "{:.0} [{:.0}–unresolved]",
-            ms(sorted[at - 1]),
-            ms(sorted[lower - 1])
-        ),
-    }
+/// `q`'s estimate and its 95% interval among `sorted`, in milliseconds, as a table cell
+/// (`hyper_measure::quantile`, `docs/tails.md` §3.3).
+fn cell(sorted: &[u64], q: Level) -> String {
+    quantile::cell(sorted, q, COVERAGE, |ns| {
+        format!("{:.0}", ns as f64 / MS as f64)
+    })
 }
 
 /// A measurement tool (`docs/tails.md`): one, three and five logs across the five regions under
@@ -1194,13 +1160,13 @@ fn multi_log_under_hostile_networks() {
             let applied = (proposed - unapplied).max(1);
             eprintln!(
                 "| {name} | {logs} | {} | {} | {} | {:.0} | {} | {} | {} | {:.0} | {:.1} | {:.0} | {unapplied}/{proposed} | {steps} |",
-                cell(&keyed, 0.5),
-                cell(&keyed, 0.99),
-                cell(&keyed, 0.999),
+                cell(&keyed, Level::P50),
+                cell(&keyed, Level::P99),
+                cell(&keyed, Level::P999),
                 keyed.last().copied().unwrap_or(0) as f64 / MS as f64,
-                cell(&global, 0.5),
-                cell(&global, 0.99),
-                cell(&global, 0.999),
+                cell(&global, Level::P50),
+                cell(&global, Level::P99),
+                cell(&global, Level::P999),
                 global.last().copied().unwrap_or(0) as f64 / MS as f64,
                 messages as f64 / applied as f64,
                 wire as f64 / applied as f64,

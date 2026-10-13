@@ -45,6 +45,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hyper_measure::quantile::{self, Level};
 use hyper_measure::usage::{self, Usage, UsageError};
 use hyper_multilog_e2e::member::{self, route_of};
 use hyper_raft::proto::{self, Entry};
@@ -598,9 +599,9 @@ impl Cluster {
             format!(
                 "{name} ({} samples): p50 {}, p99 {}, p99.9 {}, max {:.2}",
                 sorted.len(),
-                cell(&sorted, 0.5),
-                cell(&sorted, 0.99),
-                cell(&sorted, 0.999),
+                cell(&sorted, Level::P50),
+                cell(&sorted, Level::P99),
+                cell(&sorted, Level::P999),
                 sorted.last().copied().unwrap_or(0) as f64 / 1e6
             )
         };
@@ -821,57 +822,17 @@ fn verify(cluster: &mut Cluster, client: &mut Client, history: &History) -> usiz
     history.acked.len()
 }
 
-/// The 1-based ranks of the order statistics bracketing the `q`-quantile of `n` samples with at
-/// least 95% coverage (David and Nagaraja, *Order Statistics*): the count below the quantile is
-/// Binomial(`n`, `q`). `None` above when the upper rank would pass the largest sample.
-fn ranks(n: usize, q: f64) -> (usize, Option<usize>) {
-    let tail = 0.025;
-    let (lq, lp) = (q.ln(), (1.0 - q).ln());
-    let mut ln_pmf = n as f64 * lp;
-    let mut cdf = Vec::with_capacity(n + 1);
-    let mut sum = 0.0;
-    for k in 0..=n {
-        sum += ln_pmf.exp();
-        cdf.push(f64::min(sum, 1.0));
-        if k < n {
-            ln_pmf += ((n - k) as f64).ln() - ((k + 1) as f64).ln() + lq - lp;
-        }
-    }
-    let below = |rank: usize| if rank == 0 { 0.0 } else { cdf[rank - 1] };
-    let mut lower = 1;
-    while lower < n && below(lower + 1) <= tail {
-        lower += 1;
-    }
-    (lower, (lower..=n).find(|rank| below(*rank) >= 1.0 - tail))
+/// `q`'s estimate and its 95% interval among `sorted` nanoseconds, in milliseconds
+/// (`hyper_measure::quantile`, `docs/tails.md` §3.3).
+fn cell(sorted: &[u64], q: Level) -> String {
+    quantile::cell(sorted, q, COVERAGE, |ns| format!("{:.2}", ns as f64 / 1e6))
 }
 
-/// `q`'s estimate and interval among `sorted` nanoseconds, in milliseconds.
-fn cell(sorted: &[u64], q: f64) -> String {
-    let n = sorted.len();
-    if n == 0 {
-        return "none".into();
-    }
-    let at = ((n as f64 * q).ceil() as usize).clamp(1, n);
-    let (lower, upper) = ranks(n, q);
-    let ms = |ns: u64| ns as f64 / 1e6;
-    match upper {
-        Some(upper) => format!(
-            "{:.2} [{:.2}–{:.2}]",
-            ms(sorted[at - 1]),
-            ms(sorted[lower - 1]),
-            ms(sorted[upper - 1])
-        ),
-        None => format!(
-            "{:.2} [{:.2}–unresolved]",
-            ms(sorted[at - 1]),
-            ms(sorted[lower - 1])
-        ),
-    }
-}
-
-/// The samples a p99.9 needs for its 95% interval to close above (`docs/tails.md` §3.3): the
-/// least `n` with `0.999^n <= 0.025`, so that the upper order statistic lies within the samples.
-const SAMPLES_P999: usize = 3_688;
+/// The coverage of every quantile's interval (`docs/tails.md` §3.3).
+const COVERAGE: Level = match Level::new(95, 100) {
+    Ok(level) => level,
+    Err(_) => panic!("95/100 is a probability"),
+};
 
 /// The window an idle group's account is read over: a wakeup a second is resolved to a tenth of
 /// one, the resolution its report states. A measured interval, not a wait for a fact.
@@ -887,7 +848,8 @@ const IDLE: Duration = Duration::from_secs(10);
     reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
 )]
 fn tails(logs: usize, name: &'static str) -> String {
-    let writes = SAMPLES_P999;
+    // The samples a p99.9 needs for its interval to close above (`docs/tails.md` §3.3).
+    let writes = usize::try_from(quantile::samples_for(Level::P999, COVERAGE).unwrap()).unwrap();
     let mut cluster = Cluster::start(name, 3, room(logs, writes));
     let all = cluster.up_members();
     let (leader, _) = cluster.leader_among(&all);

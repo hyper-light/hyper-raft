@@ -159,10 +159,13 @@ reported as a tie at that resolution, never as a win.
 
 A quantile's interval is distribution-free: the order statistics that bracket the `q`-quantile with
 a stated coverage come from the binomial distribution of how many samples fall below it (David and
-Nagaraja, *Order Statistics*). A run reports p50, p99, p99.9, p99.99 and the maximum, each with its
-interval; a quantile whose interval reaches the maximum has too few samples and is reported as
-unresolved, not as a number. The run length follows: the samples needed above `q` for an interval
-of the stated coverage, divided by `1 − q`.
+Nagaraja, *Order Statistics*), half of what the coverage leaves out to each side. A run reports p50,
+p99, p99.9, p99.99 and the maximum, each with its interval; a quantile whose interval's upper end
+would lie past the largest sample has too few samples and is reported as unresolved, not as a
+number. The run length follows: the least `n` with `q^n` within half of what the coverage leaves
+out, about the samples needed above `q` divided by `1 − q` (3,688 for p99.9 at 95%).
+`hyper_measure::quantile` computes the ranks, checked exactly against integer binomial sums, and
+every report reads them there.
 
 ### 3.4 Tests stay exact
 
@@ -247,7 +250,11 @@ and command.
 - **T-0 The grid**: `docs/research/tails.md` verified; each condition's values derived (§2.3, §2.4).
 - **T-1 The measurement kit**: an open-loop driver and the quantile intervals of §3.3 in
   hyper-measure, with exact tests of the interval arithmetic; the per-process resource accounts of
-  §1a on the six targets, at rest and per operation.
+  §1a on the six targets, at rest and per operation. Built (2026-10-12): the Poisson schedule an
+  open loop's requests arrive on (`hyper_measure::open_loop`, seeded, each latency from its
+  scheduled time) and the intervals (`hyper_measure::quantile`), which the multilog tests,
+  hyper-raft-compare's multilog table and hyper-quic's 500 ms example each computed for themselves
+  before. The accounts of §1a remain.
 - **T-2 The relay**: the impairment relay on the six targets, sharing hyper-sim's models, its own
   delay measured; netem scripts for Linux; the host-condition scripts.
 - **T-3 onward, every crate class at once in turn**, not one layer first: for each class of §5,

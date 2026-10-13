@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use hyper_measure::quantile::{self, Level};
 use hyper_quic::rustls::RootCertStore;
 use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_quic::{
@@ -66,7 +67,10 @@ const MAX_DATAGRAM: usize = 65_527;
 /// the stop flag is seen; any datagram or deadline ends the wait first.
 const IDLE_TURN: Duration = Duration::from_millis(50);
 /// The coverage of each quantile's interval (`docs/tails.md` §3.3).
-const COVERAGE: f64 = 0.95;
+const COVERAGE: Level = match Level::new(95, 100) {
+    Ok(level) => level,
+    Err(_) => panic!("95/100 is a probability"),
+};
 
 struct Args {
     one_way: Duration,
@@ -589,53 +593,6 @@ fn open_loop(
     latencies
 }
 
-/// `ln C(n, k)`, by the log-gamma of Stirling's series (Abramowitz and Stegun 6.1.41)
-fn ln_choose(n: f64, k: f64) -> f64 {
-    fn ln_gamma(x: f64) -> f64 {
-        // ln Γ(x) for x ≥ 1 by shifting to x ≥ 8 then Stirling's series
-        let mut x = x;
-        let mut shift = 0.0;
-        while x < 8.0 {
-            shift -= x.ln();
-            x += 1.0;
-        }
-        let inv = 1.0 / x;
-        let inv2 = inv * inv;
-        shift + (x - 0.5) * x.ln() - x
-            + 0.5 * (2.0 * std::f64::consts::PI).ln()
-            + inv * (1.0 / 12.0 - inv2 * (1.0 / 360.0 - inv2 / 1260.0))
-    }
-    ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
-}
-
-/// The order statistics (1-based ranks) that bracket the `q`-quantile of `n` samples with at least
-/// `COVERAGE`: the number of samples below the quantile is Binomial(n, q) (David and Nagaraja,
-/// *Order Statistics*, §7.1). `None` when the upper rank passes `n`: too few samples.
-fn interval(n: usize, q: f64) -> Option<(usize, usize)> {
-    let pmf = |k: usize| {
-        (ln_choose(n as f64, k as f64) + k as f64 * q.ln() + (n - k) as f64 * (1.0 - q).ln()).exp()
-    };
-    let centre = ((n as f64) * q).floor() as usize;
-    let (mut lo, mut hi) = (centre, centre);
-    let mut mass = pmf(centre);
-    while mass < COVERAGE {
-        let below = if lo > 0 { pmf(lo - 1) } else { 0.0 };
-        let above = if hi < n { pmf(hi + 1) } else { 0.0 };
-        if below == 0.0 && above == 0.0 {
-            break;
-        }
-        if below >= above {
-            lo -= 1;
-            mass += below;
-        } else {
-            hi += 1;
-            mass += above;
-        }
-    }
-    // Ranks lo+1 ..= hi+1 bracket it: P(X_(lo+1) ≤ ξ < X_(hi+1)) = P(lo+1 ≤ B ≤ hi)
-    (hi + 1 < n).then_some((lo + 1, hi + 1))
-}
-
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1e6
 }
@@ -646,21 +603,15 @@ fn report(label: &str, samples: &mut [u64], less: u64) {
     let max = samples.last().copied().unwrap_or(0);
     print!("{label}: n={n}");
     for (name, q) in [
-        ("p50", 0.5),
-        ("p99", 0.99),
-        ("p99.9", 0.999),
-        ("p99.99", 0.9999),
+        ("p50", Level::P50),
+        ("p99", Level::P99),
+        ("p99.9", Level::P999),
+        ("p99.99", Level::P9999),
     ] {
-        let at = samples[((n as f64 * q).ceil() as usize).clamp(1, n) - 1];
-        match interval(n, q) {
-            Some((lo, hi)) => print!(
-                " {name}={:.3} [{:.3}, {:.3}]",
-                ms(at.saturating_sub(less)),
-                ms(samples[lo - 1].saturating_sub(less)),
-                ms(samples[hi - 1].saturating_sub(less))
-            ),
-            None => print!(" {name}=unresolved"),
-        }
+        let cell = quantile::cell(samples, q, COVERAGE, |ns| {
+            format!("{:.3}", ms(ns.saturating_sub(less)))
+        });
+        print!(" {name}={cell}");
     }
     println!(" max={:.3} ms", ms(max.saturating_sub(less)));
 }

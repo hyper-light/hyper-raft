@@ -198,6 +198,8 @@ struct Counts {
     configurations: u64,
     suspicions: u64,
     allowance: f64,
+    /// MEASUREMENT ONLY: the times the interval asked for the link's evidence grew.
+    evidence_moves: u64,
 }
 
 /// One pair.
@@ -321,6 +323,7 @@ impl Pair {
             configurations: counts.configurations,
             suspicions: counts.suspicions,
             allowance: counts.allowance,
+            evidence_moves: counts.evidence_moves,
         }
     }
 
@@ -843,9 +846,13 @@ impl Pair {
         // its evidence (`evidence_ns`); a configured one is judged by its configuration meanwhile.
         match link.estimator.arrivals() {
             Err(hyper_timing::Refusal::CorrelationUnmeasured) => {
+                #[cfg(not(feature = "no-evidence-moves"))]
                 if self.received.configuration.is_none()
                     && let Some(next) = link.estimator.independent_interval()
                 {
+                    if nanos(next) > self.received.evidence_ns {
+                        self.counts.evidence_moves = self.counts.evidence_moves.saturating_add(1);
+                    }
                     self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
                 }
                 return false;

@@ -281,6 +281,8 @@ pub struct PairReport {
     /// peer alive throughout, since each heartbeat taken is the one mistake its predecessor's
     /// freshness point can make (`docs/timing.md` §2.2).
     pub allowance: f64,
+    /// MEASUREMENT ONLY: the times the interval asked for the link's evidence grew.
+    pub evidence_moves: u64,
 }
 
 /// Where the crate's work goes: the owner queues heartbeats on the plane, makes the liveness

@@ -1048,6 +1048,32 @@ impl Sim {
 
     /// Runs until every live pair is configured; a pair that takes more heartbeats than any window
     /// holds unconfigured fails it (`unresolved`).
+    /// MEASUREMENT ONLY: `run_while` that ends at the world's step bound instead of failing there;
+    /// false when it did.
+    fn run_measured(&mut self, keep: impl Fn(&Self) -> bool) -> bool {
+        for node in 0..self.nodes.len() {
+            self.poll(node);
+        }
+        while keep(self) {
+            if self.sim.earliest().is_none() {
+                break;
+            }
+            let step = self.sim.next(&mut Fifo).unwrap();
+            self.now = self.sim.now();
+            match step {
+                Step::Event { event, .. } => self.take(event),
+                Step::Wake { node } => self.wake(node.0 as usize),
+                Step::Idle => break,
+                Step::Spent => return false,
+            }
+            self.elect();
+            self.note_configured();
+            self.told_is_believed();
+            self.counted();
+        }
+        true
+    }
+
     fn run_until_configured(&mut self) {
         self.run_while(
             |sim| {
@@ -2019,5 +2045,110 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
                 "{outcomes:?}"
             );
         }
+    }
+}
+
+/// MEASUREMENT ONLY (branch burst-evidence-arms, never landed): per world, each link's time and
+/// heartbeats to its first configuration and the moves it made for its evidence, then the mistakes
+/// of every pair against its allowance while the heartbeats double. Run as main has it and with
+/// `--features no-evidence-moves`, where a refused link waits at its interval for a longer level.
+#[test]
+#[ignore = "measurement"]
+fn measure_evidence_moves() {
+    fn q(sorted: &[u64], p: f64) -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let at = ((sorted.len() - 1) as f64 * p).round() as usize;
+        sorted[at]
+    }
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let (mut times, mut taken) = (Vec::new(), Vec::new());
+        let (mut links, mut moved, mut moves, mut unresolved, mut spent) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut mistakes, mut allowance, mut doubled) = (0u64, 0.0f64, 0u64);
+        for seed in seeds(9, 32) {
+            let mut sim = Sim::new(4, world, seed);
+            let ended = sim.run_measured(|sim| !sim.configured() && sim.unresolved().is_empty());
+            spent += u64::from(!ended);
+            unresolved += sim.unresolved().len() as u64;
+            for (index, node) in sim.nodes.iter().enumerate() {
+                for peer in (1..=4u64).filter(|p| *p != node.owner.id) {
+                    let report = node.liveness.report(peer).unwrap();
+                    links += 1;
+                    moves += report.evidence_moves;
+                    moved += u64::from(report.evidence_moves > 0);
+                    taken.push(report.taken);
+                    if let Some(at) = sim.configured_at.get(&(index, peer)) {
+                        times.push(*at);
+                    }
+                }
+            }
+            if ended && sim.configured() {
+                let suspected: u64 = sim.nodes.iter().map(|n| n.suspicions.len() as u64).sum();
+                let allowed: f64 = sim
+                    .nodes
+                    .iter()
+                    .flat_map(|n| {
+                        (1..=4u64)
+                            .filter(move |p| *p != n.owner.id)
+                            .map(move |p| n.liveness.report(p).unwrap().allowance)
+                    })
+                    .sum();
+                let pairs: Vec<(usize, PeerId, u64)> = sim
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, node)| {
+                        (1..=4u64)
+                            .filter(move |peer| *peer != node.owner.id)
+                            .map(move |peer| {
+                                (index, peer, node.liveness.report(peer).unwrap().taken)
+                            })
+                    })
+                    .collect();
+                let doubled_all = |sim: &Sim| {
+                    pairs.iter().any(|(node, peer, taken)| {
+                        sim.nodes[*node]
+                            .liveness
+                            .report(*peer)
+                            .is_some_and(|report| report.taken < (2 * taken).max(taken + 1))
+                    })
+                };
+                if sim.run_measured(doubled_all) {
+                    doubled += 1;
+                    let suspected_after: u64 =
+                        sim.nodes.iter().map(|n| n.suspicions.len() as u64).sum();
+                    let allowed_after: f64 = sim
+                        .nodes
+                        .iter()
+                        .flat_map(|n| {
+                            (1..=4u64)
+                                .filter(move |p| *p != n.owner.id)
+                                .map(move |p| n.liveness.report(p).unwrap().allowance)
+                        })
+                        .sum();
+                    mistakes += suspected_after - suspected;
+                    allowance += allowed_after - allowed;
+                }
+            }
+        }
+        times.sort_unstable();
+        taken.sort_unstable();
+        println!(
+            "MEASURE {}: links {links}, configured {}; time to configure ms p50 {} p90 {} p99 {} max {}; \
+             heartbeats taken p50 {} p90 {} max {}; links that moved for evidence {moved}, moves {moves}; \
+             unresolved {unresolved}, runs ended at the step bound {spent}; while doubling ({doubled} runs): \
+             mistakes {mistakes} against an allowance of {allowance:.2}",
+            world.name,
+            times.len(),
+            q(&times, 0.5) / MS,
+            q(&times, 0.9) / MS,
+            q(&times, 0.99) / MS,
+            q(&times, 1.0) / MS,
+            q(&taken, 0.5),
+            q(&taken, 0.9),
+            q(&taken, 1.0),
+        );
     }
 }

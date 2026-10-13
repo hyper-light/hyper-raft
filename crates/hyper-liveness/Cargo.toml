@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# MEASUREMENT ONLY (branch burst-evidence-arms, never landed): a link refused for want of tau_int
+# waits at its interval for a longer Allan level instead of asking a longer interval.
+no-evidence-moves = []
+
 [dependencies]
 hyper-timing = { path = "../hyper-timing" }
 

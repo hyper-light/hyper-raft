@@ -361,6 +361,8 @@ pub struct Net<A: Drive, B: Drive> {
     pub b_address: SocketAddr,
     /// Whether datagrams to `b` are lost: `b` is gone.
     pub b_dead: bool,
+    /// The datagrams each side has sent, `a`'s then `b`'s.
+    pub datagrams: [u64; 2],
     /// The caller's instant at the world's time zero.
     start: Instant,
     world: hyper_sim::World<Arrival>,
@@ -463,6 +465,7 @@ impl<A: Drive, B: Drive> Net<A, B> {
             a_address: "127.0.0.1:4433".parse().unwrap(),
             b_address: "127.0.0.1:4434".parse().unwrap(),
             b_dead: false,
+            datagrams: [0; 2],
             start: now,
             world,
             wire,
@@ -487,6 +490,7 @@ impl<A: Drive, B: Drive> Net<A, B> {
             bytes.clear();
             bytes.extend_from_slice(&self.out[..transmit.size]);
             let pair = if from_a { (A, B) } else { (B, A) };
+            self.datagrams[usize::from(!from_a)] += 1;
             self.wire
                 .send(
                     &mut self.world,

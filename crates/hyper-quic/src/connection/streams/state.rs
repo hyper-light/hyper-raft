@@ -412,8 +412,9 @@ impl StreamsState {
             hash_map::Entry::Vacant(_) => {}
             hash_map::Entry::Occupied(e) => {
                 if let Some(SendState::ResetSent) = e.get().as_ref().map(|s| s.state) {
+                    let credit_returned = e.get().as_ref().is_some_and(|s| s.credit_returned);
                     e.remove_entry();
-                    self.stream_freed(id, StreamHalf::Send);
+                    self.stream_freed(id, StreamHalf::Send, credit_returned);
                 }
             }
         }
@@ -875,8 +876,9 @@ impl StreamsState {
             return;
         }
 
+        let credit_returned = stream.credit_returned;
         entry.remove_entry();
-        self.stream_freed(id, StreamHalf::Send);
+        self.stream_freed(id, StreamHalf::Send, credit_returned);
         self.events.push_back(StreamEvent::Finished { id });
     }
 
@@ -1163,9 +1165,10 @@ impl StreamsState {
         ShouldTransmit(diff >= (self.receive_window / 8))
     }
 
-    /// Update counters for removal of a stream
-    pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf) {
-        if id.initiator() != self.side {
+    /// Update counters for removal of a stream. `credit_returned`: the stream's credit already
+    /// went back to its peer (`return_credit_early`), so its freeing gives none.
+    pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf, credit_returned: bool) {
+        if id.initiator() != self.side && !credit_returned {
             let fully_free = id.dir() == Dir::Uni
                 || match half {
                     StreamHalf::Send => !self.recv.contains_key(&id),
@@ -1185,7 +1188,31 @@ impl StreamsState {
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
         self.free_recv.push(recv.free(self.stream_receive_window));
-        self.stream_freed(id, StreamHalf::Recv);
+        self.stream_freed(id, StreamHalf::Recv, false);
+        self.return_credit_early(id);
+    }
+
+    /// Gives a peer-initiated bidirectional stream's credit back to its peer once its request is
+    /// read whole (its receive half freed) and its response finished, without waiting for the
+    /// acknowledgement of the response's last frames, which frees it (`VENDORED.md` §27): the
+    /// raised limit then goes out with those frames, where it went alone a round trip later.
+    /// Once for each stream; whether it gave the credit back now.
+    pub(super) fn return_credit_early(&mut self, id: StreamId) -> bool {
+        if id.initiator() == self.side || id.dir() != Dir::Bi || self.recv.contains_key(&id) {
+            return false;
+        }
+        let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
+            return false;
+        };
+        if stream.credit_returned || !matches!(stream.state, SendState::DataSent { .. }) {
+            return false;
+        }
+        stream.credit_returned = true;
+        // A stream counted when allocated is counted out once, here or as it is freed.
+        let allocated = self.allocated_remote_count.get_mut(Dir::Bi);
+        *allocated = allocated.saturating_sub(1);
+        self.ensure_remote_streams(Dir::Bi);
+        true
     }
 
     pub(super) fn max_send_data(&self, id: StreamId) -> VarInt {
@@ -2281,6 +2308,147 @@ mod tests {
         assert!(
             free(&mut client, 127),
             "the peer's credit is spent: the freed stream is announced"
+        );
+    }
+
+    /// A peer's request read whole and its response finished gives the stream's credit back at
+    /// once, so the raised limit goes out with the response (`VENDORED.md` §27): before, it went
+    /// once the response's last frames were acknowledged, alone, a round trip later. The
+    /// acknowledgement that frees the stream gives none back again. In the other order, the
+    /// response finished before the request is read, the credit goes back as the request is, and
+    /// a stream reset after its credit went back gives none again either.
+    #[test]
+    fn a_finished_response_gives_its_streams_credit_back_once_before_its_acknowledgement() {
+        // A window of two, as a pooled peer's fair share: an eighth of it is nothing, so any freed
+        // credit is announced at once (§16).
+        let mut server = StreamsState::new(
+            Side::Server,
+            0u32.into(),
+            2u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        );
+        server.set_params(&TransportParameters {
+            initial_max_data: 1000u32.into(),
+            initial_max_stream_data_bidi_local: 1000u32.into(),
+            ..TransportParameters::default()
+        });
+        let state = ConnState::Established;
+        let stream = |index| StreamId::new(Side::Client, Dir::Bi, index).unwrap();
+        let ask = |server: &mut StreamsState, id| {
+            let _ = server
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: true,
+                        data: Bytes::from_static(b"ask"),
+                    },
+                    3,
+                )
+                .unwrap();
+        };
+        // The request read whole: its end is known, so stopping frees its receive half, as reading
+        // it to its end does.
+        let read = |server: &mut StreamsState, id| {
+            let mut pending = Retransmits::default();
+            RecvStream {
+                id,
+                state: server,
+                pending: &mut pending,
+            }
+            .stop(0u32.into())
+            .unwrap();
+            // What the connection does on its next poll (`Connection::poll_transmit`).
+            server.queue_max_stream_id(&mut pending);
+            *pending.max_stream_id.get(Dir::Bi)
+        };
+        let answer = |server: &mut StreamsState, id| {
+            let mut pending = Retransmits::default();
+            let mut send = SendStream {
+                id,
+                state: server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            send.write(b"answer").unwrap();
+            send.finish().unwrap();
+            *pending.max_stream_id.get(Dir::Bi)
+        };
+        let acknowledged = |server: &mut StreamsState, id| {
+            let send = server.send.get_mut(&id).unwrap().as_mut().unwrap();
+            assert_eq!(send.pending.poll_transmit(64).0, 0..6);
+            server.received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 0..6,
+                fin: true,
+            });
+        };
+        let limit = |server: &StreamsState| *server.max_remote.get(Dir::Bi);
+        let start = limit(&server);
+
+        // Request read, then response finished: the credit goes back as the response finishes.
+        ask(&mut server, stream(0));
+        assert!(
+            !read(&mut server, stream(0)),
+            "no credit yet: the response is not finished"
+        );
+        assert!(
+            answer(&mut server, stream(0)),
+            "announced with the response"
+        );
+        assert_eq!(limit(&server), start + 1);
+        acknowledged(&mut server, stream(0));
+        assert!(
+            !server.send.contains_key(&stream(0)),
+            "the acknowledgement frees it"
+        );
+        assert_eq!(limit(&server), start + 1, "and gives no credit again");
+
+        // Response finished, then request read: the credit goes back as the request is read.
+        ask(&mut server, stream(1));
+        assert!(
+            !answer(&mut server, stream(1)),
+            "no credit yet: the request is not read"
+        );
+        assert_eq!(limit(&server), start + 1);
+        assert!(
+            read(&mut server, stream(1)),
+            "announced as the request is read"
+        );
+        assert_eq!(limit(&server), start + 2);
+        acknowledged(&mut server, stream(1));
+        assert_eq!(
+            limit(&server),
+            start + 2,
+            "the acknowledgement gives no credit again"
+        );
+
+        // A stream reset after its credit went back gives none again as its reset is acknowledged.
+        ask(&mut server, stream(2));
+        read(&mut server, stream(2));
+        assert!(answer(&mut server, stream(2)));
+        assert_eq!(limit(&server), start + 3);
+        let mut pending = Retransmits::default();
+        SendStream {
+            id: stream(2),
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+        .reset(0u32.into())
+        .unwrap();
+        server.reset_acked(stream(2));
+        assert!(
+            !server.send.contains_key(&stream(2)),
+            "the reset's acknowledgement frees it"
+        );
+        assert_eq!(limit(&server), start + 3, "and gives no credit again");
+        assert_eq!(
+            *server.allocated_remote_count.get(Dir::Bi),
+            2,
+            "the window is whole"
         );
     }
 

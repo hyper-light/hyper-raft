@@ -654,6 +654,53 @@ fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
     assert!(pool.granted <= 3, "{pool:?}");
 }
 
+/// A pooled server's stream goes back to its peer with the reply that ends its exchange, in the
+/// reply's datagrams (hyper-quic `VENDORED.md` §27): through a pool of one, twenty exchanges asked
+/// in turn take two datagrams of each side's an exchange (40 and 40). When the stream went back
+/// once the reply was acknowledged, alone, they took 59 and 59.
+#[test]
+fn a_pooled_servers_stream_goes_back_with_the_reply() {
+    let pair = Pair::new();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 1);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    net.exchange();
+    let before = net.datagrams;
+    let asked = 20u8;
+    for seed in 0..asked {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(100),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.drive(&mut net.a);
+        asker.finished()
+    });
+    assert_eq!(server.answered, 20);
+    let bound = 2 * u64::from(asked) + 2;
+    let sent = net.datagrams[1] - before[1];
+    let asks = net.datagrams[0] - before[0];
+    assert!(
+        sent <= bound,
+        "the server sent {sent} datagrams for {asked} exchanges"
+    );
+    assert!(
+        asks <= bound,
+        "the asker sent {asks} datagrams for {asked} exchanges"
+    );
+}
+
 /// An asker that bounds its queue by its credit (`AskQueue::Credit`) refuses an exchange `Unsent`
 /// at once, nothing sent, when its connection already waits for as many streams as its peer grants
 /// it: asked ten at once of a pooled peer that granted it two, it holds two, queues two, and refuses

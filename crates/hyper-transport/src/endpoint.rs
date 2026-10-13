@@ -1989,6 +1989,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             unread_since: None,
             starved: false,
             ended: false,
+            credit_settled: false,
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
@@ -2364,6 +2365,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             unread_since: None,
             starved: false,
             ended: false,
+            credit_settled: false,
         };
         let id = self.exchanges.insert(exchange)?;
         self.exchanges.place(id, conn.exchanges.len());
@@ -2629,13 +2631,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 .exchanges
                 .get_mut(id)
                 .ok_or((Refusal::UnknownExchange, false))?;
-            exchange.out.state = match (exchange.out.has_body, exchange.out.left) {
+            let (has_body, left) = (exchange.out.has_body, exchange.out.left);
+            if !has_body {
+                self.settle_credit(conn, id);
+                finish(conn, stream)?;
+            }
+            let exchange = self
+                .exchanges
+                .get_mut(id)
+                .ok_or((Refusal::UnknownExchange, false))?;
+            exchange.out.state = match (has_body, left) {
                 (true, 0) => Out::Trailer,
                 (true, _) => Out::Body,
-                (false, _) => {
-                    finish(conn, stream)?;
-                    Out::Finished
-                }
+                (false, _) => Out::Finished,
             };
         }
         self.flush_trailer(conn, id)
@@ -2657,7 +2665,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let took = pushed(push(&mut conn.quic, stream, rest, allowed))?;
         exchange.out.trailer_written = exchange.out.trailer_written.saturating_add(took);
         if exchange.out.trailer_written >= trailer.len() {
+            self.settle_credit(conn, id);
             finish(conn, stream)?;
+            let exchange = self
+                .exchanges
+                .get_mut(id)
+                .ok_or((Refusal::UnknownExchange, false))?;
             exchange.out.state = Out::Finished;
             if !exchange.opened {
                 exchange.carry.rest();
@@ -2797,6 +2810,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
+    /// A peer's exchange settles its stream's credit with the pool as its reply is finished, before
+    /// the finish: QUIC gives a stream's credit back to its peer once its request is read and its
+    /// reply finished, not once the reply is acknowledged (hyper-quic `VENDORED.md` §27), so the
+    /// connection's grant must be the pool's by then, or the stream goes back to the peer past it.
+    fn settle_credit(&mut self, conn: &mut Conn<C::Role>, id: u64) {
+        let Some(exchange) = self.exchanges.get_mut(id) else {
+            return;
+        };
+        if exchange.opened || exchange.credit_settled {
+            return;
+        }
+        exchange.credit_settled = true;
+        self.exchange_ended(conn, false);
+    }
+
+    /// An exchange that ended without its credit settled as its reply finished (one this side
+    /// opened, or one refused) settles it now.
+    fn unsettled_ended(&mut self, conn: &mut Conn<C::Role>, exchange: &Exchange<C::Class>) {
+        if !exchange.credit_settled {
+            self.exchange_ended(conn, exchange.opened);
+        }
+    }
+
     fn finish_exchange(
         &mut self,
         conn: &mut Conn<C::Role>,
@@ -2824,7 +2860,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if exchange.stream.is_some() {
             conn.credit_moved = Some(self.now);
         }
-        self.exchange_ended(conn, exchange.opened);
+        self.unsettled_ended(conn, &exchange);
         if let Some(stream) = exchange.stream
             && let Ok(at) = conn
                 .by_stream

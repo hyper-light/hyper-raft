@@ -1017,3 +1017,32 @@ al., OSDI 2020), has no other word that this side wants more.
 - **Test.** `an_open_at_the_peers_limit_says_so_once_for_each_limit`: one frame for each limit, none
   written once the limit is raised, the frame again at the new limit, and the receiving side
   blocked only at the limit it last sent with none greater on its way.
+
+## 27. A finished reply gives its stream's credit back with it (2026-10-13)
+
+A peer-initiated bidirectional stream gave its credit back (`stream_freed`: its count among the
+allocated taken out, so `ensure_remote_streams` raises the limit within the window) only once both
+halves were freed: its request read whole, and its reply's last frames acknowledged. The raised
+MAX_STREAMS then went out alone, a round trip after the reply, since a server has nothing more
+for that peer once its reply is acknowledged. hyper-transport's pooled credit
+(docs/transport.md §4g) grants a pooled peer streams one at a time, so every exchange cost the
+server that datagram, and the peer the wait for it.
+
+A stream's credit now goes back at the first of: its request read whole with its reply finished
+(`StreamsState::return_credit_early`, from `SendStream::finish` and `stream_recv_freed`), or its
+freeing as before. The stream's send half records that it did (`Send::credit_returned`), so its
+freeing, by the reply's acknowledgement or by a reset's, gives none again. Once returned at the
+finish, the raised limit is queued at once (`queue_max_stream_id`), and it goes out in the reply's
+datagrams.
+
+RFC 9000 §4.6 lets an endpoint raise MAX_STREAMS at any time; it must be prepared for what it
+allows. The streams over the window at once are those whose reply waits for its acknowledgement,
+which their state already holds: Breakwater's overcommit of credit issued in its responses (Cho et
+al., OSDI 2020). An application that manages the window (`set_max_concurrent_streams`) sets
+it before it finishes a reply, so the credit goes back within what it decided.
+
+Tests: `a_finished_response_gives_its_streams_credit_back_once_before_its_acknowledgement` (it fails
+without the change, at "announced with the response"); hyper-transport's
+`a_pooled_servers_stream_goes_back_with_the_reply` (20 exchanges through a pool of one: 40
+datagrams of each side, where they took 59) and `a_pool_sized_to_nothing_holds_its_peer_until_sized_again`
+(the pool settled before the finish).

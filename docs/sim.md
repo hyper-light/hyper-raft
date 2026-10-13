@@ -13,9 +13,11 @@
 > its conformance check, the round search of the real core, crash enumeration by fork and
 > shrinking, with each strategy's runs to catch each planted defect. **S-3's block device built**
 > (§16): hyper-block's simulated file moved here, with lost and misdirected writes, blocks read as
-> zeros or junk, and the crash states within a persistence point; its form in the world
-> (completions as events, latency, handles), the typed write queue, the namespace model and the
-> fault envelope, and S-6 to S-8, are designed, not built. Sources and
+> zeros or junk, and the crash states within a persistence point; with S-6, the typed write queue,
+> its completions events of the world. **S-6's first half built** (§17): hyper-durable's schedules
+> in the world, on its network and its write queue, judged by hyper-check's oracles, their crashes
+> enumerated by fork. The block device in the world (latency, handles), the namespace model, the
+> fault envelope, hyper-raft's half of S-6, S-7 and S-8 are designed, not built. Sources and
 > what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
 > §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
 > below shows a piece falls short.
@@ -1732,8 +1734,94 @@ refused, typed, with nothing changed), makes the images a crash there may leave 
 each omitted from the whole. A crash after every persistence point (CrashMonkey's B3) is a harness's
 crash with `Crash::LoseAll` at each flush.
 
-**Not yet built**, with §3.5: the device in the world (completions as events with latency drawn from a
-stream, handles as generational indices in the world's arena), the typed write queue that `Lagged` and
-hyper-durable's `SimStore` become (S-6), the namespace model, and the fault envelope's type. mantle's
-chunk device without `Arc` is mantle's own step (§8).
+**The typed write queue** (`hyper_sim::storage::Writes`, built with S-6, §17): writes the harness
+defines, made durable one at a time in the order submitted, then answered to their owner, who takes
+the answers later still. Its completions are events of the world: while a write is out the device has
+one completion pending (`Writes::arm`), and whichever the strategy takes completes the oldest write
+(`Writes::fire`), because the device makes its writes durable in order; so how many are out at once is
+the owner's depth, not the harness's choice of steps. A crash loses what is out and unanswered, and the
+harness keeps the queue across it, as a member's durable state outlives its process (§3.6): the
+completion pending at the crash serves the process that reopens. A completion that finds nothing out
+(its write completed at a test's word, or lost to a crash) is counted idle. hyper-durable's `SimStore`
+is this device (§17).
+
+**Not yet built**, with §3.5: the block device in the world (its completions as events, handles as
+generational indices in the world's arena), whose consumer is hyper-log under the world (§11 item 6);
+latency drawn for a completion, whose consumer is a timed run with devices (none yet: the free
+discipline's schedules order completions by the strategy, and the ordered discipline's runs persist
+at once); the namespace model; and the fault envelope's type. mantle's chunk device without `Arc` is
+mantle's own step (§8).
+
+## 17. S-6 as built: hyper-durable's schedules in the world (2026-10-13)
+
+hyper-durable's simulated groups (`crates/hyper-durable/tests/support/cluster.rs`, `tests/sim.rs`,
+`tests/keep.rs`) run on hyper-sim's world under the free discipline and are judged by hyper-check, as §8
+plans for them; `support/device.rs`, hyper-log on the simulated file one write at a time, waits for
+hyper-log under the world (§11 item 6).
+
+- **Draws.** Every decision is the world's: the schedule's (`schedule.ops`), the slow leader's
+  (`schedule.slow`) and each core's seed (`node.seed`, drawn once a member), so a run replays from its
+  trace with no seed. A step draws at most four words (the member and the roll, then a detector's peer
+  and accuracy, a change's target and kind, or the world's pick and the slow leader's draw), so the
+  trace a run reserves is stated, not measured (`WORDS_A_STEP`).
+- **Network.** Messages travel on the world's network (`hyper_sim::net::Net`) at the zero path: under
+  the free discipline any message in flight may arrive next. A loss is the schedule's own step, as it
+  was (`Op::Lose`: the world picks an event and an arrival is lost), so the network draws nothing.
+- **Devices.** `SimStore` is the typed write queue (§16): a member's writes are completed by the world's
+  event (`Devices::World`), one pending per device while a write is out, or, in directed tests, at the
+  test's word (`Devices::Directed`). The device outlives its process: a crash keeps its queue, and the
+  completion pending serves the store that reopens. The schedule's 20% of steps that made a member's
+  write durable and its 32% that delivered or lost a message are now 52% that take the world's next
+  event (50% delivered or completed, 2% lost), the world choosing among what is pending; a leader
+  applying ahead has the slowest disk as before, its device completing a quarter of the times the world
+  picks it.
+- **Oracles.** hyper-check's: Durability (I1, I2, R-6 on every message released; I3 on every commit
+  new to the group; I4 on every entry applied, which the harness did not check before; I5, I7, I8), State
+  Machine Safety, and, new to these schedules, Election Safety, Log Matching (fed from every write made
+  durable) and Leader Completeness. An entry's value is its term, kind and data, as the harness compared
+  a commit by its term. I4's "durable here" counts what the state machine holds durably, where an image
+  it installed is durable before the log's start moves past it (the first run found that case refused).
+  The harness keeps its own I5 across a crash and R22's count.
+- **Crash at every event** forks (§3.7): the schedule runs once and each step that did something is
+  copied, its member crashed in the copy, the copy run through the rest of the schedule and its liveness
+  phase. `Replica` derives `Clone` for it; a member whose log, machine or budget is not a value (a
+  device's handle) is not one. 1,488 crash points over the gate's 4 × 800 steps at two shapes, against
+  935 events the replays crashed after before the move.
+- **Run twice.** Each shape's first schedule runs twice from its seed and once from its trace, to one
+  digest (`a_schedule_runs_the_same_twice_and_from_its_trace`).
+
+**The gate** (§8: the outcome at the same seed counts): 128 schedules of 5,000 steps at each of the five
+shapes, every oracle held at every step, every group settled, and every floor reached, two new: a
+leader seen ahead of its disk in the shape that applies ahead (12), and the network's bound losing
+fewer messages than the schedule (0 against 301–827). Reached, before the move and after:
+
+| shape | committed | crashes | refused | fenced | behind the fence | deep | acted | lost |
+|---|---|---|---|---|---|---|---|---|
+| three voters, depth three, durable | 1,534 / 2,699 | 543 / 529 | 111 / 65 | 32 / 19 | 1,614 / 1,981 | 1,903 / 716 | 313 / 500 | — / 454 |
+| three voters, depth two, replayed | 1,666 / 2,535 | 544 / 522 | 97 / 56 | 33 / 12 | 1,561 / 2,641 | 1,788 / 539 | 560 / 966 | — / 401 |
+| control group, depth three | 1,014 / 1,679 | 413 / 399 | 77 / 42 | 29 / 15 | 3,124 / 3,511 | 1,181 / 431 | 2,896 / 4,788 | — / 301 |
+| leader applying ahead, depth three | 1,449 / 2,240 | 549 / 533 | 118 / 87 | 39 / 23 | 1,585 / 1,565 | 2,573 / 982 | 322 / 456 | — / 350 |
+| five voters, depth one | 2,270 / 3,738 | 679 / 674 | 169 / 132 | 44 / 39 | 1,344 / 2,400 | 169 / 244 | 1,103 / 1,276 | — / 827 |
+
+Writes complete sooner than they did (a device's completion is one event among a few pending, not a
+fifth of all steps), so groups commit 1.6 times as much, refuse and fence about half as often, and
+pipeline less deeply: every floor holds with room. The leader applying ahead was seen ahead of its disk
+12 times against 64: the world picks its completion as often as another's and draws it again three
+times in four, where the old schedule redirected three of four of its steps to another member.
+
+**The capacity `C` (§7).** The gate's schedules held at most 31 messages in flight (57 at five voters)
+under a bound of 4,096, so it lost none. A sweep found the rule's smallest capacity (fewer lost to the
+bound than to the schedule) near 24, where the five-voter shape lost 517 to the bound against 815 to
+the schedule; and below it, at 8 and 16, the run was refused: a message the network drops for room
+leaves its arrival pending in the world, which then names nothing, and those filled the world's events
+(`SimError::Full`). A bound the network reaches makes the world's event bound depend on how fast the
+strategy takes stale arrivals, so `C` stays 4,096, past what these schedules reach; the network
+cancelling a dropped message's arrival would let `C` be the rule's: open.
+
+**Costs** (`docs/benchmarks.md`, "hyper-durable's schedules in the world, against the harness they
+replace"): at the gate's 5,000 steps, 60–69% fewer allocations a step in every shape and the time within
+the old harness's range (7–9% less in two shapes, 16% more in the control group); reallocations 7–24%
+more, all of it a run's setup (equal at 20,000 steps). The world's own cost a step is its exact draws and
+the trace, which S-1 measured and which at 20,000 steps leave the new harness 9–25% slower a step:
+open with S-1's.
 

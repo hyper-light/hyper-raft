@@ -700,10 +700,12 @@ name = "hyper-durable"
 version = "0.1.0"
 dependencies = [
  "hyper-block",
+ "hyper-check",
  "hyper-liveness",
  "hyper-log",
  "hyper-measure",
  "hyper-raft",
+ "hyper-sim",
  "hyper-timing",
  "thiserror 2.0.20",
 ]

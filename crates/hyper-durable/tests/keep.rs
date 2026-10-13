@@ -3,8 +3,8 @@
 //! acknowledge of what was sent to it up to the apply point, so a resend reads them from the store's
 //! memory, never through the log's owner. A member that stops answering pins nothing past what was
 //! in flight to it: once the leader has applied past what it sent, or probes it, it holds nothing.
-//! Held after every leader drive against the leader's own tracker, on a seeded group
-//! (`support::cluster`), one follower's answers lost.
+//! Held after every leader drive against the leader's own tracker, on a seeded group in hyper-sim's
+//! world (`support::cluster`), one follower's answers lost.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -48,14 +48,7 @@ fn turn(group: &mut Cluster, id: u64) {
 
 /// Delivers every message but `silent`'s, which are lost.
 fn deliver_but(group: &mut Cluster, silent: u64) {
-    while let Some(message) = group.net.front() {
-        let op = if message.from == silent {
-            Op::Lose(0)
-        } else {
-            Op::Deliver(0)
-        };
-        group.act(op);
-    }
+    group.deliver_all(|message| message.from != silent);
 }
 
 /// After a leader's turn: the mark it owes, its apply point and the silent member's progress, with

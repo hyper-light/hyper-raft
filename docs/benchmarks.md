@@ -8312,3 +8312,53 @@ commit durable). 11 runs a length, load 11–14:
 cd crates/hyper-durable-compare && cargo build --release
 ./target/release/hyper-durable-compare publication --entries 1000,10000,50000 --runs 11
 ```
+
+## hyper-durable's schedules in the world, against the harness they replace (S-6, 2026-10-13)
+
+`docs/sim.md` §10 and §17: what a step of hyper-durable's random schedules costs on hyper-sim's world,
+network and write queue, judged by hyper-check's oracles, against the harness it replaced (its own
+seeded draws, a `VecDeque` network taken at a drawn index, its stores' queues made durable by a drawn
+step, its own checks). `tests/sim.rs`'s `random_schedules_keep_every_invariant_and_settle` in release,
+128 schedules of 5,000 steps at each of its five shapes with their liveness phases, a counting
+allocator on the test's thread (a measurement patch, not committed); the two harnesses at hyper-raft
+`6798688` and at S-6, interleaved six rounds, the order turned each round; load 6.3–10.0. Each figure is
+the whole run over its schedules' steps, so the liveness phases and each run's setup are in it.
+
+| shape | ns a step, old: median [range] | new | allocations a step, old / new | reallocations a step, old / new | bytes a step, old / new |
+|---|---|---|---|---|---|
+| three voters, depth three, durable machine | 86 [79–90] | 80 [74–81] | 1.48 / 0.59 | 0.065 / 0.075 | 91 / 51 |
+| three voters, depth two, replayed machine | 88 [85–109] | 80 [75–87] | 1.82 / 0.57 | 0.065 / 0.072 | 123 / 50 |
+| a control group, depth three | 58 [54–68] | 67 [64–76] | 0.88 / 0.45 | 0.062 / 0.068 | 57 / 41 |
+| three voters, depth three, leader applying ahead | 74 [72–75] | 75 [70–87] | 1.28 / 0.53 | 0.063 / 0.072 | 83 / 47 |
+| five voters, depth one | 102 [99–108] | 105 [100–112] | 2.09 / 0.81 | 0.071 / 0.088 | 150 / 76 |
+
+- **Allocations fall by 60–69%** in every shape: the old harness copied every applied entry of a member
+  at each of its drives to check them; the new one holds each entry to the oracles once, through one
+  value refilled for each.
+- **The time is the old one's** within its range in three shapes and 7–9% less in two; the control
+  group's is 16% more.
+- **Reallocations a step are 7–24% more, all of it a run's setup.** Over 32 schedules a shape at 1,000,
+  5,000 and 20,000 steps (load 6–9), the new harness reallocates 0.055–0.130, 0.066–0.085 and
+  0.069–0.073 a step, the old 0.042–0.075, 0.062–0.071 and 0.068–0.071: equal once a run is long, the
+  difference a world's and a network's tables growing to their run's size, about 35 a run. Neither
+  allocates more as a run goes on.
+- **What a step pays the world.** A run that judges nothing (the oracles switched off by the patch) takes
+  54 ns a step at the first shape against the old harness's 86 with its own checks; the decisions are
+  recorded and drawn exactly (focal's `below`, two divisions a draw, and a word of trace each), the cost
+  S-1 measured in the world's step against the harnesses' (§10, "behind it at 3 nodes"). At 20,000 steps,
+  where members down for long make most steps a draw and little more, the new harness is 9–25% slower a
+  step (45–60 ns against 36–54): that is the draws' cost, open with S-1's.
+- **What the oracles cost a step**, measured by switching them off at the first shape (three runs of
+  each switch): together 17–21 ns and 0.06 allocations a step (71–75 ns against 54–55 with every one
+  off); each alone is within the runs' spread, I3's tables of a commit's configurations 0.03 of the
+  allocations. Two of their first costs were the harness's, found by these switches and removed: every
+  check named its failure before knowing it failed, and I8's check of every member every step
+  allocated five times a step (238 ns and 6.35 allocations a step before, 90 and 0.95 after); and a
+  leader's whole log was copied into a map at each of its drives, where Leader Completeness reads it
+  only the first time it is seen leading a term.
+
+```sh
+cargo test --release -p hyper-durable --test sim -- random_schedules_keep_every_invariant_and_settle --exact --nocapture
+# with HYPER_DURABLE_SEEDS and HYPER_DURABLE_STEPS for the lengths; the allocator patch adds the COST lines
+```
+

@@ -23,11 +23,18 @@
 //! persistence point (ALICE, Pillai et al. §3.3), each prefix of the writes since the last flush and
 //! each with one of them omitted, are [`Device::states_since_flush`], over the writes a device records
 //! when asked to ([`Device::record`]), up to the bytes it is given.
+//!
+//! **The typed write queue** ([`Writes`]) is the other device of §3.5: writes the harness defines,
+//! made durable in order as the world completes them.
+
+mod writes;
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::rng::{Seeded, stream_seed};
+
+pub use writes::{WriteStats, Writes};
 
 /// A fault the next matching operation suffers.
 #[derive(Debug, Clone, PartialEq, Eq)]

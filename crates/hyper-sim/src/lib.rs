@@ -13,7 +13,7 @@
 //!   stated capacity, its oldest message lost past it.
 //! - **Storage** ([`storage`], step S-3): the block device, hyper-block's simulated file moved
 //!   here with the lost, misdirected, zeroed and junk faults and the crash states within a
-//!   persistence point.
+//!   persistence point; and the typed write queue, whose completions are events of the world.
 //! - **The trace** ([`Trace`]) and the **digest** ([`Digest`]): every choice recorded, so a run
 //!   replays from its seed or from its trace; and [`twice`], which runs a seed twice and its
 //!   trace once and refuses a run whose digests differ.

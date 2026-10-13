@@ -79,7 +79,7 @@ impl<T> UnsafeCell<T> {
 /// silicon's 128 bytes): producers write the tail, the consumer the head.
 #[repr(align(128))]
 #[derive(Debug)]
-struct Padded<T>(T);
+pub(super) struct Padded<T>(pub(super) T);
 
 /// One slot: the position it is free for or full at, and its value while full.
 #[derive(Debug)]

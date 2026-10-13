@@ -71,7 +71,9 @@ In hyper-rt, a step's long polls judged at one reading of the thread's clock at 
 mantle's newest fill (2026-10-13), its fill 3.3 % faster at 10M against mantle's vendored `f358210`, ahead
 in every one of six rounds. A poll's end and a task's live reading carried from the step's reading of the
 clock by the counter, read without synchronization: `mach_continuous_time` from 2.5 % of the fill's shard
-samples to 0.1 % (`docs/runtime.md` §3.9).
+samples to 0.1 % (`docs/runtime.md` §3.9). A channel's empty receive reads only its own lines, its senders'
+end on a line of its own rather than in the cell table: 1.5 ns where other threads' one-shots cost it
+2.1–2.7 ns (`docs/runtime.md` §3.9, D4).
 
 ## Open defects
 

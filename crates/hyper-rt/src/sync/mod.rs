@@ -25,14 +25,14 @@ mod room;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
-use ring::{Refused, Ring, Shared};
+use ring::{Padded, Refused, Ring, Shared};
 use room::Room;
 
 /// Why a primitive's call ended without a value.
@@ -285,13 +285,20 @@ fn poll_value<T>(tried: &mut Result<Option<T>, SyncError<()>>) -> Option<Result<
 
 // ------------------------------------------------------------------------------------------ channel
 
-/// What a channel's ends share: its values, the senders waiting for room, and how many senders live.
+/// What a channel's ends share: its values, the senders waiting for room, how many senders live, and
+/// whether every one is gone.
 #[derive(Debug)]
 struct ChannelState<T> {
     values: Ring<T>,
     room: Room,
     /// The live senders; the last to go closes the channel for the receiver.
     senders: AtomicUsize,
+    /// Whether every sender is gone, on a line of its own that only the last sender's drop writes. The
+    /// receiver reads it each time it finds the ring empty, and it used to read the cell's state word for
+    /// it, in the process-wide table where a cell is 32 bytes, four to an Apple silicon line, beside other
+    /// primitives' words that their own ends write: an empty `try_recv` cost 1.8 ns alone and 2.1–2.7 ns
+    /// while two threads churned one-shots (`benchmark-results/hyper-rt-recv-20261013`).
+    senders_gone: Padded<AtomicBool>,
 }
 
 /// The sending half of a bounded channel; clone it for more senders.
@@ -334,6 +341,7 @@ pub fn channel_with<T>(
             values,
             room,
             senders: AtomicUsize::new(1),
+            senders_gone: Padded(AtomicBool::new(false)),
         },
         cell,
     );
@@ -357,8 +365,9 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // The last sender closes the channel for the receiver, then wakes it to see so: its values, and every
         // earlier sender's (each released by its own count above), are visible to a receiver that reads the bit.
-        if self.shared.get().senders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            set_state(self.shared.cell(), SENDERS_GONE);
+        let state = self.shared.get();
+        if state.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            state.senders_gone.0.store(true, Ordering::Release);
             self.shared.cell().wake();
         }
     }
@@ -533,10 +542,10 @@ impl<T> ChannelReceiver<T> {
             state.room.grant_one();
             return Ok(Some(value));
         }
-        if !state_has(self.shared.cell(), SENDERS_GONE) {
+        if !state.senders_gone.0.load(Ordering::Acquire) {
             return Ok(None);
         }
-        // Every sender is gone; what they sent before going is visible now (the last set the bit after).
+        // Every sender is gone; what they sent before going is visible now (the last set the flag after).
         match state.values.pop() {
             Some(value) => {
                 state.room.grant_one();

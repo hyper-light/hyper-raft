@@ -520,6 +520,16 @@ case, and the loop's costs must not grow with the load.
   interleavings), a thread waiter (6,289), one and two senders waiting for room (50 and 71,847), each
   failing under its recorded mutations; `tests/channel_threads.rs` runs real threads through the blocking
   calls. `Padded`'s 128-byte alignment is shape (the largest cache line targeted, Apple silicon's).
+  A receive that finds the ring empty reads only lines its channel owns: whether every sender is gone is
+  kept on a line of its own in the channel's block, which only the last sender's drop writes, and no
+  longer in the cell's state word, in the process-wide table where a cell is 32 bytes, four to an Apple
+  silicon line, beside other primitives' words that their own ends write. In a 10M run of mantle's ranges
+  bench (the fill, a million gets, a million seeks) its shard took from its workers' channel 19,296,686
+  times, and 19,296,557 of those found it empty.
+  An empty `try_recv` cost 1.8 ns alone and 2.1–2.7 ns while two threads churned one-shots, and costs 1.4–1.7 ns
+  and 1.5 ns. In mantle's 100M fill the call fell from 2.8% to 2.5% of the shard thread's samples, its
+  read of the gone state from 41 samples to 14 (`benchmark-results/hyper-rt-recv-20261013`). What is
+  left is the call itself, about 2 ns a take, which only fewer takes save.
 
 ## 4. Running a future: `block_on`
 

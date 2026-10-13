@@ -8220,3 +8220,34 @@ cd crates/hyper-durable-compare && cargo build --release
 ./target/release/hyper-durable-compare apply --clients 1,16,64,256 --shapes register,put \
   --devices sim,file --rounds 3 --entries 3000 --warm 300
 ```
+
+## slates' retention publication against a transition through the shell (2026-10-13)
+
+`docs/durable.md` §14 item 8: a transition's publication cost at slates' record sizes, through the shell
+and on slates' own path. `hyper-durable-compare publication` (`src/slates.rs`): slates' workload from its
+`crates/cluster/tests/publication_cost.rs` at `ec5e0df`, a lone leader appending commands of 64 bytes,
+then its publication timed step by step: the clone of its retained state (`RaftNode::saved`), its
+encoding (`SavedRaft::to_bytes`) and its BLAKE3 hash, as slates makes it on every vote, append and
+configuration change. Through the shell, the same lone group on `RamStore` (slates' shape: each write
+durable as it is submitted, depth one), a transition being a command's proposal, the drive that submits
+its write and the drive that takes its answer and applies it (the run checks each applied and its
+commit durable). 11 runs a length, load 11–14:
+
+| log length | slates: bytes published | slates: clone / encode / hash µs, median | slates: µs, median [least–most] | shell: µs a transition, median [least–most] |
+|---|---|---|---|---|
+| 1,000 | 77,082 | 12.2 / 6.8 / 34.8 | 55.0 [52.2–97.2] | 0.3 [0.3–0.5] |
+| 10,000 | 770,082 | 91.4 / 39.9 / 323.7 | 457.0 [452.2–646.4] | 0.3 [0.3–1.7] |
+| 50,000 | 3,850,082 | 480.4 / 216.2 / 1,736.0 | 2,416.7 [2,134.4–11,701.6] | 0.3 [0.2–0.4] |
+
+- **slates' publication grows with its log; a transition through the shell does not.** slates publishes
+  the whole retained state each time, 77 bytes an entry, so its cost is linear in the log: 0.46 ms at
+  10,000 entries and 2.4 ms at 50,000, the hash two thirds of it. The shell's store takes each write's
+  update alone, 0.3 µs a transition at every length.
+- What the comparison leaves out: a store over slates' anchor that checks what it publishes would hash
+  each update's bytes as it writes them (a 64-byte command's BLAKE3 is a fraction of a microsecond), not
+  the state's.
+
+```sh
+cd crates/hyper-durable-compare && cargo build --release
+./target/release/hyper-durable-compare publication --entries 1000,10000,50000 --runs 11
+```

@@ -34,6 +34,7 @@ mod durable;
 mod mantle;
 mod mantle_d1;
 mod mantle_s1;
+mod slates;
 mod workload;
 
 use std::path::PathBuf;
@@ -567,6 +568,49 @@ fn apply_per_drive(args: &[String]) {
     }
 }
 
+/// `docs/durable.md` §14 item 8: slates' retention publication against a transition through this
+/// shell, at each log length (`src/slates.rs`).
+///
+/// ```text
+/// hyper-durable-compare publication [--entries 1000,10000,50000] [--runs R]
+/// ```
+fn publication(args: &[String]) {
+    let sizes = list(args, "--entries", "1000,10000,50000", |n| n.parse::<u64>().unwrap());
+    let runs = list(args, "--runs", "11", |n| n.parse::<usize>().unwrap())[0];
+    println!(
+        "| entries | slates: bytes | slates: clone / encode / hash µs, median | slates: total µs, median [least–most] | shell: transition µs, median [least–most] |"
+    );
+    println!("|---|---|---|---|---|");
+    let us = |d: Duration| d.as_secs_f64() * 1e6;
+    let spread = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        format!(
+            "{:.1} [{:.1}–{:.1}]",
+            v[v.len() / 2],
+            v[0],
+            v[v.len() - 1]
+        )
+    };
+    for &n in &sizes {
+        let published = slates::slates_publication(n, runs);
+        let shell = slates::shell_transition(n, runs);
+        let part = |f: fn(&(Duration, Duration, Duration, usize)) -> Duration| {
+            let mut v: Vec<f64> = published.iter().map(|p| us(f(p))).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!(
+            "| {n} | {} | {:.1} / {:.1} / {:.1} | {} | {} |",
+            published[0].3,
+            part(|p| p.0),
+            part(|p| p.1),
+            part(|p| p.2),
+            spread(published.iter().map(|p| us(p.0 + p.1 + p.2)).collect()),
+            spread(shell.iter().map(|d| us(*d)).collect())
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     assert!(
@@ -575,6 +619,10 @@ fn main() {
     );
     if args.get(1).map(String::as_str) == Some("apply") {
         apply_per_drive(&args);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("publication") {
+        publication(&args);
         return;
     }
     let members = list(&args, "--members", "1,3,5", |m| m.parse::<u64>().unwrap());

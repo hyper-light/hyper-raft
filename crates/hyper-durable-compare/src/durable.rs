@@ -422,7 +422,7 @@ impl<F: BlockFile + 'static> Group<F> {
         let mut out_since: VecDeque<Instant> = VecDeque::new();
         let mut next = 0usize;
         let mut latencies = Vec::with_capacity(entries.len());
-        let mut propose = |g: &mut Self, out_since: &mut VecDeque<Instant>, next: &mut usize| {
+        let propose = |g: &mut Self, out_since: &mut VecDeque<Instant>, next: &mut usize| {
             let data = entries[*next].encode().unwrap();
             g.owner
                 .get_mut(leader)

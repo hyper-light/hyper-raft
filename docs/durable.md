@@ -1179,7 +1179,11 @@ directory once, at create.
    its code's layout, not work. A budget that counts (`Bytes`) costs 13–15% more; open whether its
    settle can follow what changed instead of walking what the replica holds.
 8. **slates' store.** A transition's publication cost at slates' record sizes through the shell,
-   against its own path.
+   against its own path. Measured (`hyper-durable-compare publication`; `docs/benchmarks.md`,
+   "slates' retention publication against a transition through the shell"): slates publishes its whole
+   retained state each time, linear in its log (0.46 ms at 10,000 entries, 2.4 ms at 50,000, the BLAKE3
+   hash two thirds of it); through the shell on `RamStore` a transition is 0.3 µs at every length, its
+   write the update alone.
 
 ## 15. As built (D-1)
 

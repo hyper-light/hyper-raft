@@ -254,14 +254,15 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      `43aec4a` is slates' branch `hr-vendor-43aec4a`, one commit on its main's head that touches only
      `vendor/hyper-raft`, which its session lands on the owner's word.
 3. **The shared crates' open work**, each in its own document:
-   - hyper-durable: §14's measurements. Items 1, 2, 3, 4, 6 and 7 measured on this machine's disk
+   - hyper-durable: §14's measurements. Items 1, 2, 3, 4, 6, 7 and 8 measured on this machine
      (2026-10-12 and 13, `docs/benchmarks.md` from "A group's writes out, depth one to three on
      hyper-log"): depth earns no place for one group, nor makes a lone frame's confirmation rare;
      applying ahead halves a slowest leader's median answer and changes nothing on a shared disk, its
      slowest entries waiting to leave the leader at its write depth; a quiet group's commit costs one
      period and one write, and the bench found its deadline missing (fixed); applying mantle's
      metadata is linear in a drive's entries, so the owner's page bounds it; an `Unbounded` budget
-     costs nothing, a counting one 13–15% of an entry's instructions. Open: items 5 and 8, item 1 on
+     costs nothing, a counting one 13–15% of an entry's instructions; slates' publication grows with
+     its log where a transition through the shell does not. Open: item 5, item 1 on
      Linux and with many groups, why item 2's wait to leave grows, item 6's question of PAR's
      identifiers.
    - hyper-sim and hyper-check: S-6 (hyper-raft's and hyper-durable's harnesses onto both crates),

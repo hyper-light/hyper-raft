@@ -1,6 +1,6 @@
 [package]
 name = "hyper-durable-compare"
-description = "hyper-durable measured against the shells it replaces, on one workload: mantle's range replica on its own shell (crates/range at origin/dev 1c179e8, and at its step 1 on the log this repository's shell runs on) and on this shell (mantle's D-1); focal's DurableNode and slates' publication are later steps."
+description = "hyper-durable measured against the shells it replaces, on one workload: mantle's range replica on its own shell (crates/range at origin/dev 1c179e8, and at its step 1 on the log this repository's shell runs on) and on this shell (mantle's D-1); slates' retention publication against a transition through this shell; focal's DurableNode is a later step."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
@@ -13,6 +13,13 @@ publish = false
 [workspace]
 
 [dependencies]
+# slates' consensus retention publication at the revision docs/durable.md §14 item 8 names
+# (`src/slates.rs`): its RaftNode's retained state, cloned, encoded and hashed with BLAKE3 as slates
+# hashes it.
+slates-cluster = { git = "https://github.com/hyper-light/slates", rev = "ec5e0df941c7b32276515b0ff22ab78d7b464e3a" }
+slates-db = { git = "https://github.com/hyper-light/slates", rev = "ec5e0df941c7b32276515b0ff22ab78d7b464e3a" }
+slates-wire = { git = "https://github.com/hyper-light/slates", rev = "ec5e0df941c7b32276515b0ff22ab78d7b464e3a" }
+blake3 = "=1.8.7"
 hyper-block = { path = "../hyper-block", features = ["sim"] }
 hyper-durable = { path = "../hyper-durable" }
 hyper-log = { path = "../hyper-log" }

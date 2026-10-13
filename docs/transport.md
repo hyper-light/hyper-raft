@@ -702,6 +702,78 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   at RFC 9002's window by the datagram size, as CUBIC, NewReno and Copa do
   (`crates/hyper-quic/VENDORED.md` §21).
 
+## 4g. Admission credit: a stream pool (2026-10-13)
+
+A server that refuses what it cannot take still pays for each refusal about what an answer costs:
+the request's packets, their decryption, the read of its head, a reply and its packets. focal's
+leader on one CPU spent about 19 µs of its CPU on each write it refused at 12,000 writes a second
+offered, and committed a fifth fewer than at 1,000. That cost grows with the load offered, so at
+50,000 to 100,000 a second the refusals alone take more than a core (focal's A/B #8, 2026-10-12).
+Breakwater (Cho et al., "Overload Control for µs-scale RPCs with Breakwater", OSDI 2020) has the
+server grant credits, and a client sends only what it holds a credit for. A request the server
+could not take waits at its client, or is refused there, and costs the server nothing. QUIC has the
+credit already: a peer may open only the bidirectional streams the other side allows (MAX_STREAMS,
+RFC 9000 §4.6), and an exchange is a stream.
+
+- **`StreamCredit`** (`Limits::stream_credit`). `Fixed` is what every endpoint did: each
+  connection holds `streams_per_connection` from its handshake. `Pooled { initial }` grants
+  `initial` at the handshake, since QUIC takes back no stream it granted, and from then on the
+  connections of a pooled role (`Classes::pooled`, false unless a side says) share a pool the owner
+  sizes with `Endpoint::set_stream_pool`: the exchanges its pooled peers may have open at once, all
+  connections' together. A connection of a role outside the pool is raised to
+  `streams_per_connection` once its role is known, so a node's replication is never held to its
+  clients' pool.
+- **Granting** (`src/pool.rs`). A connection that joins while the pool has credit spare is raised
+  to its fair share at once (the pool over the connections in it, one stream at least), so a peer
+  nobody contends with waits no round trip before its second exchange. Under contention it holds
+  its handshake's grant. A peer blocked at its grant says so with STREAMS_BLOCKED (hyper-quic now
+  sends it, `crates/hyper-quic/VENDORED.md` §25), and the connection waits its turn, once. At each
+  poll, while the pool holds credit no connection is granted, the connection that has waited
+  longest is raised to its fair share, or by one if it holds that already, and sends its new
+  limit.
+- **Giving back.** A grant lowered falls as the peer's streams end. When an exchange its peer opened
+  ends, a connection gives one stream back if the pool is overspent: the owner shrank it, or the
+  connections' handshake grants exceed it. While another connection waits, it gives one back if it
+  holds more than a fair share (max-min fairness among the connections that want streams), and all
+  it holds if none of its peer's exchanges is open: credit goes with demand, as Breakwater issues
+  it only to clients with requests to send. A connection's own wait is no other's, so a lone one
+  keeps its grant; giving it back to grant it to itself again would leave it short until QUIC freed
+  the streams it held.
+- **Taking back from the idle.** QUIC takes back no stream it announced, so a connection holding
+  credit that opens nothing would keep it from every other: it gives back only as its exchanges
+  end. A connection with none of its peer's exchanges open is queued as idle, once: as it joins,
+  and as its last exchange ends with credit kept. While another waits and nothing is spare, the
+  endpoint takes back what an idle connection holds, in the pool's account (`Stats::pool.reclaimed`
+  counts it). Its peer may still open the streams it was told of, so the pool is overcommitted by
+  them, as Breakwater overcommits credit to idle clients and keeps its queue by refusing what an
+  overload sends past it: the owner's own admission.
+- **Bounds.** A connection waits once and is queued as idle once at most, so each queue holds no
+  more than the pooled connections. Exchanges open at the server at once are at most the pool,
+  plus the handshake grants not yet given back, plus what idle connections were told of before it
+  was taken back from them.
+- **The asker's side.** An exchange waiting for a stream is judged on whether its connection's
+  credit queue moves (policy C), so it waits while streams come back. If none comes for a period,
+  it is refused `Unsent`, a refusal of its own, where it was refused `Stalled`, which an exchange
+  that reached its peer is refused too. A request refused `Unsent` is known not to have been taken,
+  so its asker may send it again, where after `Stalled` it cannot know.
+- **The asker's own door** (`Limits::ask_queue`). Under `AskQueue::Table`, today's, only the
+  exchange table bounds what waits for streams, so a pooled peer's overload would move its queue to
+  its askers, where it would wait seconds rather than be refused. Under `AskQueue::Credit` an
+  exchange asked while its connection already waits for a round of its credit (the streams it
+  holds and those it may still open, hyper-quic's `Streams::remaining`, one at least) is refused
+  `Unsent` at `open`, nothing sent. The wait an asked exchange meets is held to about a round of
+  what its peer grants, as the peer's admission holds its own queue to what it answers in its
+  bound, and a refusal there costs the peer nothing. The counts are the tally's
+  (`Tally::asked`, checked against their fold under the oracle).
+- **Tests.**
+  - `pool::tests`: a lone connection raised to the pool and kept there, two connections converging
+    to equal shares, a shrunken pool given back as exchanges end, an idle connection giving its
+    grant to one waiting, a busy one at its fair share keeping it, a joining connection welcomed
+    with what is spare, and one waiting once and passed once gone.
+  - `tests/exchange.rs`: `a_pooled_peer_holds_back_what_the_pool_cannot_take` (ten exchanges asked
+    at once against a pool of three: never more than three open at the server, every one answered)
+    and `a_pool_sized_to_nothing_holds_its_peer_until_sized_again`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

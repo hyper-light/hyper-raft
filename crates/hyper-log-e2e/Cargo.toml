@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 hyper-block = { path = "../hyper-block" }
 hyper-log = { path = "../hyper-log" }
+# The sealed log's keys (docs/seal.md §11: the log is sealed by default).
+hyper-seal = { path = "../hyper-seal" }
 
 [[bin]]
 name = "hyper-log-writer"

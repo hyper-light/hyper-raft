@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use hyper_log::Log;
-use hyper_log_e2e::{ID, config, open, payload};
+use hyper_log_e2e::{ID, config, keys, open, payload};
 
 const WRITER: &str = env!("CARGO_BIN_EXE_hyper-log-writer");
 const TMP: &str = env!("CARGO_TARGET_TMPDIR");
@@ -122,7 +122,13 @@ fn heard(line: &str, acked: &mut BTreeMap<u128, Acked>) -> bool {
 
 /// Opens the log the killed writer left and checks it against what it acknowledged.
 fn check(path: &Path, acked: &BTreeMap<u128, Acked>, cycle: u64) {
-    let (log, recovery) = Log::open(open(path, false).unwrap(), config(GROUPS), ID).unwrap();
+    let (log, recovery) = Log::open_sealed(
+        open(path, false).unwrap(),
+        config(GROUPS),
+        ID,
+        keys().unwrap(),
+    )
+    .unwrap();
     assert!(
         recovery.damaged.is_empty(),
         "cycle {cycle}: damaged {recovery:?}"

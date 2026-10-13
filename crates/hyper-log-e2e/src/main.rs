@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use hyper_log::{Log, LogError, Pending};
-use hyper_log_e2e::{ID, config, open, update};
+use hyper_log_e2e::{ID, config, keys, open, update};
 
 fn run(
     path: &std::path::Path,
@@ -23,9 +23,9 @@ fn run(
     let fresh = !path.exists();
     let file = open(path, fresh)?;
     let log = if fresh {
-        Log::create(file, config(groups), ID)?
+        Log::create_sealed(file, config(groups), ID, keys()?)?
     } else {
-        Log::open(file, config(groups), ID)?.0
+        Log::open_sealed(file, config(groups), ID, keys()?)?.0
     };
     let mut next = Vec::with_capacity(groups);
     for g in 0..groups {

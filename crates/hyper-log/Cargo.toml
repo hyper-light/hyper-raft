@@ -31,5 +31,10 @@ harness = false
 name = "log"
 harness = false
 
+[[bench]]
+name = "sealing"
+# docs/seal.md §11: group commit sealed against unsealed, open loop; a table, not a criterion run.
+harness = false
+
 [lints]
 workspace = true

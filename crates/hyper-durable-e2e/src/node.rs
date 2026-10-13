@@ -49,13 +49,15 @@ use hyper_tokio::{Stamped, Taken};
 use hyper_durable::{
     Cause, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
 };
-use hyper_log::{Config as LogConfig, Log, Waits};
+use hyper_log::{Config as LogConfig, Log, Sealing, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
 use hyper_raft::wire::Record;
 use hyper_raft::{Config, Limits, StateRole, Stated};
 use hyper_raft_e2e::run::RunError;
 use hyper_raft_e2e::stream;
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
+use hyper_seal::Secret32;
+use hyper_seal::keys::{KeyId, WrappingKey};
 
 use crate::control::{self, Order, Point, Report};
 use crate::file::{self, FaultFile};
@@ -109,6 +111,8 @@ pub enum NodeError {
     Liveness(hyper_liveness::Refusal),
     /// The member has no run: its record could not be read or raised (`hyper_raft_e2e::run`).
     Run(RunError),
+    /// The log's keys could not be held: the process's key region refused.
+    Seal(hyper_seal::SealError),
 }
 
 impl std::fmt::Display for NodeError {
@@ -120,6 +124,7 @@ impl std::fmt::Display for NodeError {
             Self::Io(e) => write!(f, "the socket: {e}"),
             Self::Liveness(e) => write!(f, "the liveness stream: {e}"),
             Self::Run(e) => write!(f, "{e}"),
+            Self::Seal(e) => write!(f, "the log's keys: {e}"),
         }
     }
 }
@@ -236,15 +241,32 @@ impl LiveOutput for Asked {
     }
 }
 
-/// Opens the log at `path`, or creates it when the file is new.
+/// Keys a member's process holds at once in its locked region: its log's parent and
+/// authentication keys and a session's, with room to spare (hyper-log's sealed tests ask for the
+/// same).
+const LOCKED_KEYS: usize = 256;
+
+/// A member's log keys: from fixed bytes, so a member restarted opens its log with the ones it
+/// wrote it under. Locks the process's key region first, as every holder of keys does.
+fn keys() -> Result<Sealing, hyper_seal::SealError> {
+    hyper_seal::lock_keys(LOCKED_KEYS)?;
+    Ok(Sealing {
+        parent: WrappingKey::new(KeyId([0x64; 16]), 0, Secret32::from_bytes(&[0x64; 32])?),
+        auth: Secret32::from_bytes(&[0x75; 32])?,
+    })
+}
+
+/// Opens the log at `path`, or creates it when the file is new: sealed, the log's default since
+/// docs/seal.md §11's measurement.
 pub fn open_log(path: &Path) -> Result<Log<FaultFile>, NodeError> {
     let fresh = !path.exists();
     let file =
         FaultFile::open(path, fresh).map_err(|e| NodeError::Log(hyper_log::LogError::Disk(e)))?;
+    let keys = keys().map_err(NodeError::Seal)?;
     if fresh {
-        Log::create(file, log_config(), LOG_ID).map_err(NodeError::Log)
+        Log::create_sealed(file, log_config(), LOG_ID, keys).map_err(NodeError::Log)
     } else {
-        Log::open(file, log_config(), LOG_ID)
+        Log::open_sealed(file, log_config(), LOG_ID, keys)
             .map(|(log, _)| log)
             .map_err(NodeError::Log)
     }

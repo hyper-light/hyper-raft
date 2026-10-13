@@ -7,12 +7,31 @@
 //! <start>`, its stdout flushed after each line. A group's entry carries a hard state whose
 //! commit is the entry, and every [`KEEP`]th entry a start that compacts the group to its last
 //! [`KEEP`] entries, so the log reclaims segments as a node's does.
+//!
+//! The log is sealed (docs/seal.md §5), the default since §11's measurement: a crash at any write
+//! leaves sessions the reopen continues under keys of their own.
 
 use std::path::Path;
 
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_log::{Config, Entries, Entry, HardState, Start, Update, Waits};
+use hyper_log::{Config, Entries, Entry, HardState, Sealing, Start, Update, Waits};
+use hyper_seal::Secret32;
+use hyper_seal::keys::{KeyId, WrappingKey};
+
+/// Keys the process holds at once in its locked region: the log's parent and authentication keys
+/// and a session's, with room to spare (hyper-log's sealed tests ask for the same).
+pub const LOCKED_KEYS: usize = 256;
+
+/// The log's keys: from fixed bytes, so the writer and the test that checks its file open it with
+/// the same ones. Locks the process's key region first, as every holder of keys does.
+pub fn keys() -> Result<Sealing, hyper_seal::SealError> {
+    hyper_seal::lock_keys(LOCKED_KEYS)?;
+    Ok(Sealing {
+        parent: WrappingKey::new(KeyId([0x6c; 16]), 0, Secret32::from_bytes(&[0x6c; 32])?),
+        auth: Secret32::from_bytes(&[0x61; 32])?,
+    })
+}
 
 /// The log's ID.
 pub const ID: u128 = 0x6879_7065_722d_6c6f_672d_6532_6500;

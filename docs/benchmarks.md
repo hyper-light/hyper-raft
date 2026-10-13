@@ -7231,6 +7231,76 @@ cost of encrypting the bytes; before the frame MAC left sealed bytes to their ta
 between 8.5 and 16 ms in both modes alike, the flush's steps under other I/O; they are not a
 difference between the modes.
 
+### Group commit in an open loop, sealed against plain (2026-10-13)
+
+docs/seal.md §11's first measurement, `cargo bench -p hyper-log --bench sealing -- DIR`: appends on a
+Poisson schedule whatever the log does with earlier ones, each one's latency from its scheduled
+arrival to its answer, at entries of 100, 300, 1,024 and 16,384 bytes (slates' op log, focal's frames,
+the closed-loop bench's largest). Each log has 64 groups, at most two appends out a group (a
+replica's room in the log), an arrival with no group free waiting in the client's queue with its
+latency counting; the offered loads are 25, 50 and 75% of what the first plain log carried closed
+loop in the same run. Five rounds of 2 s, each on fresh scratch files of the internal NVMe (APFS,
+`F_FULLFSYNC`), load average 22–40 throughout.
+
+**How it is measured, and why.**
+- The first run drove a plain and then a sealed log one after the other. Their p50s stayed within a
+  third of each other, but each 2 s run that met one of the host's stalls had a p99 of 200 to 380 ms
+  where its neighbour's was 30 to 50: the sealed log's p99 came to 0.09 to 7.3 times the plain
+  one's, in either direction, row by row.
+- So the logs run at once on the same device, and a stall meets both. Fed the same arrivals, their
+  batches were ready at the same moments and the sealed log, its owner a few microseconds longer at
+  each frame, could reach the device second, a flush behind: a one-round run had its p99 1.27 times
+  the plain one's at a p50 0.995 of it. Each log has its own schedule at the same rate since.
+- Two runs of the plain and the sealed log at once, each on its own schedule, met the rule's first
+  form at 3 and 6 of 36 points, at 100 bytes and 75% in both (p99s of 236–294 ms against a flush
+  p99 of 21–25 ms) and at 16 KiB and half the capacity in both (a p99.9 1.11 and 1.32 times the
+  plain one's). A run of two plain logs alone at those sizes and loads then put the second's p99 at
+  0.43 to 1.07 times the first's: the margin the first form stated, the flush's spread, is narrower
+  than what this host makes of two identical logs. A second plain log has run beside the two since.
+
+**The rule** (docs/seal.md §11, each form fixed before its runs): each of the sealed log's p50, p99
+and p99.9 must have a 95% interval overlapping the plain log's, or exceed it by no more than the
+plain log's flush spread (the median over its runs of the flush's p99 less its p50) and, in the
+second form, the second plain log's difference from the first. The second form held at 35 of 36
+points (12:01–12:04 PDT), failing at 1,024 bytes and half the capacity, a p99.9 of 392 ms against
+366 with the flush's p99 at 25–29 ms. The third form asks a point to fail in each of two further
+runs: it held at all 36 in the first (12:04–12:07) and at 34 in the second (12:07–12:09, failing at
+300 bytes and 75%, a p99 1.035 times the plain one's past a margin of 13.6 ms by 0.4 ms, and at
+16 KiB and 75%), so no point failed in both, and the rule holds.
+
+The first further run's verdicts, the ratios of each quantile's estimates (plain against plain, then
+sealed against plain), the offered rate each log's:
+
+| entry B | offered appends/s each | plain flush spread µs | plain again / plain: p50, p99, p99.9 | sealed / plain: p50, p99, p99.9 | docs/seal.md §11's rule |
+|---|---|---|---|---|---|
+| 100 | 417 (25%) | 65012 | 0.998, 0.927, 0.967 | 0.975, 1.003, 1.047 | holds, holds, holds |
+| 100 | 834 (50%) | 41943 | 0.973, 1.143, 0.947 | 0.964, 1.031, 0.968 | holds, holds, holds |
+| 100 | 1251 (75%) | 50332 | 0.987, 1.027, 0.978 | 0.968, 0.973, 0.965 | holds, holds, holds |
+| 300 | 549 (25%) | 14680 | 0.999, 0.931, 0.999 | 1.003, 0.935, 0.994 | holds, holds, holds |
+| 300 | 1097 (50%) | 20972 | 1.002, 1.027, 0.994 | 0.988, 1.010, 0.997 | holds, holds, holds |
+| 300 | 1646 (75%) | 15729 | 1.023, 1.051, 0.933 | 1.011, 1.071, 0.879 | holds, holds, holds |
+| 1024 | 371 (25%) | 22020 | 0.993, 0.934, 0.829 | 0.990, 0.890, 0.840 | holds, holds, holds |
+| 1024 | 742 (50%) | 16777 | 0.995, 0.915, 0.971 | 0.985, 0.965, 0.964 | holds, holds, holds |
+| 1024 | 1112 (75%) | 14680 | 0.977, 0.921, 0.941 | 0.977, 0.978, 0.969 | holds, holds, holds |
+| 16384 | 467 (25%) | 17826 | 1.014, 1.065, 1.018 | 0.975, 1.052, 1.011 | holds, holds, holds |
+| 16384 | 933 (50%) | 13631 | 1.024, 0.933, 0.971 | 0.995, 0.950, 1.006 | holds, holds, holds |
+| 16384 | 1400 (75%) | 16777 | 1.009, 0.997, 0.984 | 0.986, 0.990, 0.971 | holds, holds, holds |
+
+- **At the median sealing costs nothing a run resolves**: sealed against plain 0.964–1.043 at every
+  size and load of the three runs, where the second plain log stood 0.973–1.041 from the first. A
+  frame waits milliseconds for its flush (the flush's p50 11.5–18.9 ms here) and sealing adds
+  microseconds.
+- **The tails are the host's**: the p99s of all three logs, 63 to 467 ms, and their p99.9s, 75 to
+  497 ms, move together with the stalls, in rows whose flush p99 was 17 to 117 ms.
+- **Bytes and flushes**: the bytes written an append move with the batches' padding to 4 KiB blocks
+  as much as with sealing (at 100 bytes the sealed log wrote 0.97–1.05 times the plain one's, the
+  second plain log 0.98–1.02), a sealed record carrying its 16-byte tag and a frame its 32-byte MAC
+  by construction; the flushes an append are the same.
+
+So the log is sealed by default from here: hyper-log's and hyper-durable's end-to-end suites now run
+sealed logs (docs/seal.md §12), and a consumer opens its log with `Log::create_sealed` and
+`Log::open_sealed` unless it states otherwise.
+
 ## hyper-quic at 500 ms one way under bursts: copies spaced past the burst (2026-10-05)
 
 Before is `line` at 1a385a2 (copies of the handshake's flights sent right behind their originals);

@@ -509,6 +509,26 @@ endpoint keep the standard sets.
   KiB) and mantle, p50, p99 and p999 of the acknowledgement, under the machine's own load, recorded;
   sealing is the default only if its added latency is within a margin stated from the measured flush
   distribution.
+  - **The rule, fixed before the run** (`crates/hyper-log/benches/sealing.rs`, 2026-10-13): at every
+    entry size and offered load, each of the sealed log's p50, p99 and p99.9 must either have a 95%
+    interval overlapping the plain log's, or exceed the plain estimate by less than the plain runs'
+    flush spread: the median over those runs of the flush's own p99 less its p50 (the log's `flush`
+    histogram). A sealed quantile past both is a cost the default waits on.
+  - **The rule's second form, fixed before its run** (2026-10-13), after the first runs met it in
+    rows the host's stalls decided (`docs/benchmarks.md`, "Sealing at rest"): a second plain log
+    runs beside the two, and the margin is the larger of the flush spread and that log's difference
+    from the first plain log at the same quantile, what the host makes of two identical logs in the
+    same span.
+  - **Its third form, fixed before its runs** (2026-10-13), after the second form held at 35 of 36
+    points and failed at one whose tails the host's stalls set (p99.9 near 390 ms against a flush
+    p99 of 25–29 ms): one run's margin is a single draw of a heavy-tailed difference, so a point
+    fails only where it fails in each of two further runs, a cost of sealing being one that comes
+    back.
+  - **Measured, and the default** (2026-10-13, `docs/benchmarks.md`, "Group commit in an open loop,
+    sealed against plain"): the third form holds at every point, no point failing in both runs (36
+    of 36 in the first, 34 of 36 in the second); at the median the sealed log stood 0.964–1.043 of
+    the plain one, where a second plain log stood 0.973–1.041. The log is sealed by default from
+    here: hyper-log's and hyper-durable's end-to-end suites run sealed (§12).
 - **Open of one record**: a 4 KiB and a 300 B record, p50 and p99 under load (slates: ≤ ~1 µs p99 at
   4 KiB).
 - **Key make and wrap**: p50 and p99 (slates: single-digit µs).

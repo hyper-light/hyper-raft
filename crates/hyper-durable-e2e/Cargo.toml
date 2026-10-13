@@ -12,6 +12,8 @@ publish = false
 hyper-block = { path = "../hyper-block" }
 hyper-durable = { path = "../hyper-durable" }
 hyper-log = { path = "../hyper-log" }
+# The sealed log's keys (docs/seal.md §11: the log is sealed by default).
+hyper-seal = { path = "../hyper-seal" }
 # The node-pair liveness stream the members' detectors are (timing step L-3).
 hyper-liveness = { path = "../hyper-liveness" }
 # The kernel's receive stamps on the host's clock, for the heartbeats a member reads from its own

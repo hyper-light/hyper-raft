@@ -721,6 +721,7 @@ dependencies = [
  "hyper-measure",
  "hyper-raft",
  "hyper-raft-e2e",
+ "hyper-seal",
  "hyper-timing",
  "hyper-tokio",
 ]
@@ -763,6 +764,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-block",
  "hyper-log",
+ "hyper-seal",
 ]
 
 [[package]]

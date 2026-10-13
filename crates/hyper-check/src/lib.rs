@@ -45,5 +45,5 @@ pub mod witness;
 
 pub use agree::{Agreed, Agreement, Disagreement, agree};
 pub use history::{Operation, verify};
-pub use model::{Access, Answer, Model, Register};
+pub use model::{Access, Answer, Map, Model, Register};
 pub use search::{Budget, Counterexample, Searched, Verdict, search, search_partitions};

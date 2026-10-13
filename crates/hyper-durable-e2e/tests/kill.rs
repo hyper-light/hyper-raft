@@ -5,7 +5,9 @@
 //! taken, messages released, a change behind the commit fence, a change applied, an entry acted on
 //! at start) and at random points, a flush is made to fail, a disk is stalled, and the
 //! configuration changes. What is asserted is what a client and an operator can observe:
-//! - every write a member answered is read back, linearizably, through whichever member leads;
+//! - every write a member answered is read back, linearizably, through whichever member leads,
+//!   and the clients' whole history of writes and reads is linearizable
+//!   (`hyper_raft_e2e::history`);
 //! - every member that is up applies the same history (the same digest at the same index);
 //! - focal F17's two cases: a founder that removed its only peer, killed once it applied the
 //!   removal and its peer stopped for good, elects itself alone; and a host that acted on a fence
@@ -69,6 +71,7 @@ use std::time::{Duration, Instant};
 use hyper_durable_e2e::control::{self, Order, Point, Report};
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::device::{self, Probe};
+use hyper_raft_e2e::history::Recorder;
 use hyper_raft_e2e::quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch};
 use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome};
 use hyper_raft_e2e::{run, stream};
@@ -120,6 +123,9 @@ struct Cluster {
     buffer: Vec<u8>,
     /// Every write a member answered: key → value.
     acked: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Every write and read the test asked: the clients' history, held linearizable as each
+    /// scenario ends ([`Cluster::verify`], `docs/sim.md` §6, step S-7).
+    clients: Recorder,
     /// Members that printed `stopped`: they wait to be killed and answer nothing.
     stopped: Vec<u64>,
     /// Members ordered to fail a flush: each fences and exits, which ends its process as the test
@@ -226,6 +232,7 @@ impl Cluster {
             next_id: 0,
             buffer: Vec::new(),
             acked: BTreeMap::new(),
+            clients: Recorder::new(),
             stopped: Vec::new(),
             fencing: Vec::new(),
             fast,
@@ -310,8 +317,12 @@ impl Cluster {
         self.next_id += 1;
         let ask = self.next_id;
         wire::put_request(&mut self.buffer, ask, op);
-        let body = self.exchange(id, ask)?;
-        wire::read_response(&body).map(|(_, outcome)| outcome)
+        let call = self.clients.clock();
+        let outcome = self
+            .exchange(id, ask)
+            .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
+        self.clients.record(op, call, outcome.as_ref());
+        outcome
     }
 
     fn order(&mut self, id: u64, order: Order) -> Option<Outcome> {
@@ -930,6 +941,15 @@ impl Cluster {
             caught,
             "{name}: members stopped moving before they caught up to {index}; {}",
             self.state()
+        );
+        let refused = self
+            .clients
+            .unlinearizable()
+            .unwrap_or_else(|e| panic!("{name}: a history that does not read: {e}"));
+        assert!(
+            refused.is_empty(),
+            "{name}: the clients' history of {} operations is not linearizable: {refused:#?}",
+            self.clients.operations().len()
         );
     }
 

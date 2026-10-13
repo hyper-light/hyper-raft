@@ -2,8 +2,11 @@
 //!
 //! ```text
 //! hyper-raft-node --id N --voters 1,2,3 --listen 127.0.0.1:0 --wal PATH
-//!                 --max-keys K --max-pending P --max-writes W
+//!                 --max-keys K --max-pending P --max-writes W [--stale-reads]
 //! ```
+//!
+//! `--stale-reads` plants a defect for the test that shows the clients' history check catches one
+//! (`Settings::stale_reads`).
 //!
 //! It prints `listening <port>` once its socket is bound, then serves until its standard input
 //! ends — its parent closed it or died, so a member never outlives the test that started it — or
@@ -48,6 +51,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
             max_keys: value(arguments, "--max-keys")?,
             max_pending: value(arguments, "--max-pending")?,
             max_writes: value(arguments, "--max-writes")?,
+            stale_reads: arguments.iter().any(|argument| argument == "--stale-reads"),
         },
         listen: value(arguments, "--listen")?,
         wal: PathBuf::from(value::<String>(arguments, "--wal")?),

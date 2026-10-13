@@ -52,6 +52,7 @@ fn a_member_behind_its_deadline_still_reads_what_arrived() {
         max_keys: 1,
         max_pending: 1,
         max_writes: 16,
+        stale_reads: false,
     };
     // Its first run: nothing heard it before.
     let mut node = Node::open(settings, 1, socket, wal).unwrap();

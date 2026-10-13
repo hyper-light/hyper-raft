@@ -3,7 +3,9 @@
 //! drives it as a client would, through the same datagrams a client sends. What is asserted is
 //! what a client can observe:
 //! - every write a member answered is read back, by a linearizable read through whichever
-//!   member leads, after leaders are killed, members restart and members are cut off;
+//!   member leads, after leaders are killed, members restart and members are cut off, and the
+//!   clients' whole history of writes and reads is linearizable (`hyper_raft_e2e::history`); a
+//!   member planted to read stale (`--stale-reads`) is caught by that check;
 //! - a member cut off from the group never answers a read with a value the group has replaced,
 //!   and its detectors and every other member's see the cut;
 //! - every member that is up applies the same history (the same digest at the same index);
@@ -59,6 +61,7 @@ use std::{
 use hyper_raft::proto::{self, Entry};
 use hyper_raft_e2e::{
     device::{self, Probe},
+    history::Recorder,
     node,
     quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch},
     run,
@@ -104,12 +107,15 @@ fn phase(name: &str, datagram: usize) -> usize {
 }
 
 /// What a member holds, from what its scenario writes: the keys, the asks it keeps waiting at
-/// once, and the writes, which bound its log (one entry for each, and one for each term).
+/// once, and the writes, which bound its log (one entry for each, and one for each term); and
+/// whether it reads stale, the defect planted to show the history check catches one
+/// (`node::Settings::stale_reads`).
 #[derive(Clone, Copy)]
 struct Room {
     keys: usize,
     pending: usize,
     writes: usize,
+    stale_reads: bool,
 }
 
 struct Member {
@@ -136,6 +142,9 @@ struct Cluster {
     datagram: usize,
     next_id: u64,
     buffer: Vec<u8>,
+    /// Every write and read the test asked: the clients' history, checked linearizable at the
+    /// scenario's end ([`Cluster::linearizable`]).
+    clients: Recorder,
 }
 
 impl Drop for Cluster {
@@ -161,6 +170,7 @@ fn spawn(id: u64, voters: usize, listen: &str, wal: &Path, room: Room) -> (Child
         .args(["--max-keys", &room.keys.to_string()])
         .args(["--max-pending", &room.pending.to_string()])
         .args(["--max-writes", &room.writes.to_string()])
+        .args(room.stale_reads.then_some("--stale-reads"))
         // The member serves until this pipe closes: when the test ends, however it ends.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -215,6 +225,7 @@ impl Cluster {
             datagram,
             next_id: 0,
             buffer: Vec::new(),
+            clients: Recorder::new(),
         };
         for id in cluster.up_members() {
             cluster.tell_peers(id);
@@ -287,8 +298,32 @@ impl Cluster {
         self.next_id += 1;
         let ask = self.next_id;
         wire::put_request(&mut self.buffer, ask, op);
-        let body = self.exchange(id, ask)?;
-        wire::read_response(&body).map(|(_, outcome)| outcome)
+        let call = self.clients.clock();
+        let outcome = self
+            .exchange(id, ask)
+            .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
+        self.clients.record(op, call, outcome.as_ref());
+        outcome
+    }
+    /// The keys whose histories in the clients' have no order, with what the search said of each.
+    fn unlinearizable(&self) -> Vec<String> {
+        self.clients
+            .unlinearizable()
+            .unwrap_or_else(|e| panic!("{}: a history that does not read: {e}", self.name))
+    }
+    /// The clients' history is linearizable; how many operations it held over how many keys.
+    fn linearizable(&self) -> String {
+        let refused = self.unlinearizable();
+        assert!(
+            refused.is_empty(),
+            "{}: the clients' history is not linearizable: {refused:#?}",
+            self.name
+        );
+        format!(
+            "; a history of {} operations over {} keys linearizable",
+            self.clients.operations().len(),
+            self.clients.keys()
+        )
     }
     #[allow(
         clippy::disallowed_methods,
@@ -888,6 +923,7 @@ fn commits(voters: usize, name: &'static str) -> String {
         keys: writes,
         pending: 1,
         writes,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, voters, room);
     let all = cluster.up_members();
@@ -900,8 +936,9 @@ fn commits(voters: usize, name: &'static str) -> String {
     let checked = verify(&mut cluster, &mut client, &history);
     let applied = cluster.converged(&all);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all applied index {applied} alike{detectors}",
+        "{name}: {voters} members; {checked} writes answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all applied index {applied} alike{detectors}{linear}",
         elapsed.as_secs_f64() * 1e3 / writes as f64,
         slowest.as_secs_f64() * 1e3,
     )
@@ -909,13 +946,23 @@ fn commits(voters: usize, name: &'static str) -> String {
 
 /// A client of its own for the writes in flight: it sends them at once without waiting, and reads
 /// their answers only to leave out of its next sending the ones answered. Answers to that many at
-/// once would fill the test's own socket and push out the reports it waits on.
+/// once would fill the test's own socket and push out the reports it waits on. Each sending is in
+/// the clients' history: answered when its answer is read, and never answered when it is sent
+/// again under another request or the scenario stops waiting.
 struct Flight {
     socket: UdpSocket,
-    /// The request each write was last sent under: id → the write's number.
-    sent: BTreeMap<u64, usize>,
+    /// What each write was last sent under: id → the write.
+    sent: BTreeMap<u64, Sent>,
     /// The writes a member answered committed.
     answered: std::collections::BTreeSet<usize>,
+}
+
+/// A write in flight: its number, its key and value, and when it was sent on the test's clock.
+struct Sent {
+    at: usize,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    call: u64,
 }
 
 impl Flight {
@@ -930,8 +977,8 @@ impl Flight {
     }
     /// Sends the writes `keys` of scenario `name` not yet answered to `to`, at once.
     fn send(&mut self, cluster: &mut Cluster, name: &str, to: u64, keys: std::ops::Range<usize>) {
-        self.take_answers();
-        self.sent.clear();
+        self.take_answers(cluster);
+        self.close(cluster);
         let address = cluster.address(to);
         for at in keys.filter(|at| !self.answered.contains(at)) {
             let key = format!("{name}-{at}");
@@ -946,23 +993,42 @@ impl Flight {
                 },
             );
             assert!(wire::seal(&mut cluster.buffer, cluster.datagram));
+            let call = cluster.clients.clock();
             // A full socket refuses or drops: the write is sent again.
             let _ = self.socket.send_to(&cluster.buffer, address);
-            self.sent.insert(cluster.next_id, at);
+            self.sent.insert(
+                cluster.next_id,
+                Sent {
+                    at,
+                    key: key.into_bytes(),
+                    value: value.into_bytes(),
+                    call,
+                },
+            );
         }
     }
     /// Takes the answers that have come, without waiting.
-    fn take_answers(&mut self) {
+    fn take_answers(&mut self, cluster: &mut Cluster) {
         let mut received = vec![0u8; wire::MAX_DATAGRAM];
         while let Ok((length, _)) = self.socket.recv_from(&mut received) {
             let Some((Kind::Response, body)) = wire::open(&received[..length]) else {
                 continue;
             };
             if let Some((id, Outcome::Put(_))) = wire::read_response(body)
-                && let Some(at) = self.sent.get(&id)
+                && let Some(sent) = self.sent.remove(&id)
             {
-                self.answered.insert(*at);
+                self.answered.insert(sent.at);
+                cluster.clients.write(sent.key, sent.value, sent.call, true);
             }
+        }
+    }
+    /// Every write in flight not answered goes into the history as never answered: it may take
+    /// effect at any time after it was sent, or never.
+    fn close(&mut self, cluster: &mut Cluster) {
+        for (_, sent) in std::mem::take(&mut self.sent) {
+            cluster
+                .clients
+                .write(sent.key, sent.value, sent.call, false);
         }
     }
 }
@@ -978,6 +1044,7 @@ fn leader_killed() -> String {
         keys: 3 * phase,
         pending: phase + 1,
         writes: 3 * phase,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
@@ -1027,7 +1094,8 @@ fn leader_killed() -> String {
         }
     };
     // The writes in flight that were answered are committed.
-    flight.take_answers();
+    flight.take_answers(&mut cluster);
+    flight.close(&mut cluster);
     let answered = flight.answered.len();
     for at in &flight.answered {
         let key = format!("{name}-{at}").into_bytes();
@@ -1056,8 +1124,9 @@ fn leader_killed() -> String {
     cluster.restart(old);
     let applied = cluster.converged(&all);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: leader {old} (term {old_term}) killed with the {in_flight} writes in flight in its log; {new} elected in term {new_term}; {checked} answered writes read back; {answered} of them answered before the kill, and {unknown_present} of those unanswered committed by the new leader; member {old} restarted on its log, its restart reported, and applied index {applied} alike{detectors}"
+        "{name}: leader {old} (term {old_term}) killed with the {in_flight} writes in flight in its log; {new} elected in term {new_term}; {checked} answered writes read back; {answered} of them answered before the kill, and {unknown_present} of those unanswered committed by the new leader; member {old} restarted on its log, its restart reported, and applied index {applied} alike{detectors}{linear}"
     )
 }
 
@@ -1071,6 +1140,7 @@ fn follower_restarts() -> String {
         keys: 2 * phase,
         pending: 1,
         writes: 2 * phase,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
@@ -1093,8 +1163,9 @@ fn follower_restarts() -> String {
     assert!(applied >= commit);
     let checked = verify(&mut cluster, &mut client, &history);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, its restart reported, caught up to index {applied} alike; {checked} writes read back{detectors}"
+        "{name}: follower {follower} killed after {phase} writes, {phase} written without it, restarted on its log, its restart reported, caught up to index {applied} alike; {checked} writes read back{detectors}{linear}"
     )
 }
 
@@ -1111,6 +1182,7 @@ fn partition() -> String {
         keys: 2 * phase + 1,
         pending: 1,
         writes: 2 * phase + 3,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, 5, room);
     let all = cluster.up_members();
@@ -1188,8 +1260,9 @@ fn partition() -> String {
     let (leader, _) = cluster.leader_among(&all);
     let checked = verify(&mut cluster, &mut client, &history);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; it suspected all four and all four suspected it; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {applied} alike; {checked} writes read back{detectors}"
+        "{name}: leader {old} of 5 cut off; at once it answered a read with {early_read:?} and a write with {early_write:?}, and later the read of a replaced key with {stale:?}; it suspected all four and all four suspected it; {new} elected in term {new_term}; after the filter lifted, {leader} leads and all applied index {applied} alike; {checked} writes read back{detectors}{linear}"
     )
 }
 
@@ -1207,6 +1280,7 @@ fn stalled_devices() -> String {
         keys: 2 * phase + 1,
         pending: 1,
         writes: 2 * phase + 1,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
@@ -1237,7 +1311,12 @@ fn stalled_devices() -> String {
     );
     assert!(wire::seal(&mut cluster.buffer, cluster.datagram));
     let address = cluster.address(leader);
+    let call = cluster.clients.clock();
     cluster.test.send_to(&cluster.buffer, address).unwrap();
+    // Its answer is not waited for: in the clients' history it is a write never answered.
+    cluster
+        .clients
+        .write(key.clone().into_bytes(), b"stalled".to_vec(), call, false);
     history
         .unknown
         .insert(key.into_bytes(), b"stalled".to_vec());
@@ -1257,8 +1336,9 @@ fn stalled_devices() -> String {
     let checked = verify(&mut cluster, &mut client, &history);
     let applied = cluster.converged(&all);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: every member's device held its flushes {:.1} s after {phase} writes; a write sent into the stall committed once the devices went on; {checked} writes read back; all applied index {applied} alike{detectors}",
+        "{name}: every member's device held its flushes {:.1} s after {phase} writes; a write sent into the stall committed once the devices went on; {checked} writes read back; all applied index {applied} alike{detectors}{linear}",
         stall.as_secs_f64()
     )
 }
@@ -1276,6 +1356,7 @@ fn member_stopped() -> String {
         keys: phase + 1,
         pending: 1,
         writes: phase + 1,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
@@ -1317,8 +1398,9 @@ fn member_stopped() -> String {
     let applied = cluster.converged(&all);
     let checked = verify(&mut cluster, &mut client, &history);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: member {stopped} stopped after {phase} writes; the wait for it failed after {:.1} s of its silence, naming it; let go, it applied index {applied} with the others; {checked} writes read back{detectors}",
+        "{name}: member {stopped} stopped after {phase} writes; the wait for it failed after {:.1} s of its silence, naming it; let go, it applied index {applied} with the others; {checked} writes read back{detectors}{linear}",
         silence.as_secs_f64()
     )
 }
@@ -1331,6 +1413,7 @@ fn all_killed() -> String {
         keys: phase,
         pending: 1,
         writes: phase,
+        stale_reads: false,
     };
     let mut cluster = Cluster::start(name, 3, room);
     let all = cluster.up_members();
@@ -1349,8 +1432,58 @@ fn all_killed() -> String {
     let checked = verify(&mut cluster, &mut client, &history);
     let applied = cluster.converged(&all);
     let detectors = cluster.detectors();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {applied} alike{detectors}"
+        "{name}: every member killed after {phase} answered writes and restarted on its log; {leader} leads in term {term}; {checked} writes read back; all applied index {applied} alike{detectors}{linear}"
+    )
+}
+
+/// The defect planted to show the clients' history check catches one (`docs/sim.md` §9, S-7):
+/// members that answer a read from what they applied, whoever leads (`--stale-reads`). A follower
+/// cut off answers a key's old value after its new one was written and answered, and the history
+/// check refuses that key's history, and no other.
+fn stale_read_planted() -> String {
+    let name = "stale-read-planted";
+    // The room of a phase, as the other scenarios size theirs: the core derives its bounds from
+    // what a member holds, and a member that holds less opens on none.
+    let writes = phase(name, datagram());
+    let room = Room {
+        keys: writes,
+        pending: 1,
+        writes,
+        stale_reads: true,
+    };
+    let mut cluster = Cluster::start(name, 3, room);
+    let all = cluster.up_members();
+    let (leader, _) = cluster.leader_among(&all);
+    let mut client = Client { leader };
+    let mut history = History::default();
+    let key = format!("{name}-moved");
+    assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"before"));
+    cluster.converged(&all);
+    let follower = all.iter().copied().find(|id| *id != leader).unwrap();
+    cluster.isolate(follower, true);
+    assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"after"));
+    let stale = cluster.ask(
+        follower,
+        &Op::Get {
+            key: key.as_bytes(),
+        },
+    );
+    assert_eq!(
+        stale,
+        Some(Outcome::Value(Some(b"before".to_vec()))),
+        "{name}: the member cut off answers what it applied"
+    );
+    let refused = cluster.unlinearizable();
+    assert!(
+        refused.len() == 1 && refused[0].starts_with(&key),
+        "{name}: the history check refuses the stale read's key alone: {refused:#?}"
+    );
+    cluster.isolate(follower, false);
+    format!(
+        "{name}: members reading what they applied; follower {follower} cut off answered {stale:?} after \"after\" was written and answered; the history check refused that key: {}",
+        refused[0]
     )
 }
 
@@ -1371,7 +1504,7 @@ fn main() -> ExitCode {
     )
     .unwrap();
     drop(out);
-    let scenarios: [(&str, Scenario); 8] = [
+    let scenarios: [(&str, Scenario); 9] = [
         ("commits-3", || commits(3, "commits-3")),
         ("commits-5", || commits(5, "commits-5")),
         ("leader-killed", leader_killed),
@@ -1380,6 +1513,7 @@ fn main() -> ExitCode {
         ("all-killed", all_killed),
         ("stalled-devices", stalled_devices),
         ("member-stopped", member_stopped),
+        ("stale-read-planted", stale_read_planted),
     ];
     let filter: Vec<String> = std::env::args()
         .skip(1)

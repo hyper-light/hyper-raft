@@ -21,6 +21,9 @@ hyper-tokio = { path = "../hyper-tokio" }
 hyper-timing = { path = "../hyper-timing" }
 # The wait for a datagram every member and the tests make (`hyper_measure::wait::arrives`).
 hyper-measure = { path = "../hyper-measure" }
+# The search checker the clients' history is held linearizable by (`history`, docs/sim.md §6,
+# step S-7).
+hyper-check = { path = "../hyper-check" }
 # The codec of raft-rs's wire and log types, which hyper-raft speaks (prost).
 
 # The fault report's vectored exception handler (`fault`).

@@ -123,3 +123,62 @@ impl<V: Clone + Eq + Hash + Debug> Model for Register<V> {
         )
     }
 }
+
+/// A map of registers, one a key: an operation names its key and what it asks of that key's
+/// register. A map is linearizable exactly when each key's history is (Herlihy and Wing Theorem 1),
+/// so it is searched key by key ([`crate::search_partitions`] with [`Map::key`]), each part
+/// starting from an empty register: the end-to-end clients' keys, each written and read back.
+pub struct Map<K, V>(PhantomData<fn() -> (K, V)>);
+
+impl<K, V> Map<K, V> {
+    /// The map.
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+
+    /// The key an operation names: what partitions a map's history.
+    pub fn key<O>(operation: &crate::Operation<(K, Access<V>), O>) -> K
+    where
+        K: Clone,
+    {
+        operation.input.0.clone()
+    }
+}
+
+impl<K, V> Default for Map<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> Clone for Map<K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K, V> Copy for Map<K, V> {}
+
+impl<K, V> Debug for Map<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Map")
+    }
+}
+
+impl<K: Clone + Eq + Debug, V: Clone + Eq + Hash + Debug> Model for Map<K, V> {
+    type State = Option<V>;
+    type Input = (K, Access<V>);
+    type Output = Answer<V>;
+
+    fn init(&self) -> Self::State {
+        None
+    }
+
+    fn apply(&self, state: &Self::State, input: &Self::Input) -> (Self::Output, Self::State) {
+        Register::new().apply(state, &input.1)
+    }
+
+    fn answers(&self, input: &Self::Input, output: &Self::Output) -> bool {
+        Register::<V>::new().answers(&input.1, output)
+    }
+}

@@ -122,6 +122,10 @@ pub struct Settings {
     pub max_pending: usize,
     /// The most writes the scenario makes, which bounds the log ([`Wal::open`]).
     pub max_writes: usize,
+    /// A defect planted for the test that shows the clients' history check catches one
+    /// (`docs/sim.md` §9, S-7): the member answers a read from what it applied, whoever leads,
+    /// confirming nothing (no ReadIndex), so a member cut off answers what the group has replaced.
+    pub stale_reads: bool,
 }
 
 /// A client waiting for its answer.
@@ -869,6 +873,10 @@ impl Node {
     }
 
     fn read(&mut self, asker: Asker, key: &[u8]) -> Result<(), NodeError> {
+        if self.settings.stale_reads {
+            let value = self.app.store.get(key).cloned();
+            return self.respond(asker.address, asker.id, &Outcome::Value(value));
+        }
         if !self.leads(asker)? || !self.room(asker, self.reads.len())? {
             return Ok(());
         }

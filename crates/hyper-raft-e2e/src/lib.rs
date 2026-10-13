@@ -4,13 +4,14 @@
 //! write to it and read from it as a client, kill members with `SIGKILL`, restart them on their
 //! logs, and cut them off from the others with a drop filter inside the process, and assert what
 //! a client can observe: every write a member answered is read back, from whichever member
-//! leads, and every member that is up applies the same history. Its waits keep the rule of
-//! [`quiet`], as hyper-durable-e2e's do.
+//! leads, every member that is up applies the same history, and the clients' history is
+//! linearizable ([`history`]). Its waits keep the rule of [`quiet`], as hyper-durable-e2e's do.
 //!
 //! One thread per process, and one process per member: the harness never multiplies either.
 
 pub mod device;
 pub mod fault;
+pub mod history;
 pub mod node;
 pub mod parent;
 pub mod quiet;

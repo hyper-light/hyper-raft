@@ -4,7 +4,8 @@
 //! can observe, as the core's scenarios assert it (`hyper-raft-e2e/tests/cluster.rs`):
 //! - every write a member answered is read back, by a linearizable read through whichever member
 //!   leads the key's log, after a member is killed and started again on its logs, and after a
-//!   member is cut off and let back;
+//!   member is cut off and let back, and the clients' whole history of writes and reads is
+//!   linearizable (`hyper_raft_e2e::history`);
 //! - a member cut off answers no read with a value and acknowledges no write;
 //! - every member that is up reaches the same state having merged all its logs gave it (the same
 //!   store's digest, every log's commit merged), whatever interleaving of the logs it applied in.
@@ -50,6 +51,7 @@ use hyper_measure::usage::{self, Usage, UsageError};
 use hyper_multilog_e2e::member::{self, route_of};
 use hyper_raft::proto::{self, Entry};
 use hyper_raft_e2e::{
+    history::Recorder,
     quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch},
     run,
     stream::{self, Report},
@@ -130,6 +132,9 @@ struct Cluster {
     gets: Vec<u64>,
     /// The bytes of key and value the answered writes stored.
     stored: u64,
+    /// Every write and read the test asked: the clients' history, held linearizable at the
+    /// scenario's end ([`Cluster::linearizable`], `docs/sim.md` §6, step S-7).
+    clients: Recorder,
 }
 
 impl Drop for Cluster {
@@ -222,6 +227,7 @@ impl Cluster {
             datagram,
             next_id: 0,
             buffer: Vec::new(),
+            clients: Recorder::new(),
             puts: Vec::new(),
             gets: Vec::new(),
             stored: 0,
@@ -297,8 +303,29 @@ impl Cluster {
         self.next_id += 1;
         let ask = self.next_id;
         wire::put_request(&mut self.buffer, ask, op);
-        let body = self.exchange(id, ask)?;
-        wire::read_response(&body).map(|(_, outcome)| outcome)
+        let call = self.clients.clock();
+        let outcome = self
+            .exchange(id, ask)
+            .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
+        self.clients.record(op, call, outcome.as_ref());
+        outcome
+    }
+    /// The clients' history is linearizable; how many operations it held over how many keys.
+    fn linearizable(&self) -> String {
+        let refused = self
+            .clients
+            .unlinearizable()
+            .unwrap_or_else(|e| panic!("{}: a history that does not read: {e}", self.name));
+        assert!(
+            refused.is_empty(),
+            "{}: the clients' history is not linearizable: {refused:#?}",
+            self.name
+        );
+        format!(
+            "; a history of {} operations over {} keys linearizable",
+            self.clients.operations().len(),
+            self.clients.keys()
+        )
     }
     #[allow(
         clippy::disallowed_methods,
@@ -862,8 +889,9 @@ fn tails(logs: usize, name: &'static str) -> String {
     let after = cluster.accounts();
     let applied = cluster.converged(&all);
     let tails = cluster.tails();
+    let linear = cluster.linearizable();
     let head = format!(
-        "{name}: 3 members, {logs} logs, {writes} writes ({} global) in {:.1} s; all merged {applied} entries alike{tails}",
+        "{name}: 3 members, {logs} logs, {writes} writes ({} global) in {:.1} s; all merged {applied} entries alike{linear}{tails}",
         globals(writes),
         elapsed.as_secs_f64(),
     );
@@ -1003,8 +1031,9 @@ fn commits(logs: usize, name: &'static str) -> String {
     let checked = verify(&mut cluster, &mut client, &history);
     let applied = cluster.converged(&all);
     let detectors = cluster.detectors() + &cluster.tails();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: 3 members, {logs} logs; {checked} writes ({} global) answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all merged {applied} entries alike{detectors}",
+        "{name}: 3 members, {logs} logs; {checked} writes ({} global) answered and read back ({:.2} ms per write and read, {:.2} ms the slowest); all merged {applied} entries alike{detectors}{linear}",
         globals(writes),
         elapsed.as_secs_f64() * 1e3 / writes as f64,
         slowest.as_secs_f64() * 1e3,
@@ -1043,8 +1072,9 @@ fn member_killed() -> String {
     assert!(applied >= commit);
     let checked = verify(&mut cluster, &mut client, &history);
     let detectors = cluster.detectors() + &cluster.tails();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: {logs} logs; log 0's leader {old} killed after {phase} writes, {new} elected in term {new_term}, {phase} written without it; restarted on its logs, its restart reported, all merged {applied} entries alike; {checked} writes read back{detectors}"
+        "{name}: {logs} logs; log 0's leader {old} killed after {phase} writes, {new} elected in term {new_term}, {phase} written without it; restarted on its logs, its restart reported, all merged {applied} entries alike; {checked} writes read back{detectors}{linear}"
     )
 }
 
@@ -1121,8 +1151,9 @@ fn partition() -> String {
     let applied = cluster.converged(&all);
     let checked = verify(&mut cluster, &mut client, &history);
     let detectors = cluster.detectors() + &cluster.tails();
+    let linear = cluster.linearizable();
     format!(
-        "{name}: {logs} logs; log 0's leader {old} cut off; it answered a read with {early_read:?} and a write with {early_write:?}, and later a read of the replaced key with {stale:?}; {new} elected in term {new_term}; after the filter lifted all merged {applied} entries alike; {checked} writes read back{detectors}"
+        "{name}: {logs} logs; log 0's leader {old} cut off; it answered a read with {early_read:?} and a write with {early_write:?}, and later a read of the replaced key with {stale:?}; {new} elected in term {new_term}; after the filter lifted all merged {applied} entries alike; {checked} writes read back{detectors}{linear}"
     )
 }
 

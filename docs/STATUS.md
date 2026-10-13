@@ -275,8 +275,10 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      tapes. Open: the world's chooser playing a tape (§18), hyper-durable's `support/device.rs` with
      hyper-log under the world (§11 item 6), the rest of S-3
      (the block device in the world, its completions' latency and its handles; the namespace model;
-     the fault envelope), the network cancelling a dropped message's arrival (§17, the capacity), S-7
-     (the E2E crates' histories checked) and S-8 (the consumers' simulations), `docs/sim.md` §9.
+     the fault envelope), the network cancelling a dropped message's arrival (§17, the capacity) and
+     S-8 (the consumers' simulations), `docs/sim.md` §9. S-7 is built (§19): every end-to-end
+     scenario's clients' history held linearizable by hyper-check's search, a planted stale read
+     refused.
    - Tails, `docs/tails.md` §7: T-0 (the grid), T-1 (the measurement kit: its open-loop schedule and
      quantile intervals built in hyper-measure, the per-process accounts of §1a open), T-2 (the
      impairment relay), then each crate class against its industry comparators under the same

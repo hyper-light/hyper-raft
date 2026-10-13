@@ -17,8 +17,9 @@
 > its completions events of the world. **S-6's first half built** (§17): hyper-durable's schedules
 > in the world, on its network and its write queue, judged by hyper-check's oracles, their crashes
 > enumerated by fork. The block device in the world (latency, handles), the namespace model, the
-> fault envelope, S-7 and S-8 are designed, not built. **S-6's second half** (§18): hyper-raft's
-> judged schedules under swarm configurations, `Lagged` on the write queue. Sources and
+> fault envelope and S-8 are designed, not built. **S-6's second half** (§18): hyper-raft's
+> judged schedules under swarm configurations, `Lagged` on the write queue. **S-7 built** (§19):
+> the end-to-end crates' clients' histories held linearizable, a planted stale read refused. Sources and
 > what each establishes are in `docs/research/sim.md`. The plan's starting point was mantle note 32
 > §3.10 and `docs/raft.md` §5; this design keeps their list of pieces and departs from it where §1
 > below shows a piece falls short.
@@ -1863,4 +1864,33 @@ network the world's.
   the defects of seeds 9,843 and 54,104 caught as planted mutants (`tests/check.rs`,
   `the_fast_track_without_its_first_rule_is_caught` and `_second_rule_`), their seeds' directed
   regressions kept at the fixed mix that found them.
+
+## 19. S-7 as built: the end-to-end histories (2026-10-13)
+
+The end-to-end crates (`hyper-raft-e2e`, `hyper-durable-e2e`, `hyper-multilog-e2e`) record every write
+and read their tests ask of a group (`hyper_raft_e2e::history::Recorder`): each on the test's one clock,
+its call stamped before it is sent and its return when its answer is read (Lowe §7.1). A write answered
+committed, a write never answered (it may take effect at any time after its call, or never) and a read
+answered with a value go in; a refusal took no effect and a read never answered observed nothing, so
+neither does (Herlihy and Wing §2.2). At each scenario's end the history is searched for an order by
+hyper-check's search checker as a map of registers, key by key (`hyper_check::Map`, Herlihy and Wing
+Theorem 1), and a key with no order fails the scenario, naming it with the search's counterexample.
+Reading back each answered write, which the crates did before, checks that nothing answered was lost;
+this checks that no read saw what no order of the group could give it.
+
+- **Every scenario's history is linearizable**: the core's eight (408 to 1,154 operations over 128 to
+  387 keys), the shell's at every kill point and fault (each scenario's `verify`), and the multi-log's six,
+  its tail runs 7,376 operations over 3,688 keys. `hyper-log-e2e`'s kills have one writer and no
+  reads: its history is the log's, held by its own check that every acknowledged frame is recovered.
+- **What it found first was the harness's**: the core's stalled-devices scenario sends one write
+  straight to its socket and waits for what the members apply, not for an answer, so the history held a
+  read of a value no write had given; the search refused that key at once. Such a write is now in the
+  history as a write never answered.
+- **A planted stale read is refused** (§9's gate): `hyper-raft-node --stale-reads` answers a read from
+  what its member applied, whoever leads, confirming nothing. In `stale-read-planted` a follower so
+  planted, cut off, answers a key's old value after its new one was written and answered, and the
+  search refuses that key's history alone: its prefix the two writes, the read stuck where only the new
+  value is legal. The scenario's other checks (`partition`'s: a member cut off answers no read with a
+  value) would catch the plant too; this one catches it from the clients' history alone, with no word
+  from the members.
 

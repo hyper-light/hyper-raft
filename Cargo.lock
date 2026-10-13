@@ -849,6 +849,7 @@ name = "hyper-raft-e2e"
 version = "0.1.0"
 dependencies = [
  "hyper-block",
+ "hyper-check",
  "hyper-liveness",
  "hyper-measure",
  "hyper-raft",

@@ -18,7 +18,7 @@
 use std::hash::Hash;
 
 use hyper_check::search::{Budget, Print, Searched, Spent, Verdict, search, search_with};
-use hyper_check::{Access, Answer, Model, Operation, Register, search_partitions, verify};
+use hyper_check::{Access, Answer, Map, Model, Operation, Register, search_partitions, verify};
 use hyper_sim::Seeded;
 
 type Op<V> = Operation<Access<V>, Answer<V>>;
@@ -585,4 +585,41 @@ fn a_map_is_checked_key_by_key() {
             }
         }
     }
+}
+
+/// A map of registers names its key in each operation and is searched key by key: a key read back
+/// as written, and another whose read after its write's return saw nothing, the stale read the
+/// end-to-end clients are held against (`docs/sim.md` §9, S-7). Each key's verdict is its own.
+#[test]
+fn a_map_names_its_key_in_each_operation() {
+    let map = Map::<&str, &str>::new();
+    let op = |key, call, ret: Option<u64>, input, output| Operation {
+        call,
+        ret,
+        input: (key, input),
+        output,
+    };
+    let ops = [
+        op("a", 1, Some(2), Access::Write("1"), Some(Answer::Written)),
+        op("b", 3, Some(4), Access::Write("2"), Some(Answer::Written)),
+        op("a", 5, Some(6), Access::Read, Some(Answer::Read(Some("1")))),
+        op("b", 7, Some(8), Access::Read, Some(Answer::Read(None))),
+        op("c", 9, None, Access::Write("3"), None),
+        op(
+            "c",
+            10,
+            Some(11),
+            Access::Read,
+            Some(Answer::Read(Some("3"))),
+        ),
+    ];
+    let parts = search_partitions(&map, &ops, Map::key, &Budget::default()).unwrap();
+    let verdicts: Vec<(&str, bool)> = parts
+        .iter()
+        .map(|part| {
+            let linearizable = matches!(part.searched.verdict, Verdict::Linearizable { .. });
+            (part.key, linearizable)
+        })
+        .collect();
+    assert_eq!(verdicts, vec![("a", true), ("b", false), ("c", true)]);
 }

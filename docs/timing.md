@@ -1542,7 +1542,13 @@ spend a term and depose a leader that never left.
   and woken for nothing. A member the leader suspects is left out, as CockroachDB quiesces a range
   whose behind replicas are on non-live nodes, and a leader that trusts a member again sends it a
   heartbeat, as CockroachDB wakes such ranges when the node becomes live
-  (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`).
+  (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`). What it sent
+  the member while suspecting it, it takes for lost, as raft takes a transport's report that a
+  member is unreachable (`MsgUnreachable`): the window is given up and the member probed from what
+  it is known to hold. A member cut off while its group committed was sent a window of what the cut
+  lost, and a full window is asked about only once a beat passes unanswered: without the rule it
+  caught up a round tail after the heal, and never at a leader whose owner had given it no timing
+  (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while suspected is taken for lost").
 - **A transfer** is given up `TRANSFER_ROUNDS` (two) rounds after it began, the order reaching the
   transferee and the new leader's append coming back with the transferee's vote round between
   (dissertation §3.10: given up when not finished within an election), or at once when the

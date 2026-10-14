@@ -60,97 +60,122 @@ struct BatchMark {
     listed_at_read: u64,
 }
 
-/// The shard's counters (slates' GAPS §7 tripwires read them).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Counters {
+/// Declares the shard's counters twice over, from one list: [`Counters`], the copy a reader takes, and
+/// `LiveCounters`, a `Cell` each on the desk, where the loop counts in place.
+macro_rules! counters {
+    ($($(#[$doc:meta])* $field:ident,)*) => {
+        /// The shard's counters (slates' GAPS §7 tripwires read them).
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Counters {
+            $($(#[$doc])* pub $field: u64,)*
+        }
+
+        /// The shard's counters as the loop keeps them: on the desk, a `Cell` each, counted in place, so a
+        /// reader's copy is taken when it reads and a step copies nothing (a step used to publish the whole
+        /// set to the desk, 312 bytes twice over: 15 ns of the 135 ns runtime's calibration item, two steps).
+        #[derive(Debug, Default)]
+        pub(crate) struct LiveCounters {
+            $(pub(crate) $field: std::cell::Cell<u64>,)*
+        }
+
+        impl LiveCounters {
+            /// The counts now, as the loop has kept them.
+            pub(crate) fn snapshot(&self) -> Counters {
+                Counters { $($field: self.$field.get(),)* }
+            }
+        }
+    };
+}
+
+counters! {
     /// Loop iterations.
-    pub steps: u64,
+    steps,
     /// Task polls.
-    pub polls: u64,
+    polls,
     /// Polls past the step quantum that were their task's own: past it on the CPU, or waiting inside a call.
-    pub long_steps: u64,
+    long_steps,
     /// Of `long_steps`, the polls that waited inside a call.
-    pub blocked_steps: u64,
+    blocked_steps,
     /// Polls past the quantum by the wall clock that the host held.
-    pub preempted_steps: u64,
+    preempted_steps,
     /// Polls past the quantum by the wall clock that could not be attributed.
-    pub unattributed_steps: u64,
+    unattributed_steps,
     /// The longest poll by the wall clock, in nanoseconds.
-    pub longest_step_ns: u64,
+    longest_step_ns,
     /// Kicked parks whose kick-to-running latency fed the online wake estimate.
-    pub wake_samples: u64,
+    wake_samples,
     /// Kick stamps that predated their park's announcement, dropped.
-    pub wake_stale: u64,
+    wake_stale,
     /// Kicks that found the shard not yet asleep, so no wake was measured.
-    pub wake_unslept: u64,
+    wake_unslept,
     /// The online wake estimate, nanoseconds.
-    pub wake_cost_ns: u64,
+    wake_cost_ns,
     /// The online cost of blocking: the CPU one park/wake cycle costs, the shard's park and its sender's
     /// kick, nanoseconds (`park_cost`); a tracking shard's idle spin lasts this long. 0 before the first
     /// measured park, and where the OS keeps no fine per-thread clock.
-    pub park_cost_ns: u64,
+    park_cost_ns,
     /// Parks whose CPU was measured into [`Counters::park_cost_ns`].
-    pub park_samples: u64,
+    park_samples,
     /// Tasks admitted.
-    pub spawns: u64,
+    spawns,
     /// Tasks whose future returned.
-    pub completed: u64,
+    completed,
     /// Tasks whose future was dropped.
-    pub cancelled: u64,
+    cancelled,
     /// Tasks whose poll unwound ([`Outcome::Unwound`]), and futures whose drop unwound: each caught by
     /// the shard's boundary around the task's code.
-    pub unwound: u64,
+    unwound,
     /// Wakes that arrived from other threads (the wake bitmap).
-    pub wakes_foreign: u64,
+    wakes_foreign,
     /// Of those, wakes for a slot with no task when drained: the task ended after the wake was sent. Not
     /// queued. A wake that raced its task's end *and* the slot's reuse wakes the new occupant once,
     /// spuriously, and cannot be told apart (a bit carries no generation); this counter bounds the
     /// visible half of that race (slates-dc's review item 4).
-    pub wakes_to_free_slots: u64,
+    wakes_to_free_slots,
     /// Control messages received.
-    pub controls: u64,
+    controls,
     /// Timers fired.
-    pub timers_fired: u64,
+    timers_fired,
     /// Sleeps that found every timer taken and waited for one to free (AUD-29-39).
-    pub timer_waits: u64,
+    timer_waits,
     /// Driver waits.
-    pub waits: u64,
+    waits,
     /// Non-blocking driver polls (`harvest_io`): each a system call, made only while a readiness wait is
     /// registered.
-    pub harvests: u64,
+    harvests,
     /// Reads of the thread's CPU account (`attribution::thread_account`), each a system call: made only
     /// while poll attribution is armed, and at a poll past the step quantum.
-    pub thread_accounts: u64,
+    thread_accounts,
     /// Reads of the thread's CPU clock to learn what a park costs, each a system call: two for each park
     /// the shard waits in while it learns ([`Counters::park_samples`]), and none otherwise.
-    pub park_cost_reads: u64,
+    park_cost_reads,
     /// Driver completions delivered.
-    pub completions: u64,
+    completions,
     /// Times the driver was lost.
-    pub driver_lost: u64,
+    driver_lost,
     /// Driver errors other than loss.
-    pub driver_errors: u64,
+    driver_errors,
     /// Admissions refused because no task slot was free.
-    pub admission_refused: u64,
+    admission_refused,
     /// Spawn requests drained after shutdown began and refused unadmitted.
-    pub refused_at_shutdown: u64,
+    refused_at_shutdown,
     /// Idle spins that ended with work arriving.
-    pub spin_hits: u64,
+    spin_hits,
     /// Pollers woken because their ring had something.
-    pub poller_wakes: u64,
+    poller_wakes,
     /// Idle spins that ran out and parked.
-    pub spin_misses: u64,
+    spin_misses,
     /// Idle spins ended by a timer falling due.
-    pub spin_deadlines: u64,
+    spin_deadlines,
     /// The measured scheduler overrun, nanoseconds.
-    pub scheduler_overrun_ns: u64,
+    scheduler_overrun_ns,
     /// 1 when the OS refused the core the shard's placement fixed it to.
-    pub pin_refused: u64,
+    pin_refused,
     /// Readiness registrations the driver refused (each handed to its task's next poll).
-    pub interests_refused: u64,
+    interests_refused,
     /// Marks of waits dropped away from this shard that its sweeps visited: one per marked slot, never a
     /// pass over every slot.
-    pub abandons_swept: u64,
+    abandons_swept,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -218,7 +243,6 @@ struct Core {
     timers: Wheel,
     driver: Box<dyn Driver>,
     config: RuntimeConfig,
-    counters: Counters,
     shutting_down: bool,
     exited: bool,
     driver_lost: bool,
@@ -372,7 +396,6 @@ impl Shard {
             completions: Vec::with_capacity(config.ring_entries),
             waiting: Interests::new(config.interests_per_shard)?,
             pollers: Vec::new(),
-            counters: Counters::default(),
             shutting_down: false,
             exited: false,
             driver_lost: false,
@@ -448,16 +471,7 @@ impl Shard {
 
     /// The counters.
     pub fn counters(&self) -> Counters {
-        let mut c = self.core.counters;
-        c.admission_refused = c
-            .admission_refused
-            .saturating_add(self.desk.refused_spawns.get());
-        c.timer_waits = c.timer_waits.saturating_add(self.desk.timer_waits.get());
-        c.scheduler_overrun_ns = self.desk.scheduler_overrun_ns.get();
-        c.wake_cost_ns = self.quantum_ns();
-        c.park_cost_ns = self.blocking_cost_ns().unwrap_or(0);
-        c.park_samples = self.core.park_cost.samples();
-        c
+        self.desk.counters()
     }
 
     /// Tasks not yet terminal (a finished one waiting for its joiner is not counted).
@@ -485,7 +499,7 @@ impl Shard {
 
     /// Records that the OS refused the core this shard's placement fixed it to.
     pub fn note_pin_refused(&mut self) {
-        self.core.counters.pin_refused = 1;
+        self.desk.live.pin_refused.set(1);
     }
 
     /// The driver's clock.
@@ -590,8 +604,7 @@ impl Shard {
             receipt,
         } = request;
         if self.core.shutting_down {
-            self.core.counters.refused_at_shutdown =
-                self.core.counters.refused_at_shutdown.saturating_add(1);
+            count(&self.desk.live.refused_at_shutdown, 1);
             receipt.answer(Admission::Terminated);
             return Err(RtError::ShardGone {
                 shard: self.desk.id,
@@ -748,7 +761,7 @@ impl Shard {
         if let Some(p) = parent {
             link_child(&mut self.core.tasks, p, slot);
         }
-        self.core.counters.spawns = self.core.counters.spawns.saturating_add(1);
+        count(&self.desk.live.spawns, 1);
     }
 
     fn apply_timer(&mut self, slot: u32) {
@@ -835,10 +848,16 @@ impl Shard {
         if self.core.driver_lost || self.core.exited {
             return false;
         }
+        // With no readiness wait registered and nothing pending in the driver there is nothing to harvest
+        // (`harvest_io` says the same): asked once, where the turn and the harvest asked the driver twice.
+        let pending = self.core.driver.has_pending();
+        if self.core.waiting.is_empty() && !pending {
+            return false;
+        }
         let now = self.desk.now_ns.get();
         if !self.core.real_time
             || self.desk.local.is_empty()
-            || self.core.driver.has_pending()
+            || pending
             || now.saturating_sub(self.core.last_driver_ns) >= self.quantum_ns()
         {
             self.harvest_io(now)
@@ -894,8 +913,7 @@ impl Shard {
                     })
             });
         if let Err(refusal) = armed {
-            self.core.counters.interests_refused =
-                self.core.counters.interests_refused.saturating_add(1);
+            count(&self.desk.live.interests_refused, 1);
             if refusal == RtError::DriverLost {
                 self.lose_driver();
             } else {
@@ -910,7 +928,7 @@ impl Shard {
     /// fire makes a wait ready — the handle armed again for those left.
     fn deliver(&mut self, completions: &mut Vec<Completion>) {
         for completion in completions.drain(..) {
-            self.core.counters.completions = self.core.counters.completions.saturating_add(1);
+            count(&self.desk.live.completions, 1);
             let Some(raw) = interests::handle_of(completion.user_data) else {
                 self.desk
                     .wake_local(Encoded::from_word(completion.user_data).slot());
@@ -924,8 +942,7 @@ impl Shard {
             if !left.is_empty()
                 && let Err(refusal) = self.core.driver.arm(raw, left, interests::tag_of(raw))
             {
-                self.core.counters.interests_refused =
-                    self.core.counters.interests_refused.saturating_add(1);
+                count(&self.desk.live.interests_refused, 1);
                 if refusal == RtError::DriverLost {
                     self.lose_driver();
                     break;
@@ -950,7 +967,7 @@ impl Shard {
             return false;
         }
         self.core.last_driver_ns = now_ns;
-        self.core.counters.harvests = self.core.counters.harvests.saturating_add(1);
+        count(&self.desk.live.harvests, 1);
         self.receive_completions(Some(0))
     }
 
@@ -966,7 +983,7 @@ impl Shard {
             return true;
         }
         if result.is_err() {
-            self.core.counters.driver_errors = self.core.counters.driver_errors.saturating_add(1);
+            count(&self.desk.live.driver_errors, 1);
         }
         let harvested = !completions.is_empty();
         self.deliver(&mut completions);
@@ -1018,7 +1035,7 @@ impl Shard {
                 || self.wake_ready_pollers()
                 || (harvest_due && self.harvest_io(now))
             {
-                self.core.counters.spin_hits = self.core.counters.spin_hits.saturating_add(1);
+                count(&self.desk.live.spin_hits, 1);
                 return true;
             }
             // Re-read only after the driver was asked (a system call); otherwise this turn's reading stands.
@@ -1026,13 +1043,12 @@ impl Shard {
             if let Some(deadline) = deadline_ns
                 && now >= deadline
             {
-                self.core.counters.spin_deadlines =
-                    self.core.counters.spin_deadlines.saturating_add(1);
+                count(&self.desk.live.spin_deadlines, 1);
                 self.core.waited_for_ns = Some(deadline);
                 return true;
             }
             if now >= spin_end {
-                self.core.counters.spin_misses = self.core.counters.spin_misses.saturating_add(1);
+                count(&self.desk.live.spin_misses, 1);
                 return false;
             }
             if harvest_due {
@@ -1067,31 +1083,29 @@ impl Shard {
         // before the tracker threw an unarmed read away; judging by step, the last step's reading is open.
         if self.core.real_time && self.core.attribution.reads_at_step_start() {
             let read = account_now(self.desk.now_ns.get());
-            self.core.counters.thread_accounts =
-                self.core.counters.thread_accounts.saturating_add(1);
+            count(&self.desk.live.thread_accounts, 1);
             self.core.attribution.step_began(|| read);
         }
-        self.core.counters.steps = self.core.counters.steps.saturating_add(1);
+        count(&self.desk.live.steps, 1);
         if let Some(entry) = self.desk.entry {
             entry.pulse.record(
-                self.core.counters.steps,
-                self.core.counters.spawns,
-                self.core.counters.completed,
-                self.core.counters.admission_refused,
-                self.core.counters.longest_step_ns,
+                self.desk.live.steps.get(),
+                self.desk.live.spawns.get(),
+                self.desk.live.completed.get(),
+                self.desk.live.admission_refused.get(),
+                self.desk.live.longest_step_ns.get(),
             );
         }
         if let Some(deadline) = self.core.waited_for_ns.take() {
             self.note_wait_overrun(deadline);
         }
-        self.desk.counters.set(self.counters());
-        let harvests = self.core.counters.harvests;
+        let harvests = self.desk.live.harvests.get();
         let mut did_work = self.read_inputs();
         // One clock read a poll: each poll's end is the next one's start, so the bookkeeping between two polls
         // is counted to the second. The first poll starts from the step's reading when the step's drains,
         // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
-        let mark =
-            (!did_work && self.core.counters.harvests == harvests).then(|| self.desk.now_ns.get());
+        let mark = (!did_work && self.desk.live.harvests.get() == harvests)
+            .then(|| self.desk.now_ns.get());
         did_work |= self.poll_batch(mark);
         self.judge_deferred();
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
@@ -1186,8 +1200,8 @@ impl Shard {
     /// the next poll's start is read afresh.
     fn read_inputs_within(&mut self, at: &mut BatchMark, now_ns: u64) {
         self.desk.now_ns.set(now_ns);
-        let harvests = self.core.counters.harvests;
-        if self.read_inputs() || self.core.counters.harvests != harvests {
+        let harvests = self.desk.live.harvests.get();
+        if self.read_inputs() || self.desk.live.harvests.get() != harvests {
             at.mark = None;
         }
         at.inputs_read_ns = Some(now_ns);
@@ -1273,8 +1287,7 @@ impl Shard {
                 if learns {
                     switches_before_wait = attribution::voluntary_switches_now();
                     cpu_before = attribution::thread_cpu_now();
-                    self.core.counters.park_cost_reads =
-                        self.core.counters.park_cost_reads.saturating_add(1);
+                    count(&self.desk.live.park_cost_reads, 1);
                 }
                 lost = self.wait_in_driver(deadline_ns);
             },
@@ -1286,8 +1299,7 @@ impl Shard {
             self.note_wake(entry, woken, switches_before_wait);
         }
         if let Some(before) = cpu_before {
-            self.core.counters.park_cost_reads =
-                self.core.counters.park_cost_reads.saturating_add(1);
+            count(&self.desk.live.park_cost_reads, 1);
             if let Some(after) = attribution::thread_cpu_now() {
                 self.note_park_cost(entry, after.saturating_sub(before));
             }
@@ -1357,12 +1369,12 @@ impl Shard {
             return;
         }
         if woken.stale() {
-            self.core.counters.wake_stale = self.core.counters.wake_stale.saturating_add(1);
+            count(&self.desk.live.wake_stale, 1);
             return;
         }
         let Some(latency) = woken.latency_ns() else {
             if woken.early() {
-                self.core.counters.wake_unslept = self.core.counters.wake_unslept.saturating_add(1);
+                count(&self.desk.live.wake_unslept, 1);
             }
             return;
         };
@@ -1370,7 +1382,7 @@ impl Shard {
             (switches_before_wait, attribution::voluntary_switches_now())
             && after == before
         {
-            self.core.counters.wake_unslept = self.core.counters.wake_unslept.saturating_add(1);
+            count(&self.desk.live.wake_unslept, 1);
             return;
         }
         let Some(estimate) = self.core.wake.as_mut() else {
@@ -1378,8 +1390,8 @@ impl Shard {
         };
         estimate.record(latency);
         let mean = estimate.mean_ns();
-        self.core.counters.wake_samples = self.core.counters.wake_samples.saturating_add(1);
-        self.core.counters.wake_cost_ns = mean;
+        count(&self.desk.live.wake_samples, 1);
+        self.desk.live.wake_cost_ns.set(mean);
         self.desk.quantum_ns.set(self.quantum_ns());
         entry.pulse.record_wake_cost(mean);
     }
@@ -1398,6 +1410,15 @@ impl Shard {
             self.core.kick_cost.record(cost);
             self.core.kicks_seen = (sum, kicks);
         }
+        // What blocking costs, as the counters report it, moves only here.
+        self.desk
+            .live
+            .park_cost_ns
+            .set(self.blocking_cost_ns().unwrap_or(0));
+        self.desk
+            .live
+            .park_samples
+            .set(self.core.park_cost.samples());
     }
 
     /// Folds one finished wait into the measured scheduler overrun: the shard waited for `deadline_ns` and
@@ -1422,8 +1443,7 @@ impl Shard {
         }
         if self.core.real_time && self.core.attribution.armed() {
             let read = account_now(now);
-            self.core.counters.thread_accounts =
-                self.core.counters.thread_accounts.saturating_add(1);
+            count(&self.desk.live.thread_accounts, 1);
             self.core.attribution.wait_ended(|| read);
         }
     }
@@ -1455,7 +1475,7 @@ impl Shard {
             return None;
         }
         let end = attribution::thread_account();
-        self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
+        count(&self.desk.live.thread_accounts, 1);
         Some(
             self.core
                 .attribution
@@ -1472,7 +1492,7 @@ impl Shard {
         }
         let now = self.now_ns();
         let end = attribution::thread_account();
-        self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
+        count(&self.desk.live.thread_accounts, 1);
         let off_cpu_ns = self.core.attribution.close_step(now, end);
         let mut undecided = false;
         for deferred in self.core.deferred.drain(..) {
@@ -1484,7 +1504,7 @@ impl Shard {
                 }
             };
             undecided |= matches!(attributed, Attribution::NoWindow | Attribution::Ambiguous);
-            count_long_poll(&mut self.core.counters, attributed);
+            count_long_poll(&self.desk.live, attributed);
         }
         if undecided {
             self.core.attribution.undecided();
@@ -1494,9 +1514,9 @@ impl Shard {
     /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; true
     /// when the driver was lost.
     fn wait_in_driver(&mut self, deadline_ns: Option<u64>) -> bool {
-        self.core.counters.waits = self.core.counters.waits.saturating_add(1);
+        count(&self.desk.live.waits, 1);
         if let Some(entry) = self.desk.entry {
-            entry.pulse.record_waits(self.core.counters.waits);
+            entry.pulse.record_waits(self.desk.live.waits.get());
         }
         let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
         let _ = self.receive_completions(timeout);
@@ -1516,7 +1536,7 @@ impl Shard {
             return;
         }
         self.core.driver_lost = true;
-        self.core.counters.driver_lost = self.core.counters.driver_lost.saturating_add(1);
+        count(&self.desk.live.driver_lost, 1);
         self.core.shutting_down = true;
         self.desk.accepting.set(false);
         if let Some(entry) = self.desk.entry {
@@ -1572,7 +1592,7 @@ impl Shard {
                 break;
             };
             drained = drained.saturating_add(1);
-            self.core.counters.controls = self.core.counters.controls.saturating_add(1);
+            count(&self.desk.live.controls, 1);
             self.handle_control(message);
         }
         if drained == batch {
@@ -1586,8 +1606,7 @@ impl Shard {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             let visited = self.desk.sweep_abandoned();
-            self.core.counters.abandons_swept =
-                self.core.counters.abandons_swept.saturating_add(visited);
+            count(&self.desk.live.abandons_swept, visited);
             drained = drained.saturating_add(1);
         }
         // The runtime's stop, after this batch's messages: a Shutdown at the back of the batch that took no
@@ -1616,18 +1635,19 @@ impl Shard {
                 desk.wake_local(slot);
             }
         });
-        self.core.counters.wakes_to_free_slots =
-            self.core.counters.wakes_to_free_slots.saturating_add(free);
-        self.core.counters.wakes_foreign = self
-            .core
-            .counters
-            .wakes_foreign
-            .saturating_add(u64::try_from(woken).unwrap_or(u64::MAX));
+        count(&self.desk.live.wakes_to_free_slots, free);
+        count(
+            &self.desk.live.wakes_foreign,
+            u64::try_from(woken).unwrap_or(u64::MAX),
+        );
         woken > 0
     }
 
     /// Wakes every poller whose ring is ready; a poller whose task ended is dropped.
     fn wake_ready_pollers(&mut self) -> bool {
+        if self.core.pollers.is_empty() {
+            return false;
+        }
         let desk = &self.desk;
         self.core.pollers.retain(|poller| {
             desk.task(poller.slot).is_some_and(|cell| {
@@ -1638,7 +1658,7 @@ impl Shard {
         for poller in &self.core.pollers {
             if (poller.ready)() {
                 any = true;
-                self.core.counters.poller_wakes = self.core.counters.poller_wakes.saturating_add(1);
+                count(&self.desk.live.poller_wakes, 1);
                 desk.wake_local(poller.slot);
             }
         }
@@ -1649,14 +1669,12 @@ impl Shard {
         match message {
             Control::Spawn(request) => {
                 if let Err(RtError::TooManyTasks { .. }) = self.spawn_request(*request) {
-                    self.core.counters.admission_refused =
-                        self.core.counters.admission_refused.saturating_add(1);
+                    count(&self.desk.live.admission_refused, 1);
                 }
             }
             Control::SpawnService(request) => {
                 if let Err(RtError::TooManyTasks { .. }) = self.spawn_request_with(*request, true) {
-                    self.core.counters.admission_refused =
-                        self.core.counters.admission_refused.saturating_add(1);
+                    count(&self.desk.live.admission_refused, 1);
                 }
             }
             Control::Cancel(word) => {
@@ -1686,7 +1704,7 @@ impl Shard {
         self.core.timers.advance(now, &mut fired);
         let any = !fired.is_empty();
         for (slot, word) in fired.drain(..) {
-            self.core.counters.timers_fired = self.core.counters.timers_fired.saturating_add(1);
+            count(&self.desk.live.timers_fired, 1);
             self.wake_word(Encoded::from_word(word));
             // A timer its sleep released in the meantime is freed when the release is applied; an armed one is
             // freed here.
@@ -1803,13 +1821,13 @@ impl Shard {
     /// Counts a poll that ran `elapsed` and was `attributed`.
     #[inline(always)]
     fn record_poll(&mut self, elapsed: u64, attributed: Option<Attribution>) {
-        self.core.counters.polls = self.core.counters.polls.saturating_add(1);
+        count(&self.desk.live.polls, 1);
         if let Some(attributed) = attributed {
-            count_long_poll(&mut self.core.counters, attributed);
+            count_long_poll(&self.desk.live, attributed);
         }
         // A store only when the longest grew, which most polls leave as it was.
-        if elapsed > self.core.counters.longest_step_ns {
-            self.core.counters.longest_step_ns = elapsed;
+        if elapsed > self.desk.live.longest_step_ns.get() {
+            self.desk.live.longest_step_ns.set(elapsed);
         }
     }
 
@@ -1869,7 +1887,7 @@ impl Shard {
         let dropped = crate::unwind::contained(move || drop(future));
         drop(entered);
         if dropped.is_none() {
-            self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
+            count(&self.desk.live.unwound, 1);
         }
     }
 
@@ -1895,13 +1913,13 @@ impl Shard {
         };
         match outcome {
             Outcome::Completed => {
-                self.core.counters.completed = self.core.counters.completed.saturating_add(1);
+                count(&self.desk.live.completed, 1);
             }
             Outcome::Cancelled => {
-                self.core.counters.cancelled = self.core.counters.cancelled.saturating_add(1);
+                count(&self.desk.live.cancelled, 1);
             }
             Outcome::Unwound => {
-                self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
+                count(&self.desk.live.unwound, 1);
             }
         }
         let mut child = first_child;
@@ -2091,19 +2109,24 @@ fn account_now(now_ns: u64) -> Option<(attribution::ThreadAccount, u64)> {
 }
 
 /// Counts a poll past the step quantum by the wall clock under whoever held it.
-fn count_long_poll(counters: &mut Counters, attributed: Attribution) {
+fn count_long_poll(counters: &LiveCounters, attributed: Attribution) {
     if attributed.is_tasks() {
-        counters.long_steps = counters.long_steps.saturating_add(1);
+        count(&counters.long_steps, 1);
     }
     if attributed == Attribution::Blocked {
-        counters.blocked_steps = counters.blocked_steps.saturating_add(1);
+        count(&counters.blocked_steps, 1);
     }
     if attributed == Attribution::Preempted {
-        counters.preempted_steps = counters.preempted_steps.saturating_add(1);
+        count(&counters.preempted_steps, 1);
     }
     if attributed.is_unattributed() {
-        counters.unattributed_steps = counters.unattributed_steps.saturating_add(1);
+        count(&counters.unattributed_steps, 1);
     }
+}
+
+/// Adds `by` to a counter, saturating: a counter never wraps back to small.
+fn count(counter: &std::cell::Cell<u64>, by: u64) {
+    counter.set(counter.get().saturating_add(by));
 }
 
 fn slot_mut(tasks: &mut [TaskSlot], slot: u32) -> Option<&mut TaskSlot> {

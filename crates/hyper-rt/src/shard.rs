@@ -369,8 +369,8 @@ pub struct ShardContext {
     /// One past the highest task generation issued: what the registry slot's next holder starts from. On the
     /// desk, so a join that frees its task's slot raises it as the loop's frees do.
     pub(crate) generation_high: Cell<u32>,
-    /// The loop's counters as of the start of the current step, published for tasks that report them.
-    pub(crate) counters: Cell<crate::shard_loop::Counters>,
+    /// The loop's counters, which it counts here in place (`crate::shard_loop::LiveCounters`).
+    pub(crate) live: crate::shard_loop::LiveCounters,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
     pub(crate) sim: Option<crate::sim::SimSockets>,
 }
@@ -477,7 +477,7 @@ impl ShardContext {
             root: Cell::new(None),
             root_unwound: Cell::new(false),
             generation_high: Cell::new(shape.generation_base),
-            counters: Cell::new(crate::shard_loop::Counters::default()),
+            live: crate::shard_loop::LiveCounters::default(),
             sim: None,
         }
     }
@@ -586,9 +586,17 @@ impl ShardContext {
         self.timer_tick_ns
     }
 
-    /// The shard's counters as of the start of the current step.
+    /// The shard's counters as they stand now: the loop counts on the desk in place, so a task reads what the
+    /// loop has counted up to its poll.
     pub fn counters(&self) -> crate::shard_loop::Counters {
-        self.counters.get()
+        let mut counters = self.live.snapshot();
+        counters.admission_refused = counters
+            .admission_refused
+            .saturating_add(self.refused_spawns.get());
+        counters.timer_waits = counters.timer_waits.saturating_add(self.timer_waits.get());
+        counters.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
+        counters.wake_cost_ns = self.quantum_ns.get();
+        counters
     }
 
     /// Whether this shard runs the simulation driver.

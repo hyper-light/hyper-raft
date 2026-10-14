@@ -1087,7 +1087,7 @@ al., OSDI 2020), has no other word that this side wants more.
   written once the limit is raised, the frame again at the new limit, and the receiving side
   blocked only at the limit it last sent with none greater on its way.
 
-## 27. A finished reply gives its stream's credit back with it (2026-10-13)
+## 29. A finished reply gives its stream's credit back with it (2026-10-13)
 
 A peer-initiated bidirectional stream gave its credit back (`stream_freed`: its count among the
 allocated taken out, so `ensure_remote_streams` raises the limit within the window) only once both

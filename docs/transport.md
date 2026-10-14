@@ -737,7 +737,7 @@ RFC 9000 §4.6), and an exchange is a stream.
   to its fair share at once (the pool over the connections in it, one stream at least), so a peer
   nobody contends with waits no round trip before its second exchange. Under contention it holds
   its handshake's grant. A peer blocked at its grant says so with STREAMS_BLOCKED (hyper-quic now
-  sends it, `crates/hyper-quic/VENDORED.md` §26), and the connection waits its turn, once. At each
+  sends it, `crates/hyper-quic/VENDORED.md` §28), and the connection waits its turn, once. At each
   poll, while the pool holds credit no connection is granted, the connection that has waited
   longest is raised to its fair share, or by one if it holds that already, and sends its new
   limit.
@@ -752,7 +752,7 @@ RFC 9000 §4.6), and an exchange is a stream.
 - **When it goes back.** A served exchange settles its stream with the pool as its reply is
   finished, before the finish (`Endpoint::settle_credit`): QUIC gives the stream back to its peer
   once the request is read and the reply finished, not once the reply is acknowledged
-  (`crates/hyper-quic/VENDORED.md` §27), so the raised limit goes out in the reply's datagrams, as
+  (`crates/hyper-quic/VENDORED.md` §29), so the raised limit goes out in the reply's datagrams, as
   Breakwater issues credit in its responses. Settled after, QUIC would have given the stream back
   within the connection's old grant, past a pool that shrank. Through a pool of one, twenty
   exchanges asked in turn take 40 datagrams of each side where the stream that went back once the

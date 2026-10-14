@@ -655,7 +655,7 @@ fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
 }
 
 /// A pooled server's stream goes back to its peer with the reply that ends its exchange, in the
-/// reply's datagrams (hyper-quic `VENDORED.md` §27): through a pool of one, twenty exchanges asked
+/// reply's datagrams (hyper-quic `VENDORED.md` §29): through a pool of one, twenty exchanges asked
 /// in turn take two datagrams of each side's an exchange (40 and 40). When the stream went back
 /// once the reply was acknowledged, alone, they took 59 and 59.
 #[test]

@@ -290,7 +290,9 @@ impl Drop for Shard {
         self.close_control();
         // A caught foreign poll panic leaves this existing marker set and its
         // already-unwound future absent. Retire that metadata before driving peers.
-        if let Some(slot) = self.desk.current_task.take()
+        let interrupted = self.desk.current_slot();
+        self.desk.current.set(crate::shard::NO_TASK);
+        if let Some(slot) = interrupted
             && self
                 .task_mut(slot)
                 .is_some_and(|task| task.state == State::Running && task.future.is_none())
@@ -1709,7 +1711,7 @@ impl Shard {
         // all a drop would add.
         let waker = std::mem::ManuallyDrop::new(waker_for(word));
         let mut cx = Context::from_waker(&waker);
-        self.desk.current_task.set(Some(slot));
+        self.desk.current.set(word.word());
         self.desk.now_ns.set(start);
         let entered = registry::enter_in(current, &self.desk);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
@@ -1717,7 +1719,7 @@ impl Shard {
         let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
         drop(entered);
         let ended = self.carried_from(carried).max(start);
-        self.desk.current_task.set(None);
+        self.desk.current.set(crate::shard::NO_TASK);
         // A request served in this poll opens the idle window from where the poll ended, not where it began:
         // the spin covers the moments after the shard goes idle, however long the serving took.
         if self.desk.activity_noted.get() {

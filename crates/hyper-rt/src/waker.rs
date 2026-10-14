@@ -39,6 +39,10 @@ pub(crate) fn polling_task(waker: &Waker) -> Option<Encoded> {
     let current = registry::with_current(ShardContext::current_task)
         .flatten()?
         .0;
+    // A 64-bit waker carries the whole word: the same word is the same task, at one compare.
+    if carried == current {
+        return Some(current);
+    }
     let same_task = current.shard() == carried.shard()
         && current.slot() == carried.slot()
         && (carried.generation() == current.generation()

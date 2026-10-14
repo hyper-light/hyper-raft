@@ -60,6 +60,11 @@ pub(crate) enum Phase {
     Done,
 }
 
+/// Format: "no task is being polled" in [`ShardContext`]'s current word (no task word is all ones: its
+/// generation field would be `Encoded::ANY_GENERATION` and its shard `u16::MAX`, which the registry never
+/// issues).
+pub(crate) const NO_TASK: u64 = u64::MAX;
+
 /// What a task asked of its slot since the loop last looked (bits of [`TaskCell::asks`]).
 pub(crate) mod ask {
     /// A future waits in the slot's incoming cell to be installed.
@@ -313,8 +318,9 @@ pub struct ShardContext {
     /// every push onto `dirty_tasks`, `dirty_timers` and `interests`, so the loop's look after each poll is
     /// one load when nothing was asked.
     pub(crate) asked: Cell<bool>,
-    /// The task being polled.
-    pub(crate) current_task: Cell<Option<u32>>,
+    /// The word of the task being polled, or [`NO_TASK`]: its slot for the local wake's test, its whole word
+    /// for a future that asks which task polls it (`crate::waker::polling_task`), with nothing to pack.
+    pub(crate) current: Cell<u64>,
     /// Admission is paused while owned futures are cancelled, and closed at shutdown.
     pub(crate) accepting: Cell<bool>,
     /// The shard's clock at the start of the current poll (or step), published by the loop.
@@ -442,7 +448,7 @@ impl ShardContext {
                 .collect(),
             free_waits: CellStack::full_of(wait_ids.into_iter()),
             asked: Cell::new(false),
-            current_task: Cell::new(None),
+            current: Cell::new(NO_TASK),
             accepting: Cell::new(true),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
@@ -539,9 +545,14 @@ impl ShardContext {
 
     /// The task being polled on this shard right now.
     pub fn current_task(&self) -> Option<TaskId> {
-        let slot = self.current_task.get()?;
-        let generation = self.task(slot)?.generation.get();
-        Encoded::pack(self.id, slot, generation).map(TaskId)
+        let word = self.current.get();
+        (word != NO_TASK).then(|| TaskId(Encoded::from_word(word)))
+    }
+
+    /// The slot of the task being polled, if one is.
+    pub(crate) fn current_slot(&self) -> Option<u32> {
+        let word = self.current.get();
+        (word != NO_TASK).then(|| Encoded::from_word(word).slot())
     }
 
     /// The step quantum (docs/runtime.md §3.4): the online wake estimate while the shard tracks one, else its
@@ -1089,7 +1100,8 @@ impl ShardContext {
     /// waker of this shard's tasks on its own thread ends here.
     #[inline]
     pub(crate) fn wake_local(&self, slot: u32) {
-        if self.current_task.get() == Some(slot) {
+        let current = self.current.get();
+        if current != NO_TASK && Encoded::from_word(current).slot() == slot {
             self.local.defer(slot);
         } else {
             self.local.push(slot);

@@ -1519,9 +1519,10 @@ impl Shard {
         }
     }
 
-    /// Attributes a poll against the step quantum: within it by the wall clock it is within; past it, the
-    /// attribution windows decide whose it was ([`crate::attribution`]), at once or, judging by step, at the
-    /// step's end ([`Shard::judge_deferred`]), for which it returns `None` now.
+    /// Attributes a poll's hold, from `poll_started_ns` (its start or its last go-on, docs/runtime.md §3.11)
+    /// to `ended_ns`, against `quantum` (twice the step quantum): within it by the wall clock it is within;
+    /// past it, the attribution windows decide whose it was ([`crate::attribution`]), at once or, judging by
+    /// step, at the step's end ([`Shard::judge_deferred`]), for which it returns `None` now.
     #[cold]
     fn attribute_poll(
         &mut self,
@@ -1829,8 +1830,13 @@ impl Shard {
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
         let elapsed = ended.saturating_sub(start);
-        let attributed = if elapsed > quantum_ns {
-            self.attribute_poll(start, ended, quantum_ns)
+        // How long the poll held the shard unasked (docs/runtime.md §3.11): from its start, or from the last
+        // time it asked `wanted` and was let go on; long past twice the quantum, which a task that asks once a
+        // quantum and yields when told to never reaches.
+        let held_from = start.max(self.desk.checked_ns.get());
+        let threshold = quantum_ns.saturating_mul(2);
+        let attributed = if ended.saturating_sub(held_from) > threshold {
+            self.attribute_poll(held_from, ended, threshold)
         } else {
             None
         };

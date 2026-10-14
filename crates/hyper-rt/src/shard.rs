@@ -325,6 +325,10 @@ pub struct ShardContext {
     /// waits are registered, or 0 while the driver or a poller has work for every turn; `u64::MAX` with
     /// none. [`ShardContext::wanted`] compares the clock against it.
     pub(crate) due_ns: Cell<u64>,
+    /// When the polling task last asked [`ShardContext::wanted`] and was told no, by the shard's clock: the
+    /// last time the shard let it go on, from which the loop judges how long it held the shard (a long poll
+    /// is one held past twice the quantum since then, docs/runtime.md §3.11).
+    pub(crate) checked_ns: Cell<u64>,
     /// The step quantum now, published by the loop.
     pub(crate) quantum_ns: Cell<u64>,
     /// The driver's clock, read live.
@@ -483,6 +487,7 @@ impl ShardContext {
             activity_noted: Cell::new(false),
             quantum_ns: Cell::new(1),
             due_ns: Cell::new(u64::MAX),
+            checked_ns: Cell::new(0),
             scheduler_overrun_ns: Cell::new(0),
             timer_tick_ns: shape.timer_tick_ns,
             refused_spawns: Cell::new(0),
@@ -596,15 +601,25 @@ impl ShardContext {
     /// thread, or a timer or the driver's harvest falling due. The test a task that runs operations back
     /// to back makes between them ([`crate::futures::maybe_yield`]): no system call, the desk's fields, the
     /// entry's two flags and the counter. A simulated shard always answers true, so its schedules stay a
-    /// step a yield.
+    /// step a yield. An answer of no is the shard letting the task go on: the loop judges the poll's hold
+    /// from the last one (`checked_ns`).
     pub fn wanted(&self) -> bool {
-        self.is_sim
+        if self.is_sim
             || !self.local.is_empty()
             || self.asked.get()
             || self
                 .entry
                 .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
-            || self.now_ns() >= self.due_ns.get()
+        {
+            return true;
+        }
+        let now = self.now_ns();
+        if now >= self.due_ns.get() {
+            return true;
+        }
+        // Told no: the task may go on, and the loop judges its hold from here (`checked_ns`).
+        self.checked_ns.set(now);
+        false
     }
 
     /// The online wake estimate, nanoseconds (the quantum).

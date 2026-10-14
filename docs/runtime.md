@@ -615,6 +615,27 @@ task table, the batch and the latency objective (copied from the configuration a
 scale, the last harvest and the state flags, then the readiness waits the input read's test asks; a
 batch reads the quantum from the desk's copy, which every change of the estimate publishes.
 
+### 3.11 A long poll: held past twice the quantum since the shard let it go on
+
+The long-step count is the bounded-work rule's signal (`attribution.rs`, A-31): a task that held its
+shard while others waited. A long poll is now one that held the shard past twice the step quantum since
+the shard last let it go on: from its start, or from its last `wanted` that answered no (`checked_ns`, on
+the desk's first line). A task that asks once a quantum and yields when told to holds a wanted shard less
+than a quantum and one operation, so only a task that broke that contract passes twice it; Seastar's
+reactor counts a task that ran past twice its task quota as a quota violation
+(`task_queue_group::account_runtime`, [SEASTAR-PREEMPT]). One past one quantum was long before, which a
+consumer whose turns are a quantum by design passes on about half of them: mantle's inline client sizes
+its turns to the quantum and its range's maintenance slice is the quantum, so every such poll was judged
+with readings of the thread's account (860–2,240 pairs of `clock_gettime` and `getrusage` a second on its
+shard in a 100M fill, `perf trace`, Linux VM), none of them a fault. Who held a long poll is judged as
+before, by the windows of `attribution.rs`, against twice the quantum.
+
+`tests/long_poll_held.rs`: turns of one and a half quanta on the CPU are never their task's long poll
+(each was before); a task that runs one and a half quanta between `maybe_yield`s, alone and so let go on
+each time, is judged from each go-on and is no long poll however long its one poll runs (it fails with the
+verdict from the poll's start); a task that holds a wanted shard three quanta is one long poll.
+`attribution_by_step.rs` holds its polls three quanta, past the new threshold.
+
 ## 4. Running a future: `block_on`
 
 Every consumer needs to run one future to completion on the calling thread: a CLI command, `main`, a

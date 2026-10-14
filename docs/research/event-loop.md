@@ -87,6 +87,39 @@ was picked mostly because it felt good" — a count not derived, which hyper-rt'
    when told to holds a wanted shard less than a quantum and an operation; past twice the quantum since
    its last go-on is the contract broken (Seastar's own violation threshold), and only such a poll is
    judged (§3.11).
-4. **Open:** the boot probe's quantum for a shard too busy to park (§1's swings), and contention among
-   many threads waking one shard (rt-2x put the bitmap's pending flag, summary and first words on one
-   line, best for one waker); each is measured before it is changed.
+4. **Measured, and left as they are:** the boot probe's quantum for a shard too busy to park (§1's
+   swings), and many threads waking one shard (rt-2x put the bitmap's pending flag, summary and first
+   words on one line); §4.
+
+## 4. The two left open, measured
+
+**A busy shard's quantum.** Across 55 of the 100M runs (rounds 201–234: mantle main's runtime, 767627f's,
+rt-2x's and rt-pending's), the boot probe's quantum ran from 9.8 to 424 µs. The fill's rate and put p99
+show no dependence on it beyond the runs' own spread: 767627f's two runs at 188 and 424 µs filled at
+3.26 M and 3.44 M puts a second with p99s of 0.67 and 0.59 µs, where its runs at 10–22 µs filled at
+2.61–3.95 M with p99s of 0.67–1.60 µs. §1's fixed-quantum sweep moved the fill 2.4 % between 15 and
+45 µs, inside one run's spread. Nothing here to refine.
+
+**Many threads waking one shard.** P threads each wake a task of their own on one shard, a million wakes
+a round, five rounds; the figure is the median round's, two runs each, interleaved (`xwakemp`, Apple
+M5 Max, the host busy with gates and the Linux VM's benchmarks). The measure is wakes delivered, the woken
+tasks' polls, not the wakers' calls: a shard that drains sooner leaves a waker's next call more to do, so
+a waker's nanoseconds a call could rise with rt-pending (73 against 22 with one waker, in one run) while
+the wakes it delivered rose more.
+
+| wakers | wakes delivered a second, 767627f → rt-pending | a waker's CPU a delivered wake |
+|---|---|---|
+| 1 | 2.2–3.4 M → 3.7–6.0 M | 294–460 → 166–270 ns |
+| 2 | 3.5–3.8 M → 6.0–6.3 M | 522–567 → 318–325 ns |
+| 4 | 3.9–5.1 M → 5.3–7.2 M | 784–948 → 546–728 ns |
+| 8 | 5.4 M → 6.4–6.8 M | 1,437–1,478 → 1,142–1,188 ns |
+
+The one line costs the wakers nothing at these counts; from two wakers on, the shard's drain, 6–7 M wakes
+a second, is the limit. Mantle's cross-thread wakes, the issuer's completions and the workers' results,
+come at 10⁴–10⁵ a second.
+
+**Where a consumer's switch time goes.** With every operation through the range's channel (mantle's
+`--no-inline`, a 10M fill, `perf` on the Linux VM), the shard's time is the consumer's: its serve loop
+reads the OS's clock (`std::time::Instant`, 7.8 % of the process's samples, under `ranges::serve`) and
+does its per-turn bookkeeping once an operation, while the loop's own frames, its polls, wakes and
+channel hops, come to about 4 %.

@@ -235,7 +235,10 @@ each ported test's origin, and what was left out).
   and a peer's lifecycle events tell its current connection alone, so `connection_live(peer, epoch)`
   says whether an older one is still up (what an owner keeps for each lets go by it: three clients
   of one identity at once had two refused as ungreeted when only the newest connection was told),
-  `Frame { peer, lane, kind, frame }`, `Refused { exchange, refusal, by_peer }`,
+  `Frame { peer, lane, kind, frame }`, `LaneRoom { peer, epoch, lane }` (a lane that refused a
+  frame for being full has room again: an owner whose lanes carry many groups' frames, focal's,
+  waits for it instead of losing what found the lane full; said once a refusal), `Refused { exchange,
+  refusal, by_peer }`,
   `Closed { peer, epoch, refusal }`, `Unreachable { peer, refusal }`; at most
   `Limits::event_bound` wait for the owner (below).
 - The TLS is the owner's (below, "The owner's TLS"): `Config { tls, role, limits }` takes a
@@ -337,7 +340,7 @@ refused is up and then closed: `Closed` carries the cause as `Unreachable` does
 (`tests/tls.rs`).
 
 **The events the owner has not polled** are bounded too (`Limits::event_bound`): at most
-`4·exchanges + peers·(1 + lanes_per_peer·lane_window)`, `peers` the peer table's bound (the larger
+`4·exchanges + peers·(1 + lanes_per_peer·(lane_window + 1))`, `peers` the peer table's bound (the larger
 of the identity and connection bounds). Before it the queue grew without one: an owner that did not
 poll kept every `Connected`, `Closed` and `Unreachable` a reconnecting peer caused, a `BodyReady` or
 `Writable` each time it read or wrote without polling, a request and a refusal of every exchange its
@@ -351,6 +354,7 @@ lanes carried. Each event now waits in a seat of a bounded table, given back whe
   receipt), and against its peer, at most its lanes' windows, whatever connection they came on; a lane
   at either bound is not read, so its bytes wait in QUIC, whose flow control holds the sender (RFC 9000
   §4.1), and it is read again as the owner polls its peer's frames;
+- a lane to a peer holds at most one `LaneRoom`: one arriving while one waits says nothing more;
 - a peer's lifecycle waits as one event, its latest state with its epoch (its newest connection up;
   that connection closed; a dial failed with no connection up since): a change while it waits
   replaces it and moves it to the back, after the refusals of the exchanges a closed connection

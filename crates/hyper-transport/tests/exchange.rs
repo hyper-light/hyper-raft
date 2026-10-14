@@ -1051,6 +1051,49 @@ fn a_lane_refuses_a_frame_past_the_core_s_window() {
     assert_eq!(refused, Refusal::LaneFull);
 }
 
+/// A lane that refused a frame for being full says when it has room again, once: an owner whose
+/// lane carries many groups' frames waits for it instead of losing what found the lane full.
+#[test]
+fn a_full_lane_says_when_it_has_room_again() {
+    let pair = Pair::new();
+    let mut narrow = limits();
+    narrow.lane_window = 4;
+    let mut net = connected::<Mantle, Mantle>(&pair, narrow, 256 << 20);
+    let mut server = Server::new();
+    let frame = vec![1u8; 200_000];
+    let mut queued = 0;
+    loop {
+        match net.a.send_frame(2, 0, Kind::Append, &frame) {
+            Ok(()) => queued += 1,
+            Err(Refusal::LaneFull) => break,
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(queued < 100, "the lane never filled");
+    }
+    // A second refusal before the lane has room says nothing more.
+    assert_eq!(
+        net.a.send_frame(2, 0, Kind::Append, &frame),
+        Err(Refusal::LaneFull)
+    );
+    let mut rooms = Vec::new();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        while let Some(event) = net.a.poll_event() {
+            if let Event::LaneRoom { peer, lane, .. } = event {
+                rooms.push((peer, lane));
+            }
+        }
+        !rooms.is_empty()
+    });
+    assert_eq!(rooms, [(2, 0)]);
+    assert_eq!(net.a.send_frame(2, 0, Kind::Append, &frame), Ok(()));
+    // Every frame queued arrives.
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        server.frames.len() == queued + 1
+    });
+}
+
 /// Admission (T9–T11) over real handshakes: a certificate that names no peer is charged to no
 /// identity, and an identity past its bound replaces its own connection used longest ago.
 #[test]

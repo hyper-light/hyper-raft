@@ -7,6 +7,13 @@
 
 use std::cell::Cell;
 
+/// A value alone on its cache line: the largest line the runtime targets, Apple silicon's 128 bytes (64 on
+/// the x86_64 and other aarch64 cores it runs on). A word one set of threads writes, kept off a line another
+/// thread reads, moves only between the threads that write it.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+pub(crate) struct Padded<T>(pub(crate) T);
+
 /// A bounded first-in-first-out ring of `T`: values are copied in and out, so a pop reads its slot and
 /// leaves it as it was, and the indices wrap by a comparison, never a division (a remainder a push and a
 /// pop was a hardware divide on the run queue's every listing and taking).

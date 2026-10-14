@@ -309,6 +309,10 @@ pub struct ShardContext {
     /// The readiness waits, one slot each, bounded by `interests_per_shard`.
     waits: Box<[WaitCell]>,
     free_waits: CellStack<u32>,
+    /// Whether a task asked the loop for something since the loop last applied the desk's intents: set by
+    /// every push onto `dirty_tasks`, `dirty_timers` and `interests`, so the loop's look after each poll is
+    /// one load when nothing was asked.
+    pub(crate) asked: Cell<bool>,
     /// The task being polled.
     pub(crate) current_task: Cell<Option<u32>>,
     /// Admission is paused while owned futures are cancelled, and closed at shutdown.
@@ -437,6 +441,7 @@ impl ShardContext {
                 })
                 .collect(),
             free_waits: CellStack::full_of(wait_ids.into_iter()),
+            asked: Cell::new(false),
             current_task: Cell::new(None),
             accepting: Cell::new(true),
             now_ns: Cell::new(0),
@@ -944,6 +949,7 @@ impl ShardContext {
             ticket,
             withdraw: false,
         });
+        self.asked.set(true);
         if pushed.is_err() {
             // Unreachable by the ring's sizing (see `interests`); refused rather than lost.
             self.free_wait(ticket);
@@ -1001,6 +1007,7 @@ impl ShardContext {
                     ticket,
                     withdraw: true,
                 });
+                self.asked.set(true);
                 // Unreachable by the ring's sizing (see `interests`). Were it refused, the slot would stay
                 // abandoned, held against the bound, until the handle fires and `fire_wait` frees it.
                 let _ = pushed;
@@ -1125,12 +1132,14 @@ impl ShardContext {
         if !cell.dirty.replace(true) && self.dirty_tasks.push(slot).is_err() {
             cell.dirty.set(false);
         }
+        self.asked.set(true);
     }
 
     fn timer_dirty(&self, slot: u32, cell: &TimerCell) {
         if !cell.dirty.replace(true) && self.dirty_timers.push(slot).is_err() {
             cell.dirty.set(false);
         }
+        self.asked.set(true);
     }
 }
 

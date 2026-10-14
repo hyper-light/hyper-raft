@@ -92,7 +92,10 @@ impl WakeBitmap {
     /// Hands every woken slot to `woken`, clearing it; returns how many. Starts at the word after the last
     /// one the previous drain handed over, and wraps.
     pub fn drain(&self, mut woken: impl FnMut(u32)) -> usize {
-        if !self.pending.swap(false, Ordering::AcqRel) {
+        // A load first: a drain that finds nothing pending writes nothing to the line every waker writes. A
+        // flag set after the load is the next drain's, as one set after the swap would be; a parking shard
+        // looks again after it announces (`crate::parking`), so nothing waits on this drain.
+        if !self.pending.load(Ordering::Acquire) || !self.pending.swap(false, Ordering::AcqRel) {
             return 0;
         }
         let words = self.words.len();

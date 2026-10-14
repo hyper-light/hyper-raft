@@ -18,7 +18,6 @@
 //! and keeps the loop state to itself; between polls it applies the desk's intents. There is no `unsafe`,
 //! no `RefCell` and nothing a nested call could find borrowed.
 
-use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::attribution::{self, Attribution, Tracker};
@@ -639,8 +638,21 @@ impl Shard {
     // ------------------------------------------------------------------ the desk's intents
 
     /// Applies everything the desk was asked since the loop last looked: tasks to install, cancel, detach and
-    /// reap; pollers to register; timers to arm, disarm and free; readiness to register.
+    /// reap; pollers to register; timers to arm, disarm and free; readiness to register. Only when a task
+    /// asked (the desk's `asked`, set by every intent's push): the loop looks after every poll, and most polls
+    /// ask nothing.
+    #[inline]
     fn apply(&mut self) {
+        if self.desk.asked.get() {
+            self.apply_asked();
+        }
+    }
+
+    /// [`Shard::apply`]'s work, once a task asked. An intent pushed while it runs is drained by the same
+    /// loops, and leaves the flag set for one look that finds nothing.
+    #[inline(never)]
+    fn apply_asked(&mut self) {
+        self.desk.asked.set(false);
         while let Some(slot) = self.desk.dirty_tasks.pop() {
             self.apply_task(slot);
         }
@@ -1078,8 +1090,20 @@ impl Shard {
     /// Polls that list nothing leave the order as reading would: what arrives goes behind the tasks
     /// already listed either way.
     fn poll_batch(&mut self, mark: Option<u64>) -> bool {
+        registry::with_current_cell(self, |shard, current| shard.poll_batch_in(mark, current))
+    }
+
+    /// [`Shard::poll_batch`] with the thread's current-shard cell lent for its polls.
+    fn poll_batch_in(
+        &mut self,
+        mark: Option<u64>,
+        current: Option<registry::CurrentCell<'_>>,
+    ) -> bool {
         let batch = self.core.config.batch.max(1);
         let budget_ns = self.batch_budget_ns();
+        // The quantum a poll is judged by: the wake estimate, which moves only when the shard parks, so one
+        // reading serves the batch.
+        let quantum_ns = self.quantum_ns();
         let mut at = BatchMark {
             mark,
             inputs_read_ns: None,
@@ -1096,7 +1120,7 @@ impl Shard {
                 None => self.carried_now_ns(),
             };
             let since = *at.inputs_read_ns.get_or_insert(start);
-            let ended = self.poll_slot(slot, start);
+            let ended = self.poll_slot(slot, start, quantum_ns, current);
             at.mark = Some(ended);
             self.apply();
             if polled < batch
@@ -1256,7 +1280,10 @@ impl Shard {
             });
             if ordinary && ready {
                 let start = self.now_ns();
-                self.poll_slot(slot, start);
+                let quantum_ns = self.quantum_ns();
+                registry::with_current_cell(self, |shard, current| {
+                    shard.poll_slot(slot, start, quantum_ns, current)
+                });
             }
         }
         self.judge_deferred();
@@ -1370,14 +1397,15 @@ impl Shard {
     /// Attributes a poll against the step quantum: within it by the wall clock it is within; past it, the
     /// attribution windows decide whose it was ([`crate::attribution`]), at once or, judging by step, at the
     /// step's end ([`Shard::judge_deferred`]), for which it returns `None` now.
+    #[cold]
     fn attribute_poll(
         &mut self,
         slot: u32,
         generation: u32,
         poll_started_ns: u64,
         ended_ns: u64,
+        quantum: u64,
     ) -> Option<Attribution> {
-        let quantum = self.quantum_ns();
         let wall_ns = ended_ns.saturating_sub(poll_started_ns);
         if wall_ns <= quantum {
             return None;
@@ -1512,8 +1540,9 @@ impl Shard {
             return false;
         };
         // Take (read and clear in one atomic step) before draining: a send that lands during the drain
-        // publishes the flag again and is seen on the next step at the latest.
-        if !entry.control_pending.take() {
+        // publishes the flag again and is seen on the next step at the latest. A load first, so a step with
+        // no message writes nothing to the line its senders write.
+        if !entry.control_pending.is_pending() || !entry.control_pending.take() {
             return false;
         }
         let batch = self.core.config.batch.max(1);
@@ -1653,20 +1682,24 @@ impl Shard {
         any
     }
 
-    /// Polls the task in `slot`, timed from `start`; the time the poll ended, or `start` when nothing ran.
-    fn poll_slot(&mut self, slot: u32, start: u64) -> u64 {
-        let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
-        if service
-            && self
-                .desk
-                .task(slot)
-                .is_some_and(|cell| cell.cancelled.get())
-        {
-            self.cancel_children_once(slot);
-        }
-        let Some(generation) = self.desk.task(slot).map(|cell| cell.generation.get()) else {
+    /// Polls the task in `slot`, timed from `start` and judged against `quantum_ns`, entering the desk through
+    /// `current`; the time the poll ended, or `start` when nothing ran.
+    fn poll_slot(
+        &mut self,
+        slot: u32,
+        start: u64,
+        quantum_ns: u64,
+        current: Option<registry::CurrentCell<'_>>,
+    ) -> u64 {
+        let Some(cell) = self.desk.task(slot) else {
             return start;
         };
+        // Set at admission and kept while the slot holds the task: the poll and what it asks cannot move them.
+        let service = cell.service.get();
+        let generation = cell.generation.get();
+        if service && cell.cancelled.get() {
+            self.cancel_children_once(slot);
+        }
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
             return start;
         };
@@ -1678,7 +1711,7 @@ impl Shard {
         };
         if task.cancel_requested && !service {
             task.state = State::Finishing;
-            self.drop_entered(future);
+            self.drop_entered(future, current);
             self.finish(slot, Outcome::Cancelled);
             return start;
         }
@@ -1688,7 +1721,7 @@ impl Shard {
         let mut cx = Context::from_waker(&waker);
         self.desk.current_task.set(Some(slot));
         self.desk.now_ns.set(start);
-        let entered = registry::enter(&self.desk);
+        let entered = registry::enter_in(current, &self.desk);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
@@ -1703,32 +1736,72 @@ impl Shard {
         // What the poll asked takes effect before its result is recorded: a parent that spawned children and
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
-        let attributed = self.attribute_poll(slot, generation, start, ended);
+        let elapsed = ended.saturating_sub(start);
+        let attributed = if elapsed > quantum_ns {
+            self.attribute_poll(slot, generation, start, ended, quantum_ns)
+        } else {
+            None
+        };
         let Some(poll) = poll else {
-            // A future that unwound is in no state to poll again: it is dropped, and the task ends.
-            if let Some(task) = slot_mut(&mut self.core.tasks, slot) {
-                task.state = State::Finishing;
-            }
-            self.drop_entered(future);
-            self.finish(slot, Outcome::Unwound);
-            self.desk.note_unwound(TaskId(word));
+            self.unwound(slot, future, word, current);
             return ended;
         };
-        self.after_poll(PollDone {
-            slot,
-            future,
-            elapsed: ended.saturating_sub(start),
-            done: matches!(poll, Poll::Ready(())),
-            attributed,
-        });
+        // The poll's record, then the future back in its slot or the task finished.
+        let long = attributed.is_some_and(Attribution::is_tasks);
+        self.core.counters.polls = self.core.counters.polls.saturating_add(1);
+        if let Some(attributed) = attributed {
+            count_long_poll(&mut self.core.counters, attributed);
+        }
+        self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed);
+        let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
+            return ended;
+        };
+        task.polls = task.polls.saturating_add(1);
+        if long {
+            task.long_steps = task.long_steps.saturating_add(1);
+        }
+        task.longest_step_ns = task.longest_step_ns.max(elapsed);
+        let done = matches!(poll, Poll::Ready(()));
+        if done || (task.cancel_requested && !service) {
+            let cancelled = task.cancel_requested;
+            self.drop_entered(future, current);
+            self.finish(
+                slot,
+                if cancelled && service || !done {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Completed
+                },
+            );
+            return ended;
+        }
+        task.future = Some(future);
+        task.state = State::Idle;
         ended
+    }
+
+    /// A poll that unwound: its future is in no state to poll again, so it is dropped and the task ends.
+    #[cold]
+    fn unwound(
+        &mut self,
+        slot: u32,
+        future: BoxedFuture,
+        word: Encoded,
+        current: Option<registry::CurrentCell<'_>>,
+    ) {
+        if let Some(task) = slot_mut(&mut self.core.tasks, slot) {
+            task.state = State::Finishing;
+        }
+        self.drop_entered(future, current);
+        self.finish(slot, Outcome::Unwound);
+        self.desk.note_unwound(TaskId(word));
     }
 
     /// Drops a task's future with the desk entered: its destructors may wake or cancel other tasks of this
     /// shard, or let their timers go. The drop is the task's code, inside an unwind boundary of the shard's
     /// own; one that unwinds is counted.
-    fn drop_entered(&mut self, future: BoxedFuture) {
-        let entered = registry::enter(&self.desk);
+    fn drop_entered(&mut self, future: BoxedFuture, current: Option<registry::CurrentCell<'_>>) {
+        let entered = registry::enter_in(current, &self.desk);
         let dropped = crate::unwind::contained(move || drop(future));
         drop(entered);
         if dropped.is_none() {
@@ -1743,47 +1816,6 @@ impl Shard {
         } else {
             registry::wake(word);
         }
-    }
-
-    /// Records the poll and either stores the future back or finishes the task.
-    fn after_poll(&mut self, poll: PollDone) {
-        let PollDone {
-            slot,
-            future,
-            elapsed,
-            done,
-            attributed,
-        } = poll;
-        let long = attributed.is_some_and(Attribution::is_tasks);
-        self.core.counters.polls = self.core.counters.polls.saturating_add(1);
-        if let Some(attributed) = attributed {
-            count_long_poll(&mut self.core.counters, attributed);
-        }
-        self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed);
-        let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
-        let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
-            return;
-        };
-        task.polls = task.polls.saturating_add(1);
-        if long {
-            task.long_steps = task.long_steps.saturating_add(1);
-        }
-        task.longest_step_ns = task.longest_step_ns.max(elapsed);
-        if done || (task.cancel_requested && !service) {
-            let cancelled = task.cancel_requested;
-            self.drop_entered(future);
-            self.finish(
-                slot,
-                if cancelled && service || !done {
-                    Outcome::Cancelled
-                } else {
-                    Outcome::Completed
-                },
-            );
-            return;
-        }
-        task.future = Some(future);
-        task.state = State::Idle;
     }
 
     /// Moves a task to `Finishing`, cancels its live children and reaps the done ones, and completes it when
@@ -1995,15 +2027,6 @@ impl Shard {
     fn task_mut(&mut self, slot: u32) -> Option<&mut TaskSlot> {
         self.core.tasks.get_mut(usize::try_from(slot).ok()?)
     }
-}
-
-/// One finished poll.
-struct PollDone {
-    slot: u32,
-    future: Pin<Box<dyn std::future::Future<Output = ()> + 'static>>,
-    elapsed: u64,
-    done: bool,
-    attributed: Option<Attribution>,
 }
 
 /// The thread's account and the shard clock now: an attribution window's start.

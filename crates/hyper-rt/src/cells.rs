@@ -7,8 +7,10 @@
 
 use std::cell::Cell;
 
-/// A bounded first-in-first-out ring of `T`.
-pub(crate) struct CellRing<T> {
+/// A bounded first-in-first-out ring of `T`: values are copied in and out, so a pop reads its slot and
+/// leaves it as it was, and the indices wrap by a comparison, never a division (a remainder a push and a
+/// pop was a hardware divide on the run queue's every listing and taking).
+pub(crate) struct CellRing<T: Copy> {
     slots: Box<[Cell<Option<T>>]>,
     /// The index of the oldest value.
     head: Cell<usize>,
@@ -16,7 +18,7 @@ pub(crate) struct CellRing<T> {
     len: Cell<usize>,
 }
 
-impl<T> std::fmt::Debug for CellRing<T> {
+impl<T: Copy> std::fmt::Debug for CellRing<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CellRing")
             .field("capacity", &self.slots.len())
@@ -25,7 +27,7 @@ impl<T> std::fmt::Debug for CellRing<T> {
     }
 }
 
-impl<T> CellRing<T> {
+impl<T: Copy> CellRing<T> {
     /// A ring that holds at most `capacity` values.
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
@@ -57,13 +59,14 @@ impl<T> CellRing<T> {
         if len >= capacity {
             return Err(value);
         }
-        let Some(at) = self
-            .head
-            .get()
-            .checked_add(len)
-            .and_then(|end| end.checked_rem(capacity))
-        else {
+        // `head` and `len` are each below the capacity, so their sum is below twice it: one subtraction wraps it.
+        let Some(end) = self.head.get().checked_add(len) else {
             return Err(value);
+        };
+        let at = if end >= capacity {
+            end.wrapping_sub(capacity)
+        } else {
+            end
         };
         let Some(slot) = self.slots.get(at) else {
             return Err(value);
@@ -80,13 +83,12 @@ impl<T> CellRing<T> {
             return None;
         }
         let head = self.head.get();
-        let value = self.slots.get(head)?.take();
-        let next = head
-            .checked_add(1)
-            .and_then(|next| next.checked_rem(self.slots.len()))
-            .unwrap_or(0);
-        self.head.set(next);
-        self.len.set(len.saturating_sub(1));
+        let value = self.slots.get(head)?.get();
+        // `head` is below the capacity, so the next index is at most the capacity: it wraps by a comparison.
+        let next = head.wrapping_add(1);
+        self.head
+            .set(if next >= self.slots.len() { 0 } else { next });
+        self.len.set(len.wrapping_sub(1));
         value
     }
 }

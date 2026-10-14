@@ -26,9 +26,13 @@ use crate::cells::CellRing;
 /// The queue.
 pub struct LocalQueue {
     pending: Box<[Cell<bool>]>,
-    ready: CellRing<u32>,
-    /// Slots that woke themselves since the loop last released them.
-    yielded: CellRing<u32>,
+    /// The two lists, each holding one entry per slot: `lists[ready]` the ready FIFO, the other the slots
+    /// that woke themselves since the loop last released them. A release onto an empty ready FIFO swaps the
+    /// lists' roles rather than moving each entry, the case of a round of yields whose batch drained the FIFO
+    /// before reading its inputs again.
+    lists: [CellRing<u32>; 2],
+    /// Which of `lists` is the ready FIFO: 0 or 1.
+    ready: Cell<usize>,
     /// Slots `push` has listed, a count the loop reads twice to tell whether polls between listed any.
     listed: Cell<u64>,
     overflow: Cell<u64>,
@@ -38,8 +42,8 @@ impl std::fmt::Debug for LocalQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalQueue")
             .field("capacity", &self.pending.len())
-            .field("ready", &self.ready.len())
-            .field("yielded", &self.yielded.len())
+            .field("ready", &self.ready_list().len())
+            .field("yielded", &self.yielded_list().len())
             .finish()
     }
 }
@@ -49,11 +53,23 @@ impl LocalQueue {
     pub fn new(capacity: usize) -> Self {
         Self {
             pending: (0..capacity).map(|_| Cell::new(false)).collect(),
-            ready: CellRing::new(capacity),
-            yielded: CellRing::new(capacity),
+            lists: [CellRing::new(capacity), CellRing::new(capacity)],
+            ready: Cell::new(0),
             listed: Cell::new(0),
             overflow: Cell::new(0),
         }
+    }
+
+    /// The ready FIFO.
+    fn ready_list(&self) -> &CellRing<u32> {
+        let [first, second] = &self.lists;
+        if self.ready.get() == 0 { first } else { second }
+    }
+
+    /// The slots that woke themselves, waiting for their release.
+    fn yielded_list(&self) -> &CellRing<u32> {
+        let [first, second] = &self.lists;
+        if self.ready.get() == 0 { second } else { first }
     }
 
     /// Marks a slot ready; a slot already pending is not listed twice. A slot beyond the arena is counted as
@@ -71,7 +87,7 @@ impl LocalQueue {
         }
         // A slot is in the ring at most once (its flag), and the ring holds one entry per slot, so it never
         // refuses; were it to, the flag is cleared so the next wake lists the slot again.
-        if self.ready.push(slot).is_err() {
+        if self.ready_list().push(slot).is_err() {
             flag.set(false);
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
@@ -100,7 +116,7 @@ impl LocalQueue {
             return;
         }
         // Never refused, as for `push`: one entry per slot, and the list holds one for every slot.
-        if self.yielded.push(slot).is_err() {
+        if self.yielded_list().push(slot).is_err() {
             flag.set(false);
             self.overflow.set(self.overflow.get().saturating_add(1));
         }
@@ -109,9 +125,15 @@ impl LocalQueue {
     /// Lists every slot that woke itself behind the slots ready now, oldest first: the loop calls it once its
     /// inputs are in the queue.
     pub fn release_yielded(&self) {
-        while let Some(slot) = self.yielded.pop() {
+        // Behind nothing: the lists swap roles, the released slots in the order they yielded.
+        if self.ready_list().is_empty() {
+            self.ready.set(if self.ready.get() == 0 { 1 } else { 0 });
+            return;
+        }
+        let (ready, yielded) = (self.ready_list(), self.yielded_list());
+        while let Some(slot) = yielded.pop() {
             // Never refused: a slot is in one list at most, so both hold no more than the arena's slots.
-            if self.ready.push(slot).is_err() {
+            if ready.push(slot).is_err() {
                 if let Some(flag) = self
                     .pending
                     .get(usize::try_from(slot).unwrap_or(usize::MAX))
@@ -125,18 +147,18 @@ impl LocalQueue {
 
     /// Whether a slot that woke itself waits for its release.
     pub fn has_yielded(&self) -> bool {
-        !self.yielded.is_empty()
+        !self.yielded_list().is_empty()
     }
 
     /// How many slots the step about to run may take: at most `limit`, and only those ready now, so a wake
     /// during the batch waits for the next step.
     pub fn batch(&self, limit: usize) -> usize {
-        self.ready.len().min(limit)
+        self.ready_list().len().min(limit)
     }
 
     /// Takes the oldest ready slot, clearing its pending flag so a wake during its poll lists it again.
     pub fn pop(&self) -> Option<u32> {
-        let slot = self.ready.pop()?;
+        let slot = self.ready_list().pop()?;
         if let Some(flag) = self
             .pending
             .get(usize::try_from(slot).unwrap_or(usize::MAX))
@@ -148,12 +170,14 @@ impl LocalQueue {
 
     /// Whether nothing is ready, yielded tasks included.
     pub fn is_empty(&self) -> bool {
-        self.ready.is_empty() && self.yielded.is_empty()
+        self.ready_list().is_empty() && self.yielded_list().is_empty()
     }
 
     /// Ready entries, yielded tasks included.
     pub fn len(&self) -> usize {
-        self.ready.len().saturating_add(self.yielded.len())
+        self.ready_list()
+            .len()
+            .saturating_add(self.yielded_list().len())
     }
 
     /// Wakes for slots beyond the arena, ignored.

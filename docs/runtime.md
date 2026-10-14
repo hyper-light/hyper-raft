@@ -47,6 +47,9 @@ before the part that rests on them is built.
 | FDB | J. Zhou et al. "FoundationDB: A Distributed Unbundled Transactional Key Value Store." SIGMOD '21, §4 (simulation) | peer-reviewed |
 | WAKER | Rust `core::task::{Waker, RawWakerVTable}` documentation, 1.98 | primary |
 | VYUKOV | D. Vyukov, "Intrusive MPSC node-based queue" and "Bounded MPMC queue", 1024cores.net | NON-PEER-REVIEWED |
+| IX | A. Belay et al. "IX: A Protected Dataplane Operating System for High Throughput and Low Latency." OSDI '14, §3 | peer-reviewed |
+| CONCORD | R. Iyer, M. Unal, M. Kogias, G. Candea. "Achieving Microsecond-Scale Tail Latency Efficiently with Approximate Optimal Scheduling." SOSP '23, §2.2, §3.1 | peer-reviewed |
+| SEASTAR-PREEMPT | Seastar `include/seastar/core/preempt.hh` (`need_preempt`, `preemption_monitor`), `src/core/reactor.cc` (the task-quota timer), `doc/tutorial.md` "Preemption and Task Quota" | primary (source), UNVERIFIED revision |
 
 ## 1. What the three consumers need
 
@@ -567,6 +570,37 @@ case, and the loop's costs must not grow with the load.
   and 1.5 ns. In mantle's 100M fill the call fell from 2.8% to 2.5% of the shard thread's samples, its
   read of the gone state from 41 samples to 14 (`benchmark-results/hyper-rt-recv-20261013`). What is
   left is the call itself, about 2 ns a take, which only fewer takes save.
+
+### 3.10 The shard wanted: one test between a task's operations
+
+A task that runs operations back to back yields so the shard's other work runs, but a yield with nothing
+else to run is a round trip through the loop that only polls the task again. `ShardContext::wanted` says
+whether anything other than the polling task wants the shard: a task listed or yielded, an intent the loop
+has yet to apply, a wake or control message from another thread (the entry's two flags), or a timer or
+the driver's harvest falling due. `futures::maybe_yield` yields only then; `yield_now` keeps its meaning.
+It is IX's batching only under congestion ([IX] §3: "batching only occurs in the presence of congestion")
+and Seastar's preemption point, where a task asks one cache line whether to yield ([SEASTAR-PREEMPT]:
+`need_preempt()` is two relaxed loads and a compare). Concord measured the same test as an L1 hit and a
+compare, 2 cycles, against about 30 for reading the timestamp counter, and about 1–1.5% of a worker's time
+at every quantum where interrupts cost 6–33% ([CONCORD] §2.2.1, §3.1).
+
+What the test reads is kept where it costs no system call. The timed work is one desk cell, `due_ns`, which
+the loop keeps after every change to it (an input read, an applied intent): the wheel's next occupied tick,
+never later than its next deadline, or, while readiness waits are registered, the driver's next harvest a
+quantum after its last; 0 while the driver holds a completion or a poller is registered, both looked at
+every turn. The loop reads its own inputs the same way: a turn whose intents, flags and `due_ns` say
+nothing is pending releases the yielded tasks and touches no inbox, wheel, poller list or driver (an idle
+shard with readiness waits still asks the driver at once, as before). A simulated shard always answers
+`wanted`, so its schedules stay a step a yield, and reads every turn, as its harvest does.
+
+Measured in mantle's ranges bench at 100M (Linux VM, a fixed 15 µs quantum, three rounds,
+`benchmark-results/mantle-splinterdb-20261013/serve-15.txt`): the client's yields took 1.5–1.7 M a fill,
+each 0.375–0.54 µs at the median, and the range's task ran at every one of them (its polls within 0.5% of the
+yields), as the fill leaves its engine maintenance owed at every turn; the loop's own share of a yield, the
+yields' time less the range task's polls', was 189–265 ns. Where a turn leaves nothing owed, its yield finds
+no one and `maybe_yield` saves the round trip (`tests/maybe_yield.rs`: alone on its shard, a thousand
+conditional yields are one poll, a thousand `yield_now`s a thousand and one; each kind of want lets the
+others in at the next `maybe_yield`, and each test fails without its clause).
 
 ## 4. Running a future: `block_on`
 

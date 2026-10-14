@@ -338,6 +338,11 @@ pub struct ShardContext {
     pub(crate) activity_noted: Cell<bool>,
     /// The step quantum now, published by the loop.
     pub(crate) quantum_ns: Cell<u64>,
+    /// The earliest time the loop has timed work of its own, kept by the loop as it changes
+    /// (docs/runtime.md §3.10): the wheel's next occupied tick, the driver's next harvest while readiness
+    /// waits are registered, or 0 while the driver or a poller has work for every turn; `u64::MAX` with
+    /// none. [`ShardContext::wanted`] compares the clock against it.
+    pub(crate) due_ns: Cell<u64>,
     /// The measured scheduler overrun, published by the loop.
     pub(crate) scheduler_overrun_ns: Cell<u64>,
     /// The timer wheel's tick: a deadline is kept on the tick after it.
@@ -465,6 +470,7 @@ impl ShardContext {
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),
             quantum_ns: Cell::new(1),
+            due_ns: Cell::new(u64::MAX),
             scheduler_overrun_ns: Cell::new(0),
             timer_tick_ns: shape.timer_tick_ns,
             refused_spawns: Cell::new(0),
@@ -571,6 +577,22 @@ impl ShardContext {
     /// configured step budget. A cooperative operation sizes its slices by it.
     pub fn quantum_ns(&self) -> u64 {
         self.quantum_ns.get()
+    }
+
+    /// Whether anything other than the task polling now wants this shard (docs/runtime.md §3.10): a task
+    /// listed or yielded, an intent the loop has yet to apply, a wake or a control message from another
+    /// thread, or a timer or the driver's harvest falling due. The test a task that runs operations back
+    /// to back makes between them ([`crate::futures::maybe_yield`]): no system call, the desk's fields, the
+    /// entry's two flags and the counter. A simulated shard always answers true, so its schedules stay a
+    /// step a yield.
+    pub fn wanted(&self) -> bool {
+        self.is_sim
+            || !self.local.is_empty()
+            || self.asked.get()
+            || self
+                .entry
+                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
+            || self.now_ns() >= self.due_ns.get()
     }
 
     /// The online wake estimate, nanoseconds (the quantum).

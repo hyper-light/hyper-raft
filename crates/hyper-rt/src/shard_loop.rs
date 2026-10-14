@@ -431,6 +431,7 @@ impl Shard {
         let shard = Shard { desk, core };
         shard.publish_clock();
         shard.desk.quantum_ns.set(shard.quantum_ns());
+        shard.refresh_due();
         Ok(shard)
     }
 
@@ -686,6 +687,30 @@ impl Shard {
         while let Some(interest) = self.desk.interests.pop() {
             self.apply_interest(interest);
         }
+        self.refresh_due();
+    }
+
+    /// Keeps the desk's `due_ns`, the earliest time the loop has timed work of its own (docs/runtime.md
+    /// §3.10), after every change to it (an input read, an applied intent): 0 while the driver holds a
+    /// completion or a poller is registered, both looked at every turn; else the earlier of the wheel's next
+    /// occupied tick, which is never later than its next deadline, and, while readiness waits are
+    /// registered, the driver's next harvest a quantum after its last; `u64::MAX` with neither, or once the
+    /// driver is lost or the shard has exited.
+    fn refresh_due(&self) {
+        let due = if self.core.driver_lost || self.core.exited {
+            u64::MAX
+        } else if self.core.driver.has_pending() || !self.core.pollers.is_empty() {
+            0
+        } else {
+            let timer = self.core.timers.next_deadline_ns().unwrap_or(u64::MAX);
+            let harvest = if self.core.waiting.is_empty() {
+                u64::MAX
+            } else {
+                self.core.last_driver_ns.saturating_add(self.quantum_ns())
+            };
+            timer.min(harvest)
+        };
+        self.desk.due_ns.set(due);
     }
 
     fn apply_task(&mut self, slot: u32) {
@@ -1221,6 +1246,10 @@ impl Shard {
     /// the driver's completions; then the tasks that woke themselves, behind all of them (`crate::queue`).
     /// Whether any input did work.
     fn read_inputs(&mut self) -> bool {
+        if !self.inputs_pending() {
+            self.desk.local.release_yielded();
+            return false;
+        }
         let mut did_work = self.drain_control();
         did_work |= self.drain_wakes();
         did_work |= self.expire_timers();
@@ -1228,7 +1257,23 @@ impl Shard {
         self.apply();
         did_work |= self.harvest_turn();
         self.desk.local.release_yielded();
+        self.refresh_due();
         did_work
+    }
+
+    /// Whether the inputs may hold work (docs/runtime.md §3.10), from what tells without touching them: an
+    /// intent asked, the time against `due_ns`, an idle shard with readiness waits (whose turn asks the
+    /// driver at once), and the entry's flags for control and wakes from other threads. The simulation reads
+    /// every turn, as its harvest does.
+    fn inputs_pending(&self) -> bool {
+        !self.core.real_time
+            || self.desk.asked.get()
+            || self.desk.now_ns.get() >= self.desk.due_ns.get()
+            || (self.desk.local.is_empty() && !self.core.waiting.is_empty())
+            || self
+                .desk
+                .entry
+                .is_none_or(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
     }
 
     /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement comes first

@@ -763,7 +763,6 @@ impl Shard {
         if let Some(p) = parent {
             link_child(&mut self.core.tasks, p, slot);
         }
-        count(&self.desk.live.spawns, 1);
     }
 
     fn apply_timer(&mut self, slot: u32) {

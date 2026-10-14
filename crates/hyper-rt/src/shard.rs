@@ -730,6 +730,10 @@ impl ShardContext {
         } else {
             self.local.push(slot);
         }
+        // Counted at its admission, here, whenever the loop installs it (`Counters::spawns`).
+        self.live
+            .spawns
+            .set(self.live.spawns.get().saturating_add(1));
         Ok(TaskId(word))
     }
 

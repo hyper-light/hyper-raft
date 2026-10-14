@@ -2,9 +2,9 @@
 //! many times between polls appears once and the ring never holds more than the arena's slots (slates'
 //! `queue.rs`; §4.3 "intrusive run queue"; no allocation on the wake path).
 //!
-//! Single-threaded by construction: only the owning shard's thread pushes and pops. The ring is a
-//! [`CellRing`] (docs/runtime.md §3.4), so nothing is borrowed and nothing is refused: slates' version
-//! kept its lists in `RefCell`s and counted the re-entrant accesses it refused.
+//! Single-threaded by construction: only the owning shard's thread pushes and pops. The rings are of
+//! `Cell`s (docs/runtime.md §3.4), so nothing is borrowed and nothing is refused: slates' version kept its
+//! lists in `RefCell`s and counted the re-entrant accesses it refused.
 //!
 //! A step takes at most its configured poll budget, oldest first. Wakes that arrive while the phase
 //! runs join the same FIFO behind tasks already ready and may use its remaining budget. A task waking
@@ -21,7 +21,75 @@
 
 use std::cell::Cell;
 
-use crate::cells::CellRing;
+/// A first-in-first-out ring of slot numbers, one entry per slot at most: [`crate::cells::CellRing`]'s
+/// shape with the numbers held bare, since a slot is read only between the head and the length, so no entry
+/// needs a mark of its own.
+struct SlotRing {
+    slots: Box<[Cell<u32>]>,
+    /// The index of the oldest number.
+    head: Cell<usize>,
+    /// Numbers held.
+    len: Cell<usize>,
+}
+
+impl SlotRing {
+    /// A ring that holds at most `capacity` numbers.
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: (0..capacity).map(|_| Cell::new(0)).collect(),
+            head: Cell::new(0),
+            len: Cell::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.get()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len.get() == 0
+    }
+
+    /// Appends `slot`, or hands it back when the ring is full.
+    #[inline]
+    fn push(&self, slot: u32) -> Result<(), u32> {
+        let len = self.len.get();
+        let capacity = self.slots.len();
+        if len >= capacity {
+            return Err(slot);
+        }
+        // `head` and `len` are each below the capacity, so their sum is below twice it: one subtraction wraps it.
+        let end = self.head.get().wrapping_add(len);
+        let at = if end >= capacity {
+            end.wrapping_sub(capacity)
+        } else {
+            end
+        };
+        let Some(cell) = self.slots.get(at) else {
+            return Err(slot);
+        };
+        cell.set(slot);
+        self.len.set(len.wrapping_add(1));
+        Ok(())
+    }
+
+    /// Takes the oldest number.
+    #[inline]
+    fn pop(&self) -> Option<u32> {
+        let len = self.len.get();
+        if len == 0 {
+            return None;
+        }
+        let head = self.head.get();
+        let slot = self.slots.get(head)?.get();
+        // `head` is below the capacity, so the next index is at most the capacity: it wraps by a comparison.
+        let next = head.wrapping_add(1);
+        self.head
+            .set(if next >= self.slots.len() { 0 } else { next });
+        self.len.set(len.wrapping_sub(1));
+        Some(slot)
+    }
+}
 
 /// The queue.
 pub struct LocalQueue {
@@ -30,7 +98,7 @@ pub struct LocalQueue {
     /// that woke themselves since the loop last released them. A release onto an empty ready FIFO swaps the
     /// lists' roles rather than moving each entry, the case of a round of yields whose batch drained the FIFO
     /// before reading its inputs again.
-    lists: [CellRing<u32>; 2],
+    lists: [SlotRing; 2],
     /// Which of `lists` is the ready FIFO: 0 or 1.
     ready: Cell<usize>,
     /// Slots `push` has listed, a count the loop reads twice to tell whether polls between listed any.
@@ -53,7 +121,7 @@ impl LocalQueue {
     pub fn new(capacity: usize) -> Self {
         Self {
             pending: (0..capacity).map(|_| Cell::new(false)).collect(),
-            lists: [CellRing::new(capacity), CellRing::new(capacity)],
+            lists: [SlotRing::new(capacity), SlotRing::new(capacity)],
             ready: Cell::new(0),
             listed: Cell::new(0),
             overflow: Cell::new(0),
@@ -61,19 +129,22 @@ impl LocalQueue {
     }
 
     /// The ready FIFO.
-    fn ready_list(&self) -> &CellRing<u32> {
+    #[inline]
+    fn ready_list(&self) -> &SlotRing {
         let [first, second] = &self.lists;
         if self.ready.get() == 0 { first } else { second }
     }
 
     /// The slots that woke themselves, waiting for their release.
-    fn yielded_list(&self) -> &CellRing<u32> {
+    #[inline]
+    fn yielded_list(&self) -> &SlotRing {
         let [first, second] = &self.lists;
         if self.ready.get() == 0 { second } else { first }
     }
 
     /// Marks a slot ready; a slot already pending is not listed twice. A slot beyond the arena is counted as
     /// overflow and ignored (a stale or foreign word).
+    #[inline]
     pub fn push(&self, slot: u32) {
         let Some(flag) = self
             .pending
@@ -104,6 +175,7 @@ impl LocalQueue {
     /// Marks a slot ready behind the loop's next reading of its inputs: the task woke itself in its own
     /// poll. A slot already pending keeps its place; one beyond the arena is counted as overflow and
     /// ignored.
+    #[inline]
     pub fn defer(&self, slot: u32) {
         let Some(flag) = self
             .pending
@@ -157,6 +229,7 @@ impl LocalQueue {
     }
 
     /// Takes the oldest ready slot, clearing its pending flag so a wake during its poll lists it again.
+    #[inline]
     pub fn pop(&self) -> Option<u32> {
         let slot = self.ready_list().pop()?;
         if let Some(flag) = self

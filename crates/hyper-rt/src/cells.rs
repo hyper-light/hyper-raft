@@ -42,16 +42,6 @@ impl<T: Copy> CellRing<T> {
         self.slots.len()
     }
 
-    /// Values held.
-    pub(crate) fn len(&self) -> usize {
-        self.len.get()
-    }
-
-    /// Whether it holds nothing.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len.get() == 0
-    }
-
     /// Appends `value`, or hands it back when the ring is full.
     pub(crate) fn push(&self, value: T) -> Result<(), T> {
         let len = self.len.get();
@@ -161,7 +151,7 @@ mod tests {
             std::iter::from_fn(|| ring.pop()).collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert!(ring.is_empty());
+        assert_eq!(ring.len.get(), 0);
         assert_eq!(ring.pop(), None);
     }
 

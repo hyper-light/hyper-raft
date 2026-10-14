@@ -286,11 +286,22 @@ pub struct TaskSlot {
     pub long_steps: u32,
     /// The longest poll by the wall clock, in nanoseconds.
     pub longest_step_ns: u64,
+    /// The task's packed word (shard, slot, generation), fixed while the slot holds it: its waker's data and
+    /// its id, kept here so a poll does not pack it again; 0 for an empty slot.
+    pub word: u64,
+    /// Whether the task is a service (it owns its cancellation cleanup), fixed at its admission.
+    pub service: bool,
 }
 
 impl TaskSlot {
-    /// A fresh slot for `future` under `parent`.
-    pub fn new(future: BoxedFuture, parent: Option<u32>, joinable: bool) -> Self {
+    /// A fresh slot for `future` under `parent`: the task `word` names, a service or not.
+    pub fn new(
+        future: BoxedFuture,
+        parent: Option<u32>,
+        joinable: bool,
+        word: u64,
+        service: bool,
+    ) -> Self {
         Self {
             state: State::Idle,
             future: Some(future),
@@ -305,6 +316,8 @@ impl TaskSlot {
             polls: 0,
             long_steps: 0,
             longest_step_ns: 0,
+            word,
+            service,
         }
     }
 
@@ -324,6 +337,8 @@ impl TaskSlot {
             polls: 0,
             long_steps: 0,
             longest_step_ns: 0,
+            word: 0,
+            service: false,
         }
     }
 

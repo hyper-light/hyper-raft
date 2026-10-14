@@ -1085,7 +1085,9 @@ impl ShardContext {
     }
 
     /// Wakes a task of this shard by its slot. A task that wakes itself in its own poll (a yield, or any
-    /// future with more to do) waits for the loop's next reading of its inputs (`crate::queue`).
+    /// future with more to do) waits for the loop's next reading of its inputs (`crate::queue`). Inlined: every
+    /// waker of this shard's tasks on its own thread ends here.
+    #[inline]
     pub(crate) fn wake_local(&self, slot: u32) {
         if self.current_task.get() == Some(slot) {
             self.local.defer(slot);

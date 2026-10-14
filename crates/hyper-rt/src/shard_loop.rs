@@ -556,10 +556,14 @@ impl Shard {
     /// The driver's clock now within a step: its step's reading carried forward by the counter where the
     /// shard reads one, else read again.
     fn carried_now_ns(&self) -> u64 {
-        match (
-            self.desk.carried.get(),
-            crate::machine::clock::counter_ticks(),
-        ) {
+        self.carried_from(self.desk.carried.get())
+    }
+
+    /// [`Shard::carried_now_ns`] from the step's reading `carried`, which a batch reads once: only a step's
+    /// start sets it.
+    #[inline]
+    fn carried_from(&self, carried: Option<crate::machine::clock::Carried>) -> u64 {
+        match (carried, crate::machine::clock::counter_ticks()) {
             (Some(carried), Some(ticks)) => carried.now_ns(ticks),
             _ => self.now_ns(),
         }
@@ -706,11 +710,13 @@ impl Shard {
             future,
             parent,
             joinable,
-            service: _,
+            service,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
+        let generation = self.desk.task(slot).map_or(0, |cell| cell.generation.get());
+        let word = Encoded::pack(self.desk.id, slot, generation).map_or(0, Encoded::word);
         if let Some(task) = self.task_mut(slot) {
-            *task = TaskSlot::new(future, parent, joinable);
+            *task = TaskSlot::new(future, parent, joinable, word, service);
             task.state = State::Queued;
         }
         if let Some(p) = parent {
@@ -1102,8 +1108,9 @@ impl Shard {
         let batch = self.core.config.batch.max(1);
         let budget_ns = self.batch_budget_ns();
         // The quantum a poll is judged by: the wake estimate, which moves only when the shard parks, so one
-        // reading serves the batch.
+        // reading serves the batch; and the step's clock reading, which only a step's start sets.
         let quantum_ns = self.quantum_ns();
+        let carried = self.desk.carried.get();
         let mut at = BatchMark {
             mark,
             inputs_read_ns: None,
@@ -1117,10 +1124,10 @@ impl Shard {
             polled_any = true;
             let start = match at.mark {
                 Some(start) => start,
-                None => self.carried_now_ns(),
+                None => self.carried_from(carried),
             };
             let since = *at.inputs_read_ns.get_or_insert(start);
-            let ended = self.poll_slot(slot, start, quantum_ns, current);
+            let ended = self.poll_slot(slot, start, quantum_ns, carried, current);
             at.mark = Some(ended);
             self.apply();
             if polled < batch
@@ -1281,8 +1288,9 @@ impl Shard {
             if ordinary && ready {
                 let start = self.now_ns();
                 let quantum_ns = self.quantum_ns();
+                let carried = self.desk.carried.get();
                 registry::with_current_cell(self, |shard, current| {
-                    shard.poll_slot(slot, start, quantum_ns, current)
+                    shard.poll_slot(slot, start, quantum_ns, carried, current)
                 });
             }
         }
@@ -1691,34 +1699,12 @@ impl Shard {
         slot: u32,
         start: u64,
         quantum_ns: u64,
+        carried: Option<crate::machine::clock::Carried>,
         current: Option<registry::CurrentCell<'_>>,
     ) -> u64 {
-        let Some(cell) = self.desk.task(slot) else {
+        let Some((mut future, service, word)) = self.take_to_poll(slot, current) else {
             return start;
         };
-        // Set at admission and kept while the slot holds the task: the poll and what it asks cannot move them.
-        let service = cell.service.get();
-        let generation = cell.generation.get();
-        if service && cell.cancelled.get() {
-            self.cancel_children_once(slot);
-        }
-        let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
-            return start;
-        };
-        if matches!(task.state, State::Finishing | State::Done | State::Running) {
-            return start;
-        }
-        let Some(mut future) = task.future.take() else {
-            return start;
-        };
-        if task.cancel_requested && !service {
-            task.state = State::Finishing;
-            self.drop_entered(future, current);
-            self.finish(slot, Outcome::Cancelled);
-            return start;
-        }
-        task.state = State::Running;
-        let word = Encoded::pack(self.desk.id, slot, generation).unwrap_or(Encoded::from_word(0));
         // Never dropped: the vtable's drop does nothing (`crate::waker`), and an indirect call to it a poll is
         // all a drop would add.
         let waker = std::mem::ManuallyDrop::new(waker_for(word));
@@ -1730,11 +1716,12 @@ impl Shard {
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
         drop(entered);
-        let ended = self.carried_now_ns().max(start);
+        let ended = self.carried_from(carried).max(start);
         self.desk.current_task.set(None);
         // A request served in this poll opens the idle window from where the poll ended, not where it began:
         // the spin covers the moments after the shard goes idle, however long the serving took.
-        if self.desk.activity_noted.replace(false) {
+        if self.desk.activity_noted.get() {
+            self.desk.activity_noted.set(false);
             self.desk.activity_ns.set(Some(ended));
         }
         // What the poll asked takes effect before its result is recorded: a parent that spawned children and
@@ -1742,7 +1729,7 @@ impl Shard {
         self.apply();
         let elapsed = ended.saturating_sub(start);
         let attributed = if elapsed > quantum_ns {
-            self.attribute_poll(slot, generation, start, ended, quantum_ns)
+            self.attribute_poll(slot, word.generation(), start, ended, quantum_ns)
         } else {
             None
         };
@@ -1750,22 +1737,89 @@ impl Shard {
             self.unwound(slot, future, word, current);
             return ended;
         };
-        // The poll's record, then the future back in its slot or the task finished.
-        let long = attributed.is_some_and(Attribution::is_tasks);
+        self.record_poll(slot, elapsed, attributed);
+        self.put_back_or_finish(
+            slot,
+            future,
+            matches!(poll, Poll::Ready(())),
+            service,
+            current,
+        );
+        ended
+    }
+
+    /// The future of the task in `slot`, taken out of its slot for a poll, with whether the task is a service and
+    /// its word; `None` when the slot holds no task to poll (finishing, done, being polled, or empty), and for
+    /// an ordinary task whose cancellation was asked, which ends here instead, at its poll boundary.
+    #[inline(always)]
+    fn take_to_poll(
+        &mut self,
+        slot: u32,
+        current: Option<registry::CurrentCell<'_>>,
+    ) -> Option<(BoxedFuture, bool, Encoded)> {
+        // Fixed while the slot holds the task: the poll and what it asks cannot move them.
+        let task = slot_mut(&mut self.core.tasks, slot)?;
+        let (service, word) = (task.service, Encoded::from_word(task.word));
+        if service
+            && self
+                .desk
+                .task(slot)
+                .is_some_and(|cell| cell.cancelled.get())
+        {
+            self.cancel_children_once(slot);
+        }
+        let task = slot_mut(&mut self.core.tasks, slot)?;
+        if matches!(task.state, State::Finishing | State::Done | State::Running) {
+            return None;
+        }
+        let future = task.future.take()?;
+        if task.cancel_requested && !service {
+            task.state = State::Finishing;
+            self.drop_entered(future, current);
+            self.finish(slot, Outcome::Cancelled);
+            return None;
+        }
+        task.state = State::Running;
+        Some((future, service, word))
+    }
+
+    /// Counts a poll that ran `elapsed` and was `attributed`, for the shard and for its task.
+    #[inline(always)]
+    fn record_poll(&mut self, slot: u32, elapsed: u64, attributed: Option<Attribution>) {
         self.core.counters.polls = self.core.counters.polls.saturating_add(1);
         if let Some(attributed) = attributed {
             count_long_poll(&mut self.core.counters, attributed);
         }
-        self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed);
+        // A store only when the longest grew, which most polls leave as it was.
+        if elapsed > self.core.counters.longest_step_ns {
+            self.core.counters.longest_step_ns = elapsed;
+        }
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
-            return ended;
+            return;
         };
         task.polls = task.polls.saturating_add(1);
-        if long {
+        if attributed.is_some_and(Attribution::is_tasks) {
             task.long_steps = task.long_steps.saturating_add(1);
         }
-        task.longest_step_ns = task.longest_step_ns.max(elapsed);
-        let done = matches!(poll, Poll::Ready(()));
+        if elapsed > task.longest_step_ns {
+            task.longest_step_ns = elapsed;
+        }
+    }
+
+    /// After a poll: the future back in its slot, or, when it returned or an ordinary task's cancellation was
+    /// asked while it ran, the task finished.
+    #[inline(always)]
+    fn put_back_or_finish(
+        &mut self,
+        slot: u32,
+        future: BoxedFuture,
+        done: bool,
+        service: bool,
+        current: Option<registry::CurrentCell<'_>>,
+    ) {
+        let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
+            return;
+        };
         if done || (task.cancel_requested && !service) {
             let cancelled = task.cancel_requested;
             self.drop_entered(future, current);
@@ -1777,11 +1831,10 @@ impl Shard {
                     Outcome::Completed
                 },
             );
-            return ended;
+            return;
         }
         task.future = Some(future);
         task.state = State::Idle;
-        ended
     }
 
     /// A poll that unwound: its future is in no state to poll again, so it is dropped and the task ends.

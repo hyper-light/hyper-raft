@@ -31,6 +31,8 @@ UNSAFE_ALLOWED = {
     "crates/hyper-block/src/resident/linux.rs":
         "mmap, mincore and munmap through libc: which pages of a file the page cache holds, a probe "
         "that starts no I/O (tests only)",
+    "crates/hyper-rt/src/frames.rs":
+        "a shard's task frames: a future written into a block of its size class, polled pinned in place and dropped in place by its shard, the block recycled on the shard's free list (docs/runtime.md §3.1)",
     "crates/hyper-rt/src/handoff.rs":
         "a parked thread's handle registered by address in a cell's waiter word and read once by the publisher that claimed it",
     "crates/hyper-rt/src/sync/ring.rs":

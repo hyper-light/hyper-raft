@@ -115,9 +115,17 @@ be `!Send`; a task sent to another shard is `Send` and travels through that shar
 [LITTLE], as slates derives it (`runtime.rs` `admission_limit`); a consumer that has not measured them
 states its configured value and why.
 
-**Change: one allocation per spawn, measured.** slates boxes every future (NOTE08 §3.1). Kept for now (a
-future's size is the caller's), with the allocation counted in the benchmarks of §12; a per-shard pool of
-fixed-size task frames is the measured follow-up, not a default.
+**Change: a task spawned on its own shard lives in a frame its shard recycles** (2026-10-13). slates boxes
+every future (NOTE08 §3.1), and so did this crate, with the allocation counted in the benchmarks of §12: a
+`malloc` and a `free` a task, 10.6 ns of a spawn and join that cost 43.4 ns in all on the comparison's host.
+A spawn from a task (`futures::spawn` and its kin) now writes its future into a frame of the shard's
+(`src/frames.rs`): a power of two from 16 bytes, aligned as `malloc` aligns, taken from its class's free list
+or the allocator, polled pinned where it lies and dropped in place at the task's end, the frame back on its
+class's list. A class keeps at most the shard's task slots of frames free, so the store never holds more than
+the shard once held live; a future aligned past 16 bytes has a frame of its exact layout, and a zero-sized one
+none. A spawn request from another thread, and the owner's own spawns, hand over a `Box`, which the task
+keeps: the frames are the shard's, used on its thread alone. A spawn and join, a task's frame recycled: 1,194
+to 714 instructions on the fixed-shape bench of docs/benchmarks.md (rt-2x).
 
 **A task's code runs inside an unwind boundary of the shard's own** (2026-10-11; CLAUDE.md §1, production
 code never panics). A task's poll and its future's drop are the caller's code, run on the shard's thread

@@ -382,6 +382,16 @@ impl<T> Drop for Sender<T> {
 impl<T> Sender<T> {
     /// Sends without waiting: `Full` when the channel is at its capacity, `Closed` when the receiver is gone.
     pub fn try_send(&self, value: T) -> Result<(), SyncError<T>> {
+        self.try_send_on(value, None)
+    }
+
+    /// [`Sender::try_send`] by a task polling on the shard `here`, which its wake of a waiting task of that
+    /// shard uses rather than look the thread's shard up again.
+    fn try_send_on(
+        &self,
+        value: T,
+        here: Option<&crate::shard::ShardContext>,
+    ) -> Result<(), SyncError<T>> {
         let words = self.shared.words();
         if words_have(words, RECEIVER_GONE) {
             return Err(SyncError::Closed(value));
@@ -400,7 +410,7 @@ impl<T> Sender<T> {
                         words.wake();
                     }
                 } else if let Some(words) = words {
-                    words.wake_fenced();
+                    words.wake_fenced(here);
                 }
                 Ok(())
             }
@@ -496,7 +506,28 @@ impl<T> Future for Send<'_, T> {
         let Some(value) = self.value.take() else {
             return Poll::Ready(Ok(()));
         };
-        let Some(word) = polling_task(cx.waker()) else {
+        // One lookup of the thread's shard serves the task's word and the wake of a waiting task there.
+        let this = &mut *self;
+        crate::registry::with_here(|here| match here {
+            Some(here) => this.poll_on(here, value, cx),
+            None => {
+                this.leave(false);
+                Poll::Ready(Err(SyncError::NotOnShardThread(value)))
+            }
+        })
+    }
+}
+
+impl<T> Send<'_, T> {
+    /// [`Send::poll`] on the shard `here`, the task's word taken from it; a waker that is not the polling
+    /// task's is refused `NotOnShardThread`, the value handed back.
+    fn poll_on(
+        &mut self,
+        here: &crate::shard::ShardContext,
+        value: T,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), SyncError<T>>> {
+        let Some(word) = crate::waker::polling_task_in(here, cx.waker()) else {
             self.leave(false);
             return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
         };
@@ -504,7 +535,7 @@ impl<T> Future for Send<'_, T> {
         let room = &sender.shared.get().room;
         // A grant seen before the try is used by a send that follows it.
         let granted = self.place.is_some_and(|place| room.granted(place));
-        let value = match sender.try_send(value) {
+        let value = match sender.try_send_on(value, Some(here)) {
             Err(SyncError::Full(value)) => value,
             sent => {
                 self.leave(granted);
@@ -529,7 +560,7 @@ impl<T> Future for Send<'_, T> {
         };
         room.register_task(place, word.word());
         // Room made before the place showed waiting is seen here; room made after it is granted to the place.
-        match sender.try_send(value) {
+        match sender.try_send_on(value, Some(here)) {
             Err(SyncError::Full(value)) => {
                 self.value = Some(value);
                 if room.granted(place) {

@@ -180,15 +180,27 @@ pub(crate) fn wake_waiter(waiter: &impl WaiterWord) {
 }
 
 /// [`wake_waiter`] for a publisher that has fenced after its state change and written nothing since
-/// ([`take_fenced`]).
-pub(crate) fn wake_waiter_fenced(waiter: &impl WaiterWord) {
+/// ([`take_fenced`]), on the shard `here` when the publisher is a task that looked its shard up already: a
+/// waiting task of that shard is listed on its desk at once, where the registry would look the thread's
+/// shard up again.
+pub(crate) fn wake_waiter_fenced(
+    waiter: &impl WaiterWord,
+    here: Option<&crate::shard::ShardContext>,
+) {
     let taken = take_fenced(waiter, |word| {
         // SAFETY: `take_fenced` calls this only with a registered thread word while it holds the word's claim;
         // thread words are registered only by `wait_as_thread`, whose handle lives on its stack and which does
         // not return while the word reads `CLAIMED` (`clone_thread`'s contract).
         unsafe { clone_thread(word) }
     });
-    wake_taken(taken);
+    match (taken, here) {
+        (Taken::Task(word), Some(here))
+            if crate::mem::Encoded::from_word(word).shard() == here.id =>
+        {
+            here.wake_local(crate::mem::Encoded::from_word(word).slot());
+        }
+        (taken, _) => wake_taken(taken),
+    }
 }
 
 /// Wakes what a publisher took: a task through the registry, a thread by its handle.

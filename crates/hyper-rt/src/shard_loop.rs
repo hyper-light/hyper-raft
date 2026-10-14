@@ -34,7 +34,9 @@ use crate::runtime::RuntimeConfig;
 use crate::shard::{
     DeskShape, Incoming, Kept, Phase, ShardContext, ShardId, TaskId, TimerPhase, ask,
 };
-use crate::task::{Admission, BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
+use crate::task::{
+    Admission, BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskFuture, TaskSlot,
+};
 use crate::timer::Wheel;
 use crate::waker::waker_for;
 
@@ -615,7 +617,7 @@ impl Shard {
             .map(|p| p.slot());
         let future: BoxedFuture = future;
         let admitted = self.desk.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent,
             joinable: false,
             service,
@@ -1744,7 +1746,7 @@ impl Shard {
         let entered = registry::enter_in(current, &self.desk);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
-        let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
+        let poll = crate::unwind::contained(|| future.poll(&mut cx));
         drop(entered);
         let ended = self.carried_from(carried).max(start);
         self.desk.current.set(crate::shard::NO_TASK);
@@ -1786,7 +1788,7 @@ impl Shard {
         &mut self,
         slot: u32,
         current: Option<registry::CurrentCell<'_>>,
-    ) -> Option<(BoxedFuture, bool, Encoded)> {
+    ) -> Option<(TaskFuture, bool, Encoded)> {
         // A task listed at its spawn, with no parent, is installed as it is first polled (`ShardContext::claim`).
         if slot_mut(&mut self.core.tasks, slot)?.state == State::Done {
             let incoming = self.desk.task(slot)?.incoming.take()?;
@@ -1837,7 +1839,7 @@ impl Shard {
     fn put_back_or_finish(
         &mut self,
         slot: u32,
-        future: BoxedFuture,
+        future: TaskFuture,
         done: bool,
         service: bool,
         current: Option<registry::CurrentCell<'_>>,
@@ -1867,7 +1869,7 @@ impl Shard {
     fn unwound(
         &mut self,
         slot: u32,
-        future: BoxedFuture,
+        future: TaskFuture,
         word: Encoded,
         current: Option<registry::CurrentCell<'_>>,
     ) {
@@ -1882,9 +1884,15 @@ impl Shard {
     /// Drops a task's future with the desk entered: its destructors may wake or cancel other tasks of this
     /// shard, or let their timers go. The drop is the task's code, inside an unwind boundary of the shard's
     /// own; one that unwinds is counted.
-    fn drop_entered(&mut self, future: BoxedFuture, current: Option<registry::CurrentCell<'_>>) {
+    fn drop_entered(&mut self, future: TaskFuture, current: Option<registry::CurrentCell<'_>>) {
         let entered = registry::enter_in(current, &self.desk);
-        let dropped = crate::unwind::contained(move || drop(future));
+        let desk = &*self.desk;
+        // A frame goes back to the shard's store for its next spawn of that size, its future's drop
+        // returning or unwinding (`crate::frames`).
+        let dropped = crate::unwind::contained(move || match future {
+            TaskFuture::Boxed(future) => drop(future),
+            TaskFuture::Framed(future) => desk.frames.release(future),
+        });
         drop(entered);
         if dropped.is_none() {
             count(&self.desk.live.unwound, 1);

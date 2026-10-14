@@ -67,10 +67,10 @@ impl Cell {
         crate::handoff::wake_waiter(&self.waiter);
     }
 
-    /// [`Cell::wake`] for a publisher that fenced (`SeqCst`) after its change and wrote nothing since
-    /// (`crate::handoff::wake_waiter_fenced`).
-    pub(crate) fn wake_fenced(&self) {
-        crate::handoff::wake_waiter_fenced(&self.waiter);
+    /// [`Cell::wake`] for a publisher that fenced (`SeqCst`) after its change and wrote nothing since, on the
+    /// shard `here` when it knows it (`crate::handoff::wake_waiter_fenced`).
+    pub(crate) fn wake_fenced(&self, here: Option<&crate::shard::ShardContext>) {
+        crate::handoff::wake_waiter_fenced(&self.waiter, here);
     }
 
     const fn new() -> Self {

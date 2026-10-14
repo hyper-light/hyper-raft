@@ -24,7 +24,7 @@ use crate::error::RtError;
 use crate::mem::Encoded;
 use crate::queue::LocalQueue;
 use crate::registry::{self, Entry, SlotHolder};
-use crate::task::{BoxedFuture, Outcome};
+use crate::task::{BoxedFuture, Outcome, TaskFuture};
 
 /// A shard's process-wide id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,7 +81,7 @@ pub(crate) mod ask {
 
 /// A future waiting to be installed in its slot, with how it was spawned.
 pub(crate) struct Incoming {
-    pub(crate) future: BoxedFuture,
+    pub(crate) future: TaskFuture,
     pub(crate) parent: Option<u32>,
     pub(crate) joinable: bool,
     pub(crate) service: bool,
@@ -303,6 +303,8 @@ pub struct ShardContext {
     pub id: u16,
     /// The local run queue.
     pub(crate) local: LocalQueue,
+    /// The frames the shard's own spawns write their futures into (`crate::frames`).
+    pub(crate) frames: crate::frames::Frames,
     pub(crate) tasks: Box<[TaskCell]>,
     pub(crate) free_tasks: CellStack<u32>,
     pub(crate) dirty_tasks: CellRing<u32>,
@@ -412,6 +414,7 @@ impl ShardContext {
         Self {
             id,
             local: LocalQueue::new(shape.tasks),
+            frames: crate::frames::Frames::new(shape.tasks),
             tasks: (0..shape.tasks)
                 .map(|_| TaskCell {
                     generation: Cell::new(shape.generation_base),
@@ -636,7 +639,7 @@ impl ShardContext {
     /// installs it before the next poll. Refused `TooManyTasks` when no slot is free.
     pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
         self.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent,
             joinable: true,
             service: false,
@@ -646,7 +649,7 @@ impl ShardContext {
     /// Spawns a detached task on this shard: nobody joins it, and its slot is freed when it ends.
     pub fn spawn_detached(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
         self.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent: None,
             joinable: false,
             service: false,
@@ -661,10 +664,29 @@ impl ShardContext {
         parent: Option<u32>,
     ) -> Result<TaskId, RtError> {
         self.claim(Incoming {
-            future,
+            future: TaskFuture::Boxed(future),
             parent,
             joinable: true,
             service: true,
+        })
+    }
+
+    /// Spawns `future` written into a frame of this shard's (`crate::frames`): under `parent` (a slot of this
+    /// shard), joinable or detached, a service or not. The spawns a task makes on its own shard
+    /// (`crate::futures`); refused as a claim is, and `Mem` when no frame could be had.
+    pub(crate) fn spawn_framed<F: std::future::Future<Output = ()> + 'static>(
+        &self,
+        future: F,
+        parent: Option<u32>,
+        joinable: bool,
+        service: bool,
+    ) -> Result<TaskId, RtError> {
+        let future = TaskFuture::Framed(self.frames.put(future)?);
+        self.claim(Incoming {
+            future,
+            parent,
+            joinable,
+            service,
         })
     }
 

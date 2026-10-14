@@ -23,6 +23,25 @@ use crate::shard::TaskId;
 /// through the task table (hecate's model).
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
+/// A task's future: boxed, as a spawn request from another thread or the shard's owner hands it over, or in
+/// a frame of its shard's, as a task spawning on its own shard writes it (`crate::frames`).
+pub(crate) enum TaskFuture {
+    /// In a box of its own.
+    Boxed(BoxedFuture),
+    /// In a frame its shard recycles.
+    Framed(crate::frames::Framed),
+}
+
+impl TaskFuture {
+    /// Polls it where it lies.
+    pub(crate) fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        match self {
+            TaskFuture::Boxed(future) => future.as_mut().poll(cx),
+            TaskFuture::Framed(future) => future.poll(cx),
+        }
+    }
+}
+
 /// The "no link" sentinel for child and sibling links.
 pub const NO_LINK: u32 = u32::MAX;
 
@@ -264,7 +283,7 @@ pub struct TaskSlot {
     /// The state.
     pub state: State,
     /// The future while it lives (taken out while polled).
-    pub future: Option<BoxedFuture>,
+    pub(crate) future: Option<TaskFuture>,
     /// The parent's slot index on this shard, if any.
     pub parent: Option<u32>,
     /// Live children.
@@ -290,8 +309,8 @@ pub struct TaskSlot {
 
 impl TaskSlot {
     /// A fresh slot for `future` under `parent`: the task `word` names, a service or not.
-    pub fn new(
-        future: BoxedFuture,
+    pub(crate) fn new(
+        future: TaskFuture,
         parent: Option<u32>,
         joinable: bool,
         word: u64,

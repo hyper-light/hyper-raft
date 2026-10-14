@@ -1004,7 +1004,7 @@ impl Shard {
             return false;
         };
         let window_end = activity.saturating_add(self.spin_window_ns());
-        if self.now_ns() >= window_end {
+        if self.carried_now_ns() >= window_end {
             return false;
         }
         self.core.attribution.wait_began();
@@ -1029,8 +1029,12 @@ impl Shard {
     /// preceding step's retrieval and the spin share their quantum, so idle entry does not ask twice.
     fn spin_for_work(&mut self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
         let mut next_harvest_ns = self.core.last_driver_ns.saturating_add(self.quantum_ns());
+        // A turn's time is the step's reading carried by the counter, as a poll's end is (§3.9): a turn that
+        // read the OS's clock spent most of itself there, and a wake waited for the turn to notice it. A deadline
+        // it finds a little early costs a step, which reads the clock afresh.
+        let carried = self.desk.carried.get();
         loop {
-            let now = self.now_ns();
+            let now = self.carried_from(carried);
             let harvest_due = now >= next_harvest_ns;
             if self.has_inbound()
                 || self.core.driver.has_pending()
@@ -1041,7 +1045,11 @@ impl Shard {
                 return true;
             }
             // Re-read only after the driver was asked (a system call); otherwise this turn's reading stands.
-            let now = if harvest_due { self.now_ns() } else { now };
+            let now = if harvest_due {
+                self.carried_from(carried)
+            } else {
+                now
+            };
             if let Some(deadline) = deadline_ns
                 && now >= deadline
             {

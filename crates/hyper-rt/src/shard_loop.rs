@@ -1683,7 +1683,9 @@ impl Shard {
     }
 
     /// Polls the task in `slot`, timed from `start` and judged against `quantum_ns`, entering the desk through
-    /// `current`; the time the poll ended, or `start` when nothing ran.
+    /// `current`; the time the poll ended, or `start` when nothing ran. Inlined into the batch's loop, so a
+    /// poll does not save and restore the loop's registers around it.
+    #[inline(always)]
     fn poll_slot(
         &mut self,
         slot: u32,
@@ -1717,7 +1719,9 @@ impl Shard {
         }
         task.state = State::Running;
         let word = Encoded::pack(self.desk.id, slot, generation).unwrap_or(Encoded::from_word(0));
-        let waker = waker_for(word);
+        // Never dropped: the vtable's drop does nothing (`crate::waker`), and an indirect call to it a poll is
+        // all a drop would add.
+        let waker = std::mem::ManuallyDrop::new(waker_for(word));
         let mut cx = Context::from_waker(&waker);
         self.desk.current_task.set(Some(slot));
         self.desk.now_ns.set(start);

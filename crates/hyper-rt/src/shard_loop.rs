@@ -75,7 +75,10 @@ macro_rules! counters {
         /// The shard's counters as the loop keeps them: on the desk, a `Cell` each, counted in place, so a
         /// reader's copy is taken when it reads and a step copies nothing (a step used to publish the whole
         /// set to the desk, 312 bytes twice over: 15 ns of the 135 ns runtime's calibration item, two steps).
+        /// In order (`repr(C)`), leading with what a poll counts, so those land on the desk's second line
+        /// beside the run queue (`ShardContext`'s layout).
         #[derive(Debug, Default)]
+        #[repr(C)]
         pub(crate) struct LiveCounters {
             $(pub(crate) $field: std::cell::Cell<u64>,)*
         }
@@ -90,10 +93,12 @@ macro_rules! counters {
 }
 
 counters! {
-    /// Loop iterations.
-    steps,
     /// Task polls.
     polls,
+    /// The longest poll by the wall clock, in nanoseconds.
+    longest_step_ns,
+    /// Loop iterations.
+    steps,
     /// Polls past the step quantum that were their task's own: past it on the CPU, or waiting inside a call.
     long_steps,
     /// Of `long_steps`, the polls that waited inside a call.
@@ -102,8 +107,6 @@ counters! {
     preempted_steps,
     /// Polls past the quantum by the wall clock that could not be attributed.
     unattributed_steps,
-    /// The longest poll by the wall clock, in nanoseconds.
-    longest_step_ns,
     /// Kicked parks whose kick-to-running latency fed the online wake estimate.
     wake_samples,
     /// Kick stamps that predated their park's announcement, dropped.
@@ -239,22 +242,40 @@ struct Poller {
     ready: crate::shard::PollerReady,
 }
 
-/// The loop's state, owned by the loop's frame alone.
+/// The loop's state, owned by the loop's frame alone. Laid out in order (`repr(C)`), as the desk is
+/// (`ShardContext`): what every poll and batch reads first, then what keeping `due_ns` and a long poll's
+/// judgment read, and last what parks and the configuration hold.
+#[repr(C)]
 struct Core {
+    // First: what a poll, a batch and the input read's test read.
     tasks: Box<[TaskSlot]>,
-    timers: Wheel,
-    driver: Box<dyn Driver>,
-    config: RuntimeConfig,
-    shutting_down: bool,
-    exited: bool,
+    /// The configured poll count a step's batch may make (`config.batch`, at least one), kept here so a
+    /// batch reads it from the first line rather than from the configuration's.
+    batch: usize,
+    /// The consumer's latency objective (`config.latency_objective_ns`), kept here for the batch's budget.
+    latency_objective_ns: Option<u64>,
+    /// The published time of the last driver retrieval: busy native turns share one quantum.
+    last_driver_ns: u64,
+    /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
+    /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
+    counter_scale: Option<u64>,
+    fixed_quantum_ns: u64,
+    /// Whether the driver's clock is real time (the simulation's is not).
+    real_time: bool,
     driver_lost: bool,
-    fired: Vec<(u32, u64)>,
-    completions: Vec<Completion>,
+    exited: bool,
+    shutting_down: bool,
     /// Who waits on which handle, in which direction (`crate::interests`).
     waiting: Interests,
+    // Then: what keeping `due_ns` and judging a long poll read.
     pollers: Vec<Poller>,
-    /// The absolute deadline the shard last waited for and has not stepped since.
-    waited_for_ns: Option<u64>,
+    driver: Box<dyn Driver>,
+    timers: Wheel,
+    /// The step's long polls left for one reading at its end ([`Tracker::defers`]): at most the step's poll
+    /// budget, reserved at build, so judging by step allocates nothing.
+    deferred: Vec<Deferred>,
+    attribution: Tracker,
+    // Last: what a park, a wake's estimate and the configuration's other fields hold.
     /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
     wake: Option<WakeTrack>,
     /// The CPU a park costs this shard's thread, and a kick its senders' (`crate::park_cost`): a tracking
@@ -264,19 +285,12 @@ struct Core {
     /// The parking word's kick sums last folded into `kick_cost`.
     kicks_seen: (u64, u64),
     idle_ratio: u64,
-    fixed_quantum_ns: u64,
     fixed_spin_ns: u64,
-    /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
-    /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
-    counter_scale: Option<u64>,
-    /// The published time of the last driver retrieval: busy native turns share one quantum.
-    last_driver_ns: u64,
-    /// Whether the driver's clock is real time (the simulation's is not).
-    real_time: bool,
-    attribution: Tracker,
-    /// The step's long polls left for one reading at its end ([`Tracker::defers`]): at most the step's poll
-    /// budget, reserved at build, so judging by step allocates nothing.
-    deferred: Vec<Deferred>,
+    /// The absolute deadline the shard last waited for and has not stepped since.
+    waited_for_ns: Option<u64>,
+    config: RuntimeConfig,
+    fired: Vec<(u32, u64)>,
+    completions: Vec<Completion>,
 }
 
 /// A long poll left for the step's end: how far it ran past the quantum by the wall clock.
@@ -425,6 +439,8 @@ impl Shard {
             real_time: !is_sim,
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
+            batch: config.batch.max(1),
+            latency_objective_ns: config.latency_objective_ns,
             config,
             driver,
         };
@@ -526,9 +542,10 @@ impl Shard {
     /// The budget after which a step's batch reads its inputs again (docs/runtime.md §3.3): the step
     /// quantum, or the consumer's latency objective where that is tighter.
     fn batch_budget_ns(&self) -> u64 {
-        let quantum = self.quantum_ns();
+        // The desk's copy of the quantum, which every change to the estimate publishes (`note_wake`): the
+        // desk's first line, where the estimate itself is a cold 128 bytes.
+        let quantum = self.desk.quantum_ns.get();
         self.core
-            .config
             .latency_objective_ns
             .map_or(quantum, |objective| objective.min(quantum).max(1))
     }
@@ -1178,11 +1195,11 @@ impl Shard {
         mark: Option<u64>,
         current: Option<registry::CurrentCell<'_>>,
     ) -> bool {
-        let batch = self.core.config.batch.max(1);
+        let batch = self.core.batch;
         let budget_ns = self.batch_budget_ns();
         // The quantum a poll is judged by: the wake estimate, which moves only when the shard parks, so one
         // reading serves the batch; and the step's clock reading, which only a step's start sets.
-        let quantum_ns = self.quantum_ns();
+        let quantum_ns = self.desk.quantum_ns.get();
         let carried = self.desk.carried.get();
         let mut at = BatchMark {
             mark,

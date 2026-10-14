@@ -602,6 +602,19 @@ no one and `maybe_yield` saves the round trip (`tests/maybe_yield.rs`: alone on 
 conditional yields are one poll, a thousand `yield_now`s a thousand and one; each kind of want lets the
 others in at the next `maybe_yield`, and each test fails without its clause).
 
+The fields a switch reads are laid out to be few lines (`ShardContext` and the loop's `Core`, both
+`repr(C)`). In a consumer the runtime runs between bursts of the consumer's own operations, which evict
+its lines, so a switch pays for each distinct line it touches, not for its instructions: the same mantle
+runs measured a yield's median at 375–541 ns where hyper-rt's own bench, every line hot, measures 15 ns.
+The desk's first 128-byte line holds what a poll, a yield and `wanted` read (the polling task's word, the
+clock's reading and the counter that carries it, `due_ns`, the quantum, the entry, the shard id a
+consumer's `current_shard` reads at every operation, and the four flags), and its second the run queue
+and the counters a poll counts (`LiveCounters` leads with them); the compiler's own order had spread the
+same fields over six lines, with the 728-byte spawn frames between them. The loop's first line holds the
+task table, the batch and the latency objective (copied from the configuration at build), the clock's
+scale, the last harvest and the state flags, then the readiness waits the input read's test asks; a
+batch reads the quantum from the desk's copy, which every change of the estimate publishes.
+
 ## 4. Running a future: `block_on`
 
 Every consumer needs to run one future to completion on the calling thread: a CLI command, `main`, a

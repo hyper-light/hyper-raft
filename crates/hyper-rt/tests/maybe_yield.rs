@@ -141,19 +141,21 @@ fn a_timer_fallen_due_is_let_in() {
     let mut rt = LocalRuntime::new(&config(1)).unwrap();
     let fired_first = rt
         .block_on(async {
-            let (deadlines, deadline) = channel();
             let (fired, report) = channel();
             let tick = hyper_rt::futures::timer_tick_ns();
             hyper_rt::futures::spawn(async move {
-                deadlines.send(hyper_rt::futures::now_ns() + tick).unwrap();
                 hyper_rt::futures::sleep(tick).await.unwrap();
                 fired.send(()).unwrap();
             })
             .unwrap();
-            // The sleeper's first poll, which arms its timer.
+            // The sleeper's first poll, which arms its timer a tick past the clock the sleep reads then: no later
+            // than a tick past this reading, taken after that poll. A deadline the sleeper read for itself
+            // before its sleep did is not the sleep's: a tick boundary between the two readings put the timer
+            // a tick past it (12 failures in 12 runs with the readings 50 µs apart across a boundary).
             yield_now().await;
-            // A sleep ends on the tick after its deadline: this task runs until that tick has begun.
-            let due = deadline.try_recv().unwrap() + tick;
+            // The wheel fires a deadline at the first tick boundary at or after it, within a tick of it: this
+            // task runs until that tick has begun.
+            let due = hyper_rt::futures::now_ns() + 2 * tick;
             while hyper_rt::futures::now_ns() < due {
                 std::hint::spin_loop();
             }

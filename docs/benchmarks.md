@@ -8184,6 +8184,46 @@ the reading after every park, every shard's calibrated batch back from 17 to 35 
 These are mantle's measurements of the same sources; the bench that runs them here, with slates'
 runtime beside tokio, follows.
 
+## hyper-rt: twice as fast, then twice again (rt-2x, from 2026-10-13)
+
+The owner's goal: the loop twice as fast, then twice as fast again, with no loss of what it guarantees.
+The baseline is `main` at `767627f`, `crates/hyper-rt-compare` built from it and run beside slates'
+runtime and tokio, five rounds, each (case, arm) a fresh process, the arms' order rotated each round
+(load 5.8–12.9; Apple M5 Max, macOS 26.4). Every step after it is that binary and the step's, run
+interleaved, and the instructions an operation from the OS's counters, which do not move with the
+host's load.
+
+**Step one: does the loop need to be faster?** Yes. Every request mantle serves is a poll on this loop,
+and the loop's own bookkeeping is most of a poll. Sampling the yield case (`sample`, macOS), the loop's
+functions hold 78% of the shard's samples: `poll_slot` 30%, `after_poll` 12%, `read_inputs` 11%, `apply` 9%,
+`poll_batch` 9%, the clock 5%; the task's own code under a quarter. perf in Docker Desktop's Linux VM
+on the same machine gives the same functions in the same order (29%, 14%, 12%, 11%, 11%). A yield is
+475 instructions. A spawn and join is 1,221, 16% of its time `malloc` and `free`. Between two shards the
+step's one reading of the OS's clock (`mach_continuous_time`) takes as many samples as the step's poll
+(671 and 674), and every turn of the idle spin reads it again.
+
+**Step two: how much?** Twice, then twice again. Where a case's time holds a floor that no runtime
+lowers, the floor is measured on this host and the goal is on what the loop adds above it:
+- two threads bouncing a value through one atomic each, spinning, timed as the comparison times its
+  round trip: 125 ns at the median, 292 ns at p99;
+- the comparison's own two clock reads a round trip: 37 ns;
+- a boxed future made and dropped, as a spawn makes one: 10.6 ns, `malloc` and `free`.
+
+| Case | Baseline (median) | Floor | The loop's share | Twice | Four times |
+|---|---|---|---|---|---|
+| yield | 19.1 ns (52.2 M a second), 475 instructions | — | 19.1 ns | 9.6 ns | 4.8 ns |
+| spawn and join | 43.4 ns (23.0 M a second), 1,221 instructions | 10.6 ns, the allocation | 32.8 ns | 21.7 ns | 10.9 ns, which the allocation alone outweighs: it has to go |
+| one-shard request and reply | 113 ns (8.83 M a second) | 37 ns, the harness's clock | 76 ns | 38 ns (75 ns in all) | 19 ns (56 ns in all) |
+| two-shard request and reply, p50 | 784 ns (1.15 M a second) | 125 ns | 659 ns | 330 ns (455 ns in all) | 165 ns (290 ns in all) |
+
+The cases whose time is the OS's are held, not halved: eight clients, whose server's every reply
+unparks a client thread (`std::thread::unpark`, a system call inside the poll: 1,580 of the shard's
+71,901 polls ran past the quantum); one client pausing 200 µs, which wakes a parked shard; a 1 ms sleep,
+whose lateness is the OS timer's. These must not regress, and every guarantee the loop gives stays:
+each poll inside its unwind boundary, long polls attributed, a task that wakes itself behind the
+inputs, the inputs read again once the polls have run the latency budget, cancellation at the next
+poll boundary, the idle spin as long as blocking costs.
+
 ## hyper-rt: the loop under load, against slates' runtime and tokio (2026-10-13)
 
 `crates/hyper-rt-compare` runs mantle's cases (its note 42 §7–§8) on one host with slates' runtime

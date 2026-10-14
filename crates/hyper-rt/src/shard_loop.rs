@@ -253,12 +253,9 @@ struct Core {
     deferred: Vec<Deferred>,
 }
 
-/// A long poll left for the step's end: the task, as its slot and generation, so a slot reused since
-/// is not charged, and how far the poll ran past the quantum by the wall clock.
+/// A long poll left for the step's end: how far it ran past the quantum by the wall clock.
 #[derive(Clone, Copy, Debug)]
 struct Deferred {
-    slot: u32,
-    generation: u32,
     overrun_ns: u64,
 }
 
@@ -1437,8 +1434,6 @@ impl Shard {
     #[cold]
     fn attribute_poll(
         &mut self,
-        slot: u32,
-        generation: u32,
         poll_started_ns: u64,
         ended_ns: u64,
         quantum: u64,
@@ -1454,8 +1449,6 @@ impl Shard {
             && self.core.deferred.len() < self.core.deferred.capacity()
         {
             self.core.deferred.push(Deferred {
-                slot,
-                generation,
                 overrun_ns: wall_ns.saturating_sub(quantum),
             });
             self.core.attribution.long_poll_deferred();
@@ -1472,7 +1465,7 @@ impl Shard {
 
     /// The long polls left for the step's end, judged at one reading of the thread's account
     /// ([`Tracker::close_step`], [`attribution::judge_in_window`]) and counted as the polls' own attribution
-    /// would have been; a task's own count only while its slot still holds it.
+    /// would have been.
     fn judge_deferred(&mut self) {
         if self.core.deferred.is_empty() {
             return;
@@ -1492,16 +1485,6 @@ impl Shard {
             };
             undecided |= matches!(attributed, Attribution::NoWindow | Attribution::Ambiguous);
             count_long_poll(&mut self.core.counters, attributed);
-            let still_held = self
-                .desk
-                .task(deferred.slot)
-                .is_some_and(|cell| cell.generation.get() == deferred.generation);
-            if attributed.is_tasks()
-                && still_held
-                && let Some(task) = slot_mut(&mut self.core.tasks, deferred.slot)
-            {
-                task.long_steps = task.long_steps.saturating_add(1);
-            }
         }
         if undecided {
             self.core.attribution.undecided();
@@ -1758,7 +1741,7 @@ impl Shard {
         self.apply();
         let elapsed = ended.saturating_sub(start);
         let attributed = if elapsed > quantum_ns {
-            self.attribute_poll(slot, word.generation(), start, ended, quantum_ns)
+            self.attribute_poll(start, ended, quantum_ns)
         } else {
             None
         };
@@ -1766,7 +1749,7 @@ impl Shard {
             self.unwound(slot, future, word, current);
             return ended;
         };
-        self.record_poll(slot, elapsed, attributed);
+        self.record_poll(elapsed, attributed);
         self.put_back_or_finish(
             slot,
             future,
@@ -1817,9 +1800,9 @@ impl Shard {
         Some((future, service, word))
     }
 
-    /// Counts a poll that ran `elapsed` and was `attributed`, for the shard and for its task.
+    /// Counts a poll that ran `elapsed` and was `attributed`.
     #[inline(always)]
-    fn record_poll(&mut self, slot: u32, elapsed: u64, attributed: Option<Attribution>) {
+    fn record_poll(&mut self, elapsed: u64, attributed: Option<Attribution>) {
         self.core.counters.polls = self.core.counters.polls.saturating_add(1);
         if let Some(attributed) = attributed {
             count_long_poll(&mut self.core.counters, attributed);
@@ -1827,16 +1810,6 @@ impl Shard {
         // A store only when the longest grew, which most polls leave as it was.
         if elapsed > self.core.counters.longest_step_ns {
             self.core.counters.longest_step_ns = elapsed;
-        }
-        let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
-            return;
-        };
-        task.polls = task.polls.saturating_add(1);
-        if attributed.is_some_and(Attribution::is_tasks) {
-            task.long_steps = task.long_steps.saturating_add(1);
-        }
-        if elapsed > task.longest_step_ns {
-            task.longest_step_ns = elapsed;
         }
     }
 

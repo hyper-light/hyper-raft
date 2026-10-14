@@ -1,6 +1,8 @@
-//! Task slots: the pinned future, its state, its parent and child links, and the counters the watchdog
-//! keeps (slates §4.3, `TaskSlot`). The slot's identity (its generation), its outcome and its joiner live on
-//! the shard's desk (docs/runtime.md §3.4), where tasks read them; this side is the loop's alone.
+//! Task slots: the pinned future, its state, and its parent and child links (slates §4.3, `TaskSlot`). The
+//! slot's identity (its generation), its outcome and its joiner live on the shard's desk (docs/runtime.md
+//! §3.4), where tasks read them; this side is the loop's alone. The watchdog's counts are the shard's
+//! (`crate::shard_loop::Counters`): a slot kept its own polls, long polls and longest poll too, which nothing
+//! read, at a write each poll.
 //!
 //! Children are linked through their parent's slot (first child, siblings) so that a parent's
 //! completion cancels them in O(children) and a child's completion unlinks in O(1); no task is
@@ -279,13 +281,6 @@ pub struct TaskSlot {
     pub cancel_requested: bool,
     /// Whether the slot stays until joined (true) or is reaped at termination (false).
     pub joinable: bool,
-    /// Polls so far.
-    pub polls: u64,
-    /// Polls past the step quantum that were this task's own: past it on the CPU, or waiting inside a call
-    /// (the shard's `Counters::long_steps`; a poll the host held off the CPU is not counted).
-    pub long_steps: u32,
-    /// The longest poll by the wall clock, in nanoseconds.
-    pub longest_step_ns: u64,
     /// The task's packed word (shard, slot, generation), fixed while the slot holds it: its waker's data and
     /// its id, kept here so a poll does not pack it again; 0 for an empty slot.
     pub word: u64,
@@ -313,9 +308,6 @@ impl TaskSlot {
             outcome: None,
             cancel_requested: false,
             joinable,
-            polls: 0,
-            long_steps: 0,
-            longest_step_ns: 0,
             word,
             service,
         }
@@ -334,9 +326,6 @@ impl TaskSlot {
             outcome: None,
             cancel_requested: false,
             joinable: false,
-            polls: 0,
-            long_steps: 0,
-            longest_step_ns: 0,
             word: 0,
             service: false,
         }
@@ -356,7 +345,6 @@ impl std::fmt::Debug for TaskSlot {
             .field("children", &self.children)
             .field("outcome", &self.outcome)
             .field("joinable", &self.joinable)
-            .field("polls", &self.polls)
             .finish()
     }
 }

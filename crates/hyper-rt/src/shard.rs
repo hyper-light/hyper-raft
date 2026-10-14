@@ -112,6 +112,10 @@ pub(crate) struct TaskCell {
     pub(crate) cancelled: Cell<bool>,
     /// Direct children are cancelled before a service begins cleanup, once per admission.
     pub(crate) cancel_children: Cell<bool>,
+    /// Whether the task was spawned under a parent: linking it at its install and unlinking it at its reap
+    /// are the loop's, so its install and its reap are asked of the loop; a task with no parent is listed at
+    /// its spawn, installed at its first poll, and reaped by its join.
+    pub(crate) parented: Cell<bool>,
 }
 
 /// Where a timer slot is in its life.
@@ -362,6 +366,9 @@ pub struct ShardContext {
     /// Set by the shard when the root's poll unwound and its task ended `Outcome::Unwound`: no output will
     /// come, and `block_on` is refused rather than wait for one.
     pub(crate) root_unwound: Cell<bool>,
+    /// One past the highest task generation issued: what the registry slot's next holder starts from. On the
+    /// desk, so a join that frees its task's slot raises it as the loop's frees do.
+    pub(crate) generation_high: Cell<u32>,
     /// The loop's counters as of the start of the current step, published for tasks that report them.
     pub(crate) counters: Cell<crate::shard_loop::Counters>,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
@@ -419,6 +426,7 @@ impl ShardContext {
                     service: Cell::new(false),
                     cancelled: Cell::new(false),
                     cancel_children: Cell::new(false),
+                    parented: Cell::new(false),
                 })
                 .collect(),
             free_tasks: CellStack::full_of(task_ids.into_iter()),
@@ -468,6 +476,7 @@ impl ShardContext {
             root_output: Cell::new(None),
             root: Cell::new(None),
             root_unwound: Cell::new(false),
+            generation_high: Cell::new(shape.generation_base),
             counters: Cell::new(crate::shard_loop::Counters::default()),
             sim: None,
         }
@@ -651,7 +660,9 @@ impl ShardContext {
         })
     }
 
-    /// Claims a free slot for `incoming` and asks the loop to install it.
+    /// Claims a free slot for `incoming`: a task with a parent is installed by the loop when it next applies
+    /// the desk's intents, which links it under its parent before that parent's poll is recorded; one with no
+    /// parent is listed now, and the loop installs it as it first polls it.
     pub(crate) fn claim(&self, incoming: Incoming) -> Result<TaskId, RtError> {
         if !self.accepting.get()
             || self.entry.is_some_and(|entry| {
@@ -681,9 +692,39 @@ impl ShardContext {
         cell.cancel_children.set(false);
         cell.outcome.set(None);
         cell.joiner.set(None);
+        let parented = incoming.parent.is_some();
+        cell.parented.set(parented);
         cell.incoming.set(Some(incoming));
-        self.ask(slot, ask::INSTALL);
+        if parented {
+            self.ask(slot, ask::INSTALL);
+        } else {
+            self.local.push(slot);
+        }
         Ok(TaskId(word))
+    }
+
+    /// Gives a slot back on the desk's side: emptied, a new generation (so no word minted for its last task
+    /// names the next), its intents dropped (an intent asked of its last task, still on the dirty ring, must
+    /// not reach the next one), and onto the free stack, unless its generations are spent (the slot then
+    /// retires, AUD-29-11). A slot already free is left as it is: freeing it twice would list it twice.
+    pub(crate) fn free_slot(&self, slot: u32) {
+        let Some(cell) = self.task(slot) else {
+            return;
+        };
+        if cell.phase.get() == Phase::Free {
+            return;
+        }
+        let next = cell.generation.get().saturating_add(1);
+        cell.generation.set(next);
+        cell.phase.set(Phase::Free);
+        cell.outcome.set(None);
+        cell.joiner.set(None);
+        cell.asks.set(0);
+        self.generation_high
+            .set(self.generation_high.get().max(next));
+        if next < Encoded::TASK_GENERATION_LIMIT {
+            let _ = self.free_tasks.push(slot);
+        }
     }
 
     /// Requests a task's cancellation; it terminates at its next poll boundary. Refused for a stale id.
@@ -719,8 +760,16 @@ impl ShardContext {
             if cell.asks.get() & ask::JOINED != 0 {
                 return Poll::Ready(Err(stale(id)));
             }
-            self.ask(slot, ask::JOINED);
-            return Poll::Ready(Ok(cell.outcome.get().unwrap_or(Outcome::Cancelled)));
+            let outcome = cell.outcome.get().unwrap_or(Outcome::Cancelled);
+            if cell.parented.get() {
+                // Unlinking it from its parent is the loop's.
+                self.ask(slot, ask::JOINED);
+            } else {
+                // The loop's side of a done task holds nothing to let go (its future dropped as it ended): its
+                // slot is the desk's to free, now.
+                self.free_slot(slot);
+            }
+            return Poll::Ready(Ok(outcome));
         }
         match joiner {
             Some(word) => {

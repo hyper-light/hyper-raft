@@ -227,8 +227,6 @@ struct Core {
     /// Who waits on which handle, in which direction (`crate::interests`).
     waiting: Interests,
     pollers: Vec<Poller>,
-    /// One past the highest task generation issued: what the registry slot's next holder starts from.
-    generation_high: u32,
     /// The absolute deadline the shard last waited for and has not stepped since.
     waited_for_ns: Option<u64>,
     /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
@@ -329,8 +327,14 @@ impl Drop for Shard {
                 let _ = crate::unwind::contained(move || drop(future));
             }
         }
+        // A future still on the desk, its task never installed, is its task's code as much.
+        for cell in self.desk.tasks.iter() {
+            if let Some(incoming) = cell.incoming.take() {
+                let _ = crate::unwind::contained(move || drop(incoming));
+            }
+        }
         drop(entered);
-        registry::note_arena_generation(self.desk.id, self.core.generation_high);
+        registry::note_arena_generation(self.desk.id, self.desk.generation_high.get());
         registry::note_exited(self.desk.id);
     }
 }
@@ -375,7 +379,6 @@ impl Shard {
             shutting_down: false,
             exited: false,
             driver_lost: false,
-            generation_high: generation_base,
             waited_for_ns: None,
             wake: config.wake_tracking.map(|tracking| {
                 WakeTrack::new(
@@ -480,7 +483,7 @@ impl Shard {
 
     /// One past the highest task generation issued (the registry slot's next holder starts there).
     pub fn arena_generation_high(&self) -> u32 {
-        self.core.generation_high
+        self.desk.generation_high.get()
     }
 
     /// Records that the OS refused the core this shard's placement fixed it to.
@@ -607,7 +610,8 @@ impl Shard {
             joinable: false,
             service,
         });
-        if admitted.is_ok() {
+        if let Ok(task) = &admitted {
+            self.install_listed(task.0.slot());
             self.apply();
         }
         receipt.answer(match &admitted {
@@ -625,6 +629,7 @@ impl Shard {
             });
         }
         let id = self.desk.spawn_local(future, None)?;
+        self.install_listed(id.0.slot());
         self.apply();
         Ok(id)
     }
@@ -637,6 +642,7 @@ impl Shard {
             });
         }
         let id = self.desk.spawn_service_local(future, None)?;
+        self.install_listed(id.0.slot());
         self.apply();
         Ok(id)
     }
@@ -676,9 +682,9 @@ impl Shard {
         };
         cell.dirty.set(false);
         let asks = cell.asks.replace(0);
-        if asks & ask::INSTALL != 0
-            && let Some(incoming) = cell.incoming.take()
-        {
+        // Asked to install it, or asked anything of a task listed at its spawn and not yet polled: its future
+        // goes into its slot first, so what follows acts on it.
+        if let Some(incoming) = cell.incoming.take() {
             self.install(slot, incoming);
         }
         if asks & ask::POLLER != 0
@@ -708,6 +714,24 @@ impl Shard {
     }
 
     fn install(&mut self, slot: u32, incoming: Incoming) {
+        self.install_slot(slot, incoming);
+        self.desk.wake_local(slot);
+    }
+
+    /// Installs, now, a task whose future waits on the desk: the owner's spawns and the spawn requests it
+    /// admits are installed before they return, and a pass that retires tasks without polling them finds
+    /// every task in its slot. Listed as an install lists it: a task listed at its spawn already is, and its
+    /// pending flag collapses the second listing, while one with a parent, whose install was asked of the
+    /// loop instead, is listed here, its install's only listing (the ask finds its future gone).
+    fn install_listed(&mut self, slot: u32) {
+        if let Some(incoming) = self.desk.task(slot).and_then(|cell| cell.incoming.take()) {
+            self.install(slot, incoming);
+        }
+    }
+
+    /// Moves `incoming`'s future into `slot`, links it under its parent, and carries a cancellation asked of it
+    /// before its install; not listed (the caller lists it, or polls it now).
+    fn install_slot(&mut self, slot: u32, incoming: Incoming) {
         let Incoming {
             future,
             parent,
@@ -715,17 +739,19 @@ impl Shard {
             service,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
-        let generation = self.desk.task(slot).map_or(0, |cell| cell.generation.get());
+        let (generation, cancelled) = self.desk.task(slot).map_or((0, false), |cell| {
+            (cell.generation.get(), cell.cancelled.get())
+        });
         let word = Encoded::pack(self.desk.id, slot, generation).map_or(0, Encoded::word);
         if let Some(task) = self.task_mut(slot) {
             *task = TaskSlot::new(future, parent, joinable, word, service);
             task.state = State::Queued;
+            task.cancel_requested = cancelled;
         }
         if let Some(p) = parent {
             link_child(&mut self.core.tasks, p, slot);
         }
         self.core.counters.spawns = self.core.counters.spawns.saturating_add(1);
-        self.desk.wake_local(slot);
     }
 
     fn apply_timer(&mut self, slot: u32) {
@@ -1281,6 +1307,7 @@ impl Shard {
             let Ok(slot) = u32::try_from(index) else {
                 break;
             };
+            self.install_listed(slot);
             let ordinary = self.desk.task(slot).is_some_and(|cell| !cell.service.get());
             let ready = self.task_mut(slot).is_some_and(|task| {
                 task.cancel_requested
@@ -1306,7 +1333,7 @@ impl Shard {
         if exit {
             self.core.exited = true;
             self.close_control();
-            registry::note_arena_generation(self.desk.id, self.core.generation_high);
+            registry::note_arena_generation(self.desk.id, self.desk.generation_high.get());
             registry::note_exited(self.desk.id);
         }
         exit
@@ -1759,6 +1786,11 @@ impl Shard {
         slot: u32,
         current: Option<registry::CurrentCell<'_>>,
     ) -> Option<(BoxedFuture, bool, Encoded)> {
+        // A task listed at its spawn, with no parent, is installed as it is first polled (`ShardContext::claim`).
+        if slot_mut(&mut self.core.tasks, slot)?.state == State::Done {
+            let incoming = self.desk.task(slot)?.incoming.take()?;
+            self.install_slot(slot, incoming);
+        }
         // Fixed while the slot holds the task: the poll and what it asks cannot move them.
         let task = slot_mut(&mut self.core.tasks, slot)?;
         let (service, word) = (task.service, Encoded::from_word(task.word));
@@ -1989,18 +2021,7 @@ impl Shard {
         if let Some(task) = self.task_mut(slot) {
             *task = TaskSlot::empty();
         }
-        let Some(cell) = self.desk.task(slot) else {
-            return;
-        };
-        let next = cell.generation.get().saturating_add(1);
-        cell.generation.set(next);
-        cell.phase.set(Phase::Free);
-        cell.outcome.set(None);
-        cell.joiner.set(None);
-        self.core.generation_high = self.core.generation_high.max(next);
-        if next < Encoded::TASK_GENERATION_LIMIT {
-            let _ = self.desk.free_tasks.push(slot);
-        }
+        self.desk.free_slot(slot);
     }
 
     /// Cancels every live task: what a `block_on` does once its root finished, so nothing it left running
@@ -2061,19 +2082,22 @@ impl Shard {
 
     fn cancel_all(&mut self) {
         for (slot, task) in self.core.tasks.iter_mut().enumerate() {
-            if let Ok(slot) = u32::try_from(slot)
-                && self
-                    .desk
-                    .task(slot)
-                    .is_some_and(|cell| cell.phase.get() == Phase::Live)
-                && task.state != State::Done
-            {
-                task.cancel_requested = true;
-                if let Some(cell) = self.desk.task(slot) {
-                    cell.cancelled.set(true);
-                }
-                self.desk.wake_local(slot);
+            let Ok(slot) = u32::try_from(slot) else {
+                continue;
+            };
+            let Some(cell) = self.desk.task(slot) else {
+                continue;
+            };
+            if cell.phase.get() != Phase::Live {
+                continue;
             }
+            // A task listed at its spawn and not yet polled has no slot of the loop's to mark: its install
+            // carries the desk's mark (`install_slot`).
+            if task.state != State::Done {
+                task.cancel_requested = true;
+            }
+            cell.cancelled.set(true);
+            self.desk.wake_local(slot);
         }
     }
 

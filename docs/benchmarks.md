@@ -8224,6 +8224,83 @@ each poll inside its unwind boundary, long polls attributed, a task that wakes i
 inputs, the inputs read again once the polls have run the latency budget, cancellation at the next
 poll boundary, the idle spin as long as blocking costs.
 
+**What changed, by step** (each commit's message has its own interleaved numbers):
+- `0ff646b`: the cell rings wrap by a compare, not a hardware divide; the run queue's two lists swap
+  roles on a release behind nothing; `apply` looks at one flag; the inbox drains load before they swap;
+  a batch borrows the thread's current-shard cell once.
+- `366d8c7`, `3a42b5b`: a poll inlined into its batch, its waker never dropped (an indirect call to a
+  no-op), its task's word and service flag read from its slot, the step's clock reading held by the
+  batch.
+- `629178c`: a channel's receiver takes as the ring's one taker, no compare-and-swap on the head; a
+  send's fence serves its wake too; a primitive's cell words looked up once; the polling task's word
+  kept on the desk.
+- `c5adcbc`, `4dc0377`: a task with no parent listed at its spawn and reaped by its join, neither
+  round the dirty ring; per-task watchdog counts that nothing read, gone.
+- `295d5df`: the counters counted in place on the desk, so a step copies none (15 ns of the
+  calibration item's 135); the wheel's next tick kept, so most advances are a compare; the driver
+  asked once a harvest.
+- `ec1b27b`: a task spawned on its own shard lives in a frame the shard recycles (docs/runtime.md
+  §3.1); a send hands its shard to its wake.
+- `bfa5875`: a wake from another thread moves one line (the bitmap's flag, first summary and first
+  words share it), and its kick count none the shard reads.
+- `8565bce`: the idle spin's turns read the counter.
+
+**The fixed-shape bench** (`benchmark-results/hyper-rt-2x-20261013/cpu`: a `LocalRuntime` of fixed shape,
+batch 64, no clock read inside the loops, so the instructions an operation do not move with the host;
+medians of seven rounds, interleaved, macOS, load 10-19):
+
+| Case | `767627f` | rt-2x `ec1b27b` |
+|---|---|---|
+| yield (sixteen tasks) | 20.7-24.8 ns, 461 instructions | 10.6-11.6 ns, 291 instructions |
+| spawn and join (1,000 at a time) | 45.9-48.3 ns, 1,194 instructions | 27-29 ns, 712 instructions |
+| one-shard request and reply, no clock | 59.9-66.1 ns, 1,738 instructions | 37-43 ns, 1,138 instructions |
+
+The runtime's calibration item (a simulated spawn and run until idle, which sizes every shard's batch):
+135-141 ns to 90-93 ns.
+
+**The panel** at `ec1b27b` (five rounds, every case, the arms interleaved, load 7.2-16.0; medians):
+
+| Case | `767627f` | rt-2x | Ratio |
+|---|---|---|---|
+| yield, polls a second | 50.6 M | 95.5 M | 1.89x |
+| spawn and join, tasks a second | 24.0 M | 35.5 M | 1.48x |
+| two-shard request and reply, round trips a second (p50 / p99 / p99.9 µs) | 864 k (0.8 / 2.3 / 22.0) | 1.27 M (0.7 / 0.9 / 1.8) | 1.47x |
+| one-shard request and reply, round trips a second | 9.09 M | 11.8 M | 1.30x |
+| the same with 1 µs at each end | 461 k | 466 k | 1.01x |
+| eight clients (one-way p50 / p99 µs) | 403 k (7.8 / 32.8) | 369 k (7.4 / 33.8) | 0.92x |
+| the same beside a task that yields (share) | 116 k (61 / 80; 0.72) | 119 k (54 / 76; 0.77) | 1.03x |
+| one client pausing 200 µs (one-way p50 / p99 µs) | 3.9 / 25.1 | 3.6 / 22.0 | 1.01x |
+| one client, requests a second (p50 / p99 µs) | 348 k (0.4 / 9.2) | 208 k (0.4 / 14.3) | 0.60x |
+| a 1 ms sleep, lateness p50 / p99 µs | 56 / 139 | 43 / 125 | — |
+
+The one-client row is the host's placement of two threads more than the runtime's: the baseline alone
+ran 152-432 k across its five rounds. Ten rounds of that case alone, interleaved: `767627f` 342 k
+(one-way p50 / p99 0.5 / 10.2 µs), `ec1b27b` 333 k (0.4 / 9.6), `8565bce` 363 k (0.3 / 7.9). The
+eight-client rows are the clients' own unparks (the floor above).
+
+**Linux** (Docker Desktop's VM on the same machine, 18 vCPUs, `vm_ab.sh`; `767627f` against `8565bce`, five
+rounds, every case interleaved, load 5.5-7.4; `panel-vm-8565bce.raw`):
+
+| Case | `767627f` | `8565bce` | Ratio |
+|---|---|---|---|
+| yield, polls a second | 53.4 M | 106.4 M | 1.99x |
+| spawn and join, tasks a second | 22.3 M | 29.5 M | 1.32x |
+| two-shard request and reply (p50 / p99 µs) | 967 k (0.9 / 2.0) | 1.43 M (0.6 / 0.9) | 1.48x |
+| one-shard request and reply | 10.2 M | 12.7 M | 1.25x |
+| the same with 1 µs at each end | 462 k | 463 k | 1.00x |
+| eight clients (one-way p50 / p99 µs) | 218 k (13.8 / 58.4) | 216 k (13.6 / 57.3) | 0.99x |
+| the same beside a task that yields | 103 k (60 / 96) | 103 k (59 / 92) | 1.01x |
+| one client pausing 200 µs (one-way p50 / p99 µs) | 33.8 / 92.2 | 32.8 / 90.1 | 1.00x |
+| one client (one-way p50 / p99 µs) | 70 k (0.5 / 21.5) | 87 k (0.3 / 20.5) | 1.24x |
+| a 1 ms sleep, lateness p50 / p99 µs | 983 / 1,966 | 983 / 1,802 | — |
+
+**Two shards with both threads on performance cores** (`benchmark-results/hyper-rt-2x-20261013/xhop`:
+macOS's user-interactive QoS class
+set by a task on each shard, so a cross-thread change is not measured as placement; seven runtimes a
+round of 100,000 round trips, the median of their medians, interleaved): `767627f` 834 ns at p50,
+`ec1b27b` 792 ns, `bfa5875` 583 ns (p99 1,875 to 1,375 ns). Counted by line, a hop moved about ten
+cache lines between the cores; the bitmap's one line took three of them off.
+
 ## hyper-rt: the loop under load, against slates' runtime and tokio (2026-10-13)
 
 `crates/hyper-rt-compare` runs mantle's cases (its note 42 §7–§8) on one host with slates' runtime

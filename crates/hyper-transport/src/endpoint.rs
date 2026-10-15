@@ -256,6 +256,8 @@ pub struct Stats {
     pub events: usize,
     /// Lane frames skipped because their class or the budget could not take them.
     pub frames_dropped: u64,
+    /// Lanes whose next frame, of a lossless class, waits for the budget to hold it.
+    pub frames_reserving: usize,
     /// Endpoint responses dropped at their bound.
     pub responses_dropped: u64,
     /// Streams a peer opened past a bound, refused.
@@ -524,6 +526,8 @@ struct Core<C: Classes, B, D> {
     room: Room,
     /// Moves whenever a connection is identified or goes ([`Endpoint::connection_generation`]).
     generation: u64,
+    /// Lanes whose next frame waits for the budget ([`Reading::Reserving`]).
+    reserving: usize,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -647,6 +651,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
                 room: Room::unbounded(),
                 generation: 0,
+                reserving: 0,
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -737,6 +742,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Time has reached `now`: fire every timer due.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.core.now = now;
+        self.retry_reserving();
         self.read_touched();
         let mut due = std::mem::take(&mut self.due);
         due.clear();
@@ -1180,9 +1186,39 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         self.core.budget.reserve(bytes, Lane::Class(class))
     }
 
-    /// Give a reservation back to the budget: a frame's, or one the owner reserved.
+    /// Give a reservation back to the budget: a frame's, or one the owner reserved. A lossless frame
+    /// that waited for the budget is reserved again now.
     pub fn release(&mut self, reservation: Reservation) {
         self.core.budget.release(reservation);
+        self.retry_reserving();
+    }
+
+    /// The budget may hold more than it did (the owner gave bytes back to it elsewhere): each lane
+    /// whose lossless frame waits for it ([`Classes::lossless`]) asks again, and is read on if its
+    /// frame is reserved. Nothing waits, nothing is done.
+    pub fn retry_reserving(&mut self) {
+        if self.core.reserving == 0 {
+            return;
+        }
+        for key in 0..self.conns.len() {
+            let Some(mut conn) = self.take(key) else {
+                continue;
+            };
+            // From the last: reading a lane removes at most that lane.
+            for at in (0..conn.lanes_in.len()).rev() {
+                let waiting = conn
+                    .lanes_in
+                    .get(at)
+                    .is_some_and(|lane| lane.state == Reading::Reserving);
+                if waiting {
+                    self.core.read_lane(&mut conn, at);
+                }
+            }
+            self.put(key, conn);
+            if self.core.reserving == 0 {
+                break;
+            }
+        }
     }
 
     /// Queue `frame` of `kind` on `peer`'s lane `lane`, in order after the lane's earlier frames.
@@ -1335,6 +1371,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             receive_capacity: self.core.room.capacity(),
             receive_granted: self.core.room.granted(),
             receive_refused: self.core.room.refused(),
+            frames_reserving: self.core.reserving,
             receive_rooms: self
                 .conns
                 .iter()
@@ -3493,6 +3530,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             Reading::Frame => self.lane_frame(conn, at),
             Reading::Skipping => self.lane_skip(conn, at),
+            Reading::Reserving => self.lane_reserve(conn, at),
         }
     }
 
@@ -3550,6 +3588,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if let Some(frame) = lane.frame {
             self.budget.release(frame);
         }
+        if lane.state == Reading::Reserving {
+            self.reserving = self.reserving.saturating_sub(1);
+        }
         if lane.paused
             && let Some(entry) = peer.and_then(|peer| self.peer_entry_mut(peer))
         {
@@ -3591,12 +3632,35 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         });
         let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
         lane.rank = fits.map_or(0, C::rank);
-        lane.state = if frame.is_some() {
-            Reading::Frame
-        } else {
-            Reading::Skipping
+        lane.state = match (&frame, fits) {
+            (Some(_), _) => Reading::Frame,
+            // A lossless frame the budget cannot hold now waits for it, its lane unread.
+            (None, Some(class)) if C::lossless(class) => Reading::Reserving,
+            (None, _) => Reading::Skipping,
         };
         lane.frame = frame;
+        if lane.state == Reading::Reserving {
+            self.reserving = self.reserving.saturating_add(1);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// A lossless frame's bytes ask the budget again: read on once it holds them, else the lane
+    /// stays unread.
+    fn lane_reserve(&mut self, conn: &mut Conn<C::Role>, at: usize) -> Result<bool, Refusal> {
+        let role = conn.peer.map(|(_, role)| role).ok_or(Refusal::Identity)?;
+        let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
+        let prefix = lane.decoded.ok_or(Refusal::Order)?;
+        let class = C::kind_of(lane.kind)
+            .and_then(|kind| C::class_of(kind, role))
+            .ok_or(Refusal::Kind)?;
+        let Ok(frame) = self.budget.reserve(prefix.length(), Lane::Class(class)) else {
+            return Ok(false);
+        };
+        lane.frame = Some(frame);
+        lane.state = Reading::Frame;
+        self.reserving = self.reserving.saturating_sub(1);
         Ok(true)
     }
 

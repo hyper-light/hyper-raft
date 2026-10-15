@@ -80,6 +80,9 @@ pub(crate) enum Reading {
     Frame,
     /// A frame's bytes are being skipped.
     Skipping,
+    /// A lossless frame's prefix is read and its bytes wait for the budget to hold them
+    /// ([`crate::Classes::lossless`]): the lane is not read until they can be.
+    Reserving,
 }
 
 /// A lane from a peer.

@@ -2728,3 +2728,141 @@ fn the_windows_granted_never_pass_what_the_socket_holds() {
     net.until(TURNS, |net| net.b.stats().connections == 0);
     assert_eq!(net.b.stats().receive_granted, 0, "what it held came back");
 }
+
+/// Node 1 and node 2 connected, node 1 with `sender` bytes of budget and node 2 with `receiver`.
+fn connected_budgets<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    sender: u64,
+    receiver: u64,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let book = || pair.book(Role::Node, Role::Node);
+    let a = pair.node::<A>(1, Role::Node, book(), limits, sender, now);
+    let b = pair.node::<B>(2, Role::Node, book(), limits, receiver, now);
+    let mut net = Net::of(now, a, b, hyper_sim::Source::Seed(0));
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let (mut one, mut two) = (false, false);
+    net.until(TURNS, |net| {
+        for event in events(&mut net.a) {
+            one |= matches!(event, Event::Connected { peer: 2, .. });
+        }
+        for event in events(&mut net.b) {
+            two |= matches!(event, Event::Connected { peer: 1, .. });
+        }
+        one && two
+    });
+    net
+}
+
+/// [`Mantle`] whose lane frames are lossless (`Classes::lossless`): a bus's messages, the only
+/// copy their sender holds.
+struct Kept;
+
+impl hyper_transport::Classes for Kept {
+    type Class = Class;
+    type Kind = Kind;
+    type Role = Role;
+    const RANKS: u8 = <Mantle as hyper_transport::Classes>::RANKS;
+    fn rank(class: Class) -> u8 {
+        <Mantle as hyper_transport::Classes>::rank(class)
+    }
+    fn class_of(kind: Kind, role: Role) -> Option<Class> {
+        <Mantle as hyper_transport::Classes>::class_of(kind, role)
+    }
+    fn frame_bound(class: Class) -> u64 {
+        <Mantle as hyper_transport::Classes>::frame_bound(class)
+    }
+    fn kind_code(kind: Kind) -> u16 {
+        <Mantle as hyper_transport::Classes>::kind_code(kind)
+    }
+    fn kind_of(code: u16) -> Option<Kind> {
+        <Mantle as hyper_transport::Classes>::kind_of(code)
+    }
+    fn lossless(_class: Class) -> bool {
+        true
+    }
+}
+
+/// A frame of a lossless class the receiver's budget cannot hold waits for it, its lane unread, and
+/// is never skipped: the receiver that polls nothing holds what its budget takes, the next frame
+/// waits (QUIC's flow control holds the sender behind it), and once it polls and gives the frames
+/// back every frame arrives, in order, none dropped. The same budget skips frames of a lossy class
+/// (a consensus message the protocol above sends again).
+#[test]
+fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
+    const FRAMES: u32 = 60;
+    const FRAME: usize = 1_000;
+    // Room for the connection's first window and its streams' heads, and a dozen frames.
+    let budget = first_window() * 2 + 12 * FRAME as u64;
+    let pair = Pair::new();
+    let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
+    let body = [9u8; FRAME];
+    let mut sent = 0u32;
+    while sent < FRAMES {
+        match net.a.send_frame(2, 0, Kind::Append, &body) {
+            Ok(()) => sent += 1,
+            Err(Refusal::LaneFull) => {
+                net.exchange();
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    net.exchange();
+    let stats = net.b.stats();
+    assert_eq!(stats.frames_dropped, 0, "nothing skipped");
+    assert_eq!(
+        stats.frames_reserving, 1,
+        "the next frame waits for the budget"
+    );
+    let mut order = Vec::new();
+    for _ in 0..10_000 {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(frame.bytes().len());
+                net.b.release(frame);
+            }
+        }
+        if order.len() == FRAMES as usize {
+            break;
+        }
+        net.exchange();
+    }
+    assert_eq!(order.len(), FRAMES as usize, "every frame arrived");
+    assert!(order.iter().all(|bytes| *bytes == FRAME));
+    let stats = net.b.stats();
+    assert_eq!(stats.frames_dropped, 0, "none dropped");
+    assert_eq!(stats.frames_reserving, 0);
+}
+
+/// The same receiver, its frames' class lossy, skips what its budget cannot hold, and counts it.
+#[test]
+fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {
+    const FRAMES: u32 = 60;
+    const FRAME: usize = 1_000;
+    let budget = first_window() * 2 + 12 * FRAME as u64;
+    let pair = Pair::new();
+    let mut net = connected_budgets::<Mantle, Mantle>(&pair, limits(), 256 << 20, budget);
+    let body = [9u8; FRAME];
+    let mut sent = 0u32;
+    while sent < FRAMES {
+        match net.a.send_frame(2, 0, Kind::Append, &body) {
+            Ok(()) => sent += 1,
+            Err(Refusal::LaneFull) => {
+                net.exchange();
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    net.exchange();
+    assert!(
+        net.b.stats().frames_dropped > 0,
+        "the budget's overflow skipped"
+    );
+    assert_eq!(net.b.stats().frames_reserving, 0);
+}

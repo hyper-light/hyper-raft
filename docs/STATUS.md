@@ -184,6 +184,18 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   sockets to the endpoint's connections whenever they change (`connection_generation`,
   `established`); Windows and the simulation fabric keep one socket. Test: hyper-rt-transport's
   `each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection`.
+- **hyper-transport: a lane frame the budget could not hold was skipped, even where it was its
+  sender's only copy.** A lane skips (and counts) a frame its class bound or budget cannot take, so one
+  full range never stalls a shard's stream: right for consensus messages, which Raft sends again,
+  and a silent loss for focal's event bus, whose messages a lane carries once. A class may now be
+  lossless (`Classes::lossless`): its frame waits for the budget (`Reading::Reserving`), its lane
+  unread so QUIC's flow control holds the sender, and asks again whenever bytes come back
+  (`Endpoint::release`, a timeout, or `retry_reserving` from an owner whose budget freed elsewhere);
+  a frame past its class's bound is still refused. `frame_grant` states what an outgoing frame asks
+  of the budget (the frame and its prefix), from which an owner sizes its buffers: focal's bus had
+  sized its largest at its batch bound, and a batch at the bound, plus the prefix, was refused
+  `Budget`. Tests: `a_lossless_frame_waits_for_the_budget_and_is_never_skipped`,
+  `a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted`.
 
 - **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
   38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read

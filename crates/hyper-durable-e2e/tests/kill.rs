@@ -23,7 +23,9 @@
 //!   through the same kill points, a write another entry took the index of answered as not taken
 //!   and asked again (`fast-kill-*`);
 //! - every suspicion is the member's stream's: none was told while a heartbeat the kernel stamped
-//!   before its point sat unread in the member's socket (each report's `unread`).
+//!   before its point sat unread in the member's socket (each report's `unread`);
+//! - a request a member took while it drove is driven before it waits: a read so taken by a member
+//!   with nothing timed, the one voter of its group, is answered with nothing more sent to it.
 //!
 //! The members' failure detectors are their own: each runs the node-pair liveness stream
 //! (`hyper_liveness`, timing step L-3) and takes its words to its replica, and the test tells no
@@ -275,11 +277,24 @@ impl Cluster {
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     fn answer(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
+        self.send(id)?;
+        self.answer_by(ask, Instant::now() + RTO)
+    }
+
+    /// Sends what is in the buffer to `id`, waiting for nothing.
+    fn send(&mut self, id: u64) -> Option<()> {
         let to = self.member(id).address;
         let sealed = wire::seal(&mut self.buffer, self.datagram);
         assert!(sealed);
-        self.test.send_to(&self.buffer, to).ok()?;
-        let deadline = Instant::now() + RTO;
+        self.test.send_to(&self.buffer, to).ok().map(drop)
+    }
+
+    /// The answer to `ask`, waited for until `deadline`; nothing is sent meanwhile.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn answer_by(&mut self, ask: u64, deadline: Instant) -> Option<Vec<u8>> {
         let mut received = vec![0u8; wire::MAX_DATAGRAM];
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -730,20 +745,24 @@ impl Cluster {
         #[cfg(unix)]
         self.signal(id, "-CONT");
         #[cfg(windows)]
-        {
-            use std::io::Write;
-            let stdin = self
-                .member(id)
-                .child
-                .as_mut()
-                .and_then(|child| child.stdin.as_mut())
-                .expect("a member up, its standard input the test's");
-            stdin.write_all(&[1]).unwrap();
-            stdin.flush().unwrap();
-        }
+        self.release(id);
         while self.report(id).is_none() {
             assert!(self.running(id), "member {id} ended while stopped");
         }
+    }
+
+    /// Lets go member `id`'s thread, held at the test's order (`stream::put_hold`,
+    /// `stream::put_pause`): a byte on its standard input (`hyper_raft_e2e::parent`).
+    fn release(&mut self, id: u64) {
+        use std::io::Write;
+        let stdin = self
+            .member(id)
+            .child
+            .as_mut()
+            .and_then(|child| child.stdin.as_mut())
+            .expect("a member up, its standard input the test's");
+        stdin.write_all(&[1]).unwrap();
+        stdin.flush().unwrap();
     }
 
     /// Sends `signal` to member `id`'s process with the system's `kill`.
@@ -1286,6 +1305,79 @@ fn founder_fenced() -> String {
     cluster.looks()
 }
 
+/// A member reads its socket after each drive, before it waits: what came while it drove. What it
+/// takes there owes its replica a drive before it waits (`docs/durable.md` §2.2). A member with
+/// nothing timed, the one voter of its group, held a read it took there until the next datagram
+/// came, however long, and the read's asker heard nothing (`founder` and `founder-fenced`: CI run
+/// 38523559088, and twice in a soak, "reads 1 waiting, 0 confirmed, 1 held by its core"). Here the
+/// member is held where a drive ends (`stream::put_pause`) while a read comes to it, then let go:
+/// the read is answered with nothing more sent to it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
+fn taken_while_driving() -> String {
+    let mut cluster = Cluster::start("taken-while-driving", 1);
+    cluster.write_some("before", WRITES);
+    let member = cluster.leader().expect("a leader");
+    // Nothing out and nothing timed: the member waits on its socket alone.
+    let resting = cluster.until(|reports| {
+        reports.get(&member).is_some_and(|r| {
+            r.writing_ns == 0
+                && r.durable_commit == r.status.commit
+                && r.deadline_ns == u64::MAX
+                && r.stream_wake_ns == u64::MAX
+        })
+    });
+    assert!(
+        resting,
+        "{}: the member never rested with nothing out and nothing timed; {}",
+        cluster.name,
+        cluster.state()
+    );
+    let held = cluster.instruct(member, stream::put_pause);
+    assert_eq!(
+        held,
+        Some(Outcome::Done),
+        "{}: member {member} never held where its drive ended; {}",
+        cluster.name,
+        cluster.state()
+    );
+    let (key, value) = cluster
+        .acked
+        .iter()
+        .next()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .expect("a write answered");
+    cluster.next_id += 1;
+    let ask = cluster.next_id;
+    let op = Op::Get { key: &key };
+    wire::put_request(&mut cluster.buffer, ask, &op);
+    let call = cluster.clients.clock();
+    cluster.send(member).expect("the read is sent");
+    cluster.release(member);
+    let quiet = cluster.quiet();
+    let outcome = cluster
+        .answer_by(ask, Instant::now() + quiet)
+        .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
+    cluster.clients.record(&op, call, outcome.as_ref());
+    let expected = Some(Outcome::Value(Some(value)));
+    if outcome != expected {
+        // What the member holds: it answers a look as it reads it, before it drives.
+        cluster.report(member);
+    }
+    assert_eq!(
+        outcome,
+        expected,
+        "{}: the read member {member} took while it drove was not answered in a quiet period \
+         ({quiet:?}) with nothing more sent to it; {}",
+        cluster.name,
+        cluster.state()
+    );
+    cluster.verify();
+    cluster.looks()
+}
+
 /// focal F17 (`cli_upgrade`): a member acts on a fence (an entry it acts on at its next start)
 /// and is killed there; restarted and told of no peer, it acts on the fence again from its own
 /// log before it hears from anyone.
@@ -1422,13 +1514,14 @@ fn main() -> ExitCode {
             }
         }
     }
-    let scenarios: [(&str, Scenario); 10] = [
+    let scenarios: [(&str, Scenario); 11] = [
         ("stall-leader", || stalled_disk(true)),
         ("stall-follower", || stalled_disk(false)),
         ("stalled-devices", stalled_devices),
         ("member-stopped", member_stopped),
         ("founder", founder),
         ("founder-fenced", founder_fenced),
+        ("taken-while-driving", taken_while_driving),
         ("fence-follower", || fence_host(false)),
         ("fence-leader", || fence_host(true)),
         ("flush-follower", || failed_flush(false)),

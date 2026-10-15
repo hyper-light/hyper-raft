@@ -13,7 +13,9 @@
 //! - a group whose devices all stall goes on once they do;
 //! - every write a member keeps waiting is one an apply will answer (each report's `stray`).
 //! - every suspicion is the member's stream's: none was told while a heartbeat the kernel stamped
-//!   before its point sat unread in the member's socket (each report's `unread`).
+//!   before its point sat unread in the member's socket (each report's `unread`);
+//! - a request a member took while it drove is driven before it waits: a read so taken by a member
+//!   with nothing timed is answered with nothing more sent to it.
 //!
 //! The members elect by suspicion on their own failure detectors: each runs the node-pair
 //! liveness stream (`hyper_liveness`, timing step L-3) and takes its words to its core, with the
@@ -267,10 +269,21 @@ impl Cluster {
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     fn answer(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
+        self.send(id)?;
+        self.answer_by(ask, Instant::now() + RTO)
+    }
+    /// Sends what is in the buffer to `id`, waiting for nothing.
+    fn send(&mut self, id: u64) -> Option<()> {
         assert!(wire::seal(&mut self.buffer, self.datagram));
         let to = self.address(id);
-        self.test.send_to(&self.buffer, to).ok()?;
-        let deadline = Instant::now() + RTO;
+        self.test.send_to(&self.buffer, to).ok().map(drop)
+    }
+    /// The answer to `ask`, waited for until `deadline`; nothing is sent meanwhile.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn answer_by(&mut self, ask: u64, deadline: Instant) -> Option<Vec<u8>> {
         let mut received = vec![0u8; wire::MAX_DATAGRAM];
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -655,18 +668,21 @@ impl Cluster {
         #[cfg(unix)]
         self.signal(id, "-CONT");
         #[cfg(windows)]
-        {
-            let stdin = self.members[(id - 1) as usize]
-                .child
-                .as_mut()
-                .and_then(|child| child.stdin.as_mut())
-                .expect("a member up, its standard input the test's");
-            stdin.write_all(&[1]).unwrap();
-            stdin.flush().unwrap();
-        }
+        self.release(id);
         while self.report(id).is_none() {
             self.running(id);
         }
+    }
+    /// Lets go member `id`'s thread, held at the test's order (`stream::put_hold`,
+    /// `stream::put_pause`): a byte on its standard input (`hyper_raft_e2e::parent`).
+    fn release(&mut self, id: u64) {
+        let stdin = self.members[(id - 1) as usize]
+            .child
+            .as_mut()
+            .and_then(|child| child.stdin.as_mut())
+            .expect("a member up, its standard input the test's");
+        stdin.write_all(&[1]).unwrap();
+        stdin.flush().unwrap();
     }
     /// Sends `signal` to member `id`'s process with the system's `kill`.
     #[cfg(unix)]
@@ -1439,6 +1455,72 @@ fn all_killed() -> String {
     )
 }
 
+/// A member reads its socket after each drive, before it waits: what came while it drove. What it
+/// takes there owes its core a drive before it waits: a member with nothing timed, the one voter
+/// of its group, held a read it took there until the next datagram came, however long
+/// (hyper-durable-e2e's `taken-while-driving`, a founder's read so held in CI run 38523559088).
+/// Here the member is held where a drive ends (`stream::put_pause`) while a read comes to it, then
+/// let go: the read is answered with nothing more sent to it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
+fn taken_while_driving() -> String {
+    let name = "taken-while-driving";
+    let writes = phase(name, datagram());
+    let room = Room {
+        keys: writes,
+        pending: 1,
+        writes,
+        stale_reads: false,
+    };
+    let mut cluster = Cluster::start(name, 1, room);
+    let all = cluster.up_members();
+    let (member, _) = cluster.leader_among(&all);
+    let mut client = Client { leader: member };
+    let mut history = History::default();
+    let key = format!("{name}-key");
+    assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"value"));
+    // Nothing waiting and nothing timed: the member waits on its socket alone.
+    let resting = cluster.until(&all, |reports| {
+        reports.get(&member).is_some_and(|r| {
+            r.waiting == 0 && r.deadline_ns == u64::MAX && r.stream_wake_ns == u64::MAX
+        })
+    });
+    assert!(
+        resting,
+        "{name}: the member never rested with nothing waiting and nothing timed"
+    );
+    cluster.order(member, stream::put_pause);
+    cluster.next_id += 1;
+    let ask = cluster.next_id;
+    let op = Op::Get {
+        key: key.as_bytes(),
+    };
+    wire::put_request(&mut cluster.buffer, ask, &op);
+    let call = cluster.clients.clock();
+    cluster.send(member).expect("the read is sent");
+    cluster.release(member);
+    let quiet = cluster.quiet();
+    let outcome = cluster
+        .answer_by(ask, Instant::now() + quiet)
+        .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
+    cluster.clients.record(&op, call, outcome.as_ref());
+    let expected = Some(Outcome::Value(Some(b"value".to_vec())));
+    // What the member holds: it answers a look as it reads it, before it drives.
+    let held = (outcome != expected).then(|| cluster.report(member));
+    assert_eq!(
+        outcome, expected,
+        "{name}: the read member {member} took while it drove was not answered in a quiet period \
+         ({quiet:?}) with nothing more sent to it; its report after: {held:?}"
+    );
+    let checked = verify(&mut cluster, &mut client, &history);
+    let linear = cluster.linearizable();
+    format!(
+        "{name}: 1 member; a read taken while it drove answered with nothing more sent; {checked} writes read back{linear}"
+    )
+}
+
 /// The defect planted to show the clients' history check catches one (`docs/sim.md` §9, S-7):
 /// members that answer a read from what they applied, whoever leads (`--stale-reads`). A follower
 /// cut off answers a key's old value after its new one was written and answered, and the history
@@ -1505,7 +1587,7 @@ fn main() -> ExitCode {
     )
     .unwrap();
     drop(out);
-    let scenarios: [(&str, Scenario); 9] = [
+    let scenarios: [(&str, Scenario); 10] = [
         ("commits-3", || commits(3, "commits-3")),
         ("commits-5", || commits(5, "commits-5")),
         ("leader-killed", leader_killed),
@@ -1515,6 +1597,7 @@ fn main() -> ExitCode {
         ("stalled-devices", stalled_devices),
         ("member-stopped", member_stopped),
         ("stale-read-planted", stale_read_planted),
+        ("taken-while-driving", taken_while_driving),
     ];
     let filter: Vec<String> = std::env::args()
         .skip(1)

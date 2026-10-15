@@ -168,6 +168,7 @@ fn a_report_reads_back_with_its_core_state() {
             sending_interval_ns: 6_000,
             sending_due_ns: 7,
             stream_wake_ns: u64::MAX,
+            deadline_ns: 8,
             suspected: vec![1],
             heard: vec![1, 3],
             core_suspected: vec![1, 3],

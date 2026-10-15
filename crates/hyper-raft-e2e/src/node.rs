@@ -264,6 +264,14 @@ pub struct Node {
     turn_most: u64,
     /// When it last read its socket or ended a wait on it.
     read_ns: u64,
+    /// Whether it took a datagram, or handed its core a word of its stream, since it last drove:
+    /// it then waits for nothing before it drives (hyper-durable `docs/durable.md` §2.2).
+    owed: bool,
+    /// The test's order to hold where its next drive ends (`stream::put_pause`): who asked, and
+    /// the order's id.
+    pause: Option<(SocketAddr, u64)>,
+    /// The id of the last such order it held for: one sent again is not held for twice.
+    paused: Option<u64>,
 }
 
 impl Node {
@@ -346,6 +354,9 @@ impl Node {
             flush_most: 0,
             turn_most: 0,
             read_ns: 0,
+            owed: false,
+            pause: None,
+            paused: None,
             settings,
         })
     }
@@ -369,14 +380,32 @@ impl Node {
                 self.live(clock)?;
             }
             // Woken at the core's deadline or the stream's, whichever is first; by a datagram
-            // otherwise, the parent's going among them.
-            let wake = self.liveness.wake();
-            let until = [self.raw.deadline(), wake].into_iter().flatten().min();
-            if let Some(clock) = self.receive_until(until)? {
-                self.live(clock)?;
+            // otherwise, the parent's going among them. Not while it holds what it took since it
+            // drove: a request, a peer's message or a word of its stream owes the core a drive
+            // first, and a member with nothing timed held one until the next datagram came
+            // (hyper-durable-e2e's `taken-while-driving`).
+            if !self.owed {
+                let wake = self.liveness.wake();
+                let until = [self.raw.deadline(), wake].into_iter().flatten().min();
+                if let Some(clock) = self.receive_until(until)? {
+                    self.live(clock)?;
+                }
             }
             self.measure()?;
             self.drive()?;
+            self.pause()?;
+        }
+        Ok(())
+    }
+
+    /// Holds the member's thread here, where a drive ended and before it reads its socket again,
+    /// if the test ordered it (`stream::put_pause`): it answers the order, then holds until the
+    /// test releases it, and what the test sent meanwhile is what came while it drove.
+    fn pause(&mut self) -> Result<(), NodeError> {
+        if let Some((asker, id)) = self.pause.take() {
+            self.paused = Some(id);
+            self.respond(asker, id, &Outcome::Done)?;
+            crate::parent::hold_until_released();
         }
         Ok(())
     }
@@ -471,6 +500,7 @@ impl Node {
         self.asked.heartbeats = heartbeats;
         self.asked.heartbeats.clear();
         let changes = std::mem::take(&mut self.asked.changes);
+        self.owed |= !changes.is_empty();
         for change in &changes {
             self.believe(change)?;
         }
@@ -620,6 +650,8 @@ impl Node {
             Err(error) if error.kind() == ErrorKind::ConnectionReset => return Ok(true),
             Err(error) => return Err(error.into()),
         };
+        // Whatever it is, the member drives before it waits again.
+        self.owed = true;
         let from = arrival.from;
         let datagram = std::mem::take(&mut self.received);
         let outcome = match datagram.get(..length).and_then(wire::open) {
@@ -743,6 +775,10 @@ impl Node {
                 .liveness
                 .wake()
                 .map_or(u64::MAX, |wake| wake.saturating_sub(self.now())),
+            deadline_ns: self
+                .raw
+                .deadline()
+                .map_or(u64::MAX, |at| at.saturating_sub(self.now())),
             writes: u64::try_from(
                 self.raw
                     .store()
@@ -954,6 +990,13 @@ impl Node {
             crate::parent::hold_until_released();
             return Ok(());
         }
+        if let Some(id) = stream::read_pause(body) {
+            if self.paused == Some(id) {
+                return self.respond(from, id, &Outcome::Done);
+            }
+            self.pause = Some((from, id));
+            return Ok(());
+        }
         if let Some((id, stall)) = stream::read_stall(body) {
             self.raw.store_mut().stall_flushes(stall);
             return self.respond(from, id, &Outcome::Done);
@@ -1019,6 +1062,7 @@ impl Node {
     /// due is done — and acts on each `Ready` it then has, waking it again after each, until it
     /// has none.
     fn drive(&mut self) -> Result<(), NodeError> {
+        self.owed = false;
         loop {
             let now = self.now();
             heard(self.raw.wake(now))?;

@@ -159,6 +159,16 @@ batched requests and drained at the batch's end only the replicas with `has_read
 whose step left nothing ready waited for its 750 ms deadline, and a test that pumped one frame at a
 time stalled behind it with no leader. Every request a batch takes now owes the batch its drive.
 
+The E2E harnesses' members learned it too (2026-10-15). Each reads its socket after a drive, for
+what came while it drove, then waits until the replica's deadline or its stream's wake, and drives
+after the wait. What that read took waited for the wait to end: a member with nothing timed, the
+one voter of its group, held a read its core had answered for good, until another datagram came
+(hyper-durable-e2e's `founder`, CI run 38523559088 and twice in a soak: "reads 1 waiting, 0
+confirmed, 1 held by its core", no write out, no deadline). A member that took anything since it
+drove, or handed its replica a word of its stream, now drives before it waits; each harness's
+`taken-while-driving` holds its one member where a drive ends, sends it a read, and lets it go, and
+the read is answered with nothing more sent (on the old loop it never was).
+
 ### 2.3 What one write holds, and in what order
 
 One write is one log update: the snapshot's point, the entries, the fast-track proposals, then the

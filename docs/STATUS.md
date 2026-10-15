@@ -105,20 +105,6 @@ drives, so a sighting names which of them held the group back. The waits' law co
 each member's own heartbeats go at (2026-10-15, below), which both entries here may have lacked:
 each saw no heartbeat taken through a quiet period shorter than the members' flushes.
 
-- **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
-  38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read
-  back"), and twice in a soak of the scenario in Docker's Linux (aarch64, beside busy loops; runs 11
-  and 719 of their soaks, the second's report: the founder leading alone at term 2, commit, applied
-  and last index 12, "reads 1 waiting, 0 confirmed, 1 held by its core, 0 refused, its term committed
-  true", no write out, no drive refused). The read went into the core and never came out: not
-  confirmed and waiting to apply, not refused. The reads before it in the same wait were answered.
-  Not reproduced since in 2,130 runs on the old core and 550 on the new (a sole voter now leads once
-  its vote is durable); a soak with the member printing where its core holds the read (waiting for
-  the term's first commit, its quorum, or to be taken) and why no `Ready` was taken runs on. The
-  simulation now holds every read a leader took to an answer once its group settles (10,000 seeds
-  of each shape, none held), so the cause is outside what it models: the member's log
-  (`GroupStore`, hyper-log) or its owner's loop are where to look next.
-
 - **hyper-raft-e2e `stalled-devices`.** Seen once on macOS under the load of other builds
   (2026-10-03, the tree of 9893679). After the 7 s stall the old leader had stepped down in its
   term (leader 0), its followers still trusted it, the stream trusted every member, and no member
@@ -135,8 +121,12 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   9893679's own tree with its diagnostics, and 30 in Docker's Linux at 2 CPUs; CI since 2ef0ab3:
   no failure of it on any target. A stall of every device raises each member's flush floor, and
   with it the interval its heartbeats go at, which the waits' quiet period did not cover before
-  2026-10-15. Open until a sighting's report states the core's and the stream's side, which it now
-  does.
+  2026-10-15. And until 2026-10-15 (the founder's read, below) a member handed its core a
+  suspicion its stream judged after a drive and then waited until its next wake before driving it:
+  a suspicion arms a campaign only at the core's next wake, so the campaign waited a stream interval,
+  which a stall of every device stretches to seconds. Open until a sighting's report states the
+  core's and the stream's side, which it now does; 8 runs of it and `member-stopped` in Docker's
+  Linux beside 8 busy loops on `3d86b42` passed.
 - **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
   Member 1 was stopped at term 2. Members 2 and 3 went through three elections to term 5 (3 leading,
   commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms: each write held its
@@ -148,10 +138,33 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   in 1.4 s, no election), and 47 ubuntu-24.04 gates since 2ef0ab3. Open: whether a device whose
   every write is that slow makes a pair re-elect past the law (each new leader's first write
   suspected in turn); the reports now state each member's core suspicions and campaign, and the law
-  covers the interval its heartbeats go at, which writes of 597 and 741 ms set.
+  covers the interval its heartbeats go at, which writes of 597 and 741 ms set. A vote request or a
+  suspicion a member took after a drive waited until its next wake before 2026-10-15 (the founder's
+  read, below), a stream interval that writes of 597 and 741 ms set, which slowed every election
+  here by up to that.
 
 ### Closed (2026-10-15)
 
+- **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
+  38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read
+  back"), and twice in a soak (runs 11 and 719, the second's report: "reads 1 waiting, 0 confirmed, 1
+  held by its core, 0 refused, its term committed true", no write out, no deadline). The cause was
+  the member's loop, in all three harnesses: after a drive it reads its socket for what came while
+  it drove, then waits until its replica's deadline or its stream's wake, and drives only after the
+  wait. A read that read took was answered by the core into its `Ready` and waited for the wait to
+  end, and a sole voter has nothing timed: it waited for the next datagram, and the test's ask had
+  given up. A member that took anything since it drove, or handed its replica a word of its stream,
+  now drives before it waits (`docs/durable.md` §2.2). Each harness's `taken-while-driving` holds its
+  one member where a drive ends (`stream::put_pause`), sends it a read and lets it go: on the old
+  loop the read was never answered (4 of 4 in hyper-durable-e2e, its report the sighting's, "reads 1
+  waiting, 0 confirmed, 1 held by its core"; 2 of 2 in each of the others), and now it is at once.
+- **A sole voter campaigning at every wake (since `14a014f`, I9, before it reached `main`).**
+  `taken-while-driving`'s member, the first E2E group of one, reached term 1,232,434 before it led:
+  its vote counted only once durable, and by suspicion a sole voter campaigned at once whenever it
+  was woken, so each wake before its vote's write was durable moved its term past that write. It now
+  campaigns once a term and waits for its own vote's write with nothing armed
+  (`a_sole_voter_waits_for_its_own_vote_and_campaigns_once`, which fails on the old core at its
+  first wake; `docs/durable.md` I9).
 - **hyper-durable-e2e's founder at its start, no leader: the waits' law short of the members' own
   heartbeat interval.** A soak of the scenario in Docker's Linux failed at run 771: "a write was never
   answered; nothing moved for 1s". Both members were at term 0 with no heartbeat taken and no

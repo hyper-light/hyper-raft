@@ -272,6 +272,14 @@ pub struct Member {
     flush_most: u64,
     turn_most: u64,
     read_ns: u64,
+    /// Whether it took a datagram, or handed its logs a word of its stream, since it last drove:
+    /// it then waits for nothing before it drives (hyper-durable `docs/durable.md` §2.2).
+    owed: bool,
+    /// The test's order to hold where its next drive ends (`stream::put_pause`): who asked, and
+    /// the order's id.
+    pause: Option<(SocketAddr, u64)>,
+    /// The id of the last such order it held for: one sent again is not held for twice.
+    paused: Option<u64>,
 }
 
 /// The configuration each log's member runs with, from what the member states (as
@@ -358,6 +366,9 @@ impl Member {
             flush_most: 0,
             turn_most: 0,
             read_ns: 0,
+            owed: false,
+            pause: None,
+            paused: None,
             settings,
         })
     }
@@ -375,13 +386,31 @@ impl Member {
             if let Some(clock) = self.drain(self.turn())? {
                 self.live(clock)?;
             }
-            let wake = self.liveness.wake();
-            let until = [self.deadline(), wake].into_iter().flatten().min();
-            if let Some(clock) = self.receive_until(until)? {
-                self.live(clock)?;
+            // Not while it holds what it took since it drove: a request, a peer's message or a
+            // word of its stream owes its logs a drive first, and a member with nothing timed
+            // held one until the next datagram came (hyper-durable-e2e's `taken-while-driving`).
+            if !self.owed {
+                let wake = self.liveness.wake();
+                let until = [self.deadline(), wake].into_iter().flatten().min();
+                if let Some(clock) = self.receive_until(until)? {
+                    self.live(clock)?;
+                }
             }
             self.measure()?;
             self.drive()?;
+            self.pause()?;
+        }
+        Ok(())
+    }
+
+    /// Holds the member's thread here, where a drive ended and before it reads its socket again,
+    /// if the test ordered it (`stream::put_pause`): it answers the order, then holds until the
+    /// test releases it, and what the test sent meanwhile is what came while it drove.
+    fn pause(&mut self) -> Result<(), MemberError> {
+        if let Some((asker, id)) = self.pause.take() {
+            self.paused = Some(id);
+            self.respond(asker, id, &Outcome::Done)?;
+            hyper_raft_e2e::parent::hold_until_released();
         }
         Ok(())
     }
@@ -496,6 +525,7 @@ impl Member {
         self.asked.heartbeats = heartbeats;
         self.asked.heartbeats.clear();
         let changes = std::mem::take(&mut self.asked.changes);
+        self.owed |= !changes.is_empty();
         for change in &changes {
             self.believe(change)?;
         }
@@ -615,6 +645,8 @@ impl Member {
             Err(error) if error.kind() == ErrorKind::ConnectionReset => return Ok(true),
             Err(error) => return Err(error.into()),
         };
+        // Whatever it is, the member drives before it waits again.
+        self.owed = true;
         let from = arrival.from;
         let datagram = std::mem::take(&mut self.received);
         let outcome = match datagram.get(..length).and_then(wire::open) {
@@ -756,6 +788,9 @@ impl Member {
                 .liveness
                 .wake()
                 .map_or(u64::MAX, |wake| wake.saturating_sub(self.now())),
+            deadline_ns: self
+                .deadline()
+                .map_or(u64::MAX, |at| at.saturating_sub(self.now())),
             writes: self.writes_held(),
             restarts: self.restarts,
             blocked_ns: self.blocked,
@@ -969,6 +1004,13 @@ impl Member {
             }
             return Ok(());
         }
+        if let Some(id) = stream::read_pause(body) {
+            if self.paused == Some(id) {
+                return self.respond(from, id, &Outcome::Done);
+            }
+            self.pause = Some((from, id));
+            return Ok(());
+        }
         if let Some(id) = stream::read_account_ask(body) {
             let voters = self.settings.voters.clone();
             let election = stream::timing(&self.liveness, self.settings.id, &voters)
@@ -1040,6 +1082,7 @@ impl Member {
     /// Wakes every log at the member's clock and acts on each `Ready` they have; then the merge
     /// and the barriers owed, which may make more; until no log has one.
     fn drive(&mut self) -> Result<(), MemberError> {
+        self.owed = false;
         loop {
             let now = self.now();
             self.each(|node| node.wake(now).map(drop))?;

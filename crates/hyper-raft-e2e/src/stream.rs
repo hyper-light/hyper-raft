@@ -28,6 +28,9 @@ const STALL: u8 = 5;
 /// The control tag of the test's order that a member hold its thread, outside any write of its
 /// log, until released.
 const HOLD: u8 = 6;
+/// The control tag of the test's order that a member hold its thread where its next drive ends,
+/// until released.
+const PAUSE: u8 = 7;
 /// The response tag an [`Account`] takes.
 const ACCOUNT: u8 = 8;
 
@@ -112,6 +115,24 @@ pub fn read_hold(body: &[u8]) -> Option<u64> {
     let mut reader = Reader::new(body);
     let id = reader.u64()?;
     (reader.u8()? == HOLD && reader.rest().is_empty()).then_some(id)
+}
+
+/// Puts the test's order that a member hold its thread where its next drive ends, before it reads
+/// its socket again, until a byte comes on its standard input, answering `Done` once it holds:
+/// what the test sends meanwhile is what came while the member drove. An order it held for is
+/// answered `Done` again and not held for, however often it comes (an ask is idempotent).
+pub fn put_pause(buffer: &mut Vec<u8>, id: u64) {
+    wire::begin(buffer, Kind::Control);
+    wire::put_u64(buffer, id);
+    buffer.push(PAUSE);
+}
+
+/// The id of an order that a member hold its thread where its next drive ends; none for anything
+/// else.
+pub fn read_pause(body: &[u8]) -> Option<u64> {
+    let mut reader = Reader::new(body);
+    let id = reader.u64()?;
+    (reader.u8()? == PAUSE && reader.rest().is_empty()).then_some(id)
 }
 
 /// What the node-pair stream asked of its member during one call into it.
@@ -199,6 +220,9 @@ pub struct Report {
     /// How long from the report until its stream's next wake, nanoseconds: zero when due,
     /// `u64::MAX` when it asks none.
     pub stream_wake_ns: u64,
+    /// How long from the report until its core's deadline (`hyper_raft::RawNode::deadline`),
+    /// nanoseconds: zero when due, `u64::MAX` when nothing is timed.
+    pub deadline_ns: u64,
     /// The writes its durable log holds: its entries that are not a leader's empty one. A leader
     /// proposes no write its log holds, so each is held once.
     pub writes: u64,
@@ -301,6 +325,7 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.sending_interval_ns,
         report.sending_due_ns,
         report.stream_wake_ns,
+        report.deadline_ns,
         report.writes,
         report.restarts,
         report.blocked_ns,
@@ -341,7 +366,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         last_index: reader.u64()?,
         digest: reader.u64()?,
     };
-    let mut words = [0u64; 25];
+    let mut words = [0u64; 26];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -360,6 +385,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         sending_interval_ns,
         sending_due_ns,
         stream_wake_ns,
+        deadline_ns,
         writes,
         restarts,
         blocked_ns,
@@ -402,6 +428,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
             sending_interval_ns,
             sending_due_ns,
             stream_wake_ns,
+            deadline_ns,
             writes,
             restarts,
             blocked_ns,

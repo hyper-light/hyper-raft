@@ -229,6 +229,14 @@ pub struct Node {
     turn_most: u64,
     /// When it last read its socket or ended a wait on it.
     read_ns: u64,
+    /// Whether it took a datagram, or handed its replica a word of its stream, since it last
+    /// drove: it then waits for nothing before it drives (`docs/durable.md` §2.2).
+    owed: bool,
+    /// The test's order to hold where its next drive ends (`stream::put_pause`): who asked, and
+    /// the order's id.
+    pause: Option<(SocketAddr, u64)>,
+    /// The id of the last such order it held for: one sent again is not held for twice.
+    paused: Option<u64>,
 }
 
 /// What the liveness stream asks of the member: heartbeats to send, a write to make, changes.
@@ -377,6 +385,9 @@ impl Node {
             flush_most: 0,
             turn_most: 0,
             read_ns: 0,
+            owed: false,
+            pause: None,
+            paused: None,
             told: Vec::new(),
             unread: 0,
             unmeasured: 0,
@@ -569,6 +580,7 @@ impl Node {
         self.asked.heartbeats = heartbeats;
         self.asked.heartbeats.clear();
         let changes = std::mem::take(&mut self.asked.changes);
+        self.owed |= !changes.is_empty();
         for change in &changes {
             let peer = change.peer();
             match change {
@@ -613,13 +625,19 @@ impl Node {
             }
             self.writing();
             // Woken at the replica's deadline or the stream's, whichever is first; by a datagram
-            // otherwise, the test's going among them.
-            let wake = self.liveness.wake();
-            let until = [self.replica.deadline(), wake].into_iter().flatten().min();
-            if let Some(clock) = self.receive_until(until)? {
-                self.live(clock)?;
+            // otherwise, the test's going among them. Not while it holds what it took since it
+            // drove: a request, a peer's message, the log's answer or a word of its stream owes
+            // the replica a drive first (`docs/durable.md` §2.2). A member with nothing timed, the
+            // one voter of its group, held a read the drain above took until the next datagram
+            // came, however long (`founder`, CI run 38523559088).
+            if !self.owed {
+                let wake = self.liveness.wake();
+                let until = [self.replica.deadline(), wake].into_iter().flatten().min();
+                if let Some(clock) = self.receive_until(until)? {
+                    self.live(clock)?;
+                }
+                self.writing();
             }
-            self.writing();
             if std::mem::take(&mut self.woken) && self.stops_at(Point::Durable) {
                 return Ok(Some(Point::Durable));
             }
@@ -627,8 +645,21 @@ impl Node {
             if let Some(point) = self.drive()? {
                 return Ok(Some(point));
             }
+            self.pause()?;
         }
         Ok(None)
+    }
+
+    /// Holds the member's thread here, where a drive ended and before it reads its socket again,
+    /// if the test ordered it (`stream::put_pause`): it answers the order, then holds until the
+    /// test releases it, and what the test sent meanwhile is what came while it drove.
+    fn pause(&mut self) -> Result<(), NodeError> {
+        if let Some((asker, id)) = self.pause.take() {
+            self.paused = Some(id);
+            self.respond(asker, id, &Outcome::Done)?;
+            hyper_raft_e2e::parent::hold_until_released();
+        }
+        Ok(())
     }
 
     /// Whether the member passes an armed `point` for the last time it was armed for.
@@ -733,6 +764,8 @@ impl Node {
             Err(e) if e.kind() == ErrorKind::ConnectionReset => return Ok(true),
             Err(e) => return Err(e.into()),
         };
+        // Whatever it is, the member drives before it waits again.
+        self.owed = true;
         let from = arrival.from;
         let datagram = std::mem::take(&mut self.received);
         let outcome = match datagram.get(..length).and_then(wire::open) {
@@ -926,6 +959,13 @@ impl Node {
             hyper_raft_e2e::parent::hold_until_released();
             return Ok(());
         }
+        if let Some(id) = stream::read_pause(body) {
+            if self.paused == Some(id) {
+                return self.respond(from, id, &Outcome::Done);
+            }
+            self.pause = Some((from, id));
+            return Ok(());
+        }
         let Some((id, control)) = wire::read_control(body, self.settings.voters.len()) else {
             return Ok(());
         };
@@ -1103,6 +1143,7 @@ impl Node {
     /// Drives the replica until it has nothing more to do now, stopping at an armed point. Each
     /// write the replica made durable is a flush the stream's heartbeats may prove.
     fn drive(&mut self) -> Result<Option<Point>, NodeError> {
+        self.owed = false;
         loop {
             let out_before = self.replica.in_flight();
             let made_before = self.made();

@@ -8,7 +8,9 @@
 //!   linearizable (`hyper_raft_e2e::history`);
 //! - a member cut off answers no read with a value and acknowledges no write;
 //! - every member that is up reaches the same state having merged all its logs gave it (the same
-//!   store's digest, every log's commit merged), whatever interleaving of the logs it applied in.
+//!   store's digest, every log's commit merged), whatever interleaving of the logs it applied in;
+//! - a request a member took while it drove is driven before it waits: a read so taken by a member
+//!   with nothing timed is answered with nothing more sent to it.
 //!
 //! The writes alternate a keyed write and a global one (a key beginning `*`): every keyed write in
 //! a log other than log 0 then waits at a barrier naming the global before it, and every global
@@ -272,10 +274,21 @@ impl Cluster {
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     fn answer(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
+        self.send(id)?;
+        self.answer_by(ask, Instant::now() + RTO)
+    }
+    /// Sends what is in the buffer to `id`, waiting for nothing.
+    fn send(&mut self, id: u64) -> Option<()> {
         assert!(wire::seal(&mut self.buffer, self.datagram));
         let to = self.address(id);
-        self.test.send_to(&self.buffer, to).ok()?;
-        let deadline = Instant::now() + RTO;
+        self.test.send_to(&self.buffer, to).ok().map(drop)
+    }
+    /// The answer to `ask`, waited for until `deadline`; nothing is sent meanwhile.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn answer_by(&mut self, ask: u64, deadline: Instant) -> Option<Vec<u8>> {
         let mut received = vec![0u8; wire::MAX_DATAGRAM];
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -698,6 +711,17 @@ impl Cluster {
     fn isolate(&mut self, id: u64, cut: bool) {
         self.instruct(id, &Control::Isolate(cut));
     }
+    /// Lets go member `id`'s thread, held at the test's order (`stream::put_pause`): a byte on
+    /// its standard input (`hyper_raft_e2e::parent`).
+    fn release(&mut self, id: u64) {
+        let stdin = self.members[(id - 1) as usize]
+            .child
+            .as_mut()
+            .and_then(|child| child.stdin.as_mut())
+            .expect("a member up, its standard input the test's");
+        stdin.write_all(&[1]).unwrap();
+        stdin.flush().unwrap();
+    }
     /// Waits while the group moves until every member in `among` applied the same history
     /// through the same index, all it knows committed.
     fn converged(&mut self, among: &[u64]) -> u64 {
@@ -1041,6 +1065,67 @@ fn commits(logs: usize, name: &'static str) -> String {
     )
 }
 
+/// A member reads its socket after each drive, before it waits: what came while it drove. What it
+/// takes there owes its logs a drive before it waits: a member with nothing timed, the one voter
+/// of its group, held a read it took there until the next datagram came, however long
+/// (hyper-durable-e2e's `taken-while-driving`, a founder's read so held in CI run 38523559088).
+/// Here the member is held where a drive ends (`stream::put_pause`) while a read comes to it, then
+/// let go: the read is answered with nothing more sent to it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+)]
+fn taken_while_driving() -> String {
+    let name = "taken-while-driving";
+    // The room of a phase, as the other scenarios size theirs: a member derives its bounds from
+    // what it holds, and one that holds less than a message opens on none.
+    let mut cluster = Cluster::start(name, 1, room(1, phase(name, datagram())));
+    let all = cluster.up_members();
+    let (member, _) = cluster.leader_among(&all);
+    let mut client = Client::new(&cluster, member);
+    let mut history = History::default();
+    let key = format!("{name}-key");
+    assert!(client.put(&mut cluster, &mut history, key.as_bytes(), b"value"));
+    // Nothing waiting and nothing timed: the member waits on its socket alone.
+    let resting = cluster.until(&all, |reports| {
+        reports.get(&member).is_some_and(|r| {
+            r.waiting == 0 && r.deadline_ns == u64::MAX && r.stream_wake_ns == u64::MAX
+        })
+    });
+    assert!(
+        resting,
+        "{name}: the member never rested with nothing waiting and nothing timed"
+    );
+    cluster.order(member, stream::put_pause);
+    cluster.next_id += 1;
+    let ask = cluster.next_id;
+    let op = Op::Get {
+        key: key.as_bytes(),
+    };
+    wire::put_request(&mut cluster.buffer, ask, &op);
+    let call = cluster.clients.clock();
+    cluster.send(member).expect("the read is sent");
+    cluster.release(member);
+    let quiet = cluster.quiet.period();
+    let outcome = cluster
+        .answer_by(ask, Instant::now() + quiet)
+        .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
+    cluster.clients.record(&op, call, outcome.as_ref());
+    let expected = Some(Outcome::Value(Some(b"value".to_vec())));
+    // What the member holds: it answers a look as it reads it, before it drives.
+    let held = (outcome != expected).then(|| cluster.report(member));
+    assert_eq!(
+        outcome, expected,
+        "{name}: the read member {member} took while it drove was not answered in a quiet period \
+         ({quiet:?}) with nothing more sent to it; its report after: {held:?}"
+    );
+    let checked = verify(&mut cluster, &mut client, &history);
+    let linear = cluster.linearizable();
+    format!(
+        "{name}: 1 member, 1 log; a read taken while it drove answered with nothing more sent; {checked} writes read back{linear}"
+    )
+}
+
 /// Log 0's leader is killed; the others elect in every log it led and go on, and nothing
 /// answered is lost. It comes back on its logs, its restart is reported, and it merges the same
 /// history.
@@ -1175,13 +1260,14 @@ fn main() -> ExitCode {
     )
     .unwrap();
     drop(out);
-    let scenarios: [(&str, Scenario); 6] = [
+    let scenarios: [(&str, Scenario); 7] = [
         ("commits-1", || commits(1, "commits-1")),
         ("commits-3", || commits(3, "commits-3")),
         ("member-killed", member_killed),
         ("partition", partition),
         ("tails-1", || tails(1, "tails-1")),
         ("tails-3", || tails(3, "tails-3")),
+        ("taken-while-driving", taken_while_driving),
     ];
     let filter: Vec<String> = std::env::args()
         .skip(1)

@@ -125,8 +125,8 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   suspicion its stream judged after a drive and then waited until its next wake before driving it:
   a suspicion arms a campaign only at the core's next wake, so the campaign waited a stream interval,
   which a stall of every device stretches to seconds. Open until a sighting's report states the
-  core's and the stream's side, which it now does; 8 runs of it and `member-stopped` in Docker's
-  Linux beside 8 busy loops on `3d86b42` passed.
+  core's and the stream's side, which it now does; 8 runs of hyper-raft-e2e's `stalled-devices` and
+  `member-stopped` in Docker's Linux beside 8 busy loops passed on the defects branch (2026-10-15).
 - **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
   Member 1 was stopped at term 2. Members 2 and 3 went through three elections to term 5 (3 leading,
   commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms: each write held its
@@ -158,6 +158,20 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   one member where a drive ends (`stream::put_pause`), sends it a read and lets it go: on the old
   loop the read was never answered (4 of 4 in hyper-durable-e2e, its report the sighting's, "reads 1
   waiting, 0 confirmed, 1 held by its core"; 2 of 2 in each of the others), and now it is at once.
+- **A refused write's acknowledgement released over a log cut back since (I2), hyper-durable's
+  simulation at 10,000 seeds (CI run 38774873412's explore, on `6d76f3c`).** Seed 3828 of its
+  second shape: "member 1's MsgAppendResponse: Durability { member: 1, rule: I2, at: 46, held: 41
+  }". Traced step by step: member 1 took a `Ready` whose write held entries 42 to 46 of term 1 and
+  its acknowledgement of 46; the log refused that write; before the refusal was taken, member 2's
+  append of term 2 cut member 1's log back to 41. The shell made the refused writes again as one
+  write of what the core held, to 41, with the refused write's messages, and the acknowledgement of
+  46 left over a log made durable to 41. A refused write's messages now leave with the write made
+  again only while the core's log still holds the entry it ended at when that write was laid out
+  (`Out::tip`), and are dropped otherwise, as the network may drop any message
+  (`a_refused_writes_acknowledgement_of_entries_cut_since_never_leaves` fails on the old shell:
+  "member 3's entries, cut away, were acknowledged to it: [(3, 3), (2, 1)]"; `docs/durable.md`
+  §2.4). The seed's schedule reaches the window only on the sole voter's new campaign rule (60,000
+  seeds of each shape passed on the old core); with the fix 60,000 of each pass.
 - **A sole voter campaigning at every wake (since `14a014f`, I9, before it reached `main`).**
   `taken-while-driving`'s member, the first E2E group of one, reached term 1,232,434 before it led:
   its vote counted only once durable, and by suspicion a sole voter campaigned at once whenever it

@@ -195,7 +195,13 @@ write issued until its notice), whose notice is the last refused `Ready`'s: a me
 snapshot the core took meanwhile, which no `Ready` gave, is not in it, nor the entries after it: the
 state machine has not installed it, and the log would start past the state machine (I8); its own
 `Ready` installs it and writes it, and the write made again states no commit past what earlier
-writes hold. A
+writes hold. The messages a refused write held leave with the write made again only where the
+core's log still holds the entry it ended at when that write was laid out (its tip; by Log
+Matching every entry before it is the same): the core takes inputs until the refusal is taken,
+and a later leader's append may cut back the entries a refused write's acknowledgements named, so
+made again they would acknowledge what the write no longer holds (I2). Such messages are dropped,
+as the network may drop any message (the shell's simulation, seed 3828 of its second shape, 2026-10-15:
+an acknowledgement of 46 released over a log made durable to 41). A
 snapshot report that arrives meanwhile is kept, the latest per member, since replication to that
 member pauses until its fate is known (a mantle simulation seed found a lost report pausing it for
 good).

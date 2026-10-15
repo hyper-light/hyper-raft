@@ -3346,10 +3346,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 conn.lanes_out.len().saturating_sub(1)
             }
         };
-        let full = conn
-            .lanes_out
-            .get(at)
-            .is_none_or(|out| out.queue.len() >= self.limits.lane_window);
+        // A lossless class's lane also holds at most a congestion window of bytes beyond what QUIC
+        // took, or one frame: its sender is held, not its queue grown (Linux's TCP Small Queues,
+        // which keep a socket's bytes below it to what its path drains, Dumazet 2012), so a sender
+        // past what the path carries waits a round trip's worth of bytes behind it and no more. A
+        // window of frames of the class's bound (the core's, T37) is otherwise megabytes deep.
+        let held_bytes = if C::lossless(class) {
+            Some(conn.quic.congestion_state().window())
+        } else {
+            None
+        };
+        let grant = length(PREFIX_BYTES).saturating_add(length(frame.len()));
+        let full = conn.lanes_out.get(at).is_none_or(|out| {
+            out.queue.len() >= self.limits.lane_window
+                || held_bytes
+                    .is_some_and(|window| out.bytes > 0 && out.bytes.saturating_add(grant) > window)
+        });
         if full {
             // Said once the lane has room again (`flush_frames`).
             if let Some(out) = conn.lanes_out.get_mut(at) {
@@ -3365,6 +3377,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         bytes.fill(&prefix);
         bytes.fill(frame);
         if let Some(out) = conn.lanes_out.get_mut(at) {
+            out.bytes = out.bytes.saturating_add(bytes.granted());
             out.queue.push_back((C::rank(class), bytes));
         }
         // A connection carrying frames is in use as one carrying exchanges is.
@@ -3452,6 +3465,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             out.written = 0;
             if let Some((_, frame)) = out.queue.pop_front() {
+                out.bytes = out.bytes.saturating_sub(frame.granted());
                 self.budget.release(frame);
             }
             // A lane that refused a frame has room again: its owner is told, once.

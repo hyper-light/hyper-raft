@@ -2866,3 +2866,61 @@ fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {
     );
     assert_eq!(net.b.stats().frames_reserving, 0);
 }
+
+/// Frames queued on a lane before it says it is full, the network held still.
+fn queued_until_full<A>(net: &mut Net<Node<A>, Node<A>>, frame: &[u8]) -> u32
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    let mut queued = 0;
+    for _ in 0..10_000 {
+        match net.a.send_frame(2, 0, Kind::Append, frame) {
+            Ok(()) => queued += 1,
+            Err(Refusal::LaneFull) => return queued,
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    panic!("the lane never filled");
+}
+
+/// A lossless class's lane holds about a congestion window of bytes behind QUIC, its sender then
+/// held, where a lossy class's holds a window of frames (the core's, T37): a sender past what its
+/// path carries waits a round trip's bytes behind it, not megabytes. Every frame still arrives.
+#[test]
+fn a_lossless_lane_holds_a_congestion_window_of_bytes_and_its_sender_waits() {
+    let frame = [5u8; 4_096];
+    let pair = Pair::new();
+    let mut lossy = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let mut kept = connected::<Kept, Kept>(&pair, limits(), 256 << 20);
+    let lossy_queued = queued_until_full(&mut lossy, &frame);
+    let kept_queued = queued_until_full(&mut kept, &frame);
+    let window = kept.a.path(2).unwrap().cwnd;
+
+    assert!(
+        lossy_queued >= limits().lane_window as u32,
+        "a lossy lane holds its window of frames: {lossy_queued}"
+    );
+    // What the lane holds, a window and the frame that crossed it, and what QUIC took past it, the
+    // peer's first window.
+    let most = window + frame.len() as u64 + first_window();
+    assert!(
+        u64::from(kept_queued) * frame.len() as u64 <= most,
+        "a lossless lane holds about a congestion window ({window} B), not {kept_queued} frames"
+    );
+    assert!(kept_queued < lossy_queued);
+    // Held, not dropped: every frame queued arrives once the network moves.
+    let mut arrived = 0;
+    for _ in 0..10_000 {
+        kept.exchange();
+        while let Some(event) = kept.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                arrived += 1;
+                kept.b.release(frame);
+            }
+        }
+        if arrived == kept_queued {
+            break;
+        }
+    }
+    assert_eq!(arrived, kept_queued);
+}

@@ -1133,6 +1133,18 @@ ranged from 2⁸ to 2²¹ wakes. A probe whose rounds kept fewer wakes than the 
 reports them `quick`, and is refused only when it kept none. The refusal had stopped the runtime from
 starting on a loaded host (windows-2025, CI run 38376252976).
 
+**A wake slower than its round's share is kept** (2026-10-15). A round begins wakes only within its
+share, but it waits for the answer to a wake it began until the probe's span ends, and keeps it. Before,
+the round gave up a wake at its share's end. A loaded host's slow wakes were dropped, and a probe whose
+every round met one first kept nothing and was refused. That was main's windows-2025 gates on `ccdbbd8`
+(CI run 38552220675), the same record test as run 38376252976, where the change above had left this
+refusal in place. Diag run 38756344126 traced the machine tests' probes, run at once as the gates run
+them, over 120 runs of the library on windows-2025: 349 of 4,256 rounds ended with their first wake
+answered 8 to 21 ms into an 8 ms share and kept nothing, and 19 more ended before their waiter parked. A
+probe whose every round is like that is the refusal CI saw. The span still bounds every wait
+(`a_wake_slower_than_its_rounds_share_is_kept`: a waiter that answers its first wake three shares late
+is kept, where the share's bound kept nothing).
+
 **A shard's own wakes replace the boot's.** A tracking shard keeps the median of its last five blocks'
 means (`WakeTrack`), with the probe's estimate seeding every block. The first blocks hold twelve wakes,
 the stopping rule's floor over five, so the boot's value is outvoted after 36 measured wakes. At the

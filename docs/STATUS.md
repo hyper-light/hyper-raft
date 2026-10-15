@@ -125,8 +125,9 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   suspicion its stream judged after a drive and then waited until its next wake before driving it:
   a suspicion arms a campaign only at the core's next wake, so the campaign waited a stream interval,
   which a stall of every device stretches to seconds. Open until a sighting's report states the
-  core's and the stream's side, which it now does; 8 runs of hyper-raft-e2e's `stalled-devices` and
-  `member-stopped` in Docker's Linux beside 8 busy loops passed on the defects branch (2026-10-15).
+  core's and the stream's side, which it now does; in Docker's Linux beside 8 busy loops, 8 runs of
+  it and hyper-raft-e2e's `member-stopped` passed on the defects branch and 20 on `80c1f82`
+  (2026-10-15).
 - **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
   Member 1 was stopped at term 2. Members 2 and 3 went through three elections to term 5 (3 leading,
   commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms: each write held its
@@ -141,7 +142,8 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   covers the interval its heartbeats go at, which writes of 597 and 741 ms set. A vote request or a
   suspicion a member took after a drive waited until its next wake before 2026-10-15 (the founder's
   read, below), a stream interval that writes of 597 and 741 ms set, which slowed every election
-  here by up to that.
+  here by up to that. 100 runs of it, `founder`, `founder-fenced` and `taken-while-driving` passed on
+  `80c1f82` in Docker's Linux beside 8 busy loops (load 10 to 15, 2026-10-15).
 
 ### Closed (2026-10-15)
 
@@ -377,45 +379,24 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
 
 | Consumer | Takes | State |
 |---|---|---|
-| mantle | hyper-raft, hyper-timing, hyper-log, hyper-block, hyper-measure, hyper-durable, hyper-liveness, hyper-seal and hyper-rt vendored (`vendor/`, `SNAPSHOT` `f358210`), hyper-rt and hyper-block with local changes that are on `main` since `17920a7` (mantle `vendor/UPSTREAM.md`); mantle re-vendors from `main` as its own landing | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
-| focal | every crate it takes vendored at `9fdf7ff` (`vendor/*/SNAPSHOT`), the head of `focal-transport-hooks`, whose commits are on `main` since `d1deca1`; focal re-vendors at `43aec4a` as its own landing | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
-| slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `aa82ada` (`vendor/hyper-raft/SNAPSHOT`, slates' `d33795bb`); their sources as at `67f038d`, on `main` since but for hyper-timing's `independent_interval`, which `43aec4a` removes and slates calls nowhere | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
+| mantle | on its `main` (`f3deb05`) hyper-raft, hyper-durable, hyper-liveness, hyper-log, hyper-timing, hyper-measure, hyper-seal and hyper-sim vendored at `5633487`, hyper-rt and hyper-block at `ccdbbd8` (`vendor/*/SNAPSHOT`); its `dev` at `f358210` with local changes (mantle `vendor/UPSTREAM.md`); mantle re-vendors from `main` as its own landing | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
+| focal | every crate it takes vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`eb6ce081` on its main's `95294367`; focal's gate exit 0, 167 test binaries, 3469 passed, 31 ignored), three of its tests draining until a sole voter leads (I9), which its session lands under its own rules; its `main` vendors twelve at `5007f44` and hyper-transport at `81af6b3`, both on `main` since `3d86b42` | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
+| slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`5f2a76d4` on its main's head `b85b37ea`; fmt, its structural and literal checks, clippy on slates-cluster, its library's 213 tests and the member plane's 10 pass), one commit touching only `vendor/hyper-raft`, which its session lands on the owner's word; its main vendors them at `aa82ada`, their sources the same but for hyper-timing's `independent_interval`, which `43aec4a` removed and slates calls nowhere | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
 
-## What remains (2026-10-12)
+## What remains (2026-10-15)
 
 In the owner's order: red CI first; then every consumer on one revision of `main`; then the shared
 crates' open work; then each consumer's switch-over (mantle note 32 §5, each project's own order).
 
 1. **Red CI.** The open defects above, each traced to its cause and fixed at it, and every target
-   green on `main`.
-2. **One revision for every consumer.** Today mantle, focal and slates each build a different one:
-   - focal vendors every crate it takes at `9fdf7ff`, the head of `focal-transport-hooks`, whose
-     commits are on `main` since `d1deca1`. Its trial re-vendor at `aa82ada` waited on its in-process
-     reopen failing `Compacted`, which `9fd8ead` fixes; focal re-vendors at `43aec4a`, which carries it,
-     as its own landing under its own rules, its `FloorStore` passing `keep_after` and `kept_bytes` on
-     to the store it wraps.
-   - mantle vendors every crate at `f358210` with local changes to hyper-rt and hyper-block, which
-     are on `main` since `17920a7`: mantle's seven commits (cf6e37c, 6f05bd8, 3743b25, f797bd9,
-     bfdf9c2, bb0779e, bd7c0fd; branch `mantle-runtime` keeps their replay) merged with `main`, PR #16
-     (a step's poll budget covers the wakes its own polls make) with them, its `service_resources`
-     test fixed at its causes, D1–D4 in `docs/runtime.md` §3.9 and mantle's measurements in
-     `docs/benchmarks.md`. The hyper-block changes on mantle's dev since (`bc9e910`) are on `main` since
-     `55d923e`: a5f5cf3 (a page found resident is read again without asking while the kernel reclaims
-     nothing) and the segments (0d9dfb4, 0906dfe, 8dcf196, e44d9e5, f2f6a57, abe99c8, 8384354:
-     `SegmentedFile`, the resident `Epoch` shared across a file's segments, `BlockFile::write_whole`,
-     `grow`, `grows_by_segments` and `segment_end`, `DeviceFile::write_copies_at` with `gather.rs` for
-     Windows); b9104b7 (request threads in the OS's foreground class) is not on mantle's dev and not
-     here. mantle re-vendors every crate at `43aec4a`, which carries `55d923e`, hyper-rt's long polls
-     judged by step (`4cbea75`, the thread-clock reads its ranges bench found) and hyper-block's
-     residency test asking the page cache on Linux (`1738d0e`), as its own landing, with no local delta
-     to replay; with it `LogStore::applied` is `LogStore::keep_after`, and it and
-     `kept_bytes` have no defaults, so a store of mantle's own (its range tests' `Synchronous`) states
-     both.
-   - slates vendors hyper-datagram, hyper-seal, hyper-swim and hyper-timing at `aa82ada` (slates'
-     `d33795bb`, on its main); their sources are `67f038d`'s but for hyper-timing's
-     `independent_interval`, which `43aec4a` removes and slates calls nowhere. The snapshot's move to
-     `43aec4a` is slates' branch `hr-vendor-43aec4a`, one commit on its main's head that touches only
-     `vendor/hyper-raft`, which its session lands on the owner's word.
+   green on `main` (green since `3d86b42`, 2026-10-15).
+2. **One revision for every consumer.** focal's and slates' branches take `80c1f82` (the Consumers
+   table above); mantle re-vendors at it as its own landing, from `5633487` and `ccdbbd8`: its
+   hyper-raft (I9 and a sole voter's one campaign a term: a sole voter leads after the write that
+   holds its vote; `Raft::reads_held` public), hyper-durable (a refused write's messages made again
+   only over the log they acknowledge), hyper-liveness (`PairReport::sending`, `sending_due_ns`) and
+   hyper-rt (the wake probe keeps a wake slower than its round's share) changed; hyper-log,
+   hyper-timing, hyper-measure, hyper-seal, hyper-sim and hyper-block did not.
 3. **The shared crates' open work**, each in its own document:
    - hyper-durable: §14's measurements. Items 1 to 8 measured on this machine (2026-10-12 and 13,
      `docs/benchmarks.md` from "A group's writes out, depth one to three on hyper-log"): depth earns

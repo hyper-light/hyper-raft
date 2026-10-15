@@ -203,6 +203,16 @@ pub struct Node {
     /// The suspicions it told while a heartbeat stamped before their point was unread
     /// ([`control::Report::unread`]).
     unread: u64,
+    /// The heartbeats its stream refused for want of a measured `G`
+    /// ([`control::Report::unmeasured`]).
+    unmeasured: u64,
+    /// The heartbeats its stream refused for any other reason ([`control::Report::refused`]).
+    refused: u64,
+    /// The reads it answered `Busy` for its replica's refusal ([`control::Report::reads_refused`]).
+    reads_refused: u64,
+    /// The drives its replica refused, and the latest refusal's kind
+    /// ([`control::Report::drive_refused`]).
+    drive_refused: (u64, u64),
     /// Since when the member has had a write of its log out, the replica's or the stream's, while
     /// it has one.
     writing_since: Option<u64>,
@@ -369,6 +379,10 @@ impl Node {
             read_ns: 0,
             told: Vec::new(),
             unread: 0,
+            unmeasured: 0,
+            refused: 0,
+            reads_refused: 0,
+            drive_refused: (0, 0),
             settings,
         })
     }
@@ -862,7 +876,10 @@ impl Node {
                 self.reads.insert(sequence, (asker, key.to_vec()));
                 Ok(())
             }
-            None => self.respond(asker.address, asker.id, &Outcome::Busy),
+            None => {
+                self.reads_refused = self.reads_refused.saturating_add(1);
+                self.respond(asker.address, asker.id, &Outcome::Busy)
+            }
         }
     }
 
@@ -877,6 +894,13 @@ impl Node {
             let taken = self
                 .liveness
                 .on_heartbeat(peer, message, at_ns, &mut self.asked);
+            match taken {
+                Ok(()) => {}
+                Err(hyper_liveness::Refusal::Unmeasured) => {
+                    self.unmeasured = self.unmeasured.saturating_add(1);
+                }
+                Err(_) => self.refused = self.refused.saturating_add(1),
+            }
             // The first heartbeat taken from a suspected peer says whether the suspicion was the
             // stream's or the member's: one the kernel stamped before the suspicion's point was in
             // the socket, unread, when the stream was polled past the point.
@@ -954,11 +978,39 @@ impl Node {
                     unjudged: u64::try_from(pairs.clone().filter(|pair| !pair.judged).count())
                         .unwrap_or(u64::MAX),
                     unjudged_interval_ns: pairs
+                        .clone()
                         .filter(|pair| !pair.judged)
                         .filter_map(|pair| pair.interval)
                         .map(nanos)
                         .max()
                         .unwrap_or(0),
+                    sent: pairs.clone().map(|pair| pair.sent).sum(),
+                    unproven: pairs.clone().map(|pair| pair.unproven).sum(),
+                    unmeasured: self.unmeasured,
+                    refused: self.refused,
+                    granularity_ns: self.liveness.granularity().map_or(0, nanos),
+                    sending_interval_ns: pairs
+                        .clone()
+                        .filter_map(|pair| pair.sending)
+                        .map(nanos)
+                        .max()
+                        .unwrap_or(0),
+                    sending_due_ns: pairs
+                        .filter_map(|pair| pair.sending_due_ns)
+                        .min()
+                        .map_or(u64::MAX, |due| due.saturating_sub(self.now())),
+                    stream_wake_ns: self
+                        .liveness
+                        .wake()
+                        .map_or(u64::MAX, |wake| wake.saturating_sub(self.now())),
+                    reads_waiting: u64::try_from(self.reads.len()).unwrap_or(u64::MAX),
+                    reads_confirmed: u64::try_from(self.replica.reads_held()).unwrap_or(u64::MAX),
+                    reads_pending: u64::try_from(self.replica.core().raft.reads_held())
+                        .unwrap_or(u64::MAX),
+                    term_committed: self.replica.core().raft.commit_to_current_term(),
+                    reads_refused: self.reads_refused,
+                    drive_refused: self.drive_refused.0,
+                    drive_refusal: self.drive_refused.1,
                     restarts: self.restarts,
                     fast: self.replica.core().raft.fast_stats(),
                     blocked_ns: self.blocked_now(),
@@ -1060,7 +1112,13 @@ impl Node {
             let driven = match self.replica.drive(now, &self.waker, &mut self.out) {
                 Ok(driven) => driven,
                 Err(ReplicaError::Fenced(cause)) => return Err(NodeError::Fenced(cause)),
-                Err(_) => return Ok(None),
+                Err(refused) => {
+                    self.drive_refused = (
+                        self.drive_refused.0.saturating_add(1),
+                        control::refusal_kind(&refused),
+                    );
+                    return Ok(None);
+                }
             };
             if let Some((started, durable)) = driven.flushed {
                 self.liveness.on_durable(LiveWrite::Log, started, durable);

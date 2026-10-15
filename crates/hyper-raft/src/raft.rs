@@ -3142,7 +3142,7 @@ impl<S: Storage> Raft<S> {
     }
     /// Every read this leader holds: waiting for its term's first commit, for its quorum, or to
     /// be taken.
-    fn reads_held(&self) -> usize {
+    pub fn reads_held(&self) -> usize {
         self.read_only
             .len()
             .saturating_add(self.read_states.len())

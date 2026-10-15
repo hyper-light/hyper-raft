@@ -251,6 +251,10 @@ pub struct Node {
     /// The suspicions it told while a heartbeat stamped before their point was unread
     /// ([`Report::unread`]).
     unread: u64,
+    /// The heartbeats its stream refused for want of a measured `G` ([`Report::unmeasured`]).
+    unmeasured: u64,
+    /// The heartbeats its stream refused for any other reason ([`Report::refused`]).
+    refused: u64,
     /// The time its thread has spent in the writes of its log, all told: time it could neither
     /// read its socket nor move its group.
     blocked: u64,
@@ -336,6 +340,8 @@ impl Node {
             restarts: 0,
             told: Vec::new(),
             unread: 0,
+            unmeasured: 0,
+            refused: 0,
             blocked: 0,
             flush_most: 0,
             turn_most: 0,
@@ -712,11 +718,31 @@ impl Node {
             unjudged: u64::try_from(pairs.clone().filter(|pair| !pair.judged).count())
                 .unwrap_or(u64::MAX),
             unjudged_interval_ns: pairs
+                .clone()
                 .filter(|pair| !pair.judged)
                 .filter_map(|pair| pair.interval)
                 .map(nanos)
                 .max()
                 .unwrap_or(0),
+            sent: pairs.clone().map(|pair| pair.sent).sum(),
+            unproven: pairs.clone().map(|pair| pair.unproven).sum(),
+            unmeasured: self.unmeasured,
+            refused: self.refused,
+            granularity_ns: self.liveness.granularity().map_or(0, nanos),
+            sending_interval_ns: pairs
+                .clone()
+                .filter_map(|pair| pair.sending)
+                .map(nanos)
+                .max()
+                .unwrap_or(0),
+            sending_due_ns: pairs
+                .filter_map(|pair| pair.sending_due_ns)
+                .min()
+                .map_or(u64::MAX, |due| due.saturating_sub(self.now())),
+            stream_wake_ns: self
+                .liveness
+                .wake()
+                .map_or(u64::MAX, |wake| wake.saturating_sub(self.now())),
             writes: u64::try_from(
                 self.raw
                     .store()
@@ -903,6 +929,13 @@ impl Node {
             let taken = self
                 .liveness
                 .on_heartbeat(peer, message, at_ns, &mut self.asked);
+            match taken {
+                Ok(()) => {}
+                Err(hyper_liveness::Refusal::Unmeasured) => {
+                    self.unmeasured = self.unmeasured.saturating_add(1);
+                }
+                Err(_) => self.refused = self.refused.saturating_add(1),
+            }
             // The first heartbeat taken from a suspected peer says whether the suspicion was the
             // stream's or the member's: one the kernel stamped before the suspicion's point was in
             // the socket, unread, when the stream was polled past the point.

@@ -399,6 +399,10 @@ impl Cluster {
             out.push_str(&format!(
                 "\n  member {id}, {:?} ago: term {} leads {} commit {} applied {} last {}; \
                  suspected {:?} heard {:?} unjudged {} at up to {:?} taken {} restarts {}; \
+                 its stream sent {} at up to {:?}, the next due in {}, its wake in {}, G {:?}, \
+                 refused {} unproven, {} unmeasured, {} else; reads {} waiting, {} confirmed, \
+                 {} held by its core, {} refused, its term committed {}; drives refused {}, the \
+                 latest of kind {}; \
                  detection {:?} span {:?} round {:?}; a write out {:?} all told, its oldest out \
                  {:?}, the longest write {:?}, the longest between two reads {:?}; stalled {} \
                  marked {} deadline {}; its core suspects {:?}, campaign {}",
@@ -414,6 +418,21 @@ impl Cluster {
                 Duration::from_nanos(r.unjudged_interval_ns),
                 r.taken,
                 r.restarts,
+                r.sent,
+                Duration::from_nanos(r.sending_interval_ns),
+                in_or_none(r.sending_due_ns),
+                in_or_none(r.stream_wake_ns),
+                Duration::from_nanos(r.granularity_ns),
+                r.unproven,
+                r.unmeasured,
+                r.refused,
+                r.reads_waiting,
+                r.reads_confirmed,
+                r.reads_pending,
+                r.reads_refused,
+                r.term_committed,
+                r.drive_refused,
+                r.drive_refusal,
                 Duration::from_nanos(r.detection_ns),
                 Duration::from_nanos(r.span_ns),
                 Duration::from_nanos(r.round_ns),
@@ -912,9 +931,10 @@ impl Cluster {
             assert_eq!(
                 read,
                 Some(Some(value.clone())),
-                "{}: an answered write of {} did not read back",
+                "{}: an answered write of {} did not read back; {}",
                 self.name,
-                String::from_utf8_lossy(key)
+                String::from_utf8_lossy(key),
+                self.state()
             );
         }
         let index = self.put(b"last", b"write").expect("a last write");
@@ -1430,6 +1450,15 @@ fn main() -> ExitCode {
     }
     println!("all ok in {:?}", started.elapsed());
     ExitCode::SUCCESS
+}
+
+/// A time a report states from its own clock, `u64::MAX` for none.
+fn in_or_none(ns: u64) -> String {
+    if ns == u64::MAX {
+        "none".to_string()
+    } else {
+        format!("{:?}", Duration::from_nanos(ns))
+    }
 }
 
 /// A member's campaign as its report states it (`hyper_raft::CampaignState`): when it is due from

@@ -179,6 +179,26 @@ pub struct Report {
     /// (`hyper_liveness::PairReport::interval`), nanoseconds: how long the evidence such a pair is
     /// waiting for can go without a heartbeat; zero when every pair is judged.
     pub unjudged_interval_ns: u64,
+    /// The heartbeats its stream has sent its peers, all told.
+    pub sent: u64,
+    /// The heartbeats its stream refused for their flush proof.
+    pub unproven: u64,
+    /// The heartbeats its stream refused for want of a measured `G`, its timer's lateness
+    /// (`hyper_liveness::Refusal::Unmeasured`).
+    pub unmeasured: u64,
+    /// The heartbeats its stream refused for any other reason.
+    pub refused: u64,
+    /// `G`, nanoseconds (`hyper_liveness::Liveness::granularity`); zero before it is measured.
+    pub granularity_ns: u64,
+    /// The longest interval its own heartbeats to a peer are due at
+    /// (`hyper_liveness::PairReport::sending`), nanoseconds; zero before the first is scheduled.
+    pub sending_interval_ns: u64,
+    /// How long from the report until its next heartbeat to a peer is due, nanoseconds: zero when
+    /// due, `u64::MAX` when none is scheduled.
+    pub sending_due_ns: u64,
+    /// How long from the report until its stream's next wake, nanoseconds: zero when due,
+    /// `u64::MAX` when it asks none.
+    pub stream_wake_ns: u64,
     /// The writes its durable log holds: its entries that are not a leader's empty one. A leader
     /// proposes no write its log holds, so each is held once.
     pub writes: u64,
@@ -273,6 +293,14 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.taken,
         report.unjudged,
         report.unjudged_interval_ns,
+        report.sent,
+        report.unproven,
+        report.unmeasured,
+        report.refused,
+        report.granularity_ns,
+        report.sending_interval_ns,
+        report.sending_due_ns,
+        report.stream_wake_ns,
         report.writes,
         report.restarts,
         report.blocked_ns,
@@ -313,7 +341,7 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         last_index: reader.u64()?,
         digest: reader.u64()?,
     };
-    let mut words = [0u64; 17];
+    let mut words = [0u64; 25];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -324,6 +352,14 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
         taken,
         unjudged,
         unjudged_interval_ns,
+        sent,
+        unproven,
+        unmeasured,
+        refused,
+        granularity_ns,
+        sending_interval_ns,
+        sending_due_ns,
+        stream_wake_ns,
         writes,
         restarts,
         blocked_ns,
@@ -358,6 +394,14 @@ pub fn read_report(body: &[u8], max_peers: usize) -> Option<(u64, Report)> {
             taken,
             unjudged,
             unjudged_interval_ns,
+            sent,
+            unproven,
+            unmeasured,
+            refused,
+            granularity_ns,
+            sending_interval_ns,
+            sending_due_ns,
+            stream_wake_ns,
             writes,
             restarts,
             blocked_ns,

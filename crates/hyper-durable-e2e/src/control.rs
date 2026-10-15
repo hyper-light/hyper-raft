@@ -164,6 +164,44 @@ pub struct Report {
     /// (`hyper_liveness::PairReport::interval`), nanoseconds: how long the evidence such a pair is
     /// to be judged from may go without moving; zero while none is heard and unjudged.
     pub unjudged_interval_ns: u64,
+    /// The heartbeats its stream has sent its peers, all told.
+    pub sent: u64,
+    /// The heartbeats its stream refused for their flush proof.
+    pub unproven: u64,
+    /// The heartbeats its stream refused for want of a measured `G`, its timer's lateness
+    /// (`hyper_liveness::Refusal::Unmeasured`).
+    pub unmeasured: u64,
+    /// The heartbeats its stream refused for any other reason.
+    pub refused: u64,
+    /// `G`, nanoseconds (`hyper_liveness::Liveness::granularity`); zero before it is measured.
+    pub granularity_ns: u64,
+    /// The longest interval its own heartbeats to a peer are due at
+    /// (`hyper_liveness::PairReport::sending`), nanoseconds; zero before the first is scheduled.
+    pub sending_interval_ns: u64,
+    /// How long from the report until its next heartbeat to a peer is due, nanoseconds: zero when
+    /// due, `u64::MAX` when none is scheduled.
+    pub sending_due_ns: u64,
+    /// How long from the report until its stream's next wake, nanoseconds: zero when due,
+    /// `u64::MAX` when it asks none.
+    pub stream_wake_ns: u64,
+    /// The reads it holds for an answer: asked of it and not yet answered.
+    pub reads_waiting: u64,
+    /// Of the reads its replica holds, those its core confirmed, which wait for their index to be
+    /// applied (`hyper_durable::Replica::reads_held`).
+    pub reads_confirmed: u64,
+    /// The reads its core holds (`hyper_raft::Raft::reads_held`): waiting for its term's first
+    /// commit, for their quorum, or to be taken.
+    pub reads_pending: u64,
+    /// Whether it committed an entry of its term (`hyper_raft::Raft::commit_to_current_term`): a
+    /// leader holds every read until it has.
+    pub term_committed: bool,
+    /// The reads it answered `Busy` for its replica's refusal.
+    pub reads_refused: u64,
+    /// The drives its replica refused (`hyper_durable::ReplicaError` other than a fence): each
+    /// left what that drive would have done to the next one.
+    pub drive_refused: u64,
+    /// The latest such refusal's kind ([`refusal_kind`]); zero for none.
+    pub drive_refusal: u64,
     /// The restarts of its peers its stream has seen.
     pub restarts: u64,
     /// What its core did by the fast track since it started (`hyper_raft::FastStats`).
@@ -204,6 +242,18 @@ pub struct Report {
     pub campaign: Option<hyper_raft::CampaignState>,
 }
 
+/// A replica's refusal as a report's word: 1 the core's, 2 a stall for room, 3 a mark, 4 the
+/// budget, 5 a fence.
+pub fn refusal_kind(refused: &hyper_durable::ReplicaError) -> u64 {
+    match refused {
+        hyper_durable::ReplicaError::Refused(_) => 1,
+        hyper_durable::ReplicaError::Stalled => 2,
+        hyper_durable::ReplicaError::Marked => 3,
+        hyper_durable::ReplicaError::Budget(_) => 4,
+        hyper_durable::ReplicaError::Fenced(_) => 5,
+    }
+}
+
 /// The response tag a report takes: past those of `wire::Outcome`.
 const REPORT: u8 = 10;
 
@@ -230,6 +280,20 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.taken,
         report.unjudged,
         report.unjudged_interval_ns,
+        report.sent,
+        report.unproven,
+        report.unmeasured,
+        report.refused,
+        report.granularity_ns,
+        report.sending_interval_ns,
+        report.sending_due_ns,
+        report.stream_wake_ns,
+        report.reads_waiting,
+        report.reads_confirmed,
+        report.reads_pending,
+        report.reads_refused,
+        report.drive_refused,
+        report.drive_refusal,
         report.restarts,
         report.fast.proposed,
         report.fast.displaced,
@@ -244,6 +308,7 @@ pub fn put_report(buffer: &mut Vec<u8>, id: u64, report: &Report) {
         report.unread,
         u64::from(report.stalled),
         u64::from(report.marked),
+        u64::from(report.term_committed),
         report.deadline_ns,
         report.clock_ns,
     ]
@@ -286,7 +351,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         return None;
     }
     let status = read_status(&mut reader)?;
-    let mut words = [0u64; 26];
+    let mut words = [0u64; 41];
     for word in &mut words {
         *word = reader.u64()?;
     }
@@ -299,6 +364,20 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         taken,
         unjudged,
         unjudged_interval_ns,
+        sent,
+        unproven,
+        unmeasured,
+        refused,
+        granularity_ns,
+        sending_interval_ns,
+        sending_due_ns,
+        stream_wake_ns,
+        reads_waiting,
+        reads_confirmed,
+        reads_pending,
+        reads_refused,
+        drive_refused,
+        drive_refusal,
         restarts,
         proposed,
         displaced,
@@ -313,6 +392,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
         unread,
         stalled,
         marked,
+        term_committed,
         deadline_ns,
         clock_ns,
         due,
@@ -344,6 +424,20 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             taken,
             unjudged,
             unjudged_interval_ns,
+            sent,
+            unproven,
+            unmeasured,
+            refused,
+            granularity_ns,
+            sending_interval_ns,
+            sending_due_ns,
+            stream_wake_ns,
+            reads_waiting,
+            reads_confirmed,
+            reads_pending,
+            reads_refused,
+            drive_refused,
+            drive_refusal,
             restarts,
             fast: FastStats {
                 proposed,
@@ -360,6 +454,7 @@ pub fn read_report(body: &[u8], max_voters: usize) -> Option<(u64, Report)> {
             unread,
             stalled: stalled != 0,
             marked: marked != 0,
+            term_committed: term_committed != 0,
             deadline_ns,
             suspected,
             heard,
@@ -399,6 +494,21 @@ mod tests {
                 core_suspected: vec![1, 3],
                 clock_ns: 99,
                 deadline_ns: 5,
+                sent: 11,
+                unproven: 2,
+                unmeasured: 3,
+                refused: 4,
+                granularity_ns: 5_000,
+                sending_interval_ns: 6_000,
+                sending_due_ns: 7,
+                stream_wake_ns: u64::MAX,
+                reads_waiting: 8,
+                reads_confirmed: 9,
+                reads_pending: 10,
+                reads_refused: 12,
+                drive_refused: 13,
+                drive_refusal: 4,
+                term_committed: true,
                 campaign,
                 ..Report::default()
             };

@@ -196,6 +196,22 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   sized its largest at its batch bound, and a batch at the bound, plus the prefix, was refused
   `Budget`. Tests: `a_lossless_frame_waits_for_the_budget_and_is_never_skipped`,
   `a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted`.
+- **hyper-transport: a lossless lane held seconds of frames behind QUIC.** A lane bounds its queue
+  in frames, the core's window, and a frame may be a class's bound: for focal's bus 256 frames of
+  up to 256 KiB, 64 MiB behind a path that holds about 100 kB, so a publisher past what the path
+  carried met 2.6 s of delay at the median before its sender was held. A lossless class's lane now
+  also refuses `LaneFull` once its queued bytes and the next frame would pass the connection's
+  congestion window (`docs/transport.md` §4). Test:
+  `a_lossless_lane_holds_a_congestion_window_of_bytes_and_its_sender_waits`
+  (54 frames of 4 KiB at a 210 kB window, where a lossy lane takes its 128-frame window and three).
+  That bound is the controller's window, and BBR's had grown without bound (below).
+- **hyper-transport: a consumer that could not take more queued its producers' frames without
+  bound.** A bus node whose subscriber fell behind took every publish into memory, its subscriber's
+  lag growing for as long as the publisher outran it (2.5 s at the median). `Endpoint::hold_lane`
+  reads a peer's lane no further past its opening, so the peer is held at QUIC's flow control and
+  its own lane says `LaneFull`; `release_lane` reads on from where it stopped. A hold is the peer's,
+  at most one a lane it may open, so a lane not yet opened is held from its opening. Test:
+  `an_owner_that_holds_a_peers_lane_holds_the_peer_and_loses_nothing`.
 
 - **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
   38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read

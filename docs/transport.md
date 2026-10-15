@@ -295,7 +295,19 @@ it moves (focal's residency, priced by the path's round trip, refused an 8 MiB r
 on a loaded runner; `src/progress.rs`); and a period
 that moved nothing through this side's own doing (an owner not reading a body, or bytes the peer's
 credit would take but this side has not sent) is no evidence against the peer and is not judged. Replication frames travel on lanes, unidirectional streams as wide as the core's
-window, always read; a frame its class or the budget cannot take is skipped and counted. Admission
+window, always read; a frame its class or the budget cannot take is skipped and counted. A class
+may instead be lossless (`Classes::lossless`, 2026-10-15), for frames that are their sender's only
+copy (focal's event bus; Raft sends its messages again, a bus does not). Its frame waits for the
+budget, its lane unread so QUIC's flow control holds the sender, and asks again whenever bytes come
+back (`Reading::Reserving`, `Endpoint::retry_reserving`); a frame past its class bound is still
+refused. Its lane refuses `LaneFull` once its queued bytes and the next frame would pass the
+connection's congestion window (one frame always fits an empty lane), so about a round trip's bytes
+wait behind QUIC and the rest at the sender, as Linux's TCP Small Queues keep a socket's queued
+bytes to what its path drains (Dumazet, 2012): counted in frames alone, focal's bus held 64 MiB
+behind a path of about 100 kB, 2.6 s at the median. And an owner that cannot take more holds the
+peer's lane (`Endpoint::hold_lane`, `release_lane`): read no further past its opening, the peer is
+held at QUIC's flow control and its own lane fills, where it would otherwise queue in the owner
+without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median). Admission
 bounds pending handshakes (Retry under load), identities, connections per identity (the idle one
 used longest ago replaced, below) and connections in all; every exchange and lane has a table bound.
 Every refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.

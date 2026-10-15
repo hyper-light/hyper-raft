@@ -109,6 +109,8 @@ pub(crate) struct LaneIn {
     pub(crate) queued: usize,
     /// It is not read until a seat for its next frame is free.
     pub(crate) paused: bool,
+    /// Its owner holds it ([`crate::Endpoint::hold_lane`]): it is not read until let go.
+    pub(crate) held: bool,
 }
 
 impl LaneIn {
@@ -127,6 +129,7 @@ impl LaneIn {
             rank: 0,
             queued: 0,
             paused: false,
+            held: false,
         }
     }
 }

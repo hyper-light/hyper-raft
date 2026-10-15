@@ -387,6 +387,8 @@ struct PeerEntry<R> {
     frames: usize,
     /// Its lanes not read for want of a seat for their next frame.
     paused: u32,
+    /// The lanes of its the owner holds ([`Endpoint::hold_lane`]): at most its lanes' bound.
+    holds: Vec<crate::LaneId>,
 }
 
 impl<R> PeerEntry<R> {
@@ -399,6 +401,7 @@ impl<R> PeerEntry<R> {
             role: None,
             used,
             held: 0,
+            holds: Vec::new(),
             dialing: false,
             unreachable: None,
             closed: None,
@@ -1414,6 +1417,69 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// are given back.
     pub fn set_receive_capacity(&mut self, bytes: u64) {
         self.core.room.set_capacity(bytes);
+    }
+
+    /// The owner holds `peer`'s lane `lane`: nothing more of it is read until the owner lets it go
+    /// ([`Endpoint::release_lane`]), so what the peer sends on it waits in QUIC, and QUIC's flow
+    /// control holds the peer at the window this side granted (the socket's room). A consumer's
+    /// backpressure: a node whose subscribers cannot take more holds the publishers that feed them,
+    /// rather than queueing what they send. A lane the peer has not yet opened is held from its
+    /// opening, on this connection or a later one. Refused `Lanes` past the lanes a peer may open.
+    pub fn hold_lane(&mut self, peer: PeerId, lane: crate::LaneId) -> Result<(), Refusal> {
+        let bound = usize::try_from(self.core.limits.lanes_per_peer).unwrap_or(usize::MAX);
+        let entry = self
+            .core
+            .peer_entry_mut(peer)
+            .ok_or(Refusal::NotConnected)?;
+        if !entry.holds.contains(&lane) {
+            if entry.holds.len() >= bound {
+                return Err(Refusal::Lanes);
+            }
+            entry.holds.push(lane);
+        }
+        self.mark_lanes(peer, lane, true);
+        Ok(())
+    }
+
+    /// The owner lets `peer`'s lane `lane` go: it is read again from where it stopped.
+    pub fn release_lane(&mut self, peer: PeerId, lane: crate::LaneId) -> Result<(), Refusal> {
+        let entry = self
+            .core
+            .peer_entry_mut(peer)
+            .ok_or(Refusal::NotConnected)?;
+        entry.holds.retain(|held| *held != lane);
+        self.mark_lanes(peer, lane, false);
+        Ok(())
+    }
+
+    /// Marks `peer`'s open lanes named `lane` held or not, reading on those let go.
+    fn mark_lanes(&mut self, peer: PeerId, lane: crate::LaneId, held: bool) {
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        keys.extend(self.core.admission.connections_of(peer));
+        for &key in &keys {
+            let Some(mut conn) = self.take(key) else {
+                continue;
+            };
+            // From the last: reading a lane removes at most that lane.
+            for at in (0..conn.lanes_in.len()).rev() {
+                let matches = conn
+                    .lanes_in
+                    .get(at)
+                    .is_some_and(|open| open.state != Reading::Opener && open.lane == lane);
+                if !matches {
+                    continue;
+                }
+                if let Some(open) = conn.lanes_in.get_mut(at) {
+                    open.held = held;
+                }
+                if !held {
+                    self.core.read_lane(&mut conn, at);
+                }
+            }
+            self.put(key, conn);
+        }
+        self.keys = keys;
     }
 
     /// A count that moves whenever a connection is identified or goes: an owner that keeps
@@ -3535,8 +3601,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .get(at)
             .map(|lane| lane.state)
             .ok_or(Refusal::Lanes)?;
+        // A lane its owner holds is not read past its opening: what its peer sends waits in QUIC.
+        if state != Reading::Opener && conn.lanes_in.get(at).is_some_and(|lane| lane.held) {
+            return Ok(false);
+        }
         match state {
-            Reading::Opener => lane_opener(conn, at),
+            Reading::Opener => {
+                let advanced = lane_opener(conn, at)?;
+                // The lane named itself: held from now if its owner holds its peer's lane of that name.
+                let opened = conn
+                    .lanes_in
+                    .get(at)
+                    .filter(|lane| lane.state != Reading::Opener)
+                    .map(|lane| lane.lane);
+                if let (Some(id), Some((peer, _))) = (opened, conn.peer) {
+                    let held = self
+                        .peer_entry_mut(peer)
+                        .is_some_and(|entry| entry.holds.contains(&id));
+                    if let Some(lane) = conn.lanes_in.get_mut(at) {
+                        lane.held = held;
+                    }
+                }
+                Ok(advanced)
+            }
             Reading::Prefix if self.frame_room(conn, at) => self.lane_prefix(conn, at),
             Reading::Prefix => {
                 self.pause_lane(conn, at);

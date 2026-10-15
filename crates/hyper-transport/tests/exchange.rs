@@ -2924,3 +2924,108 @@ fn a_lossless_lane_holds_a_congestion_window_of_bytes_and_its_sender_waits() {
     }
     assert_eq!(arrived, kept_queued);
 }
+
+/// An owner that holds a peer's lane reads nothing more of it until it lets it go: what the peer
+/// sends waits in QUIC, flow control holds the peer (its own lane fills and it is told `LaneFull`),
+/// and once let go every frame arrives, in order. A lane held before its peer opens it is held from
+/// its opening; one held mid-stream stops where it is.
+#[test]
+fn an_owner_that_holds_a_peers_lane_holds_the_peer_and_loses_nothing() {
+    let pair = Pair::new();
+    let mut net = connected::<Kept, Kept>(&pair, limits(), 256 << 20);
+    net.b.hold_lane(1, 0).unwrap();
+    let mut sent = 0u32;
+    let mut full = false;
+    for _ in 0..10_000 {
+        match net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes()) {
+            Ok(()) => sent += 1,
+            Err(Refusal::LaneFull) => {
+                net.exchange();
+                if net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes())
+                    == Err(Refusal::LaneFull)
+                {
+                    full = true;
+                    break;
+                }
+                sent += 1;
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    net.exchange();
+    assert!(full, "the sender was held");
+    let mut order: Vec<u32> = Vec::new();
+    while let Some(event) = net.b.poll_event() {
+        if let Event::Frame { frame, .. } = event {
+            order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+            net.b.release(frame);
+        }
+    }
+    assert!(
+        order.is_empty(),
+        "nothing read of a held lane: {}",
+        order.len()
+    );
+    // Let go: every frame, in order.
+    net.b.release_lane(1, 0).unwrap();
+    for _ in 0..10_000 {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+                net.b.release(frame);
+            }
+        }
+        if order.len() == sent as usize {
+            break;
+        }
+        net.exchange();
+        while sent < 2_000 {
+            match net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes()) {
+                Ok(()) => sent += 1,
+                Err(Refusal::LaneFull) => break,
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        order,
+        (0..sent).collect::<Vec<_>>(),
+        "every frame, in order"
+    );
+    // Held mid-stream: it stops where it is, and goes on when let go.
+    net.b.hold_lane(1, 0).unwrap();
+    let before = order.len();
+    for at in 0..50u32 {
+        let next = sent + at;
+        while net.a.send_frame(2, 0, Kind::Append, &next.to_be_bytes()) == Err(Refusal::LaneFull) {
+            net.exchange();
+        }
+    }
+    sent += 50;
+    net.exchange();
+    while let Some(event) = net.b.poll_event() {
+        if let Event::Frame { frame, .. } = event {
+            order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+            net.b.release(frame);
+        }
+    }
+    assert_eq!(order.len(), before, "a lane held mid-stream stops");
+    net.b.release_lane(1, 0).unwrap();
+    for _ in 0..10_000 {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+                net.b.release(frame);
+            }
+        }
+        if order.len() == sent as usize {
+            break;
+        }
+        net.exchange();
+    }
+    assert_eq!(
+        order,
+        (0..sent).collect::<Vec<_>>(),
+        "and goes on, in order"
+    );
+}

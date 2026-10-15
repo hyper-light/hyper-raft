@@ -49,15 +49,27 @@ pub const ELECTION_ROUNDS: u32 = 3;
 /// How long a member's law lets its group go with nothing moving, from what its report states: the
 /// longest its detectors take to suspect a crash (`η + α` over its pairs), or, while a pair no
 /// margin judges takes heartbeats at a longer interval, that interval, the most a wait that goes on
-/// while those heartbeats move can see none; then its election's span and rounds, and an ask's
-/// rounds. A live group suspects a dead leader within its stated detection, elects or starts a new
-/// term within an election, and answers within an ask's rounds.
-pub fn law(detection_ns: u64, unjudged_interval_ns: u64, span_ns: u64, round_ns: u64) -> Duration {
+/// while those heartbeats move can see none, or the interval its own heartbeats go at, the most its
+/// peers' evidence of it goes without moving, which no peer knows until a heartbeat at it has come;
+/// then its election's span and rounds, and an ask's rounds. A live group suspects a dead leader
+/// within its stated detection, elects or starts a new term within an election, and answers within
+/// an ask's rounds.
+pub fn law(
+    detection_ns: u64,
+    unjudged_interval_ns: u64,
+    sending_interval_ns: u64,
+    span_ns: u64,
+    round_ns: u64,
+) -> Duration {
     let rounds = Duration::from_nanos(round_ns)
         .saturating_mul(ELECTION_ROUNDS.saturating_add(ANSWER_ROUNDS));
-    Duration::from_nanos(detection_ns.max(unjudged_interval_ns))
-        .saturating_add(Duration::from_nanos(span_ns))
-        .saturating_add(rounds)
+    Duration::from_nanos(
+        detection_ns
+            .max(unjudged_interval_ns)
+            .max(sending_interval_ns),
+    )
+    .saturating_add(Duration::from_nanos(span_ns))
+    .saturating_add(rounds)
 }
 
 /// What a wait watches move in one member's report.
@@ -474,6 +486,31 @@ mod tests {
         assert!(
             matches!(held, Err(Stuck::Held { member: 1, .. })),
             "{held:?}"
+        );
+    }
+
+    /// A member's law covers the interval its own heartbeats go at: until a heartbeat at that
+    /// interval has come, no peer states it, and a peer that cannot take one yet takes none for that
+    /// long (hyper-durable-e2e's founder, a soak in Docker's Linux: member 1's first flush took
+    /// 2.17 s, its heartbeats went at that interval, neither member had taken a heartbeat, both
+    /// stated no interval, and the wait gave up after the one-second floor with nothing moving).
+    #[test]
+    fn a_members_law_covers_the_interval_its_own_heartbeats_go_at() {
+        let ms = |ms: u64| ms * 1_000_000;
+        assert_eq!(law(0, 0, ms(2_170), 0, 0), Duration::from_millis(2_170));
+        // Its detection, a longer interval it hears at, or its own: whichever is longest.
+        assert_eq!(
+            law(ms(300), ms(50), ms(100), 0, 0),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            law(ms(300), ms(900), ms(100), 0, 0),
+            Duration::from_millis(900)
+        );
+        // Then its election's span and its rounds.
+        assert_eq!(
+            law(0, 0, ms(2_170), ms(10), ms(1)),
+            Duration::from_millis(2_170 + 10 + 6)
         );
     }
 }

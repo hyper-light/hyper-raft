@@ -354,6 +354,7 @@ impl Cluster {
         let law = quiet::law(
             report.detection_ns,
             report.unjudged_interval_ns,
+            report.sending_interval_ns,
             report.span_ns,
             report.round_ns,
         );

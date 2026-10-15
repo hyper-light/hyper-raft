@@ -46,6 +46,20 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-15, each in its crate's document: in hyper-raft, a candidate's vote for itself counted
+once the hard state naming it is durable (`docs/durable.md` I9, `docs/raft.md` §3.3; the simulation's two
+leaders of one term, below); in hyper-rt, a wake slower than its probe round's share kept, the round
+waiting for its answer within the probe's span (`docs/runtime.md` §10.4; main's red windows-2025 gates,
+below); in hyper-quic and hyper-transport, focal's admission credit (STREAMS_BLOCKED sent and kept, the
+pooled stream credit, `Refusal::Unsent`, `AskQueue::Credit`, a finished reply's credit given back with it;
+`docs/transport.md` §4g, `VENDORED.md` §28–§29) and a lane's `Event::LaneRoom`, which focal's replication
+lanes wait on; in hyper-liveness, a pair's report states its own sending interval and next heartbeat
+(`PairReport::sending`, `sending_due_ns`); in both E2E harnesses and hyper-multilog-e2e's, every member's
+report states its stream's evidence (heartbeats sent, refused by kind, `G`, its sending interval, its
+next heartbeat and wake), and hyper-durable-e2e's its reads (waiting, confirmed, held by its core,
+refused) and the drives its replica refused, which the member had dropped silently; in hyper-durable's
+simulation, every read a leader took held to an answer once its group settles.
+
 Landed 2026-10-12, each in its crate's document: in hyper-raft, an append behind a follower's commit
 taken past it where the entry it names there is the one held (`docs/raft.md` §3.3; focal's ordered
 appends); in hyper-quic, BBR from RFC 9002's initial window, a run of PADDING decoded as one frame, and
@@ -81,11 +95,29 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 
 ## Open defects
 
-Found under load, each once. They are traced to their causes; none is worked around. Every
-member's report in both E2E harnesses now carries its core's own suspicions and what decides its
-next campaign (`hyper_raft::CampaignState`: when it is due, whether it led its term, held, a trusted
-quorum, may campaign and lead), beside the stream's suspicions, so a sighting names which of them
-held an election back.
+Found under load, each once or a few times. They are traced as far as the evidence goes; none is
+worked around. Every member's report in both E2E harnesses carries its core's own suspicions and
+what decides its next campaign (`hyper_raft::CampaignState`: when it is due, whether it led its
+term, held, a trusted quorum, may campaign and lead), beside the stream's suspicions; since
+2026-10-15 it states the stream's side too (heartbeats sent, refused by kind, `G`, the interval its
+own heartbeats go at, its next heartbeat and wake), and hyper-durable-e2e's its reads and refused
+drives, so a sighting names which of them held the group back. The waits' law covers the interval
+each member's own heartbeats go at (2026-10-15, below), which both entries here may have lacked:
+each saw no heartbeat taken through a quiet period shorter than the members' flushes.
+
+- **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
+  38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read
+  back"), and twice in a soak of the scenario in Docker's Linux (aarch64, beside busy loops; runs 11
+  and 719 of their soaks, the second's report: the founder leading alone at term 2, commit, applied
+  and last index 12, "reads 1 waiting, 0 confirmed, 1 held by its core, 0 refused, its term committed
+  true", no write out, no drive refused). The read went into the core and never came out: not
+  confirmed and waiting to apply, not refused. The reads before it in the same wait were answered.
+  Not reproduced since in 2,130 runs on the old core and 550 on the new (a sole voter now leads once
+  its vote is durable); a soak with the member printing where its core holds the read (waiting for
+  the term's first commit, its quorum, or to be taken) and why no `Ready` was taken runs on. The
+  simulation now holds every read a leader took to an answer once its group settles (10,000 seeds
+  of each shape, none held), so the cause is outside what it models: the member's log
+  (`GroupStore`, hyper-log) or its owner's loop are where to look next.
 
 - **hyper-raft-e2e `stalled-devices`.** Seen once on macOS under the load of other builds
   (2026-10-03, the tree of 9893679). After the 7 s stall the old leader had stepped down in its
@@ -101,8 +133,10 @@ held an election back.
   Not seen again on 2026-10-05: 120 runs on `line` (40 at the machine's load 5 to 27, 40 under 24
   CPU burners at load 48 to 53, 40 beside a parallel workspace build at load 6 to 23), 40 runs of
   9893679's own tree with its diagnostics, and 30 in Docker's Linux at 2 CPUs; CI since 2ef0ab3:
-  no failure of it on any target. Open until a sighting's report states the core's side, which it
-  now does.
+  no failure of it on any target. A stall of every device raises each member's flush floor, and
+  with it the interval its heartbeats go at, which the waits' quiet period did not cover before
+  2026-10-15. Open until a sighting's report states the core's and the stream's side, which it now
+  does.
 - **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
   Member 1 was stopped at term 2. Members 2 and 3 went through three elections to term 5 (3 leading,
   commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms: each write held its
@@ -113,7 +147,58 @@ held an election back.
   6.3 to 7.0, 10 runs with both members' flushes held 741 and 597 ms after the stop (each commits
   in 1.4 s, no election), and 47 ubuntu-24.04 gates since 2ef0ab3. Open: whether a device whose
   every write is that slow makes a pair re-elect past the law (each new leader's first write
-  suspected in turn); the reports now state each member's core suspicions and campaign.
+  suspected in turn); the reports now state each member's core suspicions and campaign, and the law
+  covers the interval its heartbeats go at, which writes of 597 and 741 ms set.
+
+### Closed (2026-10-15)
+
+- **hyper-durable-e2e's founder at its start, no leader: the waits' law short of the members' own
+  heartbeat interval.** A soak of the scenario in Docker's Linux failed at run 771: "a write was never
+  answered; nothing moved for 1s". Both members were at term 0 with no heartbeat taken and no
+  interval known, so both stated a law of nothing and the wait's floor, one retransmission timeout,
+  was its quiet period. Member 1's one write had taken 2.17 s before the wait began; a member's
+  heartbeats go at its flush floor, so its went 2.17 s apart, and a member takes no heartbeat until
+  its own stream's wake has measured `G`. `quiet::law` now takes the interval each member's own
+  heartbeats go at (its report's `sending_interval_ns`), the most its peers' evidence of it goes
+  without moving, which no peer can state until a heartbeat at it has come
+  (`a_members_law_covers_the_interval_its_own_heartbeats_go_at`).
+
+- **Two leaders of one term in hyper-durable's simulation (a safety defect of the core under R-4).**
+  The simulation's default 128 seeds never reached it; at 256, seed 206 of its first shape broke
+  Election Safety ("member 1 led term 3: TwoLeaders { term: 3, first: 3, second: 1 }"), on `main`
+  as on the branch. Traced step by step: member 3, the one voter of a configuration its log held
+  and had not written, campaigned, counted its own vote at once and led term 3 with its hard state
+  and that configuration in writes still out; it crashed with them unwritten, restarted at term 2
+  under the configuration before, voted for member 1 in term 3, and member 1 led term 3 too. What a
+  leader does already waited for its term and vote to be durable (I1, I3, reads at the term's first
+  commit), so nothing had left member 3. A candidate's vote for itself now counts once the hard state
+  naming it is durable, as etcd's core counts it (`docs/durable.md` I9, `docs/raft.md` §3.3):
+  `a_sole_voter_leads_only_once_its_vote_is_durable` fails on the old core; 1 seed in 1,000 broke it
+  before, none in 10,000 of each of the five shapes since. A sole voter leads after its first write:
+  an owner that proposes to it before driving that write is refused `NoLeader`.
+- **hyper-rt's record test, `MeasurementTimeout { probe: "wake" }`, windows-2025 (main's run
+  38552220675 on `ccdbbd8`, and 38376252976).** The refusal 627c176 left for a probe that kept no
+  wake: diag run 38756344126 traced every round of the machine tests' probes, run at once as the gates
+  run them, over 120 runs of the library on windows-2025, and 349 of 4,256 rounds ended with their
+  first wake answered 8 to 21 ms into an 8 ms share, kept nothing, since a round gave its wake up at
+  its share's end (176 rounds so on windows-11-arm). A round now waits for the answer to a wake it
+  began until the probe's span ends, and keeps it (`a_wake_slower_than_its_rounds_share_is_kept`
+  fails with the share's bound): rounds that kept nothing fell to 5 and 21 of about 4,300 (diag run
+  38757539787), each one whose waiter never parked or started, and the probes' time stayed within
+  their span (p50 341 against 315 ms, p99 513 against 552 ms, windows-2025; `docs/runtime.md`
+  §10.4).
+- **hyper-rt `a_wait_stepped_past_its_deadline_reports_the_lateness`, macos-15-intel (CI run
+  38445610795).** The test stepped its shard until idle and read the sleep's deadline from the last
+  step; a host that held it 5 ms between two steps let the later step fire the timer, and the test
+  lost its premise. It now takes the deadline from the step that armed it (10 ms held after a step:
+  the old form fails every run, the new passes every run).
+- **hyper-rt `a_poll_blocked_in_a_call_past_the_quantum_is_its_tasks_where_blocks_are_counted`,
+  macos-15-intel (CI run 38336430915).** The test counted a run on the CPU only where a poll's own
+  body ran past the quantum, while the shard judges a long poll over a window of its own readings,
+  which a guest that counts a stolen virtual CPU as the thread's can fill outside the body. The test
+  now holds each step's verdicts to the thread clock over the step and the one before it, every
+  window it can have judged in (with 2.5 ms of CPU spent after each held poll, the old count fails 3
+  of 3 and the new passes 3 of 3; with `attribute` planted to call every poll a run, the new fails).
 
 ### Closed (2026-10-13)
 

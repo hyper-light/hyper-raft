@@ -183,6 +183,22 @@ impl UdpSocket {
         }
     }
 
+    /// Asks the kernel for a receive buffer of `bytes` (`SO_RCVBUFFORCE` where the process may, on
+    /// Linux past `net.core.rmem_max`, else `SO_RCVBUF`; a size the OS refuses outright is halved
+    /// and asked again) and returns the buffer it reports after the ask
+    /// ([`UdpSocket::recv_buffer_bytes`]), which the OS may cap below the ask (Linux at `rmem_max`,
+    /// macOS at `kern.ipc.maxsockbuf`) and Linux reports doubled. What the buffer holds of datagram
+    /// payload is the transport's to count (hyper-transport's `socket_room`). The simulation
+    /// fabric's buffer is fixed: nothing is asked.
+    pub fn set_recv_buffer_bytes(&self, bytes: usize) -> Result<usize, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::set_recv_buffer(socket, bytes)?,
+            Inner::Sim { .. } => {}
+            Inner::Moved => return Err(moved()),
+        }
+        self.recv_buffer_bytes()
+    }
+
     /// Sends a datagram to `addr` without blocking: the bytes accepted, or `RtError::WouldBlock` when the
     /// OS has no room for it now — local pressure, typed apart from a failure of the socket, so a caller
     /// retries it once [`UdpSocket::writable`] (or sends with [`UdpSocket::send_to_writable`]) rather than

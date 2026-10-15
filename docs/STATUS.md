@@ -105,6 +105,14 @@ drives, so a sighting names which of them held the group back. The waits' law co
 each member's own heartbeats go at (2026-10-15, below), which both entries here may have lacked:
 each saw no heartbeat taken through a quiet period shorter than the members' flushes.
 
+- **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once, Linux 6.x in
+  Docker (`rust:1.98.1`, 4 CPUs) on a loaded host, `cargo test -p hyper-tokio` on the tree of the
+  socket room (above): `a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` failed at
+  `tests/stamps.rs:103` ("stamped before it was sent") and its standard-socket twin at line 189; the
+  same tests passed on `main` and on that tree three times after, alone and with the whole suite.
+  `SO_TIMESTAMPNS` stamps on `CLOCK_REALTIME`, which the adapter carries to the monotonic clock by
+  an offset: a realtime clock slewed between the offset's reading and the stamp would put a stamp
+  before the send. Not yet traced to that or ruled out.
 - **hyper-raft-e2e `stalled-devices`.** Seen once on macOS under the load of other builds
   (2026-10-03, the tree of 9893679). After the 7 s stall the old leader had stepped down in its
   term (leader 0), its followers still trusted it, the stream trusted every member, and no member
@@ -146,6 +154,27 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   `80c1f82` in Docker's Linux beside 8 busy loops (load 10 to 15, 2026-10-15).
 
 ### Closed (2026-10-15)
+
+- **hyper-transport: a stalled reader's socket dropped what its windows let peers send.** Found by
+  focal's event-bus comparison (a node on one CPU, Linux 6.x in Docker on a loaded host): at 50,000
+  messages a second the node's socket counted 1,202 `RcvbufErrors` in 25 s (69 at 10,000), its
+  clients' 583, each loss a retransmission and a congestion event, the run's tail. The cause: the
+  windows an endpoint grants are what peers may send before its owner reads, and they wait in the
+  socket's queue while the owner does not, but nothing tied the windows to the queue: the bus
+  granted windows to 8 MiB on a socket Linux had left at its default 208 KiB, and a reader the host
+  stopped for 3.5 ms overflowed it (TCP's receive window is its kernel's queue; UDP has none). Now
+  the windows granted, summed, never pass what the queue holds (`credit`'s socket room): each driver
+  (hyper-rt-transport's, hyper-tokio's) asks its socket for the endpoint's `receive_demand`
+  (`SO_RCVBUFFORCE` where the process may, else `SO_RCVBUF`, a refused size halved) and tells the
+  endpoint the room the kernel granted (`socket_room`: the buffer reported less the kernel's
+  overhead, measured on Linux 6.x at 895, 1,275 and 2,290 bytes a datagram by size class, at most
+  four times the payload from 320 bytes up); a window grows only while what is left holds the first
+  windows of the handshakes admission lets wait, and a connection whose first window does not fit is
+  refused `Refusal::ReceiveBuffer` (wire code 15). Tests: hyper-transport's
+  `a_socket_that_holds_no_first_window_refuses_the_connection` and
+  `the_windows_granted_never_pass_what_the_socket_holds`, hyper-rt-transport's
+  `a_socket_holds_the_room_the_transport_counts_in_it` (full packets sent unread up to the room,
+  every one read back, on macOS and Linux).
 
 - **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
   38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read
@@ -397,7 +426,10 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
    only over the log they acknowledge), hyper-liveness (`PairReport::sending`, `sending_due_ns`) and
    hyper-rt (the wake probe keeps a wake slower than its round's share) changed; hyper-log,
    hyper-timing, hyper-measure, hyper-seal, hyper-sim and hyper-block did not.
-3. **The shared crates' open work**, each in its own document:
+3. **The shared crates' open work**, each in its own document; and one of the socket room's
+   (`credit.rs`): a window that grew stays granted while its peer is idle, so a node of many
+   connections can find its room held by peers that no longer send; a window shrinks only as its
+   peer consumes it, which a quiet peer never does.
    - hyper-durable: §14's measurements. Items 1 to 8 measured on this machine (2026-10-12 and 13,
      `docs/benchmarks.md` from "A group's writes out, depth one to three on hyper-log"): depth earns
      no place for one group, nor makes a lone frame's confirmation rare; applying ahead halves a

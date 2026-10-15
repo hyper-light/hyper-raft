@@ -53,8 +53,8 @@ pub mod tls;
 pub use admission::{AdmissionLimits, AdmissionStats};
 pub use budget::{Budget, Fixed, Lane, Reservation};
 pub use credit::{
-    K_GRANULARITY, MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window,
-    stream_window_ceiling,
+    K_GRANULARITY, MIN_DATAGRAM, SOCKET_OVERHEAD, STREAM_BYTES_PER_PACKET, class_reserve,
+    initial_window, socket_buffer_ask, socket_room, stream_window_ceiling,
 };
 pub use endpoint::{AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit};
 pub use error::Refusal;

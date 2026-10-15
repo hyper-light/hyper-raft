@@ -41,7 +41,7 @@ use hyper_quic::{
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
 use crate::budget::{Budget, Lane, Reservation};
 use crate::credit::{
-    K_GRANULARITY, MIN_DATAGRAM, Window, class_reserve, initial_window, stream_window_ceiling,
+    K_GRANULARITY, MIN_DATAGRAM, Room, Window, class_reserve, initial_window, stream_window_ceiling,
 };
 use crate::deadlines;
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
@@ -262,6 +262,13 @@ pub struct Stats {
     pub streams_refused: u64,
     /// Receive chunks held, each charged to the budget.
     pub receive_chunks: usize,
+    /// What the socket's receive queue holds of the connections' windows, payload bytes
+    /// ([`Endpoint::set_receive_capacity`]; `u64::MAX` until the owner says).
+    pub receive_capacity: u64,
+    /// The windows granted, summed: what the peers may send unread.
+    pub receive_granted: u64,
+    /// Connections refused for the queue holding no more first windows.
+    pub receive_refused: u64,
     /// Datagrams copied into buffers of their own because no chunk could take them.
     pub receive_copied: u64,
     /// The stream pool ([`StreamCredit::Pooled`]).
@@ -508,6 +515,8 @@ struct Core<C: Classes, B, D> {
     /// The streams pooled connections share ([`StreamCredit::Pooled`]); until the owner sizes it,
     /// one connection's streams.
     pool: Pool,
+    /// What the socket's receive queue holds of the windows granted ([`Room`]).
+    room: Room,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -629,6 +638,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 ids: Vec::new(),
                 stats: Stats::default(),
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
+                room: Room::unbounded(),
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -978,14 +988,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     fn dial(&mut self, now: Instant, peer: PeerId, address: SocketAddr) -> Result<(), Refusal> {
         let grant = self.core.window_grant()?;
         let Some(name) = self.core.directory.server_name(peer) else {
-            self.core.budget.release(grant);
+            self.core.release_window(grant);
             return Err(Refusal::Identity);
         };
         let dialed = self.quic.connect(now, self.client, address, name, None);
         let (handle, quic) = match dialed {
             Ok(dialed) => dialed,
             Err(_) => {
-                self.core.budget.release(grant);
+                self.core.release_window(grant);
                 return Err(Refusal::Quic);
             }
         };
@@ -1314,8 +1324,41 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             receive_chunks: self.receive.chunks(),
             receive_copied: self.receive.copied(),
             pool: self.core.pool.stats(),
+            receive_capacity: self.core.room.capacity(),
+            receive_granted: self.core.room.granted(),
+            receive_refused: self.core.room.refused(),
             ..self.core.stats
         }
+    }
+
+    /// What the endpoint's windows may grant at most, summed, payload bytes: for every connection
+    /// admission holds and every handshake it lets wait beside them, a window at its ceiling and the
+    /// reserve on top. What its socket's receive queue should hold for no window to be held below
+    /// its ceiling by the queue ([`Endpoint::set_receive_capacity`]).
+    pub fn receive_demand(&self) -> u64 {
+        let admission = self.core.limits.admission;
+        let held = admission.connections.saturating_add(admission.pending);
+        let reserve = class_reserve(C::RANKS.saturating_sub(1));
+        let window = self
+            .core
+            .limits
+            .window_ceiling
+            .max(initial_window(MIN_DATAGRAM))
+            .saturating_add(reserve);
+        u64::try_from(held)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(window)
+    }
+
+    /// The socket's receive queue holds `bytes` of datagram payload ([`crate::socket_room`] of the
+    /// buffer the socket reports once its driver asked it for [`crate::socket_buffer_ask`] of the
+    /// endpoint's [`Endpoint::receive_demand`]): from now the windows granted,
+    /// summed, never pass it, a window grows only while what is left holds the first windows of the
+    /// handshakes that may come, and a connection whose first window it cannot hold is refused
+    /// [`Refusal::ReceiveBuffer`] (`credit`'s socket room). Windows granted already stand until they
+    /// are given back.
+    pub fn set_receive_capacity(&mut self, bytes: u64) {
+        self.core.room.set_capacity(bytes);
     }
 
     /// Sizes the stream pool ([`StreamCredit::Pooled`]): the exchanges pooled peers may have open
@@ -1488,7 +1531,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
             Err(error) => {
                 self.core.admission.end_pending();
-                self.core.budget.release(grant);
+                self.core.release_window(grant);
                 if let Some(transmit) = error.response {
                     self.respond(transmit, buffer);
                 }
@@ -1562,10 +1605,39 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D> {
+    /// A connection's first window, with the reserve on top of it: room in the socket's queue
+    /// first, then the budget's bytes.
     fn window_grant(&mut self) -> Result<Reservation, Refusal> {
+        let bytes = Self::first_window();
+        self.room.first(bytes)?;
+        match self.budget.reserve(bytes, Lane::Window) {
+            Ok(grant) => Ok(grant),
+            Err(refusal) => {
+                self.room.release(bytes);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The bytes of a connection's first window and the reserve on top of it.
+    fn first_window() -> u64 {
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
-        let bytes = initial_window(MIN_DATAGRAM).saturating_add(reserve);
-        self.budget.reserve(bytes, Lane::Window)
+        initial_window(MIN_DATAGRAM).saturating_add(reserve)
+    }
+
+    /// The room a window's growth leaves: the first windows of the handshakes admission may still
+    /// let wait at once.
+    fn kept_for_handshakes(&self) -> u64 {
+        let limit = self.limits.admission.pending;
+        let waiting = self.admission.stats().pending;
+        let more = u64::try_from(limit.saturating_sub(waiting)).unwrap_or(u64::MAX);
+        more.saturating_mul(Self::first_window())
+    }
+
+    /// A window grant given back: its room in the socket's queue and its bytes.
+    fn release_window(&mut self, grant: Reservation) {
+        self.room.release(grant.granted());
+        self.budget.release(grant);
     }
 
     fn connection_of(&self, peer: PeerId) -> Option<usize> {
@@ -1927,7 +1999,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     fn gone(&mut self, key: usize, mut conn: Box<Conn<C::Role>>) {
         self.lost(key, &mut conn);
         for grant in conn.grants.drain(..) {
-            self.budget.release(grant);
+            self.release_window(grant);
         }
     }
 
@@ -3112,7 +3184,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         };
         let more = grown.saturating_sub(conn.window.window());
+        let kept = self.kept_for_handshakes();
+        if !self.room.grow(more, kept) {
+            return;
+        }
         let Ok(grant) = self.budget.reserve(more, Lane::Window) else {
+            self.room.release(more);
             return;
         };
         conn.grants.push(grant);

@@ -2642,3 +2642,89 @@ fn an_owner_refused_a_write_finishes_writing_on_writable_alone() {
         "each refused write was answered by one Writable"
     );
 }
+
+/// A connection's first window and the reserve on top of it: what a node grants at a handshake.
+fn first_window() -> u64 {
+    use hyper_transport::Classes;
+    hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM)
+        + hyper_transport::class_reserve(<Mantle as Classes>::RANKS - 1)
+}
+
+/// A node whose socket's receive queue cannot hold a connection's first window refuses the
+/// connection, typed, and grants nothing: what peers may send it unread never passes what the
+/// queue takes (credit's socket room).
+#[test]
+fn a_socket_that_holds_no_first_window_refuses_the_connection() {
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let book = || pair.book(Role::Node, Role::Node);
+    let a = pair.node::<Mantle>(1, Role::Node, book(), limits(), 256 << 20, now);
+    let mut b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 256 << 20, now);
+    assert_eq!(b.stats().receive_capacity, u64::MAX, "unbounded until told");
+    b.set_receive_capacity(first_window() - 1);
+    let mut net = Net::of(now, a, b, hyper_sim::Source::Seed(0));
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| net.b.stats().receive_refused > 0);
+    net.exchange();
+    let stats = net.b.stats();
+    assert!(stats.receive_refused >= 1);
+    assert_eq!(stats.receive_granted, 0, "nothing granted");
+    assert_eq!(stats.connections, 0);
+    assert!(
+        events(&mut net.a)
+            .iter()
+            .all(|event| !matches!(event, Event::Connected { .. })),
+        "the dialer never connected"
+    );
+}
+
+/// The windows a node grants, summed, never pass what its socket's receive queue holds: a peer
+/// whose frames are polled as fast as they come grows its window, and only into the room left once
+/// the first windows of the handshakes admission may let wait are kept; when the connection goes,
+/// what it held comes back.
+#[test]
+fn the_windows_granted_never_pass_what_the_socket_holds() {
+    let pair = Pair::new();
+    let first = first_window();
+    // The test limits let 8 handshakes wait: their first windows are kept, and four windows'
+    // worth beside the connection's own is what it may grow into.
+    let kept = 8 * first;
+    let capacity = first + kept + 4 * first;
+    let mut net = connected_from::<Mantle, Mantle>(
+        &pair,
+        limits(),
+        256 << 20,
+        hyper_sim::Source::Seed(0),
+        |b| b.set_receive_capacity(capacity),
+    );
+    let mut most = 0;
+    let frame = [7u8; 1_000];
+    for _ in 0..400 {
+        for _ in 0..64 {
+            match net.a.send_frame(2, 0, Kind::Append, &frame) {
+                Ok(()) => {}
+                Err(Refusal::LaneFull) => break,
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        net.exchange();
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                net.b.release(frame);
+            }
+        }
+        let granted = net.b.stats().receive_granted;
+        assert!(granted <= capacity, "{granted} granted past {capacity}");
+        most = most.max(granted);
+    }
+    assert!(most > first, "the window grew within the room: {most}");
+    assert!(
+        most + kept <= capacity,
+        "the handshakes' first windows were kept: {most} of {capacity}"
+    );
+    let now = net.now;
+    net.a.disconnect(now, 2);
+    net.until(TURNS, |net| net.b.stats().connections == 0);
+    assert_eq!(net.b.stats().receive_granted, 0, "what it held came back");
+}

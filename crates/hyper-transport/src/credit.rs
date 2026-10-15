@@ -2,7 +2,7 @@
 //!
 //! QUIC's flow control is limit-based and quinn keeps one window per connection, so what a node
 //! buffers for a peer is bounded by that connection's receive window, and the classes share it.
-//! Three rules are kept here, each derived:
+//! Four rules are kept here, each derived:
 //!
 //! - **The class reserve** (slates `connection.rs`, `class_credit_reserve`): a class leaves unspent
 //!   one packet's stream bytes of the peer's connection credit for every class above it, so the
@@ -16,6 +16,12 @@
 //!   limited the transfer (Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize`, slates
 //!   `flow.rs`). Each growth is reserved from the node's budget first, so the window is
 //!   `min(BDP, share)`: it follows the path's bandwidth-delay product while the budget funds it.
+//! - **The socket's room** ([`Room`], [`socket_room`]): the windows granted, summed, never pass what the socket's
+//!   receive queue holds, so a peer never has more in flight unread than the queue takes while the
+//!   owner does not read, and a stalled owner drops nothing (TCP's receive window is its kernel's
+//!   queue; a UDP socket has no window of its own). Measured before the rule: a focal bus node on a
+//!   Linux socket of 208 KiB granted windows to 8 MiB and dropped 1,202 datagrams in a 25-second
+//!   run of 50,000 messages a second on a busy host, each a retransmission and a congestion event.
 //! - **The stream window's ceiling** is `2 · 1,024 · d`, from the floor of hyper-quic's span bound
 //!   (patch Q5): a window `W` of frames of at least `d` bytes is left with at most `W / (2d)` spans
 //!   when every other frame is lost, so this window never reaches the 1,024 past which upstream
@@ -27,6 +33,8 @@
 use std::time::{Duration, Instant};
 
 use hyper_quic::MAX_STREAM_CHUNKS;
+
+use crate::Refusal;
 
 /// The smallest datagram a QUIC path carries (RFC 9000 §14: "a UDP payload size of at least
 /// 1200 bytes").
@@ -81,6 +89,115 @@ pub fn initial_window(max_datagram: u64) -> u64 {
     let ten = max_datagram.saturating_mul(INITIAL_WINDOW_DATAGRAMS);
     let two = max_datagram.saturating_mul(2);
     ten.min(INITIAL_WINDOW_FLOOR.max(two))
+}
+
+/// Derived: what a socket's receive queue counts against its buffer for each byte of datagram it
+/// holds, at the most, for a datagram of 320 bytes or more ([`socket_room`]). Linux charges each
+/// queued datagram its allocation, a slab and its `sk_buff`, against `SO_RCVBUF` as reported:
+/// measured on Linux 6.x over loopback and a veth pair alike, 895 bytes for a datagram of up to about
+/// 250 bytes of payload, 1,275 bytes to about 650, and 2,290 bytes to a full one (1.83 times a
+/// 1,252-byte datagram); four holds from 320 bytes up, the least a sender with a window's worth to
+/// send packs. BSD's `sbspace` and Winsock count payload and an address of at most 28 bytes beside
+/// each datagram, so two holds with room to spare.
+pub const SOCKET_OVERHEAD: u64 = if cfg!(target_os = "linux") { 4 } else { 2 };
+
+/// What the kernel makes of a receive buffer asked: Linux doubles it for its bookkeeping and
+/// reports the doubled size (`socket(7)`, `SO_RCVBUF`); BSD and Winsock keep what was asked.
+const KERNEL_DOUBLES: u64 = if cfg!(target_os = "linux") { 2 } else { 1 };
+
+/// The receive buffer to ask a socket for, for its queue to hold `payload` bytes of datagrams:
+/// `payload` times the kernel's overhead, less the doubling Linux adds of its own.
+pub fn socket_buffer_ask(payload: u64) -> u64 {
+    payload
+        .saturating_mul(SOCKET_OVERHEAD)
+        .checked_div(KERNEL_DOUBLES)
+        .unwrap_or(u64::MAX)
+}
+
+/// The datagram payload a socket's receive queue holds, at the least, before it drops one, for the
+/// buffer the socket `reported` (`SO_RCVBUF` read back): what an endpoint may let its peers send it
+/// unread and lose nothing while its owner does not read ([`Endpoint::set_receive_capacity`]).
+///
+/// [`Endpoint::set_receive_capacity`]: crate::Endpoint::set_receive_capacity
+pub fn socket_room(reported: u64) -> u64 {
+    reported.checked_div(SOCKET_OVERHEAD).unwrap_or(0)
+}
+
+/// What the socket's receive queue holds of the windows its connections grant (the module's third
+/// rule). A window is what a peer may send before the owner reads it, and while the owner does not
+/// read, what arrives waits in the socket's queue, which drops a datagram past its bound: UDP holds
+/// no flow control of its own, where TCP's kernel advertises its own queue's room. So the windows
+/// granted, summed, never pass what the queue holds (hyper-rt's `recv_capacity_bytes`), and an
+/// owner the machine stops for any while loses nothing, as TCP's reader does not. A connection's
+/// first window is taken whole or the connection refused; a window grows only while what is left
+/// still holds the first windows of the handshakes admission lets wait, so a peer that grew first
+/// never shuts out one that comes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Room {
+    /// What the queue holds, payload bytes: unbounded until the owner says what its socket holds.
+    capacity: u64,
+    /// The windows granted, summed, each with the reserve on top of it.
+    granted: u64,
+    /// First windows refused for want of room.
+    refused: u64,
+}
+
+impl Room {
+    /// A room of no bound, until the owner says what its socket holds.
+    pub(crate) const fn unbounded() -> Self {
+        Self {
+            capacity: u64::MAX,
+            granted: 0,
+            refused: 0,
+        }
+    }
+    /// The queue holds `capacity` bytes: windows past it are no longer granted; those granted
+    /// stand until they are given back.
+    pub(crate) fn set_capacity(&mut self, capacity: u64) {
+        self.capacity = capacity;
+    }
+    /// What the queue holds.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+    /// The windows granted, summed.
+    pub(crate) fn granted(&self) -> u64 {
+        self.granted
+    }
+    /// First windows refused for want of room.
+    pub(crate) fn refused(&self) -> u64 {
+        self.refused
+    }
+    /// A connection's first window of `bytes`, taken whole, or refused
+    /// [`Refusal::ReceiveBuffer`].
+    pub(crate) fn first(&mut self, bytes: u64) -> Result<(), Refusal> {
+        match self.granted.checked_add(bytes) {
+            Some(granted) if granted <= self.capacity => {
+                self.granted = granted;
+                Ok(())
+            }
+            _ => {
+                self.refused = self.refused.saturating_add(1);
+                Err(Refusal::ReceiveBuffer)
+            }
+        }
+    }
+    /// A window grows by `bytes` if what is left after it still holds `kept`, the first windows of
+    /// the handshakes that may come; whether it grew.
+    pub(crate) fn grow(&mut self, bytes: u64, kept: u64) -> bool {
+        let Some(granted) = self.granted.checked_add(bytes) else {
+            return false;
+        };
+        if granted.saturating_add(kept) > self.capacity {
+            return false;
+        }
+        self.granted = granted;
+        true
+    }
+    /// Windows let go: `bytes` back.
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.granted = self.granted.saturating_sub(bytes);
+    }
 }
 
 /// A connection's receive window, auto-tuned as the application consumes it.

@@ -48,7 +48,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         clippy::disallowed_methods,
         reason = "the runtime adapter anchors the endpoint's Instant to the shard's clock once"
     )]
-    pub fn new(endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
+    pub fn new(mut endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
+        // The socket's queue holds what the endpoint's windows may grant (hyper-transport's socket
+        // room): asked for their sum, and the endpoint told what the kernel gave, so what its peers
+        // may send unread never passes what the queue takes while the owner does not read.
+        let ask = hyper_transport::socket_buffer_ask(endpoint.receive_demand());
+        let reported = socket
+            .socket()
+            .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
+        endpoint.set_receive_capacity(hyper_transport::socket_room(
+            u64::try_from(reported).unwrap_or(u64::MAX),
+        ));
         let anchor = (shard_now()?, Instant::now());
         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
         Ok(Self {

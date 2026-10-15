@@ -51,6 +51,11 @@ impl Family {
     }
 }
 
+/// Bound: the sizes asked of the kernel for a socket buffer, each half the last, before the ask is
+/// refused: a size an OS refuses (macOS past `kern.ipc.maxsockbuf`, `ENOBUFS`) is halved and asked
+/// again, and 32 halvings reach a single byte from any `usize` a 32-bit option takes.
+const BUFFER_ASKS: usize = 32;
+
 // ============================================================================== Unix (rustix)
 
 #[cfg(unix)]
@@ -97,6 +102,34 @@ mod imp {
     pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
         rustix::net::sockopt::socket_recv_buffer_size(&socket.fd)
             .map_err(|e| refused("getsockopt", e))
+    }
+
+    /// Asks for a kernel receive buffer of `bytes`: on Linux `SO_RCVBUFFORCE` first, which passes
+    /// `net.core.rmem_max` for a process that may (`CAP_NET_ADMIN`), then `SO_RCVBUF`, which Linux
+    /// caps at `rmem_max` without a word; a size the OS refuses outright (macOS past
+    /// `kern.ipc.maxsockbuf`, `ENOBUFS`) is halved and asked again, at most [`super::BUFFER_ASKS`]
+    /// times. What was granted is read back with [`recv_buffer_bytes`].
+    pub(crate) fn set_recv_buffer(socket: &Socket, bytes: usize) -> Result<(), RtError> {
+        #[cfg(target_os = "linux")]
+        if rustix::net::sockopt::set_socket_recv_buffer_size_force(&socket.fd, bytes).is_ok() {
+            return Ok(());
+        }
+        let mut asked = bytes;
+        let mut refusal = Errno::NOBUFS;
+        for _ in 0..super::BUFFER_ASKS {
+            match rustix::net::sockopt::set_socket_recv_buffer_size(&socket.fd, asked) {
+                Ok(()) => return Ok(()),
+                Err(e @ (Errno::NOBUFS | Errno::INVAL)) => {
+                    refusal = e;
+                    asked = asked.checked_div(2).unwrap_or(0);
+                    if asked == 0 {
+                        break;
+                    }
+                }
+                Err(e) => return Err(refused("setsockopt(SO_RCVBUF)", e)),
+            }
+        }
+        Err(refused("setsockopt(SO_RCVBUF)", refusal))
     }
 
     /// A non-blocking, close-on-exec datagram socket of `family`, IPv6 only when IPv6, sending with
@@ -508,6 +541,33 @@ pub(crate) mod imp {
         usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
     }
 
+    /// Asks for a kernel receive buffer of `bytes` (`SO_RCVBUF`, an `int`); a size Winsock refuses
+    /// is halved and asked again, at most [`super::BUFFER_ASKS`] times. What was granted is read
+    /// back with [`recv_buffer_bytes`].
+    pub(crate) fn set_recv_buffer(socket: &Socket, bytes: usize) -> Result<(), RtError> {
+        let mut asked = i32::try_from(bytes).unwrap_or(i32::MAX);
+        let mut refusal = None;
+        for _ in 0..super::BUFFER_ASKS {
+            match set_int(
+                socket.socket,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                asked,
+                "setsockopt(SO_RCVBUF)",
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    refusal = Some(error);
+                    asked = asked.checked_div(2).unwrap_or(0);
+                    if asked == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(refusal.unwrap_or_else(|| last("setsockopt(SO_RCVBUF)")))
+    }
+
     /// The length of a socket address structure, as Winsock takes it.
     pub(crate) fn length<T>() -> i32 {
         i32::try_from(size_of::<T>()).unwrap_or(0)
@@ -754,4 +814,5 @@ pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
     adopt, bind, dgram_socket, into_owned, local_addr, recv_buffer_bytes, recv_from, send_to,
+    set_recv_buffer,
 };

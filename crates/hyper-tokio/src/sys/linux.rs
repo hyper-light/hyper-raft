@@ -85,6 +85,57 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     status == 0
 }
 
+/// The receive buffer the kernel reports for `fd` (`SO_RCVBUF`, as Linux doubles it).
+pub(crate) fn recv_buffer(fd: RawFd) -> io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    let mut length = socklen(size_of::<libc::c_int>());
+    // SAFETY: `value` and `length` are live locals of the sizes passed; getsockopt writes at most
+    // `length` bytes into `value` and the new length into `length`.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            ptr::addr_of_mut!(value).cast(),
+            &raw mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("SO_RCVBUF read back negative"))
+}
+
+/// Asks the kernel for a receive buffer of `bytes` on `fd` ([`super::set_recv_buffer`]):
+/// `SO_RCVBUFFORCE`, past `net.core.rmem_max` for a process that may (`CAP_NET_ADMIN`), else
+/// `SO_RCVBUF`, which Linux caps at `rmem_max` without a word. The buffer reported after.
+pub(crate) fn set_recv_buffer(fd: RawFd, bytes: usize) -> io::Result<usize> {
+    let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    if set_socket_int(fd, libc::SO_RCVBUFFORCE, value).is_err() {
+        set_socket_int(fd, libc::SO_RCVBUF, value)?;
+    }
+    recv_buffer(fd)
+}
+
+/// Sets the `SOL_SOCKET` option `option` of `fd` to `value`.
+fn set_socket_int(fd: RawFd, option: libc::c_int, value: libc::c_int) -> io::Result<()> {
+    // SAFETY: `value` is a live `c_int` and the length passed is its size; setsockopt only reads it.
+    let status = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            ptr::addr_of!(value).cast(),
+            socklen(size_of::<libc::c_int>()),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// What the kernel offers this socket.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Offload {

@@ -567,3 +567,25 @@ fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
         "the datagram arrived exactly once"
     );
 }
+
+/// A socket asked for a receive buffer reports at least the size asked, where the OS grants it
+/// (a small ask, under every platform's default ceiling; Linux reports it doubled), and asking a size
+/// past every ceiling is no error: the OS caps it, and the socket reports what it granted.
+#[test]
+fn a_socket_reports_the_receive_buffer_it_was_granted() {
+    /// Shape: a small ask, which every platform's default ceiling grants (Linux 208 KiB, macOS
+    /// 8 MiB, Windows unbounded).
+    const ASK: usize = 64 << 10;
+    /// Shape: an ask past every platform's ceiling for an unprivileged process.
+    const PAST: usize = 1 << 30;
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let reported = socket.set_recv_buffer_bytes(ASK).unwrap();
+    assert!(reported >= ASK, "{reported} reported for an ask of {ASK}");
+    assert_eq!(socket.recv_buffer_bytes().unwrap(), reported);
+    let capped = socket.set_recv_buffer_bytes(PAST).unwrap();
+    assert!(
+        capped >= ASK,
+        "a cap never takes back what was granted below it: {capped}"
+    );
+    assert_eq!(socket.recv_buffer_bytes().unwrap(), capped);
+}

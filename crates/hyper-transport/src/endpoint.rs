@@ -269,6 +269,8 @@ pub struct Stats {
     pub receive_granted: u64,
     /// Connections refused for the queue holding no more first windows.
     pub receive_refused: u64,
+    /// Connections that receive on a socket of their own ([`Endpoint::set_peer_room`]).
+    pub receive_rooms: usize,
     /// Datagrams copied into buffers of their own because no chunk could take them.
     pub receive_copied: u64,
     /// The stream pool ([`StreamCredit::Pooled`]).
@@ -336,6 +338,9 @@ struct Conn<R> {
     grants: Vec<Reservation>,
     /// The connection was lost and its owner told.
     lost: bool,
+    /// The room of the socket it receives on alone, once its driver connected one to its peer
+    /// ([`Endpoint::set_peer_room`]); until then its windows are the shared socket's.
+    room: Option<Room>,
     /// Its part of the stream pool ([`StreamCredit::Pooled`]).
     share: Share,
     /// The exchanges its peer opened that are open: what a pooled connection's grant serves.
@@ -517,6 +522,8 @@ struct Core<C: Classes, B, D> {
     pool: Pool,
     /// What the socket's receive queue holds of the windows granted ([`Room`]).
     room: Room,
+    /// Moves whenever a connection is identified or goes ([`Endpoint::connection_generation`]).
+    generation: u64,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -639,6 +646,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 stats: Stats::default(),
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
                 room: Room::unbounded(),
+                generation: 0,
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1327,6 +1335,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             receive_capacity: self.core.room.capacity(),
             receive_granted: self.core.room.granted(),
             receive_refused: self.core.room.refused(),
+            receive_rooms: self
+                .conns
+                .iter()
+                .flatten()
+                .filter(|conn| conn.room.is_some())
+                .count(),
             ..self.core.stats
         }
     }
@@ -1338,16 +1352,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     pub fn receive_demand(&self) -> u64 {
         let admission = self.core.limits.admission;
         let held = admission.connections.saturating_add(admission.pending);
+        u64::try_from(held)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(self.peer_demand())
+    }
+
+    /// What one connection's windows may grant at most: its window at the ceiling and the reserve
+    /// on top. What a socket it receives on alone should hold ([`Endpoint::set_peer_room`]).
+    pub fn peer_demand(&self) -> u64 {
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
-        let window = self
-            .core
+        self.core
             .limits
             .window_ceiling
             .max(initial_window(MIN_DATAGRAM))
-            .saturating_add(reserve);
-        u64::try_from(held)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(window)
+            .saturating_add(reserve)
     }
 
     /// The socket's receive queue holds `bytes` of datagram payload ([`crate::socket_room`] of the
@@ -1359,6 +1377,55 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// are given back.
     pub fn set_receive_capacity(&mut self, bytes: u64) {
         self.core.room.set_capacity(bytes);
+    }
+
+    /// A count that moves whenever a connection is identified or goes: an owner that keeps
+    /// something for each connection (a driver's socket for each peer) looks again
+    /// ([`Endpoint::established`]) only when it moved.
+    pub fn connection_generation(&self) -> u64 {
+        self.core.generation
+    }
+
+    /// Every identified connection's peer and the address it is reached at now, into `out`
+    /// (cleared first; at most the admission's bound on connections).
+    pub fn established(&self, out: &mut Vec<(PeerId, SocketAddr)>) {
+        out.clear();
+        for conn in self.conns.iter().flatten() {
+            if let Some((peer, _)) = conn.peer
+                && !conn.lost
+            {
+                out.push((peer, conn.quic.remote_address()));
+            }
+        }
+    }
+
+    /// `peer`'s connection receives on a socket of its own from now, whose queue holds `bytes` of
+    /// datagram payload (its driver connected a socket to the peer): its windows leave the shared
+    /// socket's room for a room of their own, in which they grow alone, so each connection a node
+    /// holds brings the queue its windows need, as a TCP connection's socket does. Said again, the
+    /// room is resized. Refused `NotConnected` for a peer with no connection.
+    pub fn set_peer_room(&mut self, peer: PeerId, bytes: u64) -> Result<(), Refusal> {
+        let key = self.core.connection_of(peer).ok_or(Refusal::NotConnected)?;
+        let conn = self
+            .conns
+            .get_mut(key)
+            .and_then(Option::as_mut)
+            .ok_or(Refusal::NotConnected)?;
+        if let Some(room) = conn.room.as_mut() {
+            room.set_capacity(bytes);
+            return Ok(());
+        }
+        let held = conn
+            .grants
+            .iter()
+            .map(Reservation::granted)
+            .fold(0, u64::saturating_add);
+        self.core.room.release(held);
+        let mut room = Room::unbounded();
+        room.set_capacity(bytes);
+        room.hold(held);
+        conn.room = Some(room);
+        Ok(())
     }
 
     /// Sizes the stream pool ([`StreamCredit::Pooled`]): the exchanges pooled peers may have open
@@ -1484,6 +1551,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             delivered: Delivered::new(C::RANKS),
             grants,
             lost: false,
+            room: None,
             share: Share::default(),
             served: 0,
         };
@@ -1917,6 +1985,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             entry.epoch
         });
         conn.epoch = epoch;
+        self.generation = self.generation.wrapping_add(1);
         self.report_lifecycle(peer);
         self.accept_streams(now, key, conn, Dir::Bi);
         self.accept_streams(now, key, conn, Dir::Uni);
@@ -1998,9 +2067,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// The connection drained: what it held goes back.
     fn gone(&mut self, key: usize, mut conn: Box<Conn<C::Role>>) {
         self.lost(key, &mut conn);
+        // A connection's windows go back to the room that held them: the shared socket's, or the
+        // room of its own, which goes with it.
+        let shared = conn.room.is_none();
         for grant in conn.grants.drain(..) {
-            self.release_window(grant);
+            if shared {
+                self.room.release(grant.granted());
+            }
+            self.budget.release(grant);
         }
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn release_lanes(&mut self, conn: &mut Conn<C::Role>) {
@@ -3184,12 +3260,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         };
         let more = grown.saturating_sub(conn.window.window());
-        let kept = self.kept_for_handshakes();
-        if !self.room.grow(more, kept) {
+        // A connection on a socket of its own grows in its own room, which no handshake shares;
+        // one on the shared socket leaves the first windows of the handshakes that may come.
+        let grew = match conn.room.as_mut() {
+            Some(room) => room.grow(more, 0),
+            None => {
+                let kept = self.kept_for_handshakes();
+                self.room.grow(more, kept)
+            }
+        };
+        if !grew {
             return;
         }
         let Ok(grant) = self.budget.reserve(more, Lane::Window) else {
-            self.room.release(more);
+            match conn.room.as_mut() {
+                Some(room) => room.release(more),
+                None => self.room.release(more),
+            }
             return;
         };
         conn.grants.push(grant);

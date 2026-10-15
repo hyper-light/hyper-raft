@@ -58,6 +58,8 @@ pub struct UdpSocket {
     /// Calls that returned an astray report instead of data (module doc). Atomic only so a task that
     /// borrows the socket across an await stays `Send`; one thread counts it.
     astray: AtomicU64,
+    /// The peer the socket is connected to ([`UdpSocket::connect`]), which it sends to alone.
+    peer: Option<SocketAddr>,
 }
 
 /// The socket's backend: a real OS datagram socket (through the platform seam), or a simulation
@@ -108,7 +110,50 @@ impl UdpSocket {
         UdpSocket {
             inner,
             astray: AtomicU64::new(0),
+            peer: None,
         }
+    }
+
+    /// Binds a non-blocking UDP socket to `addr` that other sockets of this process may bind too
+    /// (`SO_REUSEPORT`): the port a listener shares with the sockets it connects to its peers
+    /// ([`UdpSocket::connect`]), each of which then takes its peer's datagrams into a receive queue
+    /// of its own, as a TCP connection's socket does. Refused `BadConfig` on Windows, where a shared
+    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
+    /// whose ports are one socket's each.
+    pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
+        let addr = addr.into();
+        if on_sim() {
+            return Err(RtError::BadConfig {
+                what: "a shared port on the simulation fabric, whose ports are one socket's",
+            });
+        }
+        let socket = netsys::dgram_socket(Family::of(addr))?;
+        netsys::share_port(&socket)?;
+        netsys::bind(&socket, addr)?;
+        Ok(UdpSocket::of(Inner::Real { socket }))
+    }
+
+    /// Connects the socket to `remote`: the kernel hands it `remote`'s datagrams to its port in
+    /// place of an unconnected socket sharing the port (a connected socket's exact match ranks first,
+    /// on Linux and the BSDs alike, measured), and it sends to `remote` alone, naming no address
+    /// (BSD refuses one on a connected socket).
+    pub fn connect(&mut self, remote: SocketAddr) -> Result<(), RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::connect(socket, remote)?,
+            Inner::Sim { .. } => {
+                return Err(RtError::BadConfig {
+                    what: "a connected socket on the simulation fabric",
+                });
+            }
+            Inner::Moved => return Err(moved()),
+        }
+        self.peer = Some(remote);
+        Ok(())
+    }
+
+    /// The peer the socket is connected to, if it is.
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
     /// Adopts an already-bound OS datagram socket (a `std::net::UdpSocket` converts into
@@ -226,7 +271,13 @@ impl UdpSocket {
     /// One non-blocking send.
     fn send_once(&self, buf: &[u8], addr: SocketAddr) -> Result<Outcome<usize>, RtError> {
         match &self.inner {
-            Inner::Real { socket } => Ok(self.outcome(netsys::send_to(socket, buf, addr)?)),
+            Inner::Real { socket } => match self.peer {
+                None => Ok(self.outcome(netsys::send_to(socket, buf, addr)?)),
+                Some(peer) if peer == addr => Ok(self.outcome(netsys::send(socket, buf)?)),
+                Some(_) => Err(RtError::BadConfig {
+                    what: "a send to another address than the peer the socket is connected to",
+                }),
+            },
             Inner::Sim { index, .. } => Ok(crate::sim::sim_send(*index, addr.port(), buf)?
                 .map_or(Outcome::NotNow, Outcome::Done)),
             Inner::Moved => Err(moved()),

@@ -198,6 +198,11 @@ impl Room {
     pub(crate) fn release(&mut self, bytes: u64) {
         self.granted = self.granted.saturating_sub(bytes);
     }
+    /// Windows granted before the room held them, `bytes` of them: they stand (a window granted
+    /// is never taken back), and the room grows nothing until it holds them.
+    pub(crate) fn hold(&mut self, bytes: u64) {
+        self.granted = self.granted.saturating_add(bytes);
+    }
 }
 
 /// A connection's receive window, auto-tuned as the application consumes it.

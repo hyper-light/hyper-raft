@@ -258,6 +258,17 @@ impl Batched {
         Self::new(UdpSocket::bind(addr)?, io, stamps)
     }
 
+    /// Binds a socket to `addr` that other sockets of this process may bind too
+    /// ([`UdpSocket::bind_shared`]) and batches it.
+    pub fn bind_shared(addr: impl Into<SocketAddr>, io: Io, stamps: bool) -> Result<Self, RtError> {
+        Self::new(UdpSocket::bind_shared(addr)?, io, stamps)
+    }
+
+    /// Connects the socket to `remote` ([`UdpSocket::connect`]).
+    pub fn connect(&mut self, remote: SocketAddr) -> Result<(), RtError> {
+        self.udp.connect(remote)
+    }
+
     /// Batches `udp`. With `stamps`, the kernel is asked to stamp each datagram it receives, where it can
     /// (the stats say whether it agreed). Refused `BadConfig` for a batch outside 1 to [`MAX_BATCH`], and
     /// `Capacity` when the receive buffers cannot be reserved.

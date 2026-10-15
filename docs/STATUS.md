@@ -174,7 +174,16 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   `a_socket_that_holds_no_first_window_refuses_the_connection` and
   `the_windows_granted_never_pass_what_the_socket_holds`, hyper-rt-transport's
   `a_socket_holds_the_room_the_transport_counts_in_it` (full packets sent unread up to the room,
-  every one read back, on macOS and Linux).
+  every one read back, on macOS and Linux). One shared socket of Linux's default 208 KiB holds about
+  three connections' first windows, so where a port can be shared (Linux, the BSDs) each connection
+  the endpoint identifies now receives on a socket of its own, bound to the listener's port and
+  connected to its peer (`UdpSocket::bind_shared`, `connect`; measured on both: the connected socket
+  takes its peer's datagrams, the listener everyone else's), its windows funded from that socket's
+  room alone (`Endpoint::set_peer_room`): a node's receive capacity grows with its connections at the
+  kernel's default each, nothing tuned, no privilege asked, as TCP's sockets do. The driver matches its
+  sockets to the endpoint's connections whenever they change (`connection_generation`,
+  `established`); Windows and the simulation fabric keep one socket. Test: hyper-rt-transport's
+  `each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection`.
 
 - **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
   38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read

@@ -321,6 +321,28 @@ mod imp {
             Err(e) => classify("sendto", e),
         }
     }
+
+    /// Lets other sockets of this process bind `socket`'s port as well (`SO_REUSEPORT`), before it
+    /// is bound: a listener and the sockets it connects to its peers share one port.
+    pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
+        rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
+            .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
+    }
+
+    /// Connects `socket` to `addr`: the kernel hands it `addr`'s datagrams to its port, and it
+    /// sends to `addr` alone.
+    pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
+        rustix::net::connect(&socket.fd, &addr).map_err(|e| refused("connect", e))
+    }
+
+    /// Sends `buf` on a connected `socket`, naming no address (`send(2)`): BSD refuses an address
+    /// on a connected socket (`EISCONN`).
+    pub(crate) fn send(socket: &Socket, buf: &[u8]) -> Result<Io<usize>, RtError> {
+        match rustix::net::send(&socket.fd, buf, SendFlags::empty()) {
+            Ok(n) => Ok(Io::Ready(n)),
+            Err(e) => classify("send", e),
+        }
+    }
 }
 
 // ============================================================================== Windows (Winsock 2)
@@ -336,9 +358,9 @@ pub(crate) mod imp {
         SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
         SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAECONNREFUSED,
         WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
-        WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname,
-        getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt,
-        socket as ws_socket,
+        WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
+        connect as ws_connect, getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom,
+        send as ws_send, sendto as ws_sendto, setsockopt, socket as ws_socket,
     };
 
     use core::net::{Ipv6Addr, SocketAddrV6};
@@ -804,6 +826,42 @@ pub(crate) mod imp {
         }
         Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
     }
+
+    /// Sharing a port as the BSDs and Linux do is not Winsock's: `SO_REUSEADDR` there lets a second
+    /// socket take the port's datagrams, not those of one peer, so a listener keeps its peers'.
+    pub(crate) fn share_port(_socket: &Socket) -> Result<(), RtError> {
+        Err(RtError::BadConfig {
+            what: "a shared port: Winsock does not hand a connected socket its peer's datagrams",
+        })
+    }
+
+    /// Connects `socket` to `addr`.
+    pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
+        let (sa, sa_len) = sockaddr(addr);
+        // SAFETY: connect reads the address from `sa`, `sa_len` bytes of it.
+        let rc = unsafe {
+            ws_connect(
+                socket.socket,
+                std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+                sa_len,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Err(last("connect"));
+        }
+        Ok(())
+    }
+
+    /// Sends `buf` on a connected `socket`, naming no address.
+    pub(crate) fn send(socket: &Socket, buf: &[u8]) -> Result<Io<usize>, RtError> {
+        let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+        // SAFETY: send reads `len` bytes from `buf`.
+        let rc = unsafe { ws_send(socket.socket, buf.as_ptr(), len, 0) };
+        if rc == SOCKET_ERROR {
+            return classify("send");
+        }
+        Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
+    }
 }
 
 /// The Winsock helpers the stream seam (`crate::tcpsys`) shares.
@@ -813,6 +871,6 @@ pub(crate) use imp as winsock;
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-    adopt, bind, dgram_socket, into_owned, local_addr, recv_buffer_bytes, recv_from, send_to,
-    set_recv_buffer,
+    adopt, bind, connect, dgram_socket, into_owned, local_addr, recv_buffer_bytes, recv_from, send,
+    send_to, set_recv_buffer, share_port,
 };

@@ -237,7 +237,10 @@ Stated over a member's durable state `D` (what a restart would read) at the mome
 - **I9 (a vote counted).** A candidate counts its vote for itself only once `D` holds it, as a voter's
   vote leaves only once that voter's `D` holds it (I1): a vote counted before, by a candidate that
   wins on it and crashes with it unwritten, is one it may cast again in the same term (etcd's core,
-  `raft.go` `campaign`).
+  `raft.go` `campaign`). A sole voter, which campaigns at once by suspicion, waits for that write
+  with no campaign armed: campaigning again at a wake before it, it moved its term past the write
+  each time, and an owner wakes a member after every call (hyper-durable-e2e's one member reached
+  term 1,232,434 before one write outran the calls between them, 2026-10-15).
 
 I1–I3 and I7 are etcd's and raft-rs's contracts (research §3); I5 is focal's F17 (research §4); I8 is
 mantle's; I9 is etcd's (raft-rs counts the vote at once, which its synchronous `Ready` makes durable
@@ -255,7 +258,7 @@ Where each is kept, as of R-4:
 | Answers (R-6) | `node::state_durable_commit`: an answer to an append or a heartbeat states no commit beyond what is durable when it leaves | `check_commit` at every release; `an_answer_a_notice_releases_states_the_durable_commit` (fails on R-4); `an_answer_states_no_commit_that_no_durable_write_stated` (mantle's case) |
 | I6, I8 | the shell's (§4; D-1) | §15's table |
 | I7 | `RawNode::on_persist` takes notices in issue order; a `Ready` gives only what no earlier one gave | `Lagged::make_durable`: once a write is durable the disk holds the term, vote and log the member held when it took the `Ready` |
-| I9 | `Raft::on_vote_durable`, from `RawNode::on_persist` and `advance_append`: a candidate's vote for itself waits there for the write that holds it | `a_sole_voter_leads_only_once_its_vote_is_durable`; the shell's simulation, Election Safety's oracle (seed 206 of its first shape had two leaders of term 3 before) |
+| I9 | `Raft::on_vote_durable`, from `RawNode::on_persist` and `advance_append`: a candidate's vote for itself waits there for the write that holds it; a sole voter's campaign waits for it unarmed (`Raft::wake_follower`) | `a_sole_voter_leads_only_once_its_vote_is_durable`; `tests/suspicion.rs`: `a_sole_voter_waits_for_its_own_vote_and_campaigns_once`; the shell's simulation, Election Safety's oracle (seed 206 of its first shape had two leaders of term 3 before) |
 
 
 Where the shell keeps each, as built (D-1, `crates/hyper-durable`; the oracle and its checks are

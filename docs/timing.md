@@ -1553,7 +1553,11 @@ spend a term and depose a leader that never left.
   transferee and the new leader's append coming back with the transferee's vote round between
   (dissertation §3.10: given up when not finished within an election), or at once when the
   transferee is suspected.
-- **A sole voter** campaigns at once, timed or not: it has no one to split a vote with.
+- **A sole voter** campaigns at once, timed or not: it has no one to split a vote with. It
+  campaigns once a term: its vote for itself counts once the write that holds it is durable
+  (`docs/durable.md` I9), and until then it waits for that write with no campaign armed, for a
+  campaign at a wake before it moved its term past the write it waited for, and an owner wakes a
+  member after every call (`a_sole_voter_waits_for_its_own_vote_and_campaigns_once`).
 
 **Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
 (`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core

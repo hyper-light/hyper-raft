@@ -637,6 +637,13 @@ pub struct Raft<S> {
     /// has a leader wait and etcd's `pendingReadIndexMessages` hold them; they count against the
     /// bound of reads with those that wait for their quorum or to be taken, and die with the term.
     deferred_reads: Vec<(NodeId, Vec<u8>)>,
+    /// Whether a candidate's vote for itself in its term waits to be counted, as it does until the
+    /// hard state naming it is durable ([`Raft::on_vote_durable`]): a vote counted before, by a
+    /// candidate that wins on it and then crashes with it unwritten, is a vote it may cast again in
+    /// the same term, and that term may have two leaders. etcd's core sends a candidate's vote to
+    /// itself, delivered after the write that holds it (`raft.go`, `campaign`: "should account for
+    /// this self vote once the vote has been durably persisted").
+    self_vote: bool,
     pub(crate) msgs: Outgoing,
     uncommitted_bytes: usize,
     /// The last index when this member last became leader: entries at or
@@ -1259,6 +1266,7 @@ impl<S: Storage> Raft<S> {
             read_only: ReadOnly::new(config.limits.pending_reads, config.limits.members),
             read_states: Vec::new(),
             deferred_reads: Vec::new(),
+            self_vote: false,
             msgs: Outgoing::default(),
             uncommitted_bytes: 0,
             leader_tail: 0,
@@ -1947,6 +1955,7 @@ impl<S: Storage> Raft<S> {
             watch.transfer = Arm::Off;
         }
         self.lead_transferee = None;
+        self.self_vote = false;
         // What was kept ahead of a hole was one leader's, in one term; a
         // learner's rounds are one leader's too.
         self.early.clear();
@@ -2716,8 +2725,17 @@ impl<S: Storage> Raft<S> {
             (MessageType::MsgRequestVote, self.term)
         };
         // A member whose log may lack what it acknowledged does not count
-        // its own vote (R-7): it is no witness for its own log.
-        let tally = self.poll(self.id, self.lost.is_none())?;
+        // its own vote (R-7): it is no witness for its own log. A candidate's
+        // vote for itself is counted once the hard state naming it is durable
+        // (`Raft::on_vote_durable`); a pre-candidate's changes nothing durable
+        // and counts at once.
+        let own = self.lost.is_none();
+        let tally = if own && campaign != Campaign::PreElection {
+            self.self_vote = true;
+            self.tracker.tally_votes()
+        } else {
+            self.poll(self.id, own)?
+        };
         if tally == Tally::Won {
             // The one voter there is.
             return Ok(tally);
@@ -2747,6 +2765,19 @@ impl<S: Storage> Raft<S> {
             push(msgs, id, own_term, priority, message)?;
         }
         Ok(tally)
+    }
+    /// The hard state naming `vote` in `term` is durable: a candidate that voted for itself in
+    /// that term counts its vote now, and leads if that wins (`Raft::self_vote`).
+    pub(crate) fn on_vote_durable(&mut self, term: u64, vote: NodeId) -> Result<()> {
+        if self.self_vote
+            && self.state == StateRole::Candidate
+            && term == self.term
+            && vote == self.id
+        {
+            self.self_vote = false;
+            self.poll(self.id, true)?;
+        }
+        Ok(())
     }
     /// Counts `from`'s vote and acts on the count: a candidate that won leads, and one that lost
     /// follows. A pre-candidate that won is left to whoever counted, which stands in the election

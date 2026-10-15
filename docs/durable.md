@@ -234,15 +234,20 @@ Stated over a member's durable state `D` (what a restart would read) at the mome
   one holds.
 - **I8 (start).** The log's start never passes what the state machine holds durably, and the state
   machine never opens past what the group committed without the log being told (§4.3).
+- **I9 (a vote counted).** A candidate counts its vote for itself only once `D` holds it, as a voter's
+  vote leaves only once that voter's `D` holds it (I1): a vote counted before, by a candidate that
+  wins on it and crashes with it unwritten, is one it may cast again in the same term (etcd's core,
+  `raft.go` `campaign`).
 
 I1–I3 and I7 are etcd's and raft-rs's contracts (research §3); I5 is focal's F17 (research §4); I8 is
-mantle's.
+mantle's; I9 is etcd's (raft-rs counts the vote at once, which its synchronous `Ready` makes durable
+before the next step).
 
 Where each is kept, as of R-4:
 
 | | Enforced | Tested |
 |---|---|---|
-| I1 | `RawNode::ready_given` (a leader's messages leave at once only with its term and vote durable; every other member's wait for the write); `RawNode::releases_now` for what a notice makes | `tests/support/lagged.rs`, `check_message` and `Lagged::take`, at every write's durability and every release; `a_leader_sends_nothing_at_once_before_its_term_is_durable` |
+| I1 | `RawNode::ready_given` (a leader's messages leave at once only with its term and vote durable; every other member's wait for the write); `RawNode::releases_now` for what a notice makes | `tests/support/lagged.rs`, `check_message` and `Lagged::take`, at every write's durability and every release; `a_sole_voter_leads_only_once_its_vote_is_durable` |
 | I2 | the same, and the write that takes a message holds everything the member held when it was made | `check_message` (acknowledgements, the fast track's word); `a_followers_answer_waits_for_the_write_that_holds_what_it_says` |
 | I3 | `Raft::on_persist_entries` moves a leader's own progress, reached only from a notice; `Raft::reset` starts it at what is durable | `Cluster::check_durable` (its own entry on its disk; each commit held durably by a majority of each half of its configuration); `readies_are_taken_while_writes_are_out` |
 | I4 | `Log::next_entries_since` and `next_range_since` give only what is committed and durable here, or a leader's own committed entries where it applies before its write is durable (`Log::unpersisted_after`, §4.4) | `Lagged::apply`, every entry given to apply; `a_leader_applies_its_own_committed_entries_before_its_write_is_durable` |
@@ -250,6 +255,7 @@ Where each is kept, as of R-4:
 | Answers (R-6) | `node::state_durable_commit`: an answer to an append or a heartbeat states no commit beyond what is durable when it leaves | `check_commit` at every release; `an_answer_a_notice_releases_states_the_durable_commit` (fails on R-4); `an_answer_states_no_commit_that_no_durable_write_stated` (mantle's case) |
 | I6, I8 | the shell's (§4; D-1) | §15's table |
 | I7 | `RawNode::on_persist` takes notices in issue order; a `Ready` gives only what no earlier one gave | `Lagged::make_durable`: once a write is durable the disk holds the term, vote and log the member held when it took the `Ready` |
+| I9 | `Raft::on_vote_durable`, from `RawNode::on_persist` and `advance_append`: a candidate's vote for itself waits there for the write that holds it | `a_sole_voter_leads_only_once_its_vote_is_durable`; the shell's simulation, Election Safety's oracle (seed 206 of its first shape had two leaders of term 3 before) |
 
 
 Where the shell keeps each, as built (D-1, `crates/hyper-durable`; the oracle and its checks are

@@ -807,7 +807,11 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
     the call that reached the first that was not. It judges by the kernel's receive stamps where the
     socket has them, else by the bytes the socket held at its first call. It reports whether the
     socket emptied (`Queued::Emptied`) or may hold more (`Queued::More`), to take at the owner's next
-    turn without awaiting a readiness that fires only on arrival.
+    turn without awaiting a readiness that fires only on arrival. On Linux a call that fills fewer
+    places than it offers ends it emptied: recvmmsg(2) with `MSG_DONTWAIT` returns what is queued,
+    so another call would only answer `EAGAIN`, one a drain (0.59 a message at 10k msgs/s, strace of
+    a bus node; `IoStats::receives_empty` counts the calls that find nothing). What lands after it
+    is a readiness the arm that follows sees, since epoll's re-arm looks again (2026-10-16).
   - `UdpSocket::queued_bytes` is `FIONREAD` as each platform counts it: every queued datagram's on
     Windows and the BSDs, the next one's on Linux, every one's on the fabric.
   - `Arrival::read_ns` carries the read time beside the stamp (docs/transport.md §4h).

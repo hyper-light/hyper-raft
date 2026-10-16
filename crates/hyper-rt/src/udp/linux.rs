@@ -205,6 +205,11 @@ pub(crate) const fn message_bytes() -> usize {
 }
 
 impl Headers {
+    /// The messages a receive offers the kernel at most, beside the buffers it is lent.
+    pub(crate) fn places(&self) -> usize {
+        self.names.len()
+    }
+
     /// Headers for up to `batch` messages.
     pub(crate) fn new(batch: usize) -> Self {
         Self {

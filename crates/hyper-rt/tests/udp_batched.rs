@@ -728,6 +728,45 @@ fn a_queued_receive_takes_what_was_queued_when_it_began() {
     .unwrap();
 }
 
+/// Do: on Linux, a ring of eight places, three datagrams queued, then one receive of what was
+/// queued. Expect: one call takes the three and says the socket is empty. recvmmsg(2) with
+/// `MSG_DONTWAIT` returns what is queued, so a call that fills fewer places than it offers found
+/// nothing more, and the receive asks no more. Until 2026-10-16 it asked again for the `EAGAIN`
+/// that said so: a system call a drain, 0.59 a message at 10,000 messages a second (strace of a bus
+/// node).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_receive_that_fills_fewer_places_than_it_offers_asks_no_more() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, true).unwrap();
+        let mut ring = Ring::new(Io { batch: 8 }).unwrap();
+        let to = receiver.local_addr().unwrap();
+        // A loopback send queues its datagram before it returns.
+        for index in 0..3u8 {
+            sender.send_to(&[index], to).unwrap();
+        }
+        let before = receiver.stats();
+        let mut taken = Vec::new();
+        let (got, ended) = receiver
+            .receive_queued(&mut ring, now_ns(), 16, |_, bytes| taken.push(bytes[0]))
+            .unwrap();
+        let after = receiver.stats();
+        assert_eq!(taken, vec![0, 1, 2]);
+        assert_eq!(got.datagrams, 3);
+        assert_eq!(ended, Queued::Emptied);
+        assert_eq!(after.receive_calls - before.receive_calls, 1);
+        assert_eq!(
+            after.receives_empty - before.receives_empty,
+            0,
+            "a call that filled three of eight places asked again"
+        );
+    })
+    .unwrap();
+}
+
 /// Do: on the simulation fabric, which stamps nothing, three datagrams queued, then two receives
 /// of what was queued. Expect: the first takes the three, the bytes the socket held when it began
 /// (`UdpSocket::queued_bytes`), and says more may follow; the second finds the socket empty.

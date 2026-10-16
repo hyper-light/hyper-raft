@@ -89,6 +89,9 @@ pub struct IoStats {
     pub received: u64,
     /// System calls that received them.
     pub receive_calls: u64,
+    /// Receive calls that found nothing queued (`EAGAIN`): a drain's last call, unless the call
+    /// before it already said the socket was drained.
+    pub receives_empty: u64,
     /// Datagrams the kernel refused to send (too large for the interface, the network down), dropped as
     /// lost: QUIC recovers them, and the plane retransmits nothing by design.
     pub send_errors: u64,
@@ -117,6 +120,7 @@ impl IoStats {
             send_calls: self.send_calls.saturating_add(other.send_calls),
             received: self.received.saturating_add(other.received),
             receive_calls: self.receive_calls.saturating_add(other.receive_calls),
+            receives_empty: self.receives_empty.saturating_add(other.receives_empty),
             send_errors: self.send_errors.saturating_add(other.send_errors),
             outbox_full: self.outbox_full.saturating_add(other.outbox_full),
             astray: self.astray.saturating_add(other.astray),
@@ -272,8 +276,13 @@ enum SendStep {
 /// One call's worth of a receive.
 enum ReceiveStep {
     /// This many datagrams were handed over, in this many messages (a coalesced one, `UDP_GRO`,
-    /// many datagrams).
-    Delivered { datagrams: usize, messages: usize },
+    /// many datagrams); `drained` when the call filled fewer places than it offered, so nothing
+    /// more waited as it returned (recvmmsg(2) with `MSG_DONTWAIT` returns what is queued).
+    Delivered {
+        datagrams: usize,
+        messages: usize,
+        drained: bool,
+    },
     /// A datagram was consumed with nothing to hand over (truncated, or from a non-internet address).
     Skipped,
     /// Nothing waits (or the call was interrupted): await readability.
@@ -886,12 +895,21 @@ impl Batched {
                 ReceiveStep::Delivered {
                     datagrams,
                     messages,
+                    drained,
                 } => {
                     taken.datagrams = taken.datagrams.saturating_add(datagrams);
                     taken.messages = taken.messages.saturating_add(messages);
+                    // The queue was empty as the call returned: another would only answer that
+                    // (`EAGAIN`), a system call a drain. What lands after it is a readiness the arm
+                    // that follows reports (epoll's re-arm and kqueue's re-add both look again).
+                    if drained {
+                        ended = Queued::Emptied;
+                        break;
+                    }
                 }
                 ReceiveStep::Skipped => {}
                 ReceiveStep::Empty => {
+                    self.stats.receives_empty = self.stats.receives_empty.saturating_add(1);
                     ended = Queued::Emptied;
                     break;
                 }
@@ -963,9 +981,11 @@ impl Batched {
             ..
         } = self;
         linux.received.clear();
-        if let Err(error) = linux::receive(fd, buffers, &mut linux.receive, &mut linux.received) {
-            return receive_failed("recvmmsg", &error);
-        }
+        let offered = buffers.len();
+        let filled = match linux::receive(fd, buffers, &mut linux.receive, &mut linux.received) {
+            Ok(filled) => filled,
+            Err(error) => return receive_failed("recvmmsg", &error),
+        };
         stats.receive_calls = stats.receive_calls.saturating_add(1);
         // The stamps' clock first, then the shard's: a thread preempted between the two reads then makes
         // the age's end later, so a stamp comes out late, never early.
@@ -1006,6 +1026,7 @@ impl Batched {
         Ok(ReceiveStep::Delivered {
             datagrams: delivered,
             messages: linux.received.len(),
+            drained: filled < offered.min(linux.receive.places()),
         })
     }
 
@@ -1043,6 +1064,7 @@ impl Batched {
         Ok(ReceiveStep::Delivered {
             datagrams: 1,
             messages: 1,
+            drained: false,
         })
     }
 
@@ -1075,6 +1097,7 @@ impl Batched {
                 Ok(ReceiveStep::Delivered {
                     datagrams: 1,
                     messages: 1,
+                    drained: false,
                 })
             }
             // The socket counted the report itself; the step only keeps the batch going.

@@ -155,6 +155,18 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
 
 ### Closed (2026-10-16)
 
+- **hyper-quic, hyper-transport: a third of a bus node's datagrams were acknowledgements.** Every
+  connection acknowledged every other ack-eliciting packet (RFC 9000 §13.2.2's default), so at
+  100,000 one-packet messages a second a node handled 3.4 datagrams a message, 1.0 of them
+  acknowledgements (the bare-metal bench, `docs/transport.md` §4k). Every connection now asks its
+  peer, through the acknowledgement frequency extension, for Google QUIC's decimation (quiche's
+  `kMaxRetransmittablePacketsBeforeAck` 10, `kPeerAckDecimationDelay` a quarter of the round trip,
+  from `kMinReceivedBeforeAckDecimation`'s 100th packet), the smoothed round trip per the draft
+  (§8.1) and the reordering threshold the loss detector's (§9): hyper-quic patch Q22,
+  `TransportConfig::decimate_acks`. Measured: 2.7 datagrams a message, the node's CPU a message 6 %
+  less. A path's probe timeout now covers the delay asked, 1 ms on a short path, not the default's
+  25 ms. Test: `tests::decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on`.
+
 - **hyper-rt: a parked shard's timed wait ended at the next millisecond.** The epoll driver handed
   rustix a timespec, which rustix (without its `linux_5_11` feature) rounds up to whole milliseconds
   for `epoll_pwait`: a timer the wheel had due in 200 µs fired after a millisecond or more on every

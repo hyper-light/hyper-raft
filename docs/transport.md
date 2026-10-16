@@ -1044,6 +1044,32 @@ skips the batch's own pass where the transport made it (`Batch::parse_verified`)
 `frame::tests::a_frame_s_own_checksum_and_its_prefix_cover_every_byte_once`,
 `a_frame_of_its_own_checksum_is_checked_by_it`.
 
+## 4k. Acknowledgements decimated (2026-10-16)
+
+Every connection asks its peer to acknowledge as Google QUIC's receivers do
+(`TransportConfig::decimate_acks`, hyper-quic patch Q22): an ACK for every 10 ack-eliciting packets
+or a quarter of the smoothed round trip after the first one waiting, at least the peer's 1 ms
+granularity, from the 100th packet on; a reordering elicits one at once only where it would let the
+sender declare a loss. Every peer is hyper-quic, which takes the extension, so the request always
+holds.
+
+RFC 9000 §13.2.2's default, an ACK for every other ack-eliciting packet, was a third of what a bus
+node handled. On the bare-metal bench (Ryzen 9 9950X3D2, the node alone on one core, the claim
+corpus's 1,150-byte messages, each a batch of its own at 100,000 a second), a node took 1.21
+datagrams of a message's publish and 0.50 of acknowledgements from its subscriber, and sent 1.15 of
+its delivery and 0.50 of acknowledgements to its publisher: 3.4 datagrams a message, each a system
+call's share, a wake and, for each it sent, the receiver's path through the kernel. Decimated, the
+acknowledgements fell to 0.14 and 0.15 (2.7 datagrams a message) and the node's CPU a message by 6 %
+(6.10 µs against 6.50, three interleaved pairs): an acknowledgement is a small packet, and what a
+message costs is mostly its own wake and its two datagrams.
+
+What changes for loss recovery: the probe timeout covers the delay the peer was asked
+(RFC 9002 §6.2.1), so on a path of a few milliseconds or less it is the round trip and 2 ms, where
+the default's 25 ms delay held it past 25 ms; a tail loss is probed sooner. The extension's own
+bounds hold: the delay asked stays under the smoothed round trip wherever the peer's granularity
+allows (draft-ietf-quic-ack-frequency-14 §8.1), and the pacer, not the acknowledgements, spaces a
+sender's bursts (§8.2).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

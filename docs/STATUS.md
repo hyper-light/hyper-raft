@@ -128,9 +128,12 @@ is worked around.
   same device slow from the start, and a peer killed once they had was suspected 4–19 s after its
   kill. The worst time without evidence the design measured is 13–35 s (`docs/timing.md` §2.8,
   "Judged before its own evidence"), and none of its worlds moves a sender's floor for good. Open:
-  what keeps a link's evidence across its sender's moves (one candidate: the interval followed up by
-  doublings, as it is followed down, which bounds a link's restarts by the logarithm of its floor's
-  range), or bounds a node's time without evidence.
+  what keeps a link's evidence across its sender's moves, or bounds a node's time without evidence.
+  One candidate, the interval followed up by doublings as it is followed down (a link's restarts
+  bounded by the logarithm of its floor's range), measured in the simulation as a prototype (not
+  committed): the links configured 169–382 s after the slowdown against 257–618 s, but a peer dead
+  in its links' first heartbeats was noticed later, at the most 1.36 s on macOS against 0.75 s and
+  5.8 s on Windows' timer against 2.5 s, the interval standing up to twice its floor.
 
 ### Closed (2026-10-16)
 

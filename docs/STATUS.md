@@ -11,7 +11,7 @@ The law's four columns:
 
 | Crate | Source | Wall | Allocs | Bench | E2E | On `main` |
 |---|---|---|---|---|---|---|
-| hyper-raft | focal-raft `a8e95f7`, with history; the owner's decision (2026-10-01): core changes start here | yes | yes: 32 → 11 → 5 allocations per entry at batch 1, 0 reallocations, the owner giving each queue back as hyper-durable's replica does (`docs/benchmarks.md`, "The bytes an entry asks, traced") | yes: against focal `a8e95f7` and `1395e22`, slates `5cce86a` and raft-rs; behind slates on catch-up and snapshot, traced to raft-proto's message size; R-2 (its own types and wire format, `docs/raft.md` §3.1) is in, and the message is 160 bytes, not 280: 344 bytes asked per entry against slates' 3,368, every byte traced (was 7,064, then 3,800 and 4,184 with each ready's queue dropped; `docs/benchmarks.md`, "The message's layout") | yes: 3- and 5-member processes over UDP with fsynced logs; kill -9 of the leader, of a follower, and of all; partition. Since L-4 the members elect by suspicion on their own node-pair liveness streams, the partition is seen by every detector, a group whose devices all stall goes on once they do (`stalled-devices`), a member silent past what the members' own measures excuse fails the wait, naming it (`member-stopped`), every report is held to the member's bookkeeping, and the test waits while the group moves, counting as quiet only time in which it saw the group (`docs/benchmarks.md`, "End to end"; the stall this closed, a shared disk holding every member's flush 1.8 s, in `docs/timing.md` §2.9). R-4 (readies ahead of their persistence) is in: allocation counts identical on every workload of the comparison, time per op within the noise of the synchronous path; the E2E members keep the synchronous path, each `Ready` written and flushed before the next is taken. R-6 (the durable commit in answers, the apply pause, a leader applying before its write is durable) is in: allocation counts identical on every workload, the raft-rs differential unchanged (`docs/benchmarks.md`, "The durable commit and the apply pause (R-6)"). Timing step L-2 (elections by suspicion: no ticks, idle groups woken for nothing, check-quorum from the detectors) is in beside the tick path, which is unchanged (`docs/timing.md` §2.9): allocations identical on all 22 cells, time and cycles within `main`'s intervals, an idle group 542.5 ns and two messages a tick on ticks against none by suspicion (`docs/benchmarks.md`, "Elections by suspicion (L-2)"). R-5 (a member whose log lost what it acknowledged repaired by its leader resending the lost entries; the mark is the core's) is in: one lost entry of 30,000 repaired in 32 µs and 1.8 KB against a snapshot's 8.9 ms and 30.7 MB in process (`docs/benchmarks.md`, "Repair by entries (R-5)"); the schedules with faults at rest lose nothing acknowledged. R-7 (a marked member elected on its log, without its own vote, by a quorum of the others that answer for no more than it holds) is in, with the TLA+ model's marked member: allocations identical on all 32 cells (`docs/benchmarks.md`, "A marked member's election (R-7)"). Found by mantle's D-1 (branch `mantle-d1`, `ORIGIN.md`): a campaign supersedes its own vote requests still waiting (234 requests after a hundred timeouts with three writes out, before), and a member keeps a spare message queue for each ready in flight (a follower's queue grown from four slots 176 times in 12,000 entries, before). R-3 (slates' enhancements, `docs/raft.md` §3.2) is done: R6, R7, R4, R5, R20 and R21 pass as slates' tests state them, with three defects at the end of what is counted and a lease its member's own timer kept fixed; the window a member is sent ahead of its answers is one rule from focal's and slates' (R16), slates' pipelining measurement reproduced on this core: at 2,000 proposals a second across five regions the rule commits every one at 125 / 127 ms where one batch out at a time falls behind (`docs/benchmarks.md`, "The window a member is sent ahead of its answers (R16)"); a member keeps what arrives ahead of a hole and its leader sends only the holes again (R17): on paths that reorder the group commits every proposal at 123 / 126 ms up to 4,000 a second, where it fell behind at 4,000 (`docs/benchmarks.md`, "What arrives ahead of a hole (R17)"); a learner is caught up in rounds before it is promoted (R13): slates' replay of the thesis's Figure 4.4(a), 45 rounds without a commit with the newcomer added directly against one round trip staged; a log is due for compaction by the thesis's rule, the shell's policy (R22): slates' finding replayed, three images to a voter a round behind at three compactions made the moment the majority held each round, none by the rule (`docs/benchmarks.md`, "When a log is compacted (R22)"); the simulation at 1,000 seeds a shape found a write made again that started the log past the state machine, in `main`'s shell, now fixed; and every bound is derived from what the member's owner states, its transport's largest message, its group's members and the bytes a queue may hold, where focal's literals and `MAX_MEMBERS` stood (`Limits::derive`). A read asked of a new leader waits for its term's first commit, as the thesis's §6.4 has it, where the core, as raft-rs, dropped it and its owner waited out a deadline; a read with no leader to ask is refused (focal's finding; `docs/raft.md` §3.3) | yes |
+| hyper-raft | focal-raft `a8e95f7`, with history; the owner's decision (2026-10-01): core changes start here | yes | yes: 32 → 11 → 5 allocations per entry at batch 1, 0 reallocations, the owner giving each queue back as hyper-durable's replica does (`docs/benchmarks.md`, "The bytes an entry asks, traced") | yes: against focal `a8e95f7` and `1395e22`, slates `5cce86a` and raft-rs; behind slates on catch-up and snapshot, traced to raft-proto's message size; R-2 (its own types and wire format, `docs/raft.md` §3.1) is in, and the message is 160 bytes, not 280: 344 bytes asked per entry against slates' 3,368, every byte traced (was 7,064, then 3,800 and 4,184 with each ready's queue dropped; `docs/benchmarks.md`, "The message's layout") | yes: 3- and 5-member processes over UDP with fsynced logs; kill -9 of the leader, of a follower, and of all; partition. Since L-4 the members elect by suspicion on their own node-pair liveness streams, the partition is seen by every detector, a group whose devices all stall goes on once they do (`stalled-devices`), a member silent past what the members' own measures excuse fails a wait on every member's own facts, naming it, while a write the others can commit is waited for as they move (`member-stopped`), every report is held to the member's bookkeeping, and the test waits while the group moves, counting as quiet only time in which it saw the group (`docs/benchmarks.md`, "End to end"; the stall this closed, a shared disk holding every member's flush 1.8 s, in `docs/timing.md` §2.9). R-4 (readies ahead of their persistence) is in: allocation counts identical on every workload of the comparison, time per op within the noise of the synchronous path; the E2E members keep the synchronous path, each `Ready` written and flushed before the next is taken. R-6 (the durable commit in answers, the apply pause, a leader applying before its write is durable) is in: allocation counts identical on every workload, the raft-rs differential unchanged (`docs/benchmarks.md`, "The durable commit and the apply pause (R-6)"). Timing step L-2 (elections by suspicion: no ticks, idle groups woken for nothing, check-quorum from the detectors) is in beside the tick path, which is unchanged (`docs/timing.md` §2.9): allocations identical on all 22 cells, time and cycles within `main`'s intervals, an idle group 542.5 ns and two messages a tick on ticks against none by suspicion (`docs/benchmarks.md`, "Elections by suspicion (L-2)"). R-5 (a member whose log lost what it acknowledged repaired by its leader resending the lost entries; the mark is the core's) is in: one lost entry of 30,000 repaired in 32 µs and 1.8 KB against a snapshot's 8.9 ms and 30.7 MB in process (`docs/benchmarks.md`, "Repair by entries (R-5)"); the schedules with faults at rest lose nothing acknowledged. R-7 (a marked member elected on its log, without its own vote, by a quorum of the others that answer for no more than it holds) is in, with the TLA+ model's marked member: allocations identical on all 32 cells (`docs/benchmarks.md`, "A marked member's election (R-7)"). Found by mantle's D-1 (branch `mantle-d1`, `ORIGIN.md`): a campaign supersedes its own vote requests still waiting (234 requests after a hundred timeouts with three writes out, before), and a member keeps a spare message queue for each ready in flight (a follower's queue grown from four slots 176 times in 12,000 entries, before). R-3 (slates' enhancements, `docs/raft.md` §3.2) is done: R6, R7, R4, R5, R20 and R21 pass as slates' tests state them, with three defects at the end of what is counted and a lease its member's own timer kept fixed; the window a member is sent ahead of its answers is one rule from focal's and slates' (R16), slates' pipelining measurement reproduced on this core: at 2,000 proposals a second across five regions the rule commits every one at 125 / 127 ms where one batch out at a time falls behind (`docs/benchmarks.md`, "The window a member is sent ahead of its answers (R16)"); a member keeps what arrives ahead of a hole and its leader sends only the holes again (R17): on paths that reorder the group commits every proposal at 123 / 126 ms up to 4,000 a second, where it fell behind at 4,000 (`docs/benchmarks.md`, "What arrives ahead of a hole (R17)"); a learner is caught up in rounds before it is promoted (R13): slates' replay of the thesis's Figure 4.4(a), 45 rounds without a commit with the newcomer added directly against one round trip staged; a log is due for compaction by the thesis's rule, the shell's policy (R22): slates' finding replayed, three images to a voter a round behind at three compactions made the moment the majority held each round, none by the rule (`docs/benchmarks.md`, "When a log is compacted (R22)"); the simulation at 1,000 seeds a shape found a write made again that started the log past the state machine, in `main`'s shell, now fixed; and every bound is derived from what the member's owner states, its transport's largest message, its group's members and the bytes a queue may hold, where focal's literals and `MAX_MEMBERS` stood (`Limits::derive`). A read asked of a new leader waits for its term's first commit, as the thesis's §6.4 has it, where the core, as raft-rs, dropped it and its owner waited out a deadline; a read with no leader to ask is refused (focal's finding; `docs/raft.md` §3.3) | yes |
 | hyper-timing | focal-timing `a8e95f7` with history, and slates' election law `5cce86a`; the detector's configurator and estimator, and the election law from them (L-1, new); a log-linear histogram of nanoseconds for owners' metrics (`docs/timing.md` §2.10, new) | yes | 0 allocations in every operation of a period and of the election law (was 1 a priority); a path read is a load (was three sorts); the detector's estimator 0 allocations, reallocations and faults a heartbeat and a configuration, 80–126 ns a heartbeat (`docs/benchmarks.md`, "The detector's estimator") | yes: against its own law before L-1, focal-timing and slates' timing, operation by operation; the per-period timing 3.8 ns against 8.4 and 8.7, even or ahead in each but a sample (28 ns against 2.3 and 3.4, the median window), a tail read (1.1 against 0.7, unexplained, under two cycles) and the span's search (306 ns, run once a detector configuration) | through hyper-swim and hyper-raft | yes |
 | hyper-datagram | new, after slates' seal and node.md §3.4 | yes | 0 allocations, reallocations and faults a datagram, reordered ones too (`docs/benchmarks.md`) | yes: against slates' seal `5cce86a`, a tenth to a half of its cost a message with the same hardware crypto, 24 to 150 times less as slates builds on aarch64 | yes: two processes, UDP; replay and forgery from a third socket | yes |
 | hyper-swim | slates' detector `5cce86a`; its timing measured, each pair an NFD-E detector (`docs/timing.md` §2.7); its view bounded by the owner's placement, a refusal typed past it, and a dead member forgotten once SWIM's dissemination window has passed; its Vivaldi engine Dabek's Fig. 3 in two dimensions and a height, every constant cited or derived (`docs/research/swim.md`); a probe states its prober's own state and an answer the answerer's suspicion or death of the prober; anti-entropy once a dissemination window, digests first and views pushed where they differ (Demers et al. §1.3, §1.5); no detection bound while a probe would go unjudged; unanswered measurement periods back off (RFC 6298 §5.5); a probe states its deadline, and a poll what it found, with the evidence | yes | 0 allocations, reallocations and faults a member a period, quiet or churning, 4 to 256 members, estimators, verdicts and the anti-entropy exchanges included (slates' was 6 to 14.5 and 8 to 13) | yes: against slates' detector `5cce86a`, a lower median a period at every point, 17 to 28 % less with the split closed (load 20.6–27.1); the directed gossip and the exchanges cost 5.4 to 20.7 % over `main` quiet and 9.3 to 40.9 % where a member refutes a suspicion every period, the exchanges themselves nothing measurable quiet (`docs/benchmarks.md`, "The split closed: the period"); the bounded view and the corrected engine had left the period within `main`'s spread or under it, and the findings leave it within the spread of the head before them | yes: five processes over hyper-datagram, SIGKILL detection under the configured detectors, one kill while the pools judge and one once every surviving pair is judged by its own estimator, every survivor within its stated bound, and every suspicion and condemnation traced, from the members' own records, to the detector's rule: its probe, the deadline stated as it was sent, and the answer that missed it or was lost (Theorem 7's allowance a report beside the counts, no test deciding by a statistical level); every wait ends on the members' stated detection bound, failing with their last lines; 2,000 runs of the one-kill form on macOS and on Linux at one, two and four CPUs with competing load, and 40 of the two-phase form on macOS at load 45–58, all passing; then 300 of the two-phase form with bounded waits at load 22–41, 298 passing: in the two, a live member's refutation missed one survivor, which forgot it. With the split closed (a probe states its prober, an answer what it holds against the prober, anti-entropy behind the rumors), the soak: 2,000 runs on macOS at load 27.6–95.2 and 500, 655 and 638 on Linux at one, two and four CPUs with busy loops, every one passing, no split and no overshoot, every survivor within 0.55 of its stated bound. With every finding traced: 2,000 runs on macOS and 454, 475 and 468 on Linux at one, two and four CPUs under ambient load, every one passing, 33,490 findings traced and every answer a live member's probe missed late, none lost (`docs/timing.md` §2.7; `docs/benchmarks.md`, "The cluster test") | yes |
@@ -95,55 +95,89 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 
 ## Open defects
 
-Found under load, each once or a few times. They are traced as far as the evidence goes; none is
-worked around. Every member's report in both E2E harnesses carries its core's own suspicions and
-what decides its next campaign (`hyper_raft::CampaignState`: when it is due, whether it led its
-term, held, a trusted quorum, may campaign and lead), beside the stream's suspicions; since
-2026-10-15 it states the stream's side too (heartbeats sent, refused by kind, `G`, the interval its
-own heartbeats go at, its next heartbeat and wake), and hyper-durable-e2e's its reads and refused
-drives, so a sighting names which of them held the group back. The waits' law covers the interval
-each member's own heartbeats go at (2026-10-15, below), which both entries here may have lacked:
-each saw no heartbeat taken through a quiet period shorter than the members' flushes.
+Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
+is worked around.
 
-- **hyper-raft-e2e `stalled-devices`.** Seen once on macOS under the load of other builds
-  (2026-10-03, the tree of 9893679). After the 7 s stall the old leader had stepped down in its
-  term (leader 0), its followers still trusted it, the stream trusted every member, and no member
-  campaigned through the quiet period (2.6 s). What the evidence adds (`gates-exact-coverage`'s
-  last look and the look after): no member took a heartbeat in that time, every count (324, 212,
-  217) the same in both looks, while every member answered the test. The core elects in every
-  order of suspicion and trust a simulation tried (1,200 orders, and 200 seeds × 16 orders with an
-  entry in flight), so the cause is outside its rules. The fixes that landed hours after it change
-  exactly that path: the stream's `G` is no longer inflated by an owner's own stall (f498c63, which
-  measured stalled-devices taking `G` to seconds) and a wait ended by an arrival counts (9588f45:
-  with no `G` the stream refuses every heartbeat as unmeasured, so nothing is taken or judged).
-  Not seen again on 2026-10-05: 120 runs on `line` (40 at the machine's load 5 to 27, 40 under 24
-  CPU burners at load 48 to 53, 40 beside a parallel workspace build at load 6 to 23), 40 runs of
-  9893679's own tree with its diagnostics, and 30 in Docker's Linux at 2 CPUs; CI since 2ef0ab3:
-  no failure of it on any target. A stall of every device raises each member's flush floor, and
-  with it the interval its heartbeats go at, which the waits' quiet period did not cover before
-  2026-10-15. And until 2026-10-15 (the founder's read, below) a member handed its core a
-  suspicion its stream judged after a drive and then waited until its next wake before driving it:
-  a suspicion arms a campaign only at the core's next wake, so the campaign waited a stream interval,
-  which a stall of every device stretches to seconds. Open until a sighting's report states the
-  core's and the stream's side, which it now does; in Docker's Linux beside 8 busy loops, 8 runs of
-  it and hyper-raft-e2e's `member-stopped` passed on the defects branch and 20 on `80c1f82`
-  (2026-10-15).
-- **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895).**
-  Member 1 was stopped at term 2. Members 2 and 3 went through three elections to term 5 (3 leading,
-  commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms: each write held its
-  member's flush-proven heartbeats past its peer's detection, so the pair suspected each other in
-  turn. The test's put waits while the stopped member's silence stays within the longest write and
-  the quiet period (2.88 s), and the elections outlasted it (3.08 s). Member 3's report is in the
-  failure's output (term 5, leading). Not seen again: 30 runs in Docker's Linux at 2 CPUs and load
-  6.3 to 7.0, 10 runs with both members' flushes held 741 and 597 ms after the stop (each commits
-  in 1.4 s, no election), and 47 ubuntu-24.04 gates since 2ef0ab3. Open: whether a device whose
-  every write is that slow makes a pair re-elect past the law (each new leader's first write
-  suspected in turn); the reports now state each member's core suspicions and campaign, and the law
-  covers the interval its heartbeats go at, which writes of 597 and 741 ms set. A vote request or a
-  suspicion a member took after a drive waited until its next wake before 2026-10-15 (the founder's
-  read, below), a stream interval that writes of 597 and 741 ms set, which slowed every election
-  here by up to that. 100 runs of it, `founder`, `founder-fenced` and `taken-while-driving` passed on
-  `80c1f82` in Docker's Linux beside 8 busy loops (load 10 to 15, 2026-10-15).
+- **hyper-liveness: a link whose sender's floor keeps moving never measures its evidence, and a
+  node with only such links suspects no one (found 2026-10-16).** A scratch fault in
+  hyper-durable-e2e's `member-stopped` (not committed) holds every flush of the two members up 741
+  and 597 ms more from the stop on: their writes take 0.5–2.5 s and lengthen as their logs' writes
+  queue behind one another. Stopped while their links were young, the two members never configured
+  them: 390 s on, 216 heartbeats taken, both pairs of each were unjudged and neither suspected the
+  stopped member; with the leader stopped instead, the two members up suspected no one and elected
+  no one in 291 s. A scratch trace of the estimators (not committed) shows why: every pair was
+  refused `CorrelationUnmeasured`, its window one heartbeat at 88 received: an unconfigured link's
+  interval is its sender's floor, followed up at once and down once the flushes it is the mean of
+  have doubled, and it moved 35 ms → 765 ms → 955 ms → 1.17 s → 1.02 s, each move retiming the
+  receiver's estimator, whose window and Allan levels start again (`LinkEstimator::retime`); the
+  node's pool, fed every link's latenesses across the moves, refused the same, its Allan levels one
+  and two. A young link is judged by its node's evidence, the widest configured link or the pool's
+  measure (`docs/timing.md` §2.8, "Judged before its own evidence"), and a node whose links are all
+  young and whose senders' floors keep moving has neither. The simulation's worlds bound a
+  survivor's time without evidence at 13–35 s, and none of them moves a sender's floor for good.
+  `E[flush]` is the mean of every flush since the log opened (`hyper_timing::Flushes`), so after the
+  device slows it climbs toward the new flushes by a little at each one, reaching halfway only once
+  as many slow flushes have come as fast ones came before, and the floor, followed up at once,
+  moves the interval at every step. Open: what keeps a link's evidence across its sender's
+  moves (one candidate: the interval followed up by doublings, as it is followed down, which bounds
+  a link's restarts by the logarithm of its floor's range), or bounds a node's time without
+  evidence.
+
+### Closed (2026-10-16)
+
+- **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895): the
+  harness's rules, not the group.** Member 1 stopped at term 2; members 2 and 3 went through three
+  elections to term 5 (3 leading, commit 7) with writes of 597 and 741 ms against detections of 54
+  and 107 ms, and the test's write was given up when member 1's silence reached 3.08 s against 2.88
+  s excused. Two rules of the harness decided it. A member silent past its excuse ended every wait
+  at once, whatever else moved, though the write needed only the two members up, which were moving.
+  And every ask waited one second, the operation then asked again with a new ask, so a commit slower
+  than a second, as one through writes of that length is, was never answered: each answer came after
+  its ask had been given up. A scratch fault (not committed) holding every flush of the two members
+  up 741 and 597 ms more from the stop reproduced it: on `main` 3 of 3 failed with CI's message on
+  macOS, no election, the write in both logs and not committed when the wait gave up; with only the
+  first rule changed the write was never answered, the leader committing it 29 times more in 85 s.
+  Now a member silent past its excuse ends at once only a wait on every member's own facts
+  (`Waits::OnEvery`: what each applied, a line one prints); a wait for what the group answers
+  through whichever members lead (`Waits::OnGroup`: a write, a read, a leader) waits on it no
+  longer, goes on while the members heard move, and fails naming it once they are quiet; an
+  operation asked again waits twice as long as its ask before, to sixty seconds (RFC 6298 §5.5,
+  §2.5); and a member's silence runs between the sendings of its asks (`3363c72`; `docs/timing.md`
+  §2.9, "A member stopped while the others' writes are slow";
+  `a_silent_member_ends_a_wait_for_the_group_only_once_the_members_heard_are_quiet` fails on the old
+  rule). Under the same fault the scenario passed 4 of 4: the write answered in 11 and 16 s with the
+  links young at the stop, and in 26 and 91 s with every pair judged before it. That answers the
+  question this entry left open: with every pair judged, a device whose every write is that slow
+  makes the pair re-elect, from term 4 to 6 and to 11 in the two runs, each new leader's writes
+  suspected in turn until their detectors had the device's evidence (detection from 0.4–0.7 s to
+  7–17 s); every election moved the group, within the members' law. With the links young, the fault
+  found the open defect above. Both scenarios soaked on 2026-10-16 (`docs/benchmarks.md`, "The two
+  E2E sightings soaked, and a member stopped while the others' writes are slow"): on `f116ac2`, 100
+  runs of each in Docker's Linux at each of one, two and four CPUs with twice as many busy loops
+  (load 5.8–32.4); on `3363c72`, 50 of each at each count there (load 6.3–22.8) after
+  hyper-raft-e2e's, hyper-durable-e2e's and hyper-multilog-e2e's binaries whole in each container,
+  50 of each on macOS (load 9.7–52.2), and on CI's six targets for 90 minutes, 58 to 388 of each a
+  target, 1,451 in all (diagnostic run 38850875933); every run passed.
+- **hyper-raft-e2e `stalled-devices`, macOS (2026-10-03, the tree of 9893679): the stream's `G`.**
+  After the 7 s stall the old leader had stepped down in its term, its followers still trusted it,
+  and no member campaigned through the quiet period (2.6 s): no member took a heartbeat in that
+  time, every count the same in two looks, while every member answered the test. The core elects in
+  every order of suspicion and trust a simulation tried (1,200 orders, and 200 seeds × 16 orders
+  with an entry in flight), so the cause was outside its rules, and the fixes that landed hours
+  after it change exactly that path: with no `G` the stream refuses every heartbeat as unmeasured,
+  so nothing is taken or judged, and a wait an arrival ended now counts toward it (9588f45); and an
+  owner's own stall no longer inflates `G` (f498c63, which measured this scenario taking it to
+  seconds). Since then a suspicion a member took after a drive is driven before it waits
+  (`6d76f3c`), and the waits' law covers the interval each member's own heartbeats go at
+  (`8978db4`), which a stall of every device raises. Not seen since: 120 runs on `line` and 40 of
+  9893679's own tree on macOS (2026-10-05), 30 in Docker's Linux at 2 CPUs, 28 there on 2026-10-15;
+  and both scenarios soaked on 2026-10-16 (`docs/benchmarks.md`, "The two E2E sightings soaked, and
+  a member stopped while the others' writes are slow"): on `f116ac2`, 100 runs of each in Docker's
+  Linux at each of one, two and four CPUs with twice as many busy loops (load 5.8–32.4); on
+  `3363c72`, 50 of each at each count there (load 6.3–22.8) after hyper-raft-e2e's,
+  hyper-durable-e2e's and hyper-multilog-e2e's binaries whole in each container, 50 of each on macOS
+  (load 9.7–52.2), and on CI's six targets for 90 minutes, 58 to 388 of each a target, 1,451 in all
+  (diagnostic run 38850875933); every run passed.
 
 ### Closed (2026-10-15)
 
@@ -379,7 +413,7 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
 
 | Consumer | Takes | State |
 |---|---|---|
-| mantle | on its `main` (`f3deb05`) hyper-raft, hyper-durable, hyper-liveness, hyper-log, hyper-timing, hyper-measure, hyper-seal and hyper-sim vendored at `5633487`, hyper-rt and hyper-block at `ccdbbd8` (`vendor/*/SNAPSHOT`); its `dev` at `f358210` with local changes (mantle `vendor/UPSTREAM.md`); mantle re-vendors from `main` as its own landing | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
+| mantle | on its `main` (`9ccd216`, a fast-forward from `f3deb05`) all ten crates it takes vendored at `80c1f82` (`vendor/*/SNAPSHOT`), no local delta, every vendored file outside the self-contained manifests equal to `80c1f82`'s (338 files); its gates pass and its CI is green on its nine jobs, the six targets, linux-aarch64-1cpu and linux-x86_64-2cpu-busy (run 38844914795); its range suites pass, a sole voter leading after its vote's write through hyper-durable's replica with no mantle change | its range replica is hyper-durable's `Replica` with its engine and layer as the state machine (D-1), electing on ticks; elections by suspicion wait for a node owner that carries the liveness stream (mantle `docs/design/node.md` §2.4) |
 | focal | every crate it takes vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`eb6ce081` on its main's `95294367`; focal's gate exit 0, 167 test binaries, 3469 passed, 31 ignored), three of its tests draining until a sole voter leads (I9), which its session lands under its own rules; its `main` vendors twelve at `5007f44` and hyper-transport at `81af6b3`, both on `main` since `3d86b42` | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
 | slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`5f2a76d4` on its main's head `b85b37ea`; fmt, its structural and literal checks, clippy on slates-cluster, its library's 213 tests and the member plane's 10 pass), one commit touching only `vendor/hyper-raft`, which its session lands on the owner's word; its main vendors them at `aa82ada`, their sources the same but for hyper-timing's `independent_interval`, which `43aec4a` removed and slates calls nowhere | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
 
@@ -390,13 +424,11 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
 
 1. **Red CI.** The open defects above, each traced to its cause and fixed at it, and every target
    green on `main` (green since `3d86b42`, 2026-10-15).
-2. **One revision for every consumer.** focal's and slates' branches take `80c1f82` (the Consumers
-   table above); mantle re-vendors at it as its own landing, from `5633487` and `ccdbbd8`: its
-   hyper-raft (I9 and a sole voter's one campaign a term: a sole voter leads after the write that
-   holds its vote; `Raft::reads_held` public), hyper-durable (a refused write's messages made again
-   only over the log they acknowledge), hyper-liveness (`PairReport::sending`, `sending_due_ns`) and
-   hyper-rt (the wake probe keeps a wake slower than its round's share) changed; hyper-log,
-   hyper-timing, hyper-measure, hyper-seal, hyper-sim and hyper-block did not.
+2. **One revision for every consumer.** mantle is on `80c1f82` on its `main` (`9ccd216`); focal's
+   and slates' branches take `80c1f82`, which their sessions land (the Consumers table above). What
+   `main` took since `80c1f82` changes the end-to-end harnesses and the documents (hyper-raft-e2e,
+   hyper-durable-e2e, hyper-multilog-e2e, `docs/`): no crate a consumer vendors, so no consumer
+   re-vendors for it.
 3. **The shared crates' open work**, each in its own document:
    - hyper-durable: §14's measurements. Items 1 to 8 measured on this machine (2026-10-12 and 13,
      `docs/benchmarks.md` from "A group's writes out, depth one to three on hyper-log"): depth earns

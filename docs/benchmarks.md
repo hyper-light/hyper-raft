@@ -8881,3 +8881,64 @@ CPU. The difference is spread over the patches' per-packet work (a profile of th
 ```sh
 cargo bench -p hyper-quic --bench vs_upstream -- 10
 ```
+
+## The two E2E sightings soaked, and a member stopped while the others' writes are slow (2026-10-16)
+
+`docs/STATUS.md`'s two open end-to-end sightings, hyper-raft-e2e's `stalled-devices` (macOS,
+2026-10-03) and hyper-durable-e2e's `kill` `member-stopped` (CI's ubuntu-24.04, run 37152765895),
+soaked on `main` (`f116ac2`) and on the harness that closes the second (`3363c72`): the two
+scenarios in turn, one round each, on the binaries the gates build (`cargo test --workspace
+--all-features --locked --no-run --test cluster --test kill`, debug). Linux: Docker Desktop's
+virtual machine (Linux 6.12.76, aarch64, `rust:1.98.1-bookworm`), three containers at once at
+`--cpus` 1, 2 and 4, each with twice as many busy loops (`while :; do :; done`) and its own volume
+over the target's tmp directory; on `3363c72` each container first ran the three binaries whole
+(`cluster`, `kill` and hyper-multilog-e2e's `cluster`, every scenario). macOS: the M5 Max beside the
+other sessions' work, no busy loops of its own. CI: a diagnostic branch (never landed; run
+38850875933) ran the two scenarios in turn on each of the six targets for 90 minutes or until a
+failure, each run through `cargo test`, whose own start its times include. Load is the one-minute
+average as each run began and ended (Linux: the virtual machine's).
+
+| host | code | `stalled-devices` | `member-stopped` | load |
+|---|---|---|---|---|
+| Linux, 1 CPU, 2 busy loops | `f116ac2` | 100 of 100, 16.9–63.3 s | 100 of 100, 5.4–8.8 s | 8.4–28.9 |
+| Linux, 2 CPUs, 4 busy loops | `f116ac2` | 100 of 100, 18.9–90.7 s | 100 of 100, 5.3–9.0 s | 6.1–32.4 |
+| Linux, 4 CPUs, 8 busy loops | `f116ac2` | 100 of 100, 18.4–94.5 s | 100 of 100, 4.3–10.1 s | 5.8–31.9 |
+| Linux, 1 CPU, 2 busy loops | `3363c72` | 50 of 50, 16.9–104.8 s | 50 of 50, 5.4–9.3 s | 6.3–22.8 |
+| Linux, 2 CPUs, 4 busy loops | `3363c72` | 50 of 50, 17.9–103.7 s | 50 of 50, 5.3–9.5 s | 6.6–22.7 |
+| Linux, 4 CPUs, 8 busy loops | `3363c72` | 50 of 50, 16.7–119.0 s | 50 of 50, 4.5–8.9 s | 6.6–20.9 |
+| macOS 26.4.1, M5 Max | `3363c72` | 50 of 50, 12.6–22.6 s | 50 of 50, 5.5–7.2 s | 9.7–52.2 |
+| CI `ubuntu-24.04` | `3363c72` | 346 of 346, 9–25 s | 346 of 346, 4–11 s | — |
+| CI `ubuntu-24.04-arm` | `3363c72` | 302 of 302, 11–26 s | 302 of 302, 4–13 s | — |
+| CI `macos-15` | `3363c72` | 388 of 388, 7–65 s | 388 of 388, 5–15 s | — |
+| CI `macos-15-intel` | `3363c72` | 275 of 275, 11–140 s | 275 of 275, 5–38 s | — |
+| CI `windows-2025` | `3363c72` | 82 of 82, 46–95 s | 82 of 82, 5–25 s | — |
+| CI `windows-11-arm` | `3363c72` | 58 of 58, 82–122 s | 58 of 58, 6–20 s | — |
+
+No run failed. On `3363c72` the three binaries passed whole in each container and on macOS:
+hyper-raft-e2e's `cluster` in 167–229 s (52 s on macOS), hyper-durable-e2e's `kill` in 76–114 s
+(56 s) and hyper-multilog-e2e's `cluster` in 248–336 s (333 s). In `member-stopped` on `3363c72`
+the wait for the stopped member to apply the write failed naming it after 3.2–6.5 s of its silence
+against 1.04–3.07 s excused, in every run.
+
+**The reproduction.** CI's `member-stopped` ran its two members up through writes of 597 and
+741 ms. A scratch fault (not committed) makes every flush of the two members up that much slower
+from the stop on, each flush held 741 and 597 ms more by the member's device thread
+(`file::hold_flushes` under an environment variable, ordered right after the stop), so every
+write the group makes after the stop takes 0.5–2.5 s, the writes queueing behind one another.
+macOS, one run each:
+
+| fault | code | outcome |
+|---|---|---|
+| flushes slowed at the stop, links young | `main` | 3 of 3 failed with CI's message: the write in both members' logs and not committed when the stopped member's silence (6.0–8.1 s) passed its excuse (3.40–3.52 s), no election, the longest write 2.4–2.5 s |
+| the same | the first rule alone (a silent member ends only a quiet wait) | the write never answered in 100 s: each ask gave up at one second, and the leader committed the write 29 times more in 85 s, an entry an ask |
+| the same | `3363c72` | 2 of 2 passed, 16.9 and 22.6 s: the write answered in 11.1 and 16.3 s, and the wait for the stopped member to apply it failed naming it, as the scenario asserts |
+| flushes slowed at the stop, every pair judged before it | `3363c72` | 2 of 2 passed, 100.1 and 32.5 s: the write answered in 91.1 and 26.0 s; the two members elected from term 4 to 11 and to 6, each new leader's writes suspected in turn until their detectors had the device's evidence (detection 0.4–0.7 s, then 7–17 s) |
+| flushes slowed at the stop, links young, the leader stopped | `3363c72` | no member suspected, no election, in 291 s: the open defect in `docs/STATUS.md` (both pairs refused `CorrelationUnmeasured`, the window one heartbeat, the sender's floor retiming it at each move) |
+
+```sh
+# Linux: the gates' binaries, built once in the container (a volume of its own for the target)
+cargo test --workspace --all-features --locked --no-run --test cluster --test kill
+# then, in each of three containers at once, docker run --cpus N with 2N busy loops:
+target/debug/deps/cluster-<hash> stalled-devices   # then
+target/debug/deps/kill-<hash> member-stopped        # in turn
+```

@@ -51,8 +51,9 @@ Landed 2026-10-16, each in its document: in the end-to-end harnesses' waits
 wait on every member's own facts, a wait for what the group answers going on while the members heard
 move, and an operation asked again waits twice its ask before, to sixty seconds (RFC 6298 §5.5,
 §2.5; `docs/timing.md` §2.9, "A member stopped while the others' writes are slow"); in hyper-durable's
-depth bench, many groups on their members' logs, measured on Linux with one group and many
-(`docs/durable.md` §14 item 1).
+depth bench, many groups on their members' logs, measured on Linux with one group and many and on
+macOS with many (`docs/durable.md` §14 item 1); in hyper-liveness's simulation, a device slowed for
+good while its node's links are young (the open defect above, measured).
 
 Landed 2026-10-15, each in its crate's document: in hyper-raft, a candidate's vote for itself counted
 once the hard state naming it is durable (`docs/durable.md` I9, `docs/raft.md` §3.3; the simulation's two
@@ -458,10 +459,14 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      members' logs"; the depth bench's `GROUPS`): on two CI runners' disks and Docker's virtual
      machine no depth beyond one raised a group's throughput, and depth 3 raised one group's p50 under
      open load (×1.03–1.25); with 16 groups on each log depth 2 or 3 raised it at 14 of 18 heavier
-     open points (×1.05–1.50), and with 256 it changed nothing. Open: the same many groups on macOS,
-     and with it the shell's depth on hyper-log (§6 bounds it at the log's three); a leader sending
-     its appends before its own write has a slot (item 2); the shell choosing an image by the
-     measured crossover (item 5); item 6's question of PAR's identifiers.
+     open points (×1.05–1.50), and with 256 it changed nothing. On macOS with many groups, where a
+     confirmation is a flush the next frame saves, depth 2 lowered the p50 at 4 of 8 open points
+     (×0.67–0.89) and raised it at none, and depth 3 raised it under heavier load (×1.15–1.35). Open:
+     the shell's depth on hyper-log, which §6 bounds at the log's three while three cost the median
+     under load everywhere and the best below it is one on Linux and two on macOS, a change every
+     consumer's suite would take; a leader sending its appends before its own write has a slot
+     (item 2); the shell choosing an image by the measured crossover (item 5); item 6's question of
+     PAR's identifiers.
    - hyper-sim and hyper-check: S-6 is built (`docs/sim.md` §17, §18): hyper-durable's schedules in
      the world, on its network and on the typed write queue, judged by hyper-check's oracles, their
      crashes forked, every floor at the same seed counts, 60–69% fewer allocations a step; hyper-raft's

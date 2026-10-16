@@ -1166,10 +1166,14 @@ directory once, at create.
    groups every frame is full of other groups' updates, and 4 of the 72 comparisons lie outside both
    bands. Where a flush costs nothing (the simulated device) a deeper group raised entries a second
    at 16 and 64 clients (×1.06–1.35, outside both bands at 4 of 12); on no device whose flush costs
-   something did it. Open: the same many groups on macOS, where a confirmation is a full flush that
-   a deeper group saves; and with it the shell's depth on hyper-log, which §6 bounds at the log's
-   three, where on Linux one did as well or better at every point measured but the runners' lightest
-   open load with 16 groups.
+   something did it. On macOS with many groups, where a confirmation is a full flush that the next
+   frame's record saves, depth 2 never raised each run's p50 outside the noise and lowered it at 4
+   of 8 open points (×0.67–0.89, the lightest loads the most), while depth 3 lowered it at the
+   lighter loads (×0.64–0.71, outside both bands at 2 of 3) and raised it under the heavier ones
+   with 16 groups (×1.15–1.35); no depth changed a closed loop. Open: the shell's depth on
+   hyper-log, which §6 bounds at the log's three while three cost the median under load on every
+   device measured, and the best depth below it differs by platform: one on Linux, where a
+   confirmation is a durable write, and two on macOS, where it is a flush.
 2. **Apply before local durability.** p99 commit-to-answer on a leader whose disk is the slowest of
    its quorum, with and without §4.2, on one disk per member and on a shared disk. Measured
    (`benches/apply.rs`; `docs/benchmarks.md`, "A leader applying ahead of its own write"): with the

@@ -85,6 +85,18 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     status == 0
 }
 
+/// The bytes waiting in `fd`'s receive queue as `FIONREAD` counts them: on Linux the next
+/// datagram's payload only (udp(7), `SIOCINQ`).
+pub(crate) fn queued_bytes(fd: RawFd) -> io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one `c_int` through the pointer; `value` is a live local of that size.
+    let status = unsafe { libc::ioctl(fd, libc::FIONREAD, ptr::addr_of_mut!(value)) };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("FIONREAD read back negative"))
+}
+
 /// The receive buffer the kernel reports for `fd` (`SO_RCVBUF`, as Linux doubles it).
 pub(crate) fn recv_buffer(fd: RawFd) -> io::Result<usize> {
     let mut value: libc::c_int = 0;

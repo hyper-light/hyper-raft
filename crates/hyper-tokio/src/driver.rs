@@ -66,7 +66,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         endpoint.set_receive_capacity(hyper_transport::socket_room(
             u64::try_from(reported).unwrap_or(u64::MAX),
         ));
-        let socket = Socket::new(socket, io, false)?;
+        // Stamped where the kernel stamps, so a drain knows what was queued when it began.
+        let socket = Socket::new(socket, io, true)?;
         // The fold reads std's `Instant`, which is the clock `Clock` reads: `CLOCK_MONOTONIC`,
         // `CLOCK_UPTIME_RAW` and `QueryPerformanceCounter` (std's `Instant` documentation).
         let resolution = Clock::new()?.resolution();
@@ -122,9 +123,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     }
 
     /// [`Driver::event`] as a poll. An event already queued is handed out at once. Otherwise
-    /// each turn takes what has arrived, up to [`TURNS`] batches, so that the socket's receive
-    /// buffer is drained before anything is surfaced; then fires the timers due, sends, and hands
-    /// out the next event, or parks.
+    /// each turn takes what had arrived when it began (`drain`), then fires the timers due, sends,
+    /// and hands out the next event, or parks. What arrives meanwhile is the next turn's: the
+    /// socket's room holds whatever its peers' windows let them send unread (hyper-transport's
+    /// socket room), so taking it later loses nothing, and the sends wait behind the backlog the
+    /// turn found, not behind whatever more its peers kept sending.
     #[allow(
         clippy::disallowed_methods,
         reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
@@ -192,13 +195,27 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         }
     }
 
-    /// Takes the datagrams that have arrived, a batch at a time, until the socket has none or
-    /// [`TURNS`] batches are taken.
+    /// Takes, a batch at a time, the datagrams that were queued when the drain began, the rest of
+    /// the batch that reached the first that was not, until the socket has none or [`TURNS`]
+    /// batches are taken. What was queued is told by the kernel's receive stamps where the socket
+    /// has them: one stamped after the drain began arrived since, and a stamp is late, never
+    /// early. A socket without counts bytes: as many as it held at the start
+    /// ([`Socket::queued_bytes`]: every queued datagram's on Windows, so the drain ends once it
+    /// has taken them). Where the platform says neither, [`TURNS`] batches bound it. A drain to
+    /// empty kept the driver reading while a peer kept sending, its sends, the peer's credit among
+    /// them, waiting behind (hyper-rt-transport's driver measured it: `docs/transport.md` §4h).
     #[allow(
         clippy::disallowed_methods,
         reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
     )]
     fn drain(&mut self, context: &mut Context<'_>) -> Result<(), Error> {
+        let began = self.socket.clock().now_ns();
+        let held = if self.socket.stats().kernel_stamps {
+            None
+        } else {
+            self.socket.queued_bytes().ok()
+        };
+        let mut read = 0usize;
         for _ in 0..TURNS {
             let Poll::Ready(ready) = self.socket.poll_ready(context, false) else {
                 return Ok(());
@@ -207,10 +224,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 return Ok(());
             }
             let endpoint = &mut self.endpoint;
+            let mut past = false;
             let taken = self.socket.receive(|arrival, bytes| {
+                past |= arrival.kernel && arrival.at_ns > began;
+                read = read.saturating_add(bytes.len());
                 endpoint.handle_datagram(Instant::now(), arrival.from, None, bytes);
             })?;
-            if taken == 0 {
+            if taken == 0 || past || held.is_some_and(|held| read >= held) {
                 return Ok(());
             }
         }

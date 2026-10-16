@@ -210,6 +210,33 @@ impl Socket {
         self.stats
     }
 
+    /// The bytes waiting in its receive queue as the platform counts them (`FIONREAD`): every
+    /// queued datagram's on Windows and macOS, only the next one's on Linux.
+    pub(crate) fn queued_bytes(&self) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            linux::queued_bytes(self.udp.as_raw_fd())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            macos::queued_bytes(self.udp.as_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            crate::sys::windows::queued_bytes(self.udp.as_raw_socket())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "the queued bytes are asked only on Linux, macOS and Windows",
+            ))
+        }
+    }
+
     /// The clock the socket stamps on.
     pub(crate) fn clock(&self) -> &Clock {
         &self.clock
@@ -542,4 +569,58 @@ pub(crate) struct Ready {
 
 fn as_u64(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The failure guard of the wait for a queue's count: yields of the thread, each giving the
+    /// kernel's delivery thread the CPU.
+    const YIELDS: usize = 1_000_000;
+
+    /// `FIONREAD` as each platform counts a datagram socket's queue, which the driver's drain
+    /// takes as what was queued when it began where the kernel does not stamp. Do: queue
+    /// datagrams of 100, 200 and 300 bytes. Expect: on Linux the next one's alone (udp(7),
+    /// `SIOCINQ`); on Windows all three ("Winsock IOCTLs": "the total number of bytes available to
+    /// read"); on macOS all three with their addresses (`soioctl`: `so_rcv.sb_cc`), past the
+    /// payload. Each platform's count is waited for, a datagram at most a wait.
+    #[test]
+    fn fionread_counts_the_queue_as_the_platform_does() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let to = receiver.local_addr().unwrap();
+            let socket = Socket::new(receiver, Io { batch: 4 }, false).unwrap();
+            let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            for length in [100usize, 200, 300] {
+                sender.send_to(&vec![7u8; length], to).unwrap();
+            }
+            // Loopback delivers on another thread on macOS: the count itself is waited for, the
+            // guard a bound on yields far past what three datagrams take.
+            let wanted = if cfg!(target_os = "linux") { 100 } else { 600 };
+            let mut queued = 0;
+            for _ in 0..YIELDS {
+                queued = socket.queued_bytes().unwrap();
+                if queued >= wanted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                std::thread::yield_now();
+            }
+            if cfg!(target_os = "linux") {
+                assert_eq!(queued, 100, "Linux counts the next datagram alone");
+            } else if cfg!(windows) {
+                assert_eq!(queued, 600, "Winsock counts every queued datagram");
+            } else {
+                assert!(
+                    queued > 600,
+                    "XNU counts every datagram and its address: {queued}"
+                );
+            }
+        });
+    }
 }

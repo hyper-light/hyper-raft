@@ -178,7 +178,10 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   (`Batched::receive_queued`): by the kernel's receive stamps where the socket has them, else by the
   bytes it held (`FIONREAD`, which Winsock and the BSDs count over every queued datagram).
   Tests: `a_queued_receive_takes_what_was_queued_when_it_began`,
-  `a_socket_without_stamps_takes_the_bytes_it_held` (`docs/transport.md` §4h).
+  `a_socket_without_stamps_takes_the_bytes_it_held` (`docs/transport.md` §4h). hyper-tokio's driver
+  had the same drain to empty, and now takes the same rule. It binds its socket with stamps and
+  counts `FIONREAD` on Windows; its test holds Linux, XNU and Winsock each to the count their
+  sources state.
 - **hyper-rt-transport: a peer socket left holding datagrams waited for the driver's next timer.**
   Readiness is one-shot and fires on arrival, and a socket marked for the next turn was not counted
   as work, so a driver with only that to do parked. A marked socket now keeps the turn loop going.

@@ -11,7 +11,7 @@ use std::io;
 use std::mem::size_of;
 
 use windows_sys::Win32::Networking::WinSock::{
-    SO_RCVBUF, SOCKET, SOCKET_ERROR, SOL_SOCKET, getsockopt, setsockopt,
+    FIONREAD, SO_RCVBUF, SOCKET, SOCKET_ERROR, SOL_SOCKET, getsockopt, ioctlsocket, setsockopt,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
@@ -61,6 +61,19 @@ impl Clock {
             .unwrap_or(u128::MAX);
         u64::try_from(ns).unwrap_or(u64::MAX)
     }
+}
+
+/// The bytes waiting in `socket`'s receive queue: for a datagram socket every queued datagram's
+/// ("Winsock IOCTLs", `FIONREAD`: "the total number of bytes available to read, not the size of
+/// the first datagram").
+pub(crate) fn queued_bytes(socket: u64) -> io::Result<usize> {
+    let socket = SOCKET::try_from(socket).map_err(|_| io::Error::other("a socket handle"))?;
+    let mut value: u32 = 0;
+    // SAFETY: FIONREAD writes one u32 through the pointer; `value` is a live local of that size.
+    if unsafe { ioctlsocket(socket, FIONREAD, &raw mut value) } == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("FIONREAD past usize"))
 }
 
 /// The receive buffer Winsock reports for `socket` (`SO_RCVBUF`).

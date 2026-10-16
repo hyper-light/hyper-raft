@@ -909,7 +909,15 @@ began. What was queued is told by:
   (`soioctl`: `so_rcv.sb_cc`); the fabric counts its own.
 
 The endpoint is still told when each datagram was read (`Arrival::read_ns`), as hyper-tokio's driver
-tells it.
+tells it. hyper-tokio's driver drained to empty on purpose ("so that the socket's receive buffer is
+drained before anything is surfaced"), a guard the socket room has made needless. It now takes the
+same rule: its socket is bound with the kernel's stamps, and on Windows it counts `FIONREAD` bytes.
+tokio's readiness stays set until a read would block, so a datagram left for the next turn is read
+at once. `socket::tests::fionread_counts_the_queue_as_the_platform_does` holds each platform to the
+count its source states:
+- Linux: the next datagram's alone (100 of three datagrams' 600 bytes);
+- XNU: every one's with its address (past 600);
+- Winsock: every one's (600).
 
 **A socket left holding datagrams is work now.** A drain that stops with datagrams waiting marks
 its socket for the next turn. Readiness is one-shot (epoll's `EPOLLONESHOT`, kqueue's `EV_ONESHOT`)

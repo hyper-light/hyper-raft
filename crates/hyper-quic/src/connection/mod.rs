@@ -53,7 +53,10 @@ pub(crate) use losses::{Ledger, LossFit, LossMemory};
 
 mod datagrams;
 use datagrams::DatagramState;
+
+mod delivery;
 pub use datagrams::{Datagrams, SendDatagramError};
+pub(crate) use delivery::{Delivery, Snapshot};
 
 mod mtud;
 mod pacing;
@@ -587,6 +590,12 @@ impl Connection {
         self.send_when_idle(now, buf, &mut tx);
 
         if buf.is_empty() {
+            // Nothing to send, and neither the window nor the pacer held anything back: what is in
+            // flight measures the application, not the path (draft-cheng-iccrg-delivery-rate-
+            // estimation-02 §3.4; Linux's `tcp_rate_check_app_limited`)
+            if self.app_limited {
+                self.path.delivery.on_app_limited(self.path.in_flight.bytes);
+            }
             return None;
         }
 
@@ -2021,15 +2030,20 @@ impl Connection {
         let (ack_eliciting_acked, acked_bytes, warm_up_bytes_acked) =
             self.on_packets_acked(now, space, &newly_acked);
 
+        // The round trip is sampled before the controller hears the acknowledgement is done, so
+        // its model is of this acknowledgement's round trip, not the one before (Chromium's
+        // order: the RTT, then the congestion event)
+        let sample =
+            (new_largest && ack_eliciting_acked).then(|| self.update_rtt(now, space, ack.delay));
+        if let Some(delivered) = self.path.delivery.sample(now, self.path.rtt.min()) {
+            self.path.congestion.on_delivered(now, &delivered);
+        }
         self.path.congestion.on_end_acks(
             now,
             self.path.in_flight.bytes,
             !self.window_limited(),
             self.spaces.get(space).largest_acked_packet,
         );
-
-        let sample =
-            (new_largest && ack_eliciting_acked).then(|| self.update_rtt(now, space, ack.delay));
         if new_largest {
             let delivered_sent = self.spaces.get(space).largest_acked_packet_sent;
             self.ledger
@@ -2113,7 +2127,7 @@ impl Connection {
         let mut warm_up_acked = 0u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces.get_mut(space).take(packet) {
-                if let Some(acked) = info.largest_acked {
+                if let Some(acked) = info.largest_acked.get() {
                     // Assume ACKs for all packets below the largest acknowledged in `packet` have
                     // been received. This can cause the peer to spuriously retransmit if some of
                     // our earlier ACKs were lost, but allows for simpler state tracking. See
@@ -2236,6 +2250,17 @@ impl Connection {
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
         self.remove_in_flight(&info);
+        // In flight and delivered on this path: the acknowledgement's delivery-rate sample counts
+        // it. One sent on an earlier path measured that path's flights
+        if info.size != 0 && info.path_generation == self.path.generation() {
+            self.path.delivery.on_acked(
+                now,
+                info.time_sent,
+                u64::from(info.size),
+                info.delivery,
+                info.app_limited,
+            );
+        }
         // What reached the peer (patch Q6): a request's bytes in a bottleneck's queue are sent and
         // not yet had, and an application that asks whether the peer has them reads this.
         self.stats.path.acked_bytes = self

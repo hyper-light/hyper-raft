@@ -727,6 +727,15 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   and sixteen initial windows, scaled with it to 3.84 MB of padding a connection. BBR now starts
   at RFC 9002's window by the datagram size, as CUBIC, NewReno and Copa do
   (`crates/hyper-quic/VENDORED.md` §21).
+- **BBR's model from delivery-rate samples** (2026-10-15). Each path keeps what it delivered, and
+  each packet in flight what had been delivered when it went (draft-cheng-iccrg-delivery-rate-
+  estimation, Linux's `tcp_rate.c`). An acknowledgement's newest packet gives the delivery rate over
+  the longer of its flight's send and ack phases, and BBR's bandwidth is the windowed maximum of
+  those (`Controller::on_delivered`). Three other divergences from Chromium went with the old
+  estimator: startup compared the gain with its target, so an app-limited sender's window grew
+  without end; the bandwidth filter took no app-limited sample; and the minimum round trip expired
+  before it was ever measured, so every connection began in ProbeRTT. A bus publisher's window had
+  reached 409 MB on a 72 µs path (`crates/hyper-quic/VENDORED.md` §30).
 
 ## 4g. Admission credit: a stream pool (2026-10-13)
 

@@ -426,7 +426,7 @@ pub(super) struct SentPacket {
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
     /// The largest packet number acknowledged by this packet
-    pub(super) largest_acked: Option<u64>,
+    pub(super) largest_acked: LargestAcked,
     /// Data which needs to be retransmitted in case the packet is lost.
     /// The data is boxed to minimize `SentPacket` size for the typical case of
     /// packets only containing ACKs and STREAM frames.
@@ -445,10 +445,36 @@ pub(super) struct SentPacket {
     /// Whether the packet is the path's warm-up's (`Connection::write_warm_up`), whose samples
     /// alone judge the warm-up's queue
     pub(super) warm_up: bool,
+    /// What the path had delivered as the packet went, for the delivery-rate sample its
+    /// acknowledgement takes ([`super::Delivery`]); read of a packet in flight alone
+    pub(super) delivery: super::Snapshot,
+    /// Whether the packet went in a phase the application limited, its delivery's sample then of
+    /// the application (draft-cheng-iccrg-delivery-rate-estimation-02 §3.4)
+    pub(super) app_limited: bool,
     /// The next ack-eliciting packet this space sent after this one, if this one is ack-eliciting:
     /// its number and when it went, the neighbour whose fate says whether a loss of this one came
     /// in a burst (`losses.rs`)
     pub(super) next: Option<(u64, Instant)>,
+}
+
+/// The largest packet number an ACK frame in a packet acknowledged, held as one more than it in
+/// eight bytes, `None`'s in the niche: a packet number is below 2^62 (RFC 9000 §12.3), so one more
+/// never overflows. Sixteen bytes as an `Option<u64>`, and a sent packet's record holds 128.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct LargestAcked(Option<std::num::NonZeroU64>);
+
+impl LargestAcked {
+    pub(super) fn new(largest: Option<u64>) -> Self {
+        Self(
+            largest
+                .and_then(|pn| pn.checked_add(1))
+                .and_then(std::num::NonZeroU64::new),
+        )
+    }
+
+    pub(super) fn get(self) -> Option<u64> {
+        self.0.and_then(|held| held.get().checked_sub(1))
+    }
 }
 
 /// Retransmittable data queue

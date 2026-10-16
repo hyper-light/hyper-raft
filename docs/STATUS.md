@@ -205,6 +205,25 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   `a_lossless_lane_holds_a_congestion_window_of_bytes_and_its_sender_waits`
   (54 frames of 4 KiB at a 210 kB window, where a lossy lane takes its 128-frame window and three).
   That bound is the controller's window, and BBR's had grown without bound (below).
+- **hyper-quic: BBR's window grew without bound.** Found by focal's event bus: under overload a
+  publisher's window reached 409 MB on a 72 µs path, and the lossless lane bound to it (above) held
+  1.7 s of messages at the median. The port's BBR diverged from Chromium's in four places
+  (`crates/hyper-quic/VENDORED.md` §30):
+  - its startup compared the gain with the target;
+  - its bandwidth filter took no app-limited sample;
+  - its minimum round trip expired before it was ever measured, so every connection began in
+    ProbeRTT at four datagrams;
+  - and its bandwidth estimate divided bytes by the gaps between unrelated acknowledgements and
+    sends: 357 MB/s on a 12.5 MB/s pair, a window 65 times the path's product.
+
+  Each path now keeps delivery-rate samples (draft-cheng-iccrg-delivery-rate-estimation; Linux's
+  `tcp_rate.c`): a 16-byte snapshot a packet, and the sent packet's record stays within its 128
+  bytes. BBR takes them through `Controller::on_delivered`, in Chromium's order. NewReno, CUBIC and
+  Copa wrote the same 495 rows of slates' bake-off byte for byte. BBR's goodput shortfall went from
+  1.075 to 1.020.
+
+  Open: BBR states no pacing rate. A sender its window holds therefore keeps about a product of queue
+  (ping p99 about twice the round trip); Chromium paces at its model's rate.
 - **hyper-transport: a consumer that could not take more queued its producers' frames without
   bound.** A bus node whose subscriber fell behind took every publish into memory, its subscriber's
   lag growing for as long as the publisher outran it (2.5 s at the median). `Endpoint::hold_lane`

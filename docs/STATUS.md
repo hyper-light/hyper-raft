@@ -168,6 +168,21 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   is now a one-shot `NOTE_CRITICAL` timer in the wait's own call (5.03 ms). Tests beside it, in
   `epoll` and `kqueue`. Open: Windows rounds to milliseconds and then to its 15.6 ms timer
   interrupt.
+- **hyper-block on overlayfs: AIO reads spun for good, and a handle said it read from memory where it
+  could not.** overlayfs (Linux 6.12, a container's own file system) refuses `RWF_NOWAIT` with
+  `EOPNOTSUPP`, where ext4 takes it (measured: `preadv2` on the overlay and on a volume, 2026-10-16).
+  An AIO submission of reads asked the flag, the kernel refused it, and the context took the refusal
+  for an error rather than the flag's (it knew only `EINVAL`, a kernel before 4.14); `pump` then
+  returned before putting the submission's transfers back, so `fail_waiting` found none and their
+  batches were never answered: five of `tests/aio.rs` ran 14 minutes at 100% CPU each (traced: two
+  `io_submit` answered `EOPNOTSUPP`, then no system call at all). The context now sends reads again
+  without the flag on `EOPNOTSUPP`, and a refused submission's transfers go back to the queue first,
+  so each fails typed (`aio::tests::a_submission_the_kernel_refuses_fails_its_batch`). And a
+  buffered handle said it read from memory until a read found otherwise (`reads_resident` read
+  neither the refusal nor, for a segmented file, any segment but the first); it now asks the kernel
+  as it opens, one byte at the file's end, and says so (`segmented`'s
+  `a_segment_written_whole_holds_its_fill_and_takes_no_memory`, which failed on overlayfs).
+
 - **hyper-transport: a socket's room rested on an assumed charge.** The windows a socket's peers
   were granted were held to its buffer over a fixed four times a datagram's payload (Linux) or
   twice (elsewhere): three loopback measurements on one kernel, rounded up, and wrong both ways

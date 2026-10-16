@@ -411,9 +411,21 @@ the wait's own `kevent` call (5 ms ended at 5.03 ms): `kevent64`'s `NOTE_LEEWAY`
 tick, but XNU serves a kqueue one record format and the tick there is a few microseconds. Tests:
 `epoll::tests::a_timed_wait_ends_at_its_timeout_not_the_next_millisecond`,
 `epoll::tests::a_shard_s_slack_is_its_thread_s_until_its_driver_goes`,
-`kqueue::tests::a_timed_wait_ends_at_its_timeout_not_where_xnu_coalesces_it`. Still open: Windows
-rounds to milliseconds and then to its timer interrupt (15.6 ms unless a process raises the rate);
-a high-resolution waitable timer associated with the port is Go's answer (1.23).
+`kqueue::tests::a_timed_wait_ends_at_its_timeout_not_where_xnu_coalesces_it`.
+
+On Windows `GetQueuedCompletionStatusEx` takes milliseconds and ends on the system's timer
+interrupt, 15.6 ms apart unless some process has raised the rate. A timed wait there arms a
+high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803) whose
+signal ntdll's wait completion packet posts to the port under its own key, the wait's millisecond
+timeout (rounded up) only backing it: Go's netpoller since 1.23 (`netpoll_windows.go`,
+`netpollQueueTimer`). The packet's last wait is cancelled before it is armed again (its signal
+removed if posted), one the kernel cannot cancel yet is firing and the wait keeps its own timeout
+alone, a timer that fired between its setting and its association ends the wait at once, and an
+untimed wait first cancels what a timed one left, as on epoll's timerfd and kqueue. The packet
+functions are found at run time, as Go finds them; where they or the timer are missing a wait is
+one of milliseconds. Tests: `iocp::tests::a_timed_wait_ends_at_its_timeout_not_the_clock_s_interrupt`,
+`iocp::tests::an_untimed_wait_disarms_the_timer_a_timed_one_left`; Windows is clippy-checked, its
+run owed to the Windows CI lanes.
 
 ### 3.7 Drivers
 
@@ -424,7 +436,7 @@ interest, report the clock. Readiness mode on every OS:
 |---|---|---|
 | Linux | epoll | `EPOLLONESHOT`; the kick an eventfd; the wait `epoll_pwait2`, or a timerfd before 5.11 (§3.6) |
 | macOS, FreeBSD | kqueue | one-shot `EVFILT_READ`/`EVFILT_WRITE`, `EVFILT_USER` kick [LEMON]; a timed wait a `NOTE_CRITICAL` timer on macOS (§3.6) |
-| Windows | IOCP with AFD polling | `IOCTL_AFD_POLL` on `\Device\Afd` for socket readiness [AFD]; the kick a posted packet |
+| Windows | IOCP with AFD polling | `IOCTL_AFD_POLL` on `\Device\Afd` for socket readiness [AFD]; the kick a posted packet; a timed wait a high-resolution timer's wait completion packet (§3.6) |
 | all | simulation | §11 |
 
 **Change: io_uring is not carried.** slates' io_uring driver runs in readiness mode only (`PollAdd`, no

@@ -48,7 +48,10 @@ UNSAFE_ALLOWED = {
         "through libc::syscall (rustix carries it only behind a feature that fails every wait "
         "before Linux 5.11)",
     "crates/hyper-rt/src/iocp.rs":
-        "I/O completion ports: CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus",
+        "I/O completion ports: CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus; "
+        "a timed wait's high-resolution waitable timer (CreateWaitableTimerExW, SetWaitableTimer) and "
+        "ntdll's wait completion packet that posts its signal to the port (NtCreateWaitCompletionPacket, "
+        "NtAssociateWaitCompletionPacket, NtCancelWaitCompletionPacket, found through GetProcAddress)",
     "crates/hyper-rt/src/kqueue.rs":
         "kevent through rustix (unsafe by signature: the udata word) and the EVFILT_USER trigger, "
         "and a timed wait's kevent through libc (its NOTE_CRITICAL timer, which rustix's timer "

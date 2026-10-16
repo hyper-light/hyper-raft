@@ -166,8 +166,12 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   the shard's tick: the shard thread's timer slack on Linux, restored when the driver goes. macOS
   coalesced a `kevent` timeout too (a 5 ms wait ended at 6.3 ms at the median); a timed wait there
   is now a one-shot `NOTE_CRITICAL` timer in the wait's own call (5.03 ms). Tests beside it, in
-  `epoll` and `kqueue`. Open: Windows rounds to milliseconds and then to its 15.6 ms timer
-  interrupt.
+  `epoll` and `kqueue`. Windows rounded to milliseconds and then to its 15.6 ms timer interrupt; a
+  timed wait there now arms a high-resolution waitable timer whose signal ntdll's wait completion
+  packet posts to the port, the wait's own timeout backing it (Go's netpoller since 1.23), and an
+  untimed wait cancels what a timed one left. Tests: `iocp::tests::a_timed_wait_ends_at_its_timeout_not_the_clock_s_interrupt`,
+  `iocp::tests::an_untimed_wait_disarms_the_timer_a_timed_one_left`; clippy-checked here, their run
+  owed to the Windows CI lanes.
 - **hyper-block on overlayfs: AIO reads spun for good, and a handle said it read from memory where it
   could not.** overlayfs (Linux 6.12, a container's own file system) refuses `RWF_NOWAIT` with
   `EOPNOTSUPP`, where ext4 takes it (measured: `preadv2` on the overlay and on a volume, 2026-10-16).

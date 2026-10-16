@@ -491,6 +491,33 @@ fn finish_stream_simple() {
     let _ = chunks.finalize();
 }
 
+/// The STREAM frame bytes a connection received count what its datagrams carried (patch Q20), not
+/// flow control's end offsets, which move by a gap's bytes when a frame lands past one. Do: lose
+/// the packet carrying a stream's first 100 bytes, deliver the one carrying its next 100, then let
+/// the first be sent again. Expect: 100 counted when the second lands past the gap, where the end
+/// offsets moved by 200; then at least 200, the first's bytes as they arrive again.
+#[test]
+fn stream_bytes_received_count_what_frames_carried() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let before = pair.server_conn_mut(server_ch).stream_bytes_received();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(&[1u8; 100]).unwrap();
+    pair.drive_client();
+    pair.server.inbound.clear(); // Lose the packet carrying the first 100 bytes
+    pair.client_send(client_ch, s).write(&[2u8; 100]).unwrap();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stream_bytes_received() - before,
+        100,
+        "the second frame's bytes, landed past the gap"
+    );
+    pair.drive();
+    assert!(pair.server_conn_mut(server_ch).stream_bytes_received() - before >= 200);
+}
+
 #[test]
 fn reset_stream() {
     let _guard = subscribe();

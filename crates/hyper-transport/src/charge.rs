@@ -335,18 +335,23 @@ impl SocketCharge {
     }
 
     /// A drain ended: it began with `before`, the account after it was `after` (when
-    /// [`SocketCharge::wants_after`] said to read it), it took `datagrams` and consumed `consumed`
-    /// stream bytes of the peers' windows, and it left the socket `emptied` or not.
+    /// [`SocketCharge::wants_after`] said to read it), it took `datagrams` of `bytes` payload that
+    /// carried `consumed` stream bytes, and it left the socket `emptied` or not. A message carries
+    /// no more stream bytes than its own payload, and the kernel charges it no less than that
+    /// payload: a sample past either bound says the counts did not describe the message alone, and
+    /// is not taken.
     pub fn after(
         &mut self,
         before: Option<Account>,
         after: Option<Account>,
         consumed: u64,
-        datagrams: u64,
+        (datagrams, bytes): (u64, u64),
         emptied: bool,
     ) {
         if let (Some(before), Some(after)) = (before, after)
             && after.charged == 0
+            && consumed <= bytes
+            && before.charged >= bytes
         {
             self.charge.sample(Charged {
                 charged: before.charged.max(before.message_floor),
@@ -544,5 +549,35 @@ mod tests {
         assert_eq!(probes_within(Duration::from_secs(30)), 32);
         assert_eq!(probes_within(Duration::from_millis(1)), 2);
         assert_eq!(probes_within(Duration::ZERO), 2);
+    }
+
+    /// A drain is a sample only within the physical bounds: a message carries no more stream
+    /// bytes than its payload, and is charged no less than its payload. Do: one message of 1,200
+    /// bytes charged 2,304 whose window count moved by 9,000 (a frame landed past a gap), then the
+    /// same message counted right. Expect: the first is no sample, the second is.
+    #[test]
+    fn a_sample_past_the_messages_own_bytes_is_not_taken() {
+        let before = Account {
+            charged: 2_304,
+            buffer: QUEUE.buffer,
+            drops: Some(0),
+            release_lag: QUEUE.release_lag,
+            message_floor: 0,
+        };
+        let after = Account {
+            charged: 0,
+            ..before
+        };
+        let mut socket = SocketCharge::new(15_000);
+        socket.before(before);
+        socket.after(Some(before), Some(after), 9_000, (1, 1_200), true);
+        assert_eq!(socket.room(Unprompted::default()), None, "no sample taken");
+        socket.before(before);
+        socket.after(Some(before), Some(after), 1_150, (1, 1_200), true);
+        let usable = QUEUE.buffer - QUEUE.release_lag;
+        assert_eq!(
+            socket.room(Unprompted::default()),
+            Some(usable * 1_150 / 2_304)
+        );
     }
 }

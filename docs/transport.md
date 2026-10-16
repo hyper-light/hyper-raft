@@ -967,7 +967,17 @@ Linux 6.6), and nothing in it is assumed.
   drain took exactly one message and emptied the socket, and the account after it is nothing, the
   account before was that message's charge exactly. A datagram that came between the two reads
   shows as a second message, or as a charge after. The stream bytes it carried are the difference
-  in the window its peers had consumed (hyper-quic patch Q20, `stream_bytes_received`).
+  in the STREAM frame bytes its connection received (hyper-quic patch Q20,
+  `stream_bytes_received`).
+  - The first build took the difference in flow control's count instead, the receive streams' end
+    offsets summed, which moves by a gap's bytes when a frame lands past one. A datagram read
+    alone after a loss then seemed to carry more stream bytes than its whole payload. In one busy
+    run at 100k/s the room told reached 1.98 MB against a buffer of 426 KB, and the node's sockets
+    dropped 376,148 datagrams.
+  - A sample past the message's own bounds is not taken: more stream bytes than its payload, or a
+    charge below its payload, which no kernel makes.
+  - Tests: `stream_bytes_received_count_what_frames_carried` (hyper-quic) and
+    `a_sample_past_the_messages_own_bytes_is_not_taken`.
 - **The room** (`ReceiveCharge::room`): the buffer, less the release lag, less what peers may send
   unprompted by any window, at the costliest stream byte sampled. The unprompted messages are an
   acknowledgement for each of this side's ack-eliciting packets in flight (RFC 9000 §13.2: a

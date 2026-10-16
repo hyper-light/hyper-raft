@@ -1210,8 +1210,13 @@ charged for each stream byte a peer sends (hyper-transport's receive charge, `do
 - what each message it read carried against the connection's window;
 - what the peer may send unprompted by any window.
 
-- `Connection::stream_bytes_received` is the connection's `data_recvd`: every receive stream's end
-  offset, summed, gaps included, as flow control counts it (RFC 9000 §4.1).
+- `Connection::stream_bytes_received` counts the bytes of every STREAM frame received, each as it
+  arrived, repeats and frames past a gap included: what the datagrams carried. It is a counter
+  beside the frame's processing and changes nothing else. The first version returned flow
+  control's `data_recvd`, every receive stream's end offset summed. That moves by a gap's bytes when
+  a frame lands past one, so a datagram read alone after a loss seemed to carry more stream bytes
+  than its whole payload, and the room told from it passed its socket's buffer (`docs/transport.md`
+  §4i).
 - `Connection::ack_eliciting_in_flight` is the current path's `in_flight.ack_eliciting`: the packets
   the peer may acknowledge, one acknowledgement each at the most (RFC 9000 §13.2).
 

@@ -617,7 +617,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             _ => None,
         };
         let datagrams = u64::try_from(taken.datagrams).unwrap_or(u64::MAX);
-        measure.after(before, after, consumed, datagrams, emptied);
+        let bytes = u64::try_from(taken.bytes).unwrap_or(u64::MAX);
+        measure.after(before, after, consumed, (datagrams, bytes), emptied);
         Ok(ended)
     }
 

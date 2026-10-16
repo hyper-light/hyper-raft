@@ -266,7 +266,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             }
             _ => None,
         };
-        let taken = u64::try_from(datagrams).unwrap_or(u64::MAX);
+        let taken = (
+            u64::try_from(datagrams).unwrap_or(u64::MAX),
+            u64::try_from(read).unwrap_or(u64::MAX),
+        );
         self.measure.after(before, after, consumed, taken, emptied);
         let room = self
             .measure

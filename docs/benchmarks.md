@@ -8933,7 +8933,7 @@ macOS, one run each:
 | the same | the first rule alone (a silent member ends only a quiet wait) | the write never answered in 100 s: each ask gave up at one second, and the leader committed the write 29 times more in 85 s, an entry an ask |
 | the same | `3363c72` | 2 of 2 passed, 16.9 and 22.6 s: the write answered in 11.1 and 16.3 s, and the wait for the stopped member to apply it failed naming it, as the scenario asserts |
 | flushes slowed at the stop, every pair judged before it | `3363c72` | 2 of 2 passed, 100.1 and 32.5 s: the write answered in 91.1 and 26.0 s; the two members elected from term 4 to 11 and to 6, each new leader's writes suspected in turn until their detectors had the device's evidence (detection 0.4–0.7 s, then 7–17 s) |
-| flushes slowed at the stop, links young, the leader stopped | `3363c72` | no member suspected, no election, in 291 s: the open defect in `docs/STATUS.md` (both pairs refused `CorrelationUnmeasured`, the window one heartbeat, the sender's floor retiming it at each move) |
+| flushes slowed at the stop, links young, the leader stopped | `3363c72` | no member suspected, no election, in 291 s: the open defect in `docs/STATUS.md` (both pairs refused `CorrelationUnmeasured`, the window one heartbeat, the sender's floor retiming it at each move; in the simulation such links configure 257–618 s after the slowdown) |
 
 ```sh
 # Linux: the gates' binaries, built once in the container (a volume of its own for the target)

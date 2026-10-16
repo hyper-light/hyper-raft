@@ -1890,9 +1890,10 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   and to 11 in the two runs, and to 13 in a third under the first rule, each new leader's writes
   suspected in turn until their detectors had the device's evidence (detection from 0.4–0.7 s to
   7–17 s); every election moved the group, so no wait went quiet. With the links young at the stop,
-  they never configured under that fault (390 s, 216 heartbeats taken), and no member suspected
+  none had configured 390 s on under that fault (216 heartbeats taken), and no member suspected
   another: with the leader stopped instead, the two members up suspected no one and elected no one
-  in 291 s (the open defect in `docs/STATUS.md`).
+  in 291 s. The simulation puts the time to configure at 257–618 s after such a slowdown, against
+  74–198 s for a device that slow from the start (the open defect in `docs/STATUS.md`).
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

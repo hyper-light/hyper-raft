@@ -106,30 +106,31 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
-- **hyper-liveness: a link whose sender's floor keeps moving never measures its evidence, and a
-  node with only such links suspects no one (found 2026-10-16).** A scratch fault in
-  hyper-durable-e2e's `member-stopped` (not committed) holds every flush of the two members up 741
-  and 597 ms more from the stop on: their writes take 0.5–2.5 s and lengthen as their logs' writes
-  queue behind one another. Stopped while their links were young, the two members never configured
-  them: 390 s on, 216 heartbeats taken, both pairs of each were unjudged and neither suspected the
+- **hyper-liveness: a link whose sender's floor keeps moving measures its evidence minutes late, and
+  a node with only such links suspects no one meanwhile (found 2026-10-16).** A scratch fault in
+  hyper-durable-e2e's `member-stopped` (branch `diag/slow-flush-repro`, never landed) holds every
+  flush of the two members up 741 and 597 ms more from the stop on: their writes take 0.5–2.5 s and
+  lengthen as their logs' writes queue behind one another. Stopped while their links were young, the
+  two members had configured none of them 390 s on (216 heartbeats taken), and neither suspected the
   stopped member; with the leader stopped instead, the two members up suspected no one and elected
-  no one in 291 s. A scratch trace of the estimators (not committed) shows why: every pair was
-  refused `CorrelationUnmeasured`, its window one heartbeat at 88 received: an unconfigured link's
-  interval is its sender's floor, followed up at once and down once the flushes it is the mean of
-  have doubled, and it moved 35 ms → 765 ms → 955 ms → 1.17 s → 1.02 s, each move retiming the
-  receiver's estimator, whose window and Allan levels start again (`LinkEstimator::retime`); the
-  node's pool, fed every link's latenesses across the moves, refused the same, its Allan levels one
-  and two. A young link is judged by its node's evidence, the widest configured link or the pool's
-  measure (`docs/timing.md` §2.8, "Judged before its own evidence"), and a node whose links are all
-  young and whose senders' floors keep moving has neither. The simulation's worlds bound a
-  survivor's time without evidence at 13–35 s, and none of them moves a sender's floor for good.
-  `E[flush]` is the mean of every flush since the log opened (`hyper_timing::Flushes`), so after the
-  device slows it climbs toward the new flushes by a little at each one, reaching halfway only once
-  as many slow flushes have come as fast ones came before, and the floor, followed up at once,
-  moves the interval at every step. Open: what keeps a link's evidence across its sender's
-  moves (one candidate: the interval followed up by doublings, as it is followed down, which bounds
-  a link's restarts by the logarithm of its floor's range), or bounds a node's time without
-  evidence.
+  no one in 291 s. A scratch trace of the estimators showed every pair refused
+  `CorrelationUnmeasured`, its window one heartbeat at 88 received: an unconfigured link's interval
+  is its sender's floor, followed up at once and down once the flushes it is the mean of have
+  doubled, and it moved 35 ms → 765 ms → 955 ms → 1.17 s → 1.02 s, each move retiming the receiver's
+  estimator, whose window and Allan levels start again (`LinkEstimator::retime`); the node's pool,
+  fed every link's latenesses across the moves, refused the same. `E[flush]` is the mean of every
+  flush since the log opened (`hyper_timing::Flushes`), so after the device slows it climbs toward
+  the new flushes by a little at each one, reaching halfway only once as many slow flushes have come
+  as fast ones came before, and the floor, followed up at once, moves the interval at every step.
+  The simulation measures it (`links_young_when_every_device_slows_for_good_still_configure`: three
+  nodes, every flush 741 ms more from the victim's first heartbeat on, 8 seeds of each of the macOS
+  and Linux worlds): every pair configured 257–618 s after the slowdown, against 74–198 s for the
+  same device slow from the start, and a peer killed once they had was suspected 4–19 s after its
+  kill. The worst time without evidence the design measured is 13–35 s (`docs/timing.md` §2.8,
+  "Judged before its own evidence"), and none of its worlds moves a sender's floor for good. Open:
+  what keeps a link's evidence across its sender's moves (one candidate: the interval followed up by
+  doublings, as it is followed down, which bounds a link's restarts by the logarithm of its floor's
+  range), or bounds a node's time without evidence.
 
 ### Closed (2026-10-16)
 

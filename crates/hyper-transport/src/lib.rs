@@ -60,6 +60,7 @@ pub use credit::{
 };
 pub use endpoint::{AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit};
 pub use error::Refusal;
+pub use frame::Embedded;
 /// The congestion controllers a connection may run ([`Config::congestion`]).
 pub use hyper_quic::congestion;
 pub use hyper_quic::{EcnCodepoint, Transmit};
@@ -127,6 +128,15 @@ pub trait Classes {
     fn lossless(class: Self::Class) -> bool {
         let _ = class;
         false
+    }
+    /// Where a lane frame of `kind` carries its own CRC-32C, which its receiver's protocol checks
+    /// end to end ([`Embedded`]): the transport's prefix checksum then covers the frame only before
+    /// it, and the transport verifies the frame's own on receipt, so a frame is summed once, not
+    /// twice. Each frame of such a kind must carry it; one whose own checksum fails is refused as
+    /// corrupt, as one whose prefix checksum fails is. None does, unless a side says so.
+    fn embedded_checksum(kind: Self::Kind) -> Option<Embedded> {
+        let _ = kind;
+        None
     }
 }
 

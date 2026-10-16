@@ -263,6 +263,9 @@ pub struct Stats {
     pub responses_dropped: u64,
     /// Streams a peer opened past a bound, refused.
     pub streams_refused: u64,
+    /// Lanes stopped at a frame refused: corrupt (its prefix's or its own checksum failed), or a
+    /// lane past its bounds.
+    pub lanes_refused: u64,
     /// Receive chunks held, each charged to the budget.
     pub receive_chunks: usize,
     /// What the socket's receive queue holds of the connections' windows, payload bytes
@@ -1254,9 +1257,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         }
         let key = self.core.connection_of(peer).ok_or(Refusal::NotConnected)?;
         let mut conn = self.take(key).ok_or(Refusal::NotConnected)?;
-        let queued = self
-            .core
-            .send_frame(&mut conn, lane, (C::kind_code(kind), class), frame);
+        let queued = self.core.send_frame(
+            &mut conn,
+            lane,
+            (C::kind_code(kind), class, C::embedded_checksum(kind)),
+            frame,
+        );
         self.put(key, conn);
         queued
     }
@@ -3486,7 +3492,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         &mut self,
         conn: &mut Conn<C::Role>,
         lane: crate::LaneId,
-        (kind, class): (u16, C::Class),
+        (kind, class, embedded): (u16, C::Class, Option<crate::Embedded>),
         frame: &[u8],
     ) -> Result<(), Refusal> {
         if conn.peer.is_none() || conn.lost {
@@ -3524,7 +3530,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             return Err(Refusal::LaneFull);
         }
-        let prefix = Prefix::encode(kind, frame, None)?;
+        // A frame of its own checksum is covered by the prefix only before it: its owner summed
+        // the rest, and its receiver verifies that sum.
+        let prefix = match embedded {
+            Some(embedded) => {
+                Prefix::encode_covering(kind, frame.len(), embedded.head(frame)?, None)?
+            }
+            None => Prefix::encode(kind, frame, None)?,
+        };
         let mut bytes = self.budget.reserve(
             length(PREFIX_BYTES).saturating_add(length(frame.len())),
             Lane::Class(class),
@@ -3667,6 +3680,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(refusal) => {
+                    self.stats.lanes_refused = self.stats.lanes_refused.saturating_add(1);
                     if at < conn.lanes_in.len() {
                         let lane = conn.lanes_in.remove(at);
                         let _ = conn
@@ -3866,11 +3880,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
         let frame = lane.frame.take().ok_or(Refusal::Order)?;
         lane.state = Reading::Prefix;
-        let verified = lane
-            .decoded
-            .ok_or(Refusal::Order)?
-            .verify(&lane.prefix, frame.bytes());
+        let decoded = lane.decoded.ok_or(Refusal::Order)?;
         let (peer, kind) = (conn.peer.map(|(peer, _)| peer), C::kind_of(lane.kind));
+        // A frame of its own checksum: the prefix's covers what that does not, and that the rest.
+        let verified = match kind.and_then(C::embedded_checksum) {
+            Some(embedded) => embedded
+                .head(frame.bytes())
+                .and_then(|head| decoded.verify(&lane.prefix, head))
+                .and_then(|()| embedded.verify(frame.bytes())),
+            None => decoded.verify(&lane.prefix, frame.bytes()),
+        };
         let (lane_id, stream) = (lane.lane, lane.stream);
         match (verified, peer, kind) {
             (Ok(()), Some(peer), Some(kind)) => {

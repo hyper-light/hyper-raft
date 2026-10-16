@@ -1032,6 +1032,43 @@ fn frames_on_a_lane_arrive_in_order() {
     }
 }
 
+/// A lane frame of a kind that carries its own CRC-32C is checked by it as it arrives
+/// (`Classes::embedded_checksum`): the prefix's checksum covers only the bytes before the frame's
+/// covered span, so each byte is summed once, and a frame whose covered bytes changed after they
+/// were summed never reaches its owner: its lane stops there, and the stop is counted.
+#[test]
+fn a_frame_of_its_own_checksum_is_checked_by_it() {
+    let pair = Pair::new();
+    let mut net = connected::<Embedding, Embedding>(&pair, limits(), 256 << 20);
+    let mut server = Server::new();
+    let summed = |fill: u8| {
+        let mut frame = vec![0u8; 8];
+        frame.extend_from_slice(&[fill; 64]);
+        let sum = crc32c::crc32c(&frame[8..]);
+        frame[..4].copy_from_slice(&sum.to_le_bytes());
+        frame
+    };
+    let good = summed(1);
+    net.a.send_frame(2, 0, Kind::Append, &good).unwrap();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        server.frames.len() == 1
+    });
+    let mut lying = summed(2);
+    lying[40] ^= 1;
+    net.a.send_frame(2, 0, Kind::Append, &lying).unwrap();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        net.b.stats().lanes_refused == 1
+    });
+    assert_eq!(
+        server.frames.len(),
+        1,
+        "the changed frame reached its owner"
+    );
+    assert_eq!(server.frames[0].2, good);
+}
+
 /// A lane's queue holds the core's window and no more.
 #[test]
 fn a_lane_refuses_a_frame_past_the_core_s_window() {

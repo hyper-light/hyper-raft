@@ -1021,6 +1021,29 @@ Linux 6.6), and nothing in it is assumed.
   datagram against `SO_RCVBUF` is documented nowhere. A self-probe at the driver's start can
   measure it: fill a probe socket of the same buffer until its count stops growing.
 
+## 4j. A frame that carries its own checksum is summed once (2026-10-16)
+
+Every message's prefix carries a CRC-32C of the prefix and the head, mantle's rule that a network
+payload carries a checksum verified on read, which catches a framing bug the AEAD cannot. A bus
+batch carries its producer's CRC-32C too (Kafka's record batch CRC, KIP-98), which its broker checks
+as it appends and its consumer as it takes it, end to end (Hochschild et al., HotOS 2021). So a bus
+node summed each batch three times, its prefix's on receipt, the batch's, and its prefix's again
+to deliver it, and a subscriber twice: CRC-32C was 3.6 % of the node's busy samples at 100,000
+messages a second (macOS, `sample`, 2026-10-16).
+
+`Classes::embedded_checksum(kind)` says where a lane frame of a kind carries its own CRC-32C
+(`Embedded { covered_from, at }`: of the bytes from `covered_from`, little-endian at `at..at + 4`,
+which lies before `covered_from`). For those kinds the prefix's checksum covers the prefix and the
+frame only before `covered_from`, and the receiver verifies the frame's own checksum where it would
+have summed the same bytes again; each byte is covered by exactly one checksum, verified on read.
+A frame whose own checksum fails is refused as corrupt, as one whose prefix's fails is, and its
+lane stops (`Stats::lanes_refused`, which counts every lane a refused frame stopped). The bus
+declares it for publishes and deliveries (`focal_bus::batch::EMBEDDED`, the 24 bytes before it
+holding the length, the CRC and the fields its owner stamps), so a node sums each batch once and
+skips the batch's own pass where the transport made it (`Batch::parse_verified`). Tests:
+`frame::tests::a_frame_s_own_checksum_and_its_prefix_cover_every_byte_once`,
+`a_frame_of_its_own_checksum_is_checked_by_it`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

@@ -30,11 +30,15 @@
 //! rounds and an ask's rounds, by the members' own law; never less than the test's own
 //! retransmission timeout, RFC 6298's one second before any measurement and never less after
 //! (§2.1, §2.4), past which it could not tell a member that did not move from an answer it did
-//! not wait for. An ask waits that timeout for its answer. Quiet is only time in which the test
-//! saw the group: a member's one thread answers nothing while it is in a write of its log, so a
-//! look that did not hear every member decides nothing, and the time the members say they spent in
-//! their logs' writes is not quiet either (`hyper_raft_e2e::quiet`, which hyper-durable-e2e's waits
-//! keep too).
+//! not wait for. An ask waits that timeout for its answer, and a write or a read asked again waits
+//! twice as long as its ask before, to sixty seconds (RFC 6298 §5.5, §2.5), so a commit slower
+//! than a timeout is still answered. Quiet is only time in which the test saw the group: a member's
+//! one thread answers nothing while it is in a write of its log, so a look that did not hear every
+//! member decides nothing, and the time the members say they spent in their logs' writes is not
+//! quiet either. A member silent past what the members' own measures excuse ends a wait on every
+//! member's own facts at once, naming it, and a wait for what the group answers once the others are
+//! quiet (`hyper_raft_e2e::quiet`, which hyper-durable-e2e's and hyper-multilog-e2e's waits keep
+//! too).
 //!
 //! The scenarios run one after another in this one thread (`harness = false`), one group at a
 //! time: at most five member processes at once.

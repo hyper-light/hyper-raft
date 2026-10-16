@@ -67,6 +67,9 @@ UNSAFE_ALLOWED = {
         "Winsock 2 stream calls (socket, accept, connect, recv, send, WSARecv, WSASend over IoSlice's WSABUF layout, shutdown) and the TCP options rustix lacks (TCP_NOTSENT_LOWAT, TCP_RXT_CONNDROPTIME, SO_NOSIGPIPE)",
     "crates/hyper-rt/src/udp/linux.rs":
         "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1)",
+    "crates/hyper-rt/tests/udp_batched.rs":
+        "setsockopt(SO_NO_CHECK) through libc, which the runtime has no call for: a socket whose "
+        "segmented sends the kernel refuses (tests only, docs/transport.md §4h)",
     "crates/hyper-rt/src/udp/macos.rs":
         "recvmsg with SCM_TIMESTAMP_MONOTONIC and mach_absolute_time, which rustix drops (kernel receive stamps, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/retire.rs":

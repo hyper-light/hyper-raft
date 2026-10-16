@@ -753,6 +753,18 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   segmented send is; `Batched::held_bytes` says what is held now (`tests/udp_batched.rs`). Before
   2026-10-10 a slot grew to whatever was put in it and nothing told an owner what the socket held: focal's
   listeners held their sockets uncharged (found by focal's `network_listener`).
+- **Sends from the caller's buffer; receive buffers lent** (2026-10-15).
+  - `Batched::send_segments` sends a run of datagrams of one size, the last possibly shorter,
+    straight from the caller's buffer, after whatever the outbox holds. Where the kernel segments, it
+    makes one `sendmmsg` of one `UDP_SEGMENT` message per 64 datagrams or 65,507 bytes; elsewhere it
+    sends a datagram a call. It returns how many datagrams are done; the rest are the caller's to send
+    once the socket is writable.
+  - A socket made by `Batched::lent` holds no receive buffers. It receives into a `Ring` its owner
+    lends it for the call (`receive_with`), so a driver of many sockets holds one batch of buffers
+    for all of them.
+  - A segmented message refused EIO or EINVAL turns segmentation off, and the message goes again
+    unsegmented, in both the outbox's sends and `send_segments` (docs/transport.md §4h; before, only
+    EIO did, and a socket refused EINVAL dropped every segmented message).
 - **Done** (2026-10-06): `UdpSocket` and `Batched` on IPv4 and IPv6; the batched calls and stamps moved from
   hyper-tokio's `sys` layer into `udp/linux.rs` and `udp/macos.rs`. Measured by `tests/udp_batched.rs` on
   macOS and on Linux 6.12 (Docker): a 32-datagram batch crosses loopback in fewer calls than datagrams

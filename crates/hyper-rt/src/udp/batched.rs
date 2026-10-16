@@ -107,6 +107,26 @@ pub struct IoStats {
     pub oversize: u64,
 }
 
+impl IoStats {
+    /// These and `other`'s summed, each count saturating; a flag is set where either's is.
+    #[must_use]
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            sent: self.sent.saturating_add(other.sent),
+            send_calls: self.send_calls.saturating_add(other.send_calls),
+            received: self.received.saturating_add(other.received),
+            receive_calls: self.receive_calls.saturating_add(other.receive_calls),
+            send_errors: self.send_errors.saturating_add(other.send_errors),
+            outbox_full: self.outbox_full.saturating_add(other.outbox_full),
+            astray: self.astray.saturating_add(other.astray),
+            gso: self.gso || other.gso,
+            gro: self.gro || other.gro,
+            kernel_stamps: self.kernel_stamps || other.kernel_stamps,
+            oversize: self.oversize.saturating_add(other.oversize),
+        }
+    }
+}
+
 /// Where and when a datagram arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Arrival {
@@ -126,6 +146,75 @@ pub struct Slot {
     pub bytes: Vec<u8>,
     /// Where it goes.
     pub to: SocketAddr,
+}
+
+/// Receive buffers a driver lends whichever of its sockets it reads ([`Batched::receive_with`]):
+/// one batch of them for any number of sockets, where a socket that holds its own holds a batch
+/// each. [`Io::batch`] buffers of [`RECEIVE_BYTES`] on Linux and one elsewhere, and on Linux the
+/// headers of a receive.
+pub struct Ring {
+    batch: usize,
+    buffers: Vec<Vec<u8>>,
+    #[cfg(target_os = "linux")]
+    headers: linux::Headers,
+    #[cfg(target_os = "linux")]
+    received: Vec<linux::Received>,
+}
+
+impl std::fmt::Debug for Ring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ring")
+            .field("batch", &self.batch)
+            .field("buffers", &self.buffers.len())
+            .finish()
+    }
+}
+
+impl Ring {
+    /// A ring for batches of `io`'s size. Refused `BadConfig` for a batch outside 1 to
+    /// [`MAX_BATCH`], and `Capacity` when its buffers cannot be reserved.
+    pub fn new(io: Io) -> Result<Self, RtError> {
+        if io.batch == 0 || io.batch > MAX_BATCH {
+            return Err(RtError::BadConfig {
+                what: "a datagram batch outside 1 to MAX_BATCH",
+            });
+        }
+        let count = if cfg!(target_os = "linux") {
+            io.batch
+        } else {
+            1
+        };
+        let mut buffers = Vec::new();
+        buffers
+            .try_reserve_exact(count)
+            .map_err(|_| RtError::Capacity {
+                what: "datagram receive buffers",
+                bound: count,
+            })?;
+        for _ in 0..count {
+            buffers.push(zeroed(RECEIVE_BYTES)?);
+        }
+        Ok(Self {
+            batch: io.batch,
+            buffers,
+            #[cfg(target_os = "linux")]
+            headers: linux::Headers::new(io.batch),
+            #[cfg(target_os = "linux")]
+            received: Vec::with_capacity(io.batch),
+        })
+    }
+
+    /// The bytes it holds while it lives: what its owner charges for it.
+    pub fn held_bound(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        let headers = linux::message_bytes().saturating_mul(self.batch);
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        self.buffers
+            .len()
+            .saturating_mul(RECEIVE_BYTES)
+            .saturating_add(headers)
+    }
 }
 
 /// Whether the outbox drained.
@@ -273,6 +362,30 @@ impl Batched {
     /// (the stats say whether it agreed). Refused `BadConfig` for a batch outside 1 to [`MAX_BATCH`], and
     /// `Capacity` when the receive buffers cannot be reserved.
     pub fn new(udp: UdpSocket, io: Io, stamps: bool) -> Result<Self, RtError> {
+        Self::new_with(udp, io, stamps, true)
+    }
+
+    /// Binds a socket to `addr`, lent its receive buffers ([`Batched::lent`]).
+    pub fn bind_lent(addr: impl Into<SocketAddr>, stamps: bool) -> Result<Self, RtError> {
+        Self::lent(UdpSocket::bind(addr)?, stamps)
+    }
+
+    /// Binds a socket to `addr` that other sockets of this process may bind too, lent its receive
+    /// buffers ([`Batched::lent`]).
+    pub fn bind_shared_lent(addr: impl Into<SocketAddr>, stamps: bool) -> Result<Self, RtError> {
+        Self::lent(UdpSocket::bind_shared(addr)?, stamps)
+    }
+
+    /// Batches `udp` without receive buffers of its own: it receives into a [`Ring`] its owner lends
+    /// it ([`Batched::receive_with`]) and sends from its owner's buffers
+    /// ([`Batched::send_segments`]), so a driver of many sockets holds one batch of buffers for all
+    /// of them where each held its own (a socket a peer, thousands of them). Its outbox holds one
+    /// datagram.
+    pub fn lent(udp: UdpSocket, stamps: bool) -> Result<Self, RtError> {
+        Self::new_with(udp, Io { batch: 1 }, stamps, false)
+    }
+
+    fn new_with(udp: UdpSocket, io: Io, stamps: bool, own: bool) -> Result<Self, RtError> {
         if io.batch == 0 || io.batch > MAX_BATCH {
             return Err(RtError::BadConfig {
                 what: "a datagram batch outside 1 to MAX_BATCH",
@@ -337,6 +450,7 @@ impl Batched {
             let _ = (raw, stamps);
             1
         };
+        let buffer_count = if own { buffer_count } else { 0 };
         let mut buffers = Vec::new();
         buffers
             .try_reserve_exact(buffer_count)
@@ -362,6 +476,11 @@ impl Batched {
             #[cfg(target_os = "macos")]
             mach,
         })
+    }
+
+    /// The most datagrams one of its system calls carries, either way ([`Io::batch`]).
+    pub fn batch(&self) -> usize {
+        self.batch
     }
 
     /// The local address the socket is bound to.
@@ -498,6 +617,115 @@ impl Batched {
         Sent::Drained
     }
 
+    /// Sends `bytes` to `to` now as datagrams of `segment` bytes each (the last may be shorter),
+    /// straight from the caller's buffer with no copy into the outbox: in segmented sends where the
+    /// kernel segments (`UDP_SEGMENT`, each within the kernel's segment and byte bounds), else a
+    /// datagram a call. What the outbox holds goes first, so every datagram leaves in the order it
+    /// was given. Returns how many of the datagrams are done, sent or refused (a datagram the kernel
+    /// refuses is dropped and counted, as the outbox drops one: the protocols above recover it):
+    /// all of them, or fewer when the socket takes no more now (await [`Batched::writable`] and send
+    /// the rest), none while the outbox still holds datagrams. Each pass of its loop sends a
+    /// message, or returns, or marks an astray report (once a datagram), or switches segmentation
+    /// off (once), so it ends within three passes a datagram and two.
+    pub fn send_segments(&mut self, to: SocketAddr, bytes: &[u8], segment: usize) -> usize {
+        let segment = segment.clamp(1, RECEIVE_BYTES);
+        let total = bytes.len().div_ceil(segment);
+        if total == 0 || (self.pending() && self.send() == Sent::Blocked) {
+            return 0;
+        }
+        let mut done = 0usize;
+        let mut astray_at = None;
+        for _ in 0..total.saturating_mul(3).saturating_add(2) {
+            let Some(left) = total.checked_sub(done).filter(|left| *left > 0) else {
+                break;
+            };
+            let count = self.segments_a_message(segment).min(left);
+            let from = done.saturating_mul(segment).min(bytes.len());
+            let to_byte = from
+                .saturating_add(count.saturating_mul(segment))
+                .min(bytes.len());
+            let Some(message) = bytes.get(from..to_byte) else {
+                break;
+            };
+            match self.send_message(to, message, segment) {
+                SendStep::Took(_) => {
+                    done = done.saturating_add(count);
+                    self.stats.sent = self.stats.sent.saturating_add(as_u64(count));
+                    self.stats.send_calls = self.stats.send_calls.saturating_add(1);
+                    astray_at = None;
+                }
+                SendStep::NotNow => break,
+                SendStep::Astray(_) if astray_at != Some(done) => astray_at = Some(done),
+                SendStep::Refused(_) | SendStep::Astray(_) => {
+                    done = done.saturating_add(count);
+                    self.stats.send_errors = self.stats.send_errors.saturating_add(as_u64(count));
+                    astray_at = None;
+                }
+                #[cfg(target_os = "linux")]
+                SendStep::Unsegmented => {}
+            }
+        }
+        done
+    }
+
+    /// The datagrams of `segment` bytes one message carries: as many as a segmented send takes
+    /// where the kernel segments, else one.
+    fn segments_a_message(&self, segment: usize) -> usize {
+        #[cfg(target_os = "linux")]
+        if self.stats.gso && matches!(self.udp.inner, Inner::Real { .. }) {
+            return linux::segments_per_message(segment);
+        }
+        let _ = segment;
+        1
+    }
+
+    /// One message of `bytes` to `to`, segmented into datagrams of `segment` bytes where it holds
+    /// more than one.
+    #[cfg(target_os = "linux")]
+    fn send_message(&mut self, to: SocketAddr, bytes: &[u8], segment: usize) -> SendStep {
+        let Inner::Real { socket } = &self.udp.inner else {
+            return self.send_message_portable(to, bytes);
+        };
+        let fd = socket.raw_id();
+        match linux::send_one(fd, to, bytes, segment, &mut self.linux.send) {
+            Ok(()) => SendStep::Took(1),
+            Err(failed) => match failed.error.raw_os_error() {
+                Some(libc::EAGAIN | libc::EINTR) => SendStep::NotNow,
+                Some(
+                    libc::ECONNREFUSED | libc::ECONNRESET | libc::EHOSTUNREACH | libc::ENETUNREACH,
+                ) => {
+                    self.stats.astray = self.stats.astray.saturating_add(1);
+                    SendStep::Astray(1)
+                }
+                // EIO or EINVAL from a segmented message: the path cannot segment (`send_some`).
+                // Later sends go a datagram a message, this one among them.
+                Some(libc::EIO | libc::EINVAL) if self.stats.gso && segment < bytes.len() => {
+                    self.stats.gso = false;
+                    SendStep::Unsegmented
+                }
+                _ => SendStep::Refused(1),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn send_message(&mut self, to: SocketAddr, bytes: &[u8], _segment: usize) -> SendStep {
+        self.send_message_portable(to, bytes)
+    }
+
+    /// One datagram of `bytes` to `to` through the socket's own send.
+    fn send_message_portable(&mut self, to: SocketAddr, bytes: &[u8]) -> SendStep {
+        let astray_before = self.udp.astray_reports();
+        match self.udp.send_once(bytes, to) {
+            Ok(Outcome::Done(_)) => SendStep::Took(1),
+            Ok(Outcome::NotNow) if self.udp.astray_reports() != astray_before => {
+                SendStep::Astray(1)
+            }
+            Ok(Outcome::NotNow) => SendStep::NotNow,
+            Err(_) => SendStep::Refused(1),
+        }
+    }
+
     /// One system call's worth of the queue.
     #[cfg(target_os = "linux")]
     fn send_some(&mut self) -> SendStep {
@@ -518,9 +746,12 @@ impl Batched {
                     self.stats.astray = self.stats.astray.saturating_add(1);
                     SendStep::Astray(failed.slots)
                 }
-                // EIO from a segmented send: the device cannot segment (its checksum offload is off,
-                // udp(7)); later sends go one datagram a message, this one among them.
-                Some(libc::EIO) if self.stats.gso => {
+                // EIO or EINVAL from a segmented message: the path cannot segment (udp(7) names EIO
+                // for a device without checksum offload; the kernel refuses EINVAL to a socket sending
+                // without checksums, and quinn-udp has met it from drivers too). Later sends go one
+                // datagram a message, this one among them. A message of one datagram was not
+                // segmented, and its error is its own.
+                Some(libc::EIO | libc::EINVAL) if self.stats.gso && failed.slots > 1 => {
                     self.stats.gso = false;
                     SendStep::Unsegmented
                 }
@@ -554,12 +785,45 @@ impl Batched {
     /// Takes one batch of datagrams that have arrived, handing each to `deliver` with its arrival; returns
     /// how many, 0 when none had (await [`Batched::readable`]). At most [`Io::batch`] calls, so a socket
     /// that keeps reporting astray datagrams cannot hold the shard.
-    pub fn receive(
+    pub fn receive(&mut self, deliver: impl FnMut(Arrival, &mut [u8])) -> Result<usize, RtError> {
+        if self.buffers.is_empty() {
+            return Err(RtError::BadConfig {
+                what: "a lent socket receives into its owner's ring (Batched::receive_with)",
+            });
+        }
+        self.receive_turns(self.batch, deliver)
+    }
+
+    /// [`Batched::receive`] into `ring`, lent for the call: a batch of the ring's size, its buffers
+    /// and headers moved in for the call and back out after it.
+    pub fn receive_with(
         &mut self,
+        ring: &mut Ring,
+        deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<usize, RtError> {
+        self.lend(ring);
+        let received = self.receive_turns(ring.batch, deliver);
+        self.lend(ring);
+        received
+    }
+
+    /// Exchanges the socket's receive buffers and headers with `ring`'s (twice restores them).
+    fn lend(&mut self, ring: &mut Ring) {
+        core::mem::swap(&mut self.buffers, &mut ring.buffers);
+        #[cfg(target_os = "linux")]
+        {
+            core::mem::swap(&mut self.linux.receive, &mut ring.headers);
+            core::mem::swap(&mut self.linux.received, &mut ring.received);
+        }
+    }
+
+    fn receive_turns(
+        &mut self,
+        turns: usize,
         mut deliver: impl FnMut(Arrival, &mut [u8]),
     ) -> Result<usize, RtError> {
         let mut delivered = 0usize;
-        for _ in 0..self.batch {
+        for _ in 0..turns {
             match self.receive_some(&mut deliver)? {
                 ReceiveStep::Delivered(count) => {
                     delivered = delivered.saturating_add(count);

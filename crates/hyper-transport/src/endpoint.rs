@@ -704,6 +704,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 
     /// The next datagram to send, written into `out` (cleared first).
     pub fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<Transmit> {
+        self.poll_transmit_batch(now, 1, out)
+    }
+
+    /// The next datagrams to send, written into `out` (cleared first): up to `max_datagrams` of one
+    /// connection's, to one destination, each but the last [`Transmit::segment_size`] bytes, for a
+    /// socket that sends them in one segmented call (`UDP_SEGMENT`) or splits them. A driver that
+    /// asked for one at a time made a call, and a slot of its outbox, a datagram.
+    pub fn poll_transmit_batch(
+        &mut self,
+        now: Instant,
+        max_datagrams: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<Transmit> {
         self.core.now = now;
         out.clear();
         if let Some((transmit, bytes)) = self.responses.pop_front() {
@@ -721,7 +734,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             let Some(Some(conn)) = self.conns.get_mut(key) else {
                 continue;
             };
-            let sent = conn.quic.poll_transmit(now, 1, out, self.quic.configs());
+            let sent = conn
+                .quic
+                .poll_transmit(now, max_datagrams.max(1), out, self.quic.configs());
             // Sending, or finding nothing to send, moves the connection's timers.
             self.rearm_later(key);
             if let Some(transmit) = sent {

@@ -10,6 +10,15 @@
 //! no privilege asked: one shared socket of Linux's default 208 KiB held about three connections'
 //! first windows. The listener keeps the handshakes and any peer whose socket could not be made.
 //! Elsewhere (Windows, the simulation fabric) the listener takes every peer.
+//!
+//! **One set of buffers, and sends straight from the endpoint's.** Every socket receives into one
+//! [`Ring`] the driver lends whichever it reads, so a socket a peer costs its descriptor and a few
+//! headers, not a batch of 64 KiB buffers: a peer's socket had held two, and so carried two
+//! datagrams a system call. The endpoint makes up to `SEGMENTS_A_TRANSMIT` of one connection's
+//! datagrams at once, which the socket sends from the driver's buffer in one segmented call where
+//! the kernel segments (`UDP_SEGMENT`), so a peer's bulk leaves, and arrives through `UDP_GRO`, as
+//! a few large messages, where it left a datagram a slot of a two-slot outbox (quinn's driver and
+//! `quinn-udp` send a connection's batch so; measured in `docs/transport.md` §4h).
 
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -20,7 +29,7 @@ use std::time::{Duration, Instant};
 use hyper_rt::RtError;
 use hyper_rt::futures::{Sleep, sleep};
 use hyper_rt::readiness::Ready;
-use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, Sent};
+use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, Ring, UdpSocket};
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness, PeerId};
 
 /// Derived: the turns one poll of [`Driver::event`] takes before it yields to the shard, the bound
@@ -33,14 +42,25 @@ fn shard_now() -> Result<u64, RtError> {
     hyper_rt::registry::with_current(|context| context.now_ns()).ok_or(RtError::NotOnShardThread)
 }
 
-/// Bound: the datagrams one turn takes from the endpoint into the outboxes before the turn's other
-/// work: one system call's most ([`MAX_BATCH`]).
-const TRANSMITS_A_TURN: usize = MAX_BATCH;
+/// Bound: the datagrams one turn takes from the endpoint and sends before the turn's other work:
+/// one system call's most ([`MAX_BATCH`]).
+const DATAGRAMS_A_TURN: usize = MAX_BATCH;
 
-/// Bound: a peer socket's batch, datagrams a system call each way. Each socket holds its receive
-/// buffers ([`hyper_rt::udp::RECEIVE_BYTES`] each, for the kernel's coalesced receives) for as long
-/// as its peer is connected, so a peer's is two, against the listener's batch.
-const PEER_IO: Io = Io { batch: 2 };
+/// Format: the datagrams of one connection's the endpoint makes at once, `UDP_MAX_SEGMENTS`
+/// (`include/linux/udp.h`), the most one segmented send carries; a socket that does not segment
+/// sends them a datagram a call.
+const SEGMENTS_A_TRANSMIT: usize = 64;
+
+/// A transmit its socket took only part of: its rest waits for the socket to write, and nothing the
+/// endpoint makes is sent past it.
+struct Held {
+    to: SocketAddr,
+    bytes: Vec<u8>,
+    /// The bytes of it sent.
+    done: usize,
+    /// Each datagram's size but the last's.
+    segment: usize,
+}
 
 /// A socket connected to one of the endpoint's peers, sharing the listener's port.
 struct PeerSocket {
@@ -75,37 +95,53 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     seen: u64,
     /// The endpoint's connections as last listed ([`Endpoint::established`]).
     listed: Vec<(PeerId, SocketAddr)>,
-    /// A datagram the endpoint made, and where it goes, waiting for its socket's outbox to have room:
-    /// at most one.
-    held: Option<(SocketAddr, Vec<u8>)>,
-    /// The buffer the endpoint makes each datagram in, kept between datagrams.
+    /// A transmit its socket took only part of, waiting for it to write: at most one.
+    held: Option<Held>,
+    /// The buffer the endpoint makes each transmit in, kept between transmits.
     outgoing: Vec<u8>,
+    /// The receive buffers every socket is lent as it is read.
+    ring: Ring,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
     /// A driver for `endpoint` on a socket bound to `address`, its port shared with a socket for
     /// each peer where the platform lets it (the module's doc). Called on a shard thread.
     pub fn bind(endpoint: Endpoint<C, B, D>, address: SocketAddr, io: Io) -> Result<Self, RtError> {
-        match Batched::bind_shared(address, io, false) {
+        let ring = Ring::new(io)?;
+        match Batched::bind_shared_lent(address, false) {
             Ok(socket) => {
                 let local = socket.local_addr()?;
-                let mut driver = Self::new(endpoint, socket)?;
+                let mut driver = Self::with_ring(endpoint, socket, ring)?;
                 driver.shared = Some(local);
                 Ok(driver)
             }
-            Err(RtError::BadConfig { .. }) => {
-                Self::new(endpoint, Batched::bind(address, io, false)?)
-            }
+            Err(RtError::BadConfig { .. }) => Self::with_ring(
+                endpoint,
+                Batched::lent(UdpSocket::bind(address)?, false)?,
+                ring,
+            ),
             Err(error) => Err(error),
         }
     }
 
-    /// A driver for `endpoint` on `socket`. Called on a shard thread.
+    /// A driver for `endpoint` on `socket`, whose sockets receive into a ring of `socket`'s batch.
+    /// Called on a shard thread.
+    pub fn new(endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
+        let ring = Ring::new(Io {
+            batch: socket.batch(),
+        })?;
+        Self::with_ring(endpoint, socket, ring)
+    }
+
     #[allow(
         clippy::disallowed_methods,
         reason = "the runtime adapter anchors the endpoint's Instant to the shard's clock once"
     )]
-    pub fn new(mut endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
+    fn with_ring(
+        mut endpoint: Endpoint<C, B, D>,
+        socket: Batched,
+        ring: Ring,
+    ) -> Result<Self, RtError> {
         // The socket's queue holds what the endpoint's windows may grant (hyper-transport's socket
         // room): asked for their sum, and the endpoint told what the kernel gave, so what its peers
         // may send unread never passes what the queue takes while the owner does not read.
@@ -132,6 +168,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             listed: Vec::new(),
             held: None,
             outgoing: Vec::new(),
+            ring,
         })
     }
 
@@ -169,6 +206,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// What the listener's socket has done.
     pub fn stats(&self) -> IoStats {
         self.socket.stats()
+    }
+
+    /// What the sockets of the peers it holds now have done, summed; a flag is set where any of
+    /// theirs is.
+    pub fn peer_stats(&self) -> IoStats {
+        self.peers.iter().fold(IoStats::default(), |sum, peer| {
+            sum.plus(&peer.socket.stats())
+        })
     }
 
     /// The sockets the driver holds connected to its peers (the module's doc).
@@ -250,7 +295,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             outcome?;
             fired = true;
         }
-        if self.socket.pending() {
+        // A socket is awaited writable while its outbox holds datagrams or it holds the transmit
+        // the driver waits on.
+        let held = self.held.as_ref().map(|held| held.to);
+        let listener_holds = held.is_some_and(|to| {
+            self.peers
+                .binary_search_by_key(&to, |peer| peer.remote)
+                .is_err()
+        });
+        if self.socket.pending() || listener_holds {
             let writable = self.writable.get_or_insert_with(|| self.socket.writable());
             if let Poll::Ready(outcome) = Pin::new(writable).poll(context) {
                 self.writable = None;
@@ -268,7 +321,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                     fired = true;
                 }
             }
-            if peer.socket.pending() {
+            if peer.socket.pending() || held == Some(peer.remote) {
                 let writable = peer.writable.get_or_insert_with(|| peer.socket.writable());
                 if let Poll::Ready(outcome) = Pin::new(writable).poll(context) {
                     peer.writable = None;
@@ -313,7 +366,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             {
                 continue;
             }
-            let Ok(mut socket) = Batched::bind_shared(local, PEER_IO, false) else {
+            let Ok(mut socket) = Batched::bind_shared_lent(local, false) else {
                 continue;
             };
             if socket.connect(remote).is_err() {
@@ -394,7 +447,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             endpoint.handle_datagram(at, arrival.from, None, bytes);
         };
         for _ in 0..TURNS {
-            if self.socket.receive(&mut deliver)? == 0 {
+            if self.socket.receive_with(&mut self.ring, &mut deliver)? == 0 {
                 break;
             }
         }
@@ -404,7 +457,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             }
             let mut emptied = false;
             for _ in 0..TURNS {
-                if peer.socket.receive(&mut deliver)? == 0 {
+                if peer.socket.receive_with(&mut self.ring, &mut deliver)? == 0 {
                     emptied = true;
                     break;
                 }
@@ -415,43 +468,68 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         Ok(())
     }
 
-    /// Moves what the endpoint transmits into the outboxes, each datagram into its peer's socket's or
-    /// the listener's, and sends them; whether the turn's bound was reached with the endpoint likely
-    /// to have more. A datagram whose outbox is full and stays so waits, held, until its socket can
-    /// write: none is dropped.
+    /// Sends what the endpoint transmits, each transmit straight from the driver's buffer on its
+    /// peer's socket or the listener ([`Batched::send_segments`]); whether the turn's bound was
+    /// reached with the endpoint likely to have more. A transmit its socket took only part of waits,
+    /// held, until the socket can write, and nothing is sent past it: none is dropped.
     fn send(&mut self, now: Instant) -> bool {
-        if let Some((to, bytes)) = self.held.take() {
-            if !self.queue(to, &bytes) {
-                self.held = Some((to, bytes));
-                let _ = self.flush_all();
-                return false;
-            }
-            self.outgoing = bytes;
+        if let Some(held) = self.held.take()
+            && let Some(rest) = self.send_held(held)
+        {
+            self.held = Some(rest);
+            return false;
         }
-        let mut taken = 0;
+        let mut datagrams = 0usize;
         let mut more = false;
-        while taken < TRANSMITS_A_TURN {
+        while datagrams < DATAGRAMS_A_TURN {
             let mut outgoing = std::mem::take(&mut self.outgoing);
             outgoing.clear();
-            let Some(transmit) = self.endpoint.poll_transmit(now, &mut outgoing) else {
+            let Some(transmit) =
+                self.endpoint
+                    .poll_transmit_batch(now, SEGMENTS_A_TRANSMIT, &mut outgoing)
+            else {
                 self.outgoing = outgoing;
                 break;
             };
-            taken = taken.saturating_add(1);
             outgoing.truncate(transmit.size);
-            if !self.queue(transmit.destination, &outgoing) {
-                self.held = Some((transmit.destination, outgoing));
-                break;
+            let segment = transmit.segment_size.unwrap_or(transmit.size).max(1);
+            datagrams = datagrams.saturating_add(outgoing.len().div_ceil(segment));
+            let held = Held {
+                to: transmit.destination,
+                bytes: outgoing,
+                done: 0,
+                segment,
+            };
+            if let Some(rest) = self.send_held(held) {
+                self.held = Some(rest);
+                return false;
             }
-            self.outgoing = outgoing;
-            more = taken == TRANSMITS_A_TURN;
+            more = datagrams >= DATAGRAMS_A_TURN;
         }
-        self.flush_all() && more
+        more
     }
 
-    /// Queues `bytes` for `to` in its peer's socket's outbox, or the listener's; whether it had room.
-    fn queue(&mut self, to: SocketAddr, bytes: &[u8]) -> bool {
-        let socket = match self
+    /// Sends what `held` has left on its socket: none left, its buffer kept for the next transmit,
+    /// or the rest when the socket took no more.
+    fn send_held(&mut self, mut held: Held) -> Option<Held> {
+        let rest = held.bytes.get(held.done..).unwrap_or(&[]);
+        let sent = self
+            .socket_for(held.to)
+            .send_segments(held.to, rest, held.segment);
+        held.done = held
+            .done
+            .saturating_add(sent.saturating_mul(held.segment))
+            .min(held.bytes.len());
+        if held.done < held.bytes.len() {
+            return Some(held);
+        }
+        self.outgoing = held.bytes;
+        None
+    }
+
+    /// The socket `to`'s datagrams leave by: its peer's, or the listener's.
+    fn socket_for(&mut self, to: SocketAddr) -> &mut Batched {
+        match self
             .peers
             .binary_search_by_key(&to, |peer| peer.remote)
             .ok()
@@ -459,22 +537,6 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         {
             Some(peer) => &mut peer.socket,
             None => &mut self.socket,
-        };
-        if socket.queue(to, bytes) {
-            return true;
         }
-        // Full: what it holds goes now, and the datagram is queued if that made room.
-        socket.send() == Sent::Drained && socket.queue(to, bytes)
-    }
-
-    /// Sends what every outbox holds; whether all drained.
-    fn flush_all(&mut self) -> bool {
-        let mut drained = !self.socket.pending() || self.socket.send() == Sent::Drained;
-        for peer in &mut self.peers {
-            if peer.socket.pending() && peer.socket.send() == Sent::Blocked {
-                drained = false;
-            }
-        }
-        drained
     }
 }

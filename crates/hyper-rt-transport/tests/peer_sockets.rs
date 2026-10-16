@@ -182,6 +182,16 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
                     "the peer's datagrams came by its own socket"
                 );
             }
+            // The client's bulk leaves its peer's socket as the endpoint made it, several datagrams
+            // a call where the kernel segments.
+            let peer = client.peer_stats();
+            if cfg!(target_os = "linux") {
+                assert!(peer.gso, "{peer:?}");
+                assert!(
+                    peer.send_calls * 2 < peer.sent,
+                    "segmented sends carried two datagrams or fewer a call: {peer:?}"
+                );
+            }
 
             // The connection goes, and its socket with it.
             let now = client.clock().unwrap();
@@ -192,7 +202,9 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
             }
             assert_eq!(server.endpoint().stats().receive_rooms, 0);
             format!(
-                "{FRAMES} frames by the peer's own socket ({shared} a side); its socket let go with it"
+                "{FRAMES} frames by the peer's own socket ({shared} a side), {} datagrams in {} calls; \
+                 its socket let go with it",
+                peer.sent, peer.send_calls
             )
         })
         .unwrap();

@@ -818,6 +818,81 @@ RFC 9000 §4.6), and an exchange is a stream.
     at once against a pool of three: never more than three open at the server, every one answered)
     and `a_pool_sized_to_nothing_holds_its_peer_until_sized_again`.
 
+## 4h. A connection's batch in one call, and one set of receive buffers (2026-10-15)
+
+focal's event bus, measured against NATS (each node on one CPU, Linux 6.x in Docker), carried 45,000
+to 56,000 messages a second whatever was offered from 100,000 to 100,000,000 a second, where NATS
+carried about 250,000. Diagnostic builds of the bus at 1,000,000 a second offered (three runs each)
+traced it to the driver's sends, which two bounds held to a datagram or two a system call:
+
+- hyper-transport asked hyper-quic for one datagram at a time (`poll_transmit(now, 1, ..)`), so each
+  datagram cost its own pass through the connection's packet assembly and a copy into an outbox
+  slot; and
+- a peer's socket (hyper-rt-transport's socket a peer, its driver's module doc) batched two datagrams a call, because each socket held its
+  own receive buffers, 64 KiB each, for as long as its peer was connected. A peer's bulk therefore
+  left two datagrams a `sendmmsg`, never enough to segment.
+
+A peer batch of 64 in place of 2 took the bus from 118,000 to 144,000 a second. With the kernel's
+charge counted at twice the payload rather than four times (the socket room, still open, below), it
+reached 257,000, with nothing dropped in either.
+
+The design is quinn's (its endpoint driver and `quinn-udp`):
+
+- **A batch at a time.** The endpoint makes up to `SEGMENTS_A_TRANSMIT` (64, `UDP_MAX_SEGMENTS`) of
+  one connection's datagrams at once (`Endpoint::poll_transmit_batch`). They go into the driver's one
+  buffer, each but the last of the transmit's segment size; hyper-quic already built such batches for
+  any caller that asked (`enable_segmentation_offload`, on by default).
+- **Sent from the driver's buffer.** The socket sends a batch with no copy (`Batched::send_segments`).
+  Where the kernel segments, it uses one `sendmmsg` of one message carrying `UDP_SEGMENT`, as many
+  messages as the kernel's bounds need (64 segments, 65,507 bytes). Elsewhere it sends a datagram a
+  call. What a socket's outbox already holds leaves first, so datagrams leave in the order they were
+  made.
+- **Nothing dropped for room.** When the socket takes only part of a transmit, the driver holds the
+  transmit with its progress. It awaits that socket's writability and sends nothing the endpoint
+  makes until the transmit is done.
+- **One set of receive buffers.** Every socket receives into one `Ring` that the driver lends to
+  whichever socket it reads (`Batched::receive_with`). The ring holds `Io::batch` buffers of 64 KiB on
+  Linux and one elsewhere, where each peer's socket had held its own. A peer's socket
+  (`Batched::lent`) holds only its descriptor and the headers of a one-message call; its own
+  `receive` is refused `BadConfig`, since it has nothing to receive into.
+- **When the path cannot segment.** A segmented message refused EIO (udp(7): a device without
+  checksum offload) or EINVAL turns segmentation off for the socket, and the message goes again a
+  datagram a call. The kernel returns EINVAL to a socket sending without checksums (`udp_send_skb`),
+  and quinn-udp turns segmentation off on EINVAL because drivers have returned it. A one-datagram
+  message was not segmented, so its error is its own. This applies to the outbox's batched sends
+  too. Before, they turned segmentation off only on EIO: a socket refused EINVAL dropped every
+  segmented message, counted as send errors, so its connection lost its bulk until it timed out.
+
+**Bounds.**
+- The ring: `Ring::held_bound`, a batch of 64 KiB buffers and their headers on Linux.
+- One transmit buffer: 64 of the path's datagrams, 93 KB at 1,452 bytes.
+- Per peer socket: the headers of a one-message call and an empty one-slot outbox. A thousand peers
+  had held 128 MiB of receive buffers between them; they now hold none of their own.
+- Each turn sends at most `MAX_BATCH` datagrams before its other work, as before.
+- `send_segments`' loop ends within three passes a datagram, plus two. Each pass sends a message,
+  returns, marks one astray report, or turns segmentation off once.
+
+**Tests.**
+- hyper-rt `tests/udp_batched.rs`:
+  - `a_segmented_send_crosses_whole_and_in_order_from_the_callers_buffer`: 150 datagrams of
+    100 bytes (64 a message) and 60 of 1,200 (54 a message), each last one shorter, over IPv4 and
+    IPv6. Each arrives once, in order, at its own length. On Linux the batch takes exactly as many
+    calls as the bounds need; elsewhere, one a datagram.
+  - `what_the_outbox_holds_leaves_before_a_segmented_send`.
+  - `a_segmented_send_the_socket_does_not_take_is_done_by_none_and_sent_again`: on the simulation
+    fabric, whose sends can be blocked.
+  - `one_ring_serves_every_lent_socket_and_none_holds_its_buffers`.
+  - `a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone`: `SO_NO_CHECK`. It fails
+    under the EIO-only rule, with all ten datagrams refused.
+- hyper-rt-transport `each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection`:
+  on Linux, the client's peer socket sent 1,459 datagrams in 92 calls, where it had been held to two
+  a call. macOS took 1,449 calls for 1,449 datagrams, since it has no segmentation.
+
+Open: the socket room counts the kernel's charge at four times a datagram's payload, the worst case
+measured on Linux 6.x; MTU-sized datagrams are charged 1.58 times. With room for twice as many
+datagrams, the bus nearly doubled its throughput (above) without a drop. The charge should be
+learned per socket, not assumed, and 64 KiB-page kernels differ.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

@@ -155,6 +155,29 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
 
 ### Closed (2026-10-15)
 
+- **hyper-rt-transport: a peer's socket carried two datagrams a system call.** Found by focal's
+  event bus, which carried 45,000–56,000 messages a second at every rate offered past 100,000, where
+  NATS carried 250,000. Two bounds caused it:
+  - the endpoint asked hyper-quic for one datagram at a time;
+  - each peer's socket batched two datagrams, because it held its own 64 KiB receive buffers.
+
+  Now, as quinn's driver does:
+  - the endpoint makes up to 64 of a connection's datagrams at once
+    (`Endpoint::poll_transmit_batch`);
+  - the socket sends them from the driver's buffer, segmented where the kernel segments
+    (`Batched::send_segments`);
+  - every socket receives into one ring the driver lends it (`Ring`, `Batched::receive_with`);
+  - a transmit a socket took only part of is held until the socket can write, nothing sent past it.
+
+  On Linux the bulk test's peer socket sent 1,459 datagrams in 92 calls (`docs/transport.md` §4h).
+- **hyper-rt: a socket whose segmented sends the kernel refused with EINVAL dropped every one.** The
+  batched send turned segmentation off on EIO alone. EINVAL, which the kernel returns to a socket
+  sending without checksums and which quinn-udp has met from drivers, was counted as a refusal each
+  time, so the connection lost every batch until it timed out. A segmented message refused either
+  way now turns segmentation off and goes again a datagram a call. Test:
+  `a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone` (`SO_NO_CHECK`), in which ten
+  datagrams were all refused before the fix.
+
 - **hyper-transport: a stalled reader's socket dropped what its windows let peers send.** Found by
   focal's event-bus comparison (a node on one CPU, Linux 6.x in Docker on a loaded host): at 50,000
   messages a second the node's socket counted 1,202 `RcvbufErrors` in 25 s (69 at 10,000), its

@@ -24,7 +24,8 @@ use hyper_rt::RtError;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sim::SimRuntime;
 use hyper_rt::udp::{
-    Arrival, Batched, Io, Ipv4Addr, Ipv6Addr, MAX_BATCH, RECEIVE_BYTES, Sent, SocketAddr, UdpSocket,
+    Arrival, Batched, Io, IoStats, Ipv4Addr, Ipv6Addr, MAX_BATCH, RECEIVE_BYTES, Ring, Sent,
+    SocketAddr, UdpSocket,
 };
 
 fn config() -> RuntimeConfig {
@@ -248,6 +249,10 @@ fn a_batch_outside_its_bounds_is_refused() {
                 Batched::bind(loopback, Io { batch }, false),
                 Err(RtError::BadConfig { .. })
             ));
+            assert!(matches!(
+                Ring::new(Io { batch }),
+                Err(RtError::BadConfig { .. })
+            ));
         }
     })
     .unwrap();
@@ -342,6 +347,324 @@ fn a_send_waiting_for_room_is_refused_for_a_destination_with_no_route() {
             .await
             .unwrap();
         assert!(matches!(sent, Some(Err(_))), "{sent:?}");
+    })
+    .unwrap();
+}
+
+/// `UDP_MAX_SEGMENTS` (`include/linux/udp.h`): the most datagrams one segmented send carries.
+const MOST_SEGMENTS: usize = 64;
+
+/// What a segmented round trip looked like.
+struct Segmented {
+    /// Each datagram's index and length, in the order they arrived.
+    arrived: Vec<(usize, usize)>,
+    /// What [`Batched::send_segments`] said it had done, call by call.
+    done: Vec<usize>,
+    sender: IoStats,
+    receiver: IoStats,
+}
+
+/// `count` datagrams of `segment` bytes, the last `last` bytes, back to back as an endpoint makes a
+/// batch, each beginning with its index.
+fn datagrams(count: usize, segment: usize, last: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for index in 0..count {
+        let length = if index + 1 == count { last } else { segment };
+        let start = bytes.len();
+        bytes.resize(start + length, 0xA5);
+        bytes[start..start + 2].copy_from_slice(&(index as u16).to_be_bytes());
+    }
+    bytes
+}
+
+/// Takes `count` datagrams on `receiver` through `ring`: each one's index and length, in order.
+async fn take(
+    receiver: &mut Batched,
+    ring: &mut Ring,
+    count: usize,
+) -> Result<Vec<(usize, usize)>, RtError> {
+    let mut arrived = Vec::new();
+    while arrived.len() < count {
+        let taken = receiver.receive_with(ring, |_, datagram| {
+            let index = usize::from(u16::from_be_bytes([datagram[0], datagram[1]]));
+            arrived.push((index, datagram.len()));
+        })?;
+        if taken == 0 {
+            receiver.readable().await?;
+        }
+    }
+    Ok(arrived)
+}
+
+/// Sends [`datagrams`] from one lent socket to another on `loopback` with
+/// [`Batched::send_segments`], straight from the buffer, until all are done, and takes them through
+/// a ring.
+async fn segmented_round_trip(
+    loopback: SocketAddr,
+    count: usize,
+    segment: usize,
+    last: usize,
+) -> Result<Segmented, RtError> {
+    let mut sender = Batched::bind_lent(loopback, false)?;
+    let mut receiver = Batched::bind_lent(loopback, false)?;
+    let mut ring = Ring::new(Io { batch: 8 })?;
+    let to = receiver.local_addr()?;
+    let bytes = datagrams(count, segment, last);
+    let mut done = Vec::new();
+    let mut sent = 0;
+    while sent < count {
+        let from = (sent * segment).min(bytes.len());
+        let now = sender.send_segments(to, &bytes[from..], segment);
+        done.push(now);
+        sent += now;
+        if sent < count {
+            sender.writable().await?;
+        }
+    }
+    let arrived = take(&mut receiver, &mut ring, count).await?;
+    Ok(Segmented {
+        arrived,
+        done,
+        sender: sender.stats(),
+        receiver: receiver.stats(),
+    })
+}
+
+/// Do: in one call, more datagrams than one segmented send carries: 150 of 100 bytes (64 a message,
+/// the kernel's segment bound) and 60 of 1,200 (54 a message, its byte bound), the last of each
+/// shorter, over IPv4 and IPv6 loopback, received through a ring. Expect: every datagram once, in
+/// order, with its own length (the last too); on Linux, which segments, as few calls as the bounds
+/// allow and no more; elsewhere a call a datagram.
+#[test]
+fn a_segmented_send_crosses_whole_and_in_order_from_the_callers_buffer() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    for loopback in [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+    ] {
+        for (count, segment, last) in [(150, 100, 37), (60, 1_200, 700)] {
+            let trip = rt
+                .block_on(segmented_round_trip(loopback, count, segment, last))
+                .unwrap()
+                .unwrap();
+            let expected: Vec<(usize, usize)> = (0..count)
+                .map(|index| (index, if index + 1 == count { last } else { segment }))
+                .collect();
+            assert_eq!(
+                trip.arrived, expected,
+                "{count} of {segment} bytes over {loopback}: every one, in order, its own length"
+            );
+            assert_eq!(trip.done.iter().sum::<usize>(), count, "{:?}", trip.done);
+            assert_eq!(trip.sender.sent, count as u64);
+            assert_eq!(trip.receiver.received, count as u64);
+            let per_message = (65_507 / segment).min(MOST_SEGMENTS);
+            if cfg!(target_os = "linux") {
+                assert!(
+                    trip.sender.gso,
+                    "Linux 4.18 and later segment: {:?}",
+                    trip.sender
+                );
+                assert_eq!(
+                    trip.sender.send_calls,
+                    count.div_ceil(per_message) as u64,
+                    "a call a message of {per_message}: {:?}",
+                    trip.sender
+                );
+            } else {
+                assert_eq!(trip.sender.send_calls, count as u64, "{:?}", trip.sender);
+            }
+        }
+    }
+}
+
+/// Do: two datagrams queued in a socket's outbox, then a segmented send of three. Expect: the queued
+/// two arrive first, then the three, each whole: a segmented send never passes what the outbox
+/// holds.
+#[test]
+fn what_the_outbox_holds_leaves_before_a_segmented_send() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let receiver = UdpSocket::bind(loopback).unwrap();
+        let to = receiver.local_addr().unwrap();
+        let mut sender = Batched::bind(loopback, Io { batch: 4 }, false).unwrap();
+        assert!(sender.queue(to, b"first"));
+        assert!(sender.queue(to, b"second"));
+        assert_eq!(sender.send_segments(to, b"aaabbbcc", 3), 3);
+        assert!(!sender.pending());
+        let mut buffer = [0u8; 16];
+        for expected in [&b"first"[..], b"second", b"aaa", b"bbb", b"cc"] {
+            let (length, _) = receiver.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(&buffer[..length], expected);
+        }
+    })
+    .unwrap();
+}
+
+/// Do: on the simulation fabric, a segmented send of five while the socket takes nothing, then the
+/// same once it takes again. Expect: none done and none sent the first time, all five the second,
+/// arriving once each and in order: what the socket did not take is the caller's to send again.
+#[test]
+fn a_segmented_send_the_socket_does_not_take_is_done_by_none_and_sent_again() {
+    let mut sim = SimRuntime::new(&config(), 1).unwrap();
+    let id = sim.shard_ids()[0];
+    let (done_tx, done_rx) = channel();
+    sim.spawn_on(id, async move {
+        let outcome = async {
+            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let mut sender = Batched::bind_lent(loopback, false)?;
+            let mut receiver = Batched::bind_lent(loopback, false)?;
+            let mut ring = Ring::new(Io { batch: 4 })?;
+            let to = receiver.local_addr()?;
+            let port = sender.local_addr()?.port();
+            let bytes = datagrams(5, 10, 4);
+            hyper_rt::sim::sim_udp_block_sends(port);
+            let refused = sender.send_segments(to, &bytes, 10);
+            let sent_while_blocked = sender.stats().sent;
+            hyper_rt::sim::sim_udp_release_sends(port);
+            let done = sender.send_segments(to, &bytes, 10);
+            let arrived = take(&mut receiver, &mut ring, 5).await?;
+            Ok::<_, RtError>((refused, sent_while_blocked, done, arrived, sender.stats()))
+        }
+        .await;
+        let _ = done_tx.send(outcome);
+    })
+    .unwrap();
+    sim.run_until_idle();
+    let (refused, sent_while_blocked, done, arrived, stats) = done_rx.try_recv().unwrap().unwrap();
+    assert_eq!(
+        (refused, sent_while_blocked),
+        (0, 0),
+        "nothing taken, nothing done"
+    );
+    assert_eq!(done, 5);
+    assert_eq!(
+        arrived,
+        vec![(0, 10), (1, 10), (2, 10), (3, 10), (4, 4)],
+        "each once, in order"
+    );
+    assert_eq!(
+        stats.send_calls, 5,
+        "the fabric does not segment: {stats:?}"
+    );
+}
+
+/// Do: one ring, two lent sockets each sent three datagrams, each read through the ring in turn.
+/// Expect: each socket hands over its own three; neither holds a receive buffer of its own before or
+/// after (the ring's buffers go back to it); a lent socket's own receive is refused, there being
+/// nothing to receive into.
+#[test]
+fn one_ring_serves_every_lent_socket_and_none_holds_its_buffers() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut ring = Ring::new(Io { batch: 4 }).unwrap();
+        assert!(
+            ring.held_bound() >= RECEIVE_BYTES,
+            "the ring holds the buffers"
+        );
+        let mut sender = Batched::bind_lent(loopback, false).unwrap();
+        let mut first = Batched::bind_lent(loopback, false).unwrap();
+        let mut second = Batched::bind_lent(loopback, false).unwrap();
+        for socket in [&first, &second] {
+            assert!(
+                socket.held_bytes() < RECEIVE_BYTES,
+                "{}",
+                socket.held_bytes()
+            );
+        }
+        let bytes = datagrams(3, 8, 8);
+        for socket in [&first, &second] {
+            assert_eq!(
+                sender.send_segments(socket.local_addr().unwrap(), &bytes, 8),
+                3
+            );
+        }
+        for socket in [&mut first, &mut second] {
+            let arrived = take(socket, &mut ring, 3).await.unwrap();
+            assert_eq!(arrived, vec![(0, 8), (1, 8), (2, 8)]);
+            assert!(
+                socket.held_bytes() < RECEIVE_BYTES,
+                "{}",
+                socket.held_bytes()
+            );
+            assert!(matches!(
+                socket.receive(|_, _| {}),
+                Err(RtError::BadConfig { .. })
+            ));
+        }
+    })
+    .unwrap();
+}
+
+/// A socket whose segmented sends the kernel refuses: one sending without UDP checksums
+/// (`SO_NO_CHECK`), which `udp_send_skb` refuses to segment with EINVAL, as drivers that cannot
+/// segment have refused it (quinn-udp). Do: ten datagrams of equal size in one segmented send, and
+/// ten queued in an outbox the kernel would segment as one message. Expect: every datagram arrives,
+/// once and in order, each sent a datagram a call once the socket stops segmenting; none refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone() {
+    use std::os::fd::AsRawFd;
+
+    /// A socket bound to `loopback` that sends without UDP checksums.
+    #[allow(
+        unsafe_code,
+        reason = "SO_NO_CHECK, which the runtime has no call for, is set through libc"
+    )]
+    fn unchecked(loopback: SocketAddr) -> UdpSocket {
+        let owned = UdpSocket::bind(loopback).unwrap().into_owned().unwrap();
+        let one: libc::c_int = 1;
+        // SAFETY: `owned` is an open socket, and the option's value is a live `c_int` of the
+        // length passed.
+        let set = unsafe {
+            libc::setsockopt(
+                owned.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NO_CHECK,
+                (&raw const one).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        UdpSocket::adopt(owned).unwrap()
+    }
+
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut receiver = Batched::bind_lent(loopback, false).unwrap();
+        let mut ring = Ring::new(Io { batch: 4 }).unwrap();
+        let to = receiver.local_addr().unwrap();
+        let expected: Vec<(usize, usize)> = (0..10).map(|index| (index, 100)).collect();
+
+        let mut lent = Batched::lent(unchecked(loopback), false).unwrap();
+        assert!(
+            lent.stats().gso,
+            "the kernel offers segmentation: {:?}",
+            lent.stats()
+        );
+        assert_eq!(lent.send_segments(to, &datagrams(10, 100, 100), 100), 10);
+        let stats = lent.stats();
+        assert!(!stats.gso, "the socket stopped segmenting: {stats:?}");
+        assert_eq!(
+            (stats.sent, stats.send_calls, stats.send_errors),
+            (10, 10, 0)
+        );
+        assert_eq!(take(&mut receiver, &mut ring, 10).await.unwrap(), expected);
+
+        let mut outboxed = Batched::new(unchecked(loopback), Io { batch: 16 }, false).unwrap();
+        let bytes = datagrams(10, 100, 100);
+        for datagram in bytes.chunks(100) {
+            assert!(outboxed.queue(to, datagram));
+        }
+        while outboxed.send() == Sent::Blocked {
+            outboxed.writable().await.unwrap();
+        }
+        let stats = outboxed.stats();
+        assert!(!stats.gso, "the socket stopped segmenting: {stats:?}");
+        assert_eq!((stats.sent, stats.send_errors), (10, 0), "{stats:?}");
+        assert_eq!(take(&mut receiver, &mut ring, 10).await.unwrap(), expected);
     })
     .unwrap();
 }

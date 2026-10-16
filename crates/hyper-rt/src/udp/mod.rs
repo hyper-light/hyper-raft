@@ -34,7 +34,7 @@ mod batched;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use batched::{Arrival, Batched, Io, IoStats, MAX_BATCH, RECEIVE_BYTES, Sent, Slot};
+pub use batched::{Arrival, Batched, Io, IoStats, MAX_BATCH, RECEIVE_BYTES, Ring, Sent, Slot};
 
 use crate::error::RtError;
 use crate::netsys::{self, Family, Socket};

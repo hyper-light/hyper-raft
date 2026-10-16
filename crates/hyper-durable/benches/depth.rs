@@ -1,23 +1,27 @@
 //! What a committed entry costs at each depth of a group's writes on hyper-log (`docs/durable.md`
 //! §14, item 1): the flushes and the latency at depths one to three, closed and open loop, for one
-//! group: whether its third write out earns its place as the log's third pipeline frame does for
-//! the log.
+//! group, and for many groups sharing their members' logs: whether a group's third write out earns
+//! its place as the log's third pipeline frame does for the log.
 //!
 //! ```text
-//! cargo bench -p hyper-durable --bench depth -- DIR [CLIENTS] [LOADS] [ROUNDS] [DEVICES] [ENTRIES]
+//! cargo bench -p hyper-durable --bench depth -- DIR [CLIENTS] [LOADS] [ROUNDS] [DEVICES] [ENTRIES] [GROUPS]
 //! ```
 //!
 //! Three voters on hyper-log, every member's log on one kind of device (`DEVICES`, `file,sim` by
-//! default), driven as `support` states.
+//! default), driven as `support` states. `GROUPS` (comma-separated, `1` by default) is how many
+//! groups the three logs hold, member `id` of every group on log `id`, as a node's log holds every
+//! group it hosts; each group's member 1 leads.
 //!
 //! - Closed loop (`CLIENTS`, comma-separated, `1,4,16,64` by default, the pipeline bench's): that
-//!   many proposals out at the leader at once, each proposed again when the leader applies it;
-//!   each latency is its proposal to its answer, and the numbers are labelled closed loop
-//!   (`docs/tails.md` §3.1).
+//!   many proposals out at each group's leader at once, each proposed again when the leader
+//!   applies it; each latency is its proposal to its answer, and the numbers are labelled closed
+//!   loop (`docs/tails.md` §3.1).
+//! - `ENTRIES` are measured a run, a group where there are many, after each group's first
+//!   [`support::WARM`].
 //! - Open loop (`LOADS`, percentages of the device's capacity, `25,50,75,90` by default): proposals
 //!   arrive as a Poisson process at that share of the most entries a second any depth's closed
-//!   loop reached on the device in this run; each latency counts from its arrival, whenever the
-//!   driver got to propose it.
+//!   loop reached on the device in this run, the `k`th to group `k mod GROUPS`; each latency
+//!   counts from its arrival, whenever the driver got to propose it.
 //!
 //! Each point runs every depth `ROUNDS` times (3 by default), the depths' order rotated each
 //! round, each run on fresh logs, measuring `ENTRIES` (by default the run length a p99.9 needs for
@@ -49,6 +53,7 @@ fn point(
     wakes: &Wakes,
     dir: &Path,
     device: Device,
+    groups: usize,
     mode: Mode,
     rounds: usize,
     entries: u64,
@@ -61,12 +66,22 @@ fn point(
             let shape = Shape::on(device, DEPTHS[at]);
             // One schedule a round for every depth: the depths meet the same arrivals.
             let seed = 0x6465_7074 ^ ((round as u64) << 8);
-            runs[at].push(support::run(wakes, dir, shape, mode, entries, seed));
+            runs[at].push(if groups == 1 {
+                support::run(wakes, dir, shape, mode, entries, seed)
+            } else {
+                // `entries` a group, so every group commits as many as one group's run measures.
+                let total = entries * groups as u64;
+                support::run_groups(wakes, dir, groups, shape, mode, total, seed)
+            });
         }
     }
+    let label = match mode {
+        Mode::Closed(clients) if groups > 1 => format!("closed loop, {clients} client(s) a group"),
+        _ => mode.label(),
+    };
+    let each = if groups > 1 { " a group" } else { "" };
     println!(
-        "\n**{device:?}, {}; {entries} entries a run, {rounds} rounds; load {before} → {}**\n",
-        mode.label(),
+        "\n**{device:?}, {groups} group(s), {label}; {entries} entries{each} a run, {rounds} rounds; load {before} → {}**\n",
         support::load()
     );
     println!("| depth {HEAD}\n|---|---|---|---|---|---|---|---|---|");
@@ -112,22 +127,34 @@ fn main() {
     let entries: u64 = args
         .get(5)
         .map_or_else(|| support::default_entries(rounds), |n| n.parse().unwrap());
-    let wakes = Wakes::new();
-    for device in devices {
-        let mut capacity = 0.0f64;
-        for &c in &clients {
-            capacity = capacity.max(point(
-                &wakes,
-                &dir,
-                device,
-                Mode::Closed(c),
-                rounds,
-                entries,
-            ));
-        }
-        for &l in &loads {
-            let rate = capacity * l as f64 / 100.0;
-            point(&wakes, &dir, device, Mode::Open(rate), rounds, entries);
+    let group_counts: Vec<usize> = support::list(args.get(6), &[1]);
+    let wakes = Wakes::for_groups(group_counts.iter().copied().max().unwrap_or(1));
+    for &groups in &group_counts {
+        for &device in &devices {
+            let mut capacity = 0.0f64;
+            for &c in &clients {
+                capacity = capacity.max(point(
+                    &wakes,
+                    &dir,
+                    device,
+                    groups,
+                    Mode::Closed(c),
+                    rounds,
+                    entries,
+                ));
+            }
+            for &l in &loads {
+                let rate = capacity * l as f64 / 100.0;
+                point(
+                    &wakes,
+                    &dir,
+                    device,
+                    groups,
+                    Mode::Open(rate),
+                    rounds,
+                    entries,
+                );
+            }
         }
     }
 }

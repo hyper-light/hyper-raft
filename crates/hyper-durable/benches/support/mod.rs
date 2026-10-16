@@ -272,14 +272,24 @@ impl LogStore for Depth {
 
 /// A log large enough for a run's frames, never compacted: one group, mantle's waits.
 fn log_config() -> LogConfig {
+    log_config_for(1)
+}
+
+/// The log of one group's, holding `groups` groups: one group's segments for each (a run's groups
+/// commit as many entries each as one group's run, and nothing is compacted), and a queue that
+/// admits every write their members may have out at the log's depth, three
+/// (`GroupStore::depth`), as hyper-log's own benches size theirs by the replicas they drive, so no
+/// write waits for room and stalls its group.
+fn log_config_for(groups: usize) -> LogConfig {
+    let segments = u32::try_from(groups).unwrap() * 64;
     LogConfig {
         segment_bytes: 1 << 20,
-        max_segments: 64,
-        max_groups: 1,
+        max_segments: segments,
+        max_groups: groups,
         group_entries: 1 << 18,
         group_bytes: 1 << 26,
         group_cache: 1 << 16,
-        queue_submissions: 64,
+        queue_submissions: (groups * 3).max(64),
         waits: Waits::Measured,
     }
 }
@@ -324,8 +334,16 @@ pub struct Wakes {
 
 impl Wakes {
     pub fn new() -> Self {
-        let (tell, woken) = sync_channel(4096);
-        let wakers = (0..MEMBERS as usize)
+        Self::for_groups(1)
+    }
+
+    /// Wakers for `groups` groups' members, one a member. A waker that finds the channel full
+    /// drops its wake, so the channel holds every wake that can be pending at once: one a write a
+    /// member has out, at most the log's three pipeline frames (`GroupStore::depth`).
+    pub fn for_groups(groups: usize) -> Self {
+        let slots = groups * MEMBERS as usize;
+        let (tell, woken) = sync_channel((slots * 3).max(4096));
+        let wakers = (0..slots)
             .map(|slot| hyper_measure::wake::waker(slot, tell.clone()).0)
             .collect();
         Self { wakers, woken }
@@ -454,7 +472,7 @@ impl<'w, M: StateMachine<Answer = ()>> Group<'w, M> {
         mut machine: impl FnMut(u64) -> M,
     ) -> Self {
         while wakes.woken.try_recv().is_ok() {}
-        let mut owner = Owner::new(wakes.wakers.clone());
+        let mut owner = Owner::new(wakes.wakers[..MEMBERS as usize].to_vec());
         let mut logs = Vec::new();
         let mut handles = Vec::new();
         for (id, kind) in (1..=MEMBERS).zip(shape.devices) {
@@ -931,6 +949,405 @@ fn drive(
         durable_writes_per_entry: per_entry(end.durable_writes, mark.counts.durable_writes),
         cpu_per_entry: cpu / entries as f64,
     }
+}
+
+/// Many groups of three voters on three logs, member `id` of every group on log `id`: a node's log
+/// holding every group the node hosts, as mantle's ranges share their node's (`docs/durable.md`
+/// §14 item 1). Every group's member 1 leads; one owner drives them all on this thread.
+pub struct Groups<'w> {
+    // Dropped before the logs, whose owners the handles reach.
+    owner: Owner<Depth, Counter, Unbounded>,
+    logs: Vec<Log<Member>>,
+    /// Each group's members' handles, member 1, its leader, first.
+    handles: Vec<[Handle; MEMBERS as usize]>,
+    /// Each slot's handle and group.
+    slots: Vec<(Handle, usize)>,
+    woken: &'w Receiver<usize>,
+    out: Output<()>,
+    /// Messages sent and not yet delivered, each with its group.
+    wire: VecDeque<(usize, Message)>,
+    /// Each slot's own deadline, as its last drive gave it.
+    deadlines: Vec<Option<u64>>,
+    /// The store's depth: writes a member may have out.
+    pub depth: usize,
+}
+
+impl<'w> Groups<'w> {
+    /// `groups` groups of `shape`, each member's log on its device.
+    pub fn open(
+        wakes: &'w Wakes,
+        groups: usize,
+        shape: Shape,
+        mut device: impl FnMut(Device, u64) -> Member,
+    ) -> Self {
+        while wakes.woken.try_recv().is_ok() {}
+        let count = groups * MEMBERS as usize;
+        assert!(
+            count <= wakes.wakers.len(),
+            "{groups} groups past the wakers"
+        );
+        let mut owner = Owner::new(wakes.wakers[..count].to_vec());
+        let logs: Vec<Log<Member>> = (1..=MEMBERS)
+            .zip(shape.devices)
+            .map(|(id, kind)| {
+                Log::create(
+                    device(kind, id),
+                    log_config_for(groups),
+                    0x6c6f67 + u128::from(id),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut handles = Vec::with_capacity(groups);
+        let mut slots = vec![None; count];
+        for g in 0..groups {
+            let mut members = Vec::with_capacity(MEMBERS as usize);
+            for (at, log) in logs.iter().enumerate() {
+                let id = at as u64 + 1;
+                let store = GroupStore::claim(log, GROUP + g as u128).unwrap();
+                assert!(
+                    shape.depth <= store.depth(),
+                    "depth {} past the log's",
+                    shape.depth
+                );
+                let replica = Replica::open(
+                    &settings(id, shape.apply_ahead, shape.quiet),
+                    Depth(store, shape.depth),
+                    Counter {
+                        configuration: ConfState {
+                            voters: (1..=MEMBERS).collect(),
+                            ..ConfState::default()
+                        },
+                    },
+                    Unbounded,
+                )
+                .expect("a member opens");
+                let h = owner.insert(replica).map_err(|_| ()).unwrap();
+                slots[h.slot()] = Some((h, g));
+                members.push(h);
+            }
+            handles.push(<[Handle; MEMBERS as usize]>::try_from(members).unwrap());
+        }
+        let mut set = Self {
+            owner,
+            logs,
+            handles,
+            slots: slots.into_iter().map(Option::unwrap).collect(),
+            woken: &wakes.woken,
+            out: Output::default(),
+            wire: VecDeque::new(),
+            deadlines: vec![None; count],
+            depth: shape.depth,
+        };
+        for g in 0..groups {
+            let first = set.handles[g][0];
+            set.owner.get_mut(first).unwrap().campaign().unwrap();
+            set.owner.schedule(first);
+        }
+        let mut answers = vec![0; groups];
+        // A counted budget of turns: each group's election on this thread takes a handful.
+        for _ in 0..100_000 * groups {
+            set.turn(&mut answers);
+            let lead = set
+                .handles
+                .iter()
+                .all(|m| set.owner.get(m[0]).unwrap().is_leader());
+            if lead && !set.busy() {
+                return set;
+            }
+            set.wait(None);
+        }
+        panic!("the groups never elected their members 1");
+    }
+
+    /// How many groups the logs hold.
+    pub fn count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Drives every queued member once and delivers what they sent; each group's leader's answers
+    /// this turn in `answers`, a slot a group.
+    pub fn turn(&mut self, answers: &mut [usize]) {
+        answers.fill(0);
+        let (wire, deadlines, handles, slots) = (
+            &mut self.wire,
+            &mut self.deadlines,
+            &self.handles,
+            &self.slots,
+        );
+        self.owner.turn(now(), &mut self.out, |h, driven, out| {
+            let driven = driven.expect("a member drives");
+            let g = slots[h.slot()].1;
+            wire.extend(out.messages.drain(..).map(|m| (g, m)));
+            deadlines[h.slot()] = driven.wake;
+            if handles[g][0] == h {
+                answers[g] += out.answers.len();
+            }
+        });
+        while let Some((g, m)) = self.wire.pop_front() {
+            let Some(&to) = self.handles[g].get(usize::try_from(m.to).unwrap() - 1) else {
+                continue;
+            };
+            match self.owner.get_mut(to).unwrap().step(m) {
+                Ok(()) | Err(ReplicaError::Refused(_) | ReplicaError::Stalled) => {}
+                Err(e) => panic!("step: {e}"),
+            }
+            self.owner.schedule(to);
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        self.owner.has_work() || !self.wire.is_empty()
+    }
+
+    /// Whether a member has a write out, whose answer will wake the owner.
+    fn writes_out(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|&(h, _)| self.owner.get(h).is_some_and(|r| r.in_flight() > 0))
+    }
+
+    /// With nothing to drive, waits for a log's answer, a member's deadline or `until`.
+    pub fn wait(&mut self, until: Option<u64>) {
+        if !self.busy() {
+            let deadline = self.deadlines.iter().flatten().copied().chain(until).min();
+            let at = now();
+            match deadline {
+                Some(d) if d <= at => {}
+                Some(d) => {
+                    if let Ok(slot) = self.woken.recv_timeout(Duration::from_nanos(d - at)) {
+                        self.owner.woken(slot);
+                    }
+                }
+                None => {
+                    if let Ok(slot) = self.woken.try_recv() {
+                        self.owner.woken(slot);
+                    } else {
+                        // Only a log's answer can wake the groups now: with no write out, none
+                        // will come.
+                        assert!(
+                            self.writes_out(),
+                            "the groups wait with nothing to wake them: {:#?}",
+                            self.stuck()
+                        );
+                        if let Ok(slot) = self.woken.recv() {
+                            self.owner.woken(slot);
+                        }
+                    }
+                }
+            }
+        }
+        while let Ok(slot) = self.woken.try_recv() {
+            self.owner.woken(slot);
+        }
+        let at = now();
+        for (slot, d) in self.deadlines.iter_mut().enumerate() {
+            if d.is_some_and(|d| d <= at) {
+                *d = None;
+                self.owner.schedule(self.slots[slot].0);
+            }
+        }
+    }
+
+    /// The members of every group whose last index passes what they applied, or that hold a
+    /// `Ready` or are stalled: what groups that wait with nothing to wake them were left in.
+    fn stuck(&self) -> Vec<String> {
+        self.handles
+            .iter()
+            .enumerate()
+            .flat_map(|(g, members)| members.iter().map(move |&h| (g, h)))
+            .filter_map(|(g, h)| {
+                let r = self.owner.get(h)?;
+                let raft = &r.core().raft;
+                let last = raft.log().last_index().unwrap_or(0);
+                (last > r.applied().index || r.core().has_ready() || r.is_stalled()).then(|| {
+                    format!(
+                        "group {g} member {}: {:?} term {} applied {} committed {} last {} out {} \
+                         ready {} stalled {}",
+                        r.id(),
+                        raft.state(),
+                        raft.term(),
+                        r.applied().index,
+                        raft.log().committed(),
+                        last,
+                        r.in_flight(),
+                        r.core().has_ready(),
+                        r.is_stalled()
+                    )
+                })
+            })
+            .take(24)
+            .collect()
+    }
+
+    /// Proposes an entry at group `g`'s leader; false when its core refused it for now.
+    pub fn propose(&mut self, g: usize) -> bool {
+        let leader = self.handles[g][0];
+        let taken = self
+            .owner
+            .get_mut(leader)
+            .unwrap()
+            .propose(Vec::new(), vec![0x5a; ENTRY_BYTES])
+            .is_ok();
+        self.owner.schedule(leader);
+        taken
+    }
+
+    /// What every member's log has written and flushed since it opened.
+    pub fn counts(&self) -> Counts {
+        self.logs.iter().fold(Counts::default(), |c, log| {
+            let s = log.stats(None).expect("a log answers its statistics");
+            Counts {
+                frames: c.frames + s.frames,
+                flushes: c.flushes + s.flushes,
+                durable_writes: c.durable_writes + s.durable_writes,
+            }
+        })
+    }
+}
+
+/// One run's loop over many groups: arrivals from `arrive`, the `k`th to group `k mod groups`,
+/// each proposed as its group's leader takes it and timed from its arrival; `again` proposes a
+/// closed loop's next entry into the group that answered. [`WARM`] entries a group come before
+/// the measured `entries`.
+fn drive_groups(
+    set: &mut Groups<'_>,
+    entries: u64,
+    mut arrive: impl FnMut(u64) -> Option<u64>,
+    again: bool,
+) -> Run {
+    let groups = set.count();
+    let warm = WARM * groups as u64;
+    let total = warm + entries;
+    let mut waiting: Vec<VecDeque<u64>> = vec![VecDeque::new(); groups];
+    let mut taken: Vec<VecDeque<u64>> = vec![VecDeque::new(); groups];
+    let mut answers = vec![0usize; groups];
+    let mut latencies = Vec::with_capacity(usize::try_from(entries).unwrap());
+    let mut arrived = 0u64;
+    let mut answered = 0u64;
+    let mut next = arrive(now());
+    let mut mark = Mark {
+        at: now(),
+        counts: set.counts(),
+        usage: hyper_measure::usage::this().ok(),
+    };
+    while answered < total {
+        let at = now();
+        while let Some(t) = next.filter(|&t| t <= at && arrived < total) {
+            waiting[usize::try_from(arrived % groups as u64).unwrap()].push_back(t);
+            arrived += 1;
+            next = arrive(at).filter(|_| arrived < total);
+        }
+        let mut refused = false;
+        let mut queued = false;
+        for g in 0..groups {
+            while let Some(&t) = waiting[g].front() {
+                if !set.propose(g) {
+                    refused = true;
+                    break;
+                }
+                taken[g].push_back(t);
+                waiting[g].pop_front();
+            }
+            queued |= !waiting[g].is_empty();
+        }
+        set.turn(&mut answers);
+        let at = now();
+        let mut any = false;
+        for (g, &n) in answers.iter().enumerate() {
+            for _ in 0..n {
+                let t = taken[g]
+                    .pop_front()
+                    .expect("an answer for each proposal taken");
+                any = true;
+                answered += 1;
+                if answered > warm {
+                    latencies.push(at.saturating_sub(t));
+                }
+                if answered == warm {
+                    mark = Mark {
+                        at,
+                        counts: set.counts(),
+                        usage: hyper_measure::usage::this().ok(),
+                    };
+                }
+                if again && arrived < total {
+                    waiting[g].push_back(at);
+                    arrived += 1;
+                }
+            }
+        }
+        // With nothing answered and nothing it could propose, the loop waits for the groups.
+        if !any && (!queued || refused) {
+            set.wait(next);
+        }
+    }
+    let elapsed = now().saturating_sub(mark.at).max(1) as f64 / 1e9;
+    let cpu = mark
+        .usage
+        .and_then(|b| hyper_measure::usage::this().ok().map(|a| a.since(&b)))
+        .map_or(f64::NAN, |u| (u.user_ns + u.system_ns) as f64 / 1e3);
+    let end = set.counts();
+    let per_entry = |n: u64, at: u64| n.saturating_sub(at) as f64 / entries as f64;
+    Run {
+        latencies,
+        phases: Vec::new(),
+        held: Vec::new(),
+        readies_per_entry: f64::NAN,
+        empty_per_entry: f64::NAN,
+        entries_per_second: entries as f64 / elapsed,
+        frames_per_entry: per_entry(end.frames, mark.counts.frames),
+        flushes_per_entry: per_entry(end.flushes, mark.counts.flushes),
+        durable_writes_per_entry: per_entry(end.durable_writes, mark.counts.durable_writes),
+        cpu_per_entry: cpu / entries as f64,
+    }
+}
+
+/// One run of `groups` groups of `shape` under `mode` on fresh logs, its files under `dir`; a
+/// closed loop's clients are `clients` a group.
+pub fn run_groups(
+    wakes: &Wakes,
+    dir: &Path,
+    groups: usize,
+    shape: Shape,
+    mode: Mode,
+    entries: u64,
+    seed: u64,
+) -> Run {
+    let mut scratch: Vec<Scratch> = Vec::new();
+    let run = {
+        let mut set = Groups::open(wakes, groups, shape, |kind, id| {
+            device(kind, id, dir, seed, &mut scratch)
+        });
+        match mode {
+            Mode::Closed(clients) => {
+                let mut first = clients * groups;
+                drive_groups(
+                    &mut set,
+                    entries,
+                    |at| {
+                        (first > 0).then(|| {
+                            first -= 1;
+                            at
+                        })
+                    },
+                    true,
+                )
+            }
+            Mode::Open(rate) => {
+                let mut arrivals = Arrivals::poisson(rate, seed, now()).unwrap();
+                drive_groups(
+                    &mut set,
+                    entries,
+                    |_| Some(arrivals.next_arrival().unwrap()),
+                    false,
+                )
+            }
+        }
+    };
+    // The groups, their owner and their logs are gone; the files go after them.
+    drop(scratch);
+    run
 }
 
 /// A member's device of `kind`: a scratch file under `dir`, kept in `scratch` until the group is

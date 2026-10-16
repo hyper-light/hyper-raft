@@ -389,6 +389,32 @@ instructions of search).
 **Change: a full wheel delays, never refuses early.** slates already makes a sleep that finds the wheel
 full wait for a timer to free (AUD-29-39); kept, with the count exposed.
 
+**Change: the driver's wait keeps the wheel's deadline (2026-10-16).** A parked shard waits in its
+driver until its next deadline, and the tick above is only as good as that wait. `epoll_wait(2)` takes
+milliseconds, and rustix (built without its `linux_5_11` feature, which would fail every wait on an
+older kernel) rounded the driver's timespec up to the next one: a timer due in 200 µs fired after a
+millisecond or more on every Linux host. The epoll driver now waits with `epoll_pwait2(2)` (Linux 5.11,
+a timespec), asked once when the driver is made; where the kernel or a seccomp filter refuses it
+(`ENOSYS`, `EPERM`), a timerfd on the instance is armed at each timed wait's timeout and the wait itself
+is untimed, libevent's precise timer (`EVENT_BASE_FLAG_PRECISE_TIMER`). A kernel without
+high-resolution timers keeps every timer to its tick (Docker Desktop's LinuxKit kernel:
+`CONFIG_HIGH_RES_TIMERS` unset, `clock_getres` 1 ms), which no wait can beat.
+
+The OS's own coalescing is held to the shard's tick (`Driver::set_timer_slack_ns`, given once as
+the shard is built): a parked shard cannot fire a timer sooner than it wakes, so a slack under the
+tick buys nothing and one over it adds lateness past the wheel's bound. On Linux it is the shard
+thread's timer slack (prctl(2) `PR_SET_TIMERSLACK`; the kernel's default is 50 µs or a thousandth
+of the timeout, fs/select.c), the thread's own put back when the driver goes. On macOS XNU coalesces
+a `kevent` timeout as it sees fit (a 1 ms wait ended at 1.3 ms at the median and a 5 ms one at
+6.3 ms, measured 2026-10-16), so a timed wait is a one-shot `EVFILT_TIMER` with `NOTE_CRITICAL` in
+the wait's own `kevent` call (5 ms ended at 5.03 ms): `kevent64`'s `NOTE_LEEWAY` would carry the
+tick, but XNU serves a kqueue one record format and the tick there is a few microseconds. Tests:
+`epoll::tests::a_timed_wait_ends_at_its_timeout_not_the_next_millisecond`,
+`epoll::tests::a_shard_s_slack_is_its_thread_s_until_its_driver_goes`,
+`kqueue::tests::a_timed_wait_ends_at_its_timeout_not_where_xnu_coalesces_it`. Still open: Windows
+rounds to milliseconds and then to its timer interrupt (15.6 ms unless a process raises the rate);
+a high-resolution waitable timer associated with the port is Go's answer (1.23).
+
 ### 3.7 Drivers
 
 One seam (`trait Driver`): wait for completions until a deadline, register one-shot readable or writable
@@ -396,8 +422,8 @@ interest, report the clock. Readiness mode on every OS:
 
 | OS | Driver | Notes |
 |---|---|---|
-| Linux | epoll | `EPOLLONESHOT`; the kick an eventfd |
-| macOS, FreeBSD | kqueue | one-shot `EVFILT_READ`/`EVFILT_WRITE`, `EVFILT_USER` kick [LEMON] |
+| Linux | epoll | `EPOLLONESHOT`; the kick an eventfd; the wait `epoll_pwait2`, or a timerfd before 5.11 (§3.6) |
+| macOS, FreeBSD | kqueue | one-shot `EVFILT_READ`/`EVFILT_WRITE`, `EVFILT_USER` kick [LEMON]; a timed wait a `NOTE_CRITICAL` timer on macOS (§3.6) |
 | Windows | IOCP with AFD polling | `IOCTL_AFD_POLL` on `\Device\Afd` for socket readiness [AFD]; the kick a posted packet |
 | all | simulation | §11 |
 

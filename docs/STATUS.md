@@ -155,6 +155,19 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
 
 ### Closed (2026-10-16)
 
+- **hyper-rt: a parked shard's timed wait ended at the next millisecond.** The epoll driver handed
+  rustix a timespec, which rustix (without its `linux_5_11` feature) rounds up to whole milliseconds
+  for `epoll_pwait`: a timer the wheel had due in 200 µs fired after a millisecond or more on every
+  Linux host, whatever the kernel's timers keep. The driver now asks the kernel once for
+  `epoll_pwait2` (Linux 5.11, a timespec) and, where it is refused, arms a timerfd at each timed
+  wait's timeout, the wait untimed (libevent's precise timer). Test:
+  `epoll::tests::a_timed_wait_ends_at_its_timeout_not_the_next_millisecond` (its ends asked only of
+  a kernel with high-resolution timers; Docker Desktop's has none). The OS's coalescing is held to
+  the shard's tick: the shard thread's timer slack on Linux, restored when the driver goes. macOS
+  coalesced a `kevent` timeout too (a 5 ms wait ended at 6.3 ms at the median); a timed wait there
+  is now a one-shot `NOTE_CRITICAL` timer in the wait's own call (5.03 ms). Tests beside it, in
+  `epoll` and `kqueue`. Open: Windows rounds to milliseconds and then to its 15.6 ms timer
+  interrupt.
 - **hyper-transport: a socket's room rested on an assumed charge.** The windows a socket's peers
   were granted were held to its buffer over a fixed four times a datagram's payload (Linux) or
   twice (elsewhere): three loopback measurements on one kernel, rounded up, and wrong both ways

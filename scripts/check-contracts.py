@@ -44,11 +44,15 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/src/attribution.rs":
         "getrusage(RUSAGE_THREAD) through libc (a long poll's voluntary context switches)",
     "crates/hyper-rt/src/epoll.rs":
-        "epoll and eventfd where rustix's wrappers are unsafe by signature",
+        "epoll and eventfd where rustix's wrappers are unsafe by signature, and epoll_pwait2(2) "
+        "through libc::syscall (rustix carries it only behind a feature that fails every wait "
+        "before Linux 5.11)",
     "crates/hyper-rt/src/iocp.rs":
         "I/O completion ports: CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus",
     "crates/hyper-rt/src/kqueue.rs":
-        "kevent through rustix (unsafe by signature: the udata word) and the EVFILT_USER trigger",
+        "kevent through rustix (unsafe by signature: the udata word) and the EVFILT_USER trigger, "
+        "and a timed wait's kevent through libc (its NOTE_CRITICAL timer, which rustix's timer "
+        "filter does not set)",
     "crates/hyper-rt/src/machine/clock.rs":
         "clock_gettime and mach_absolute_time through libc; QueryPerformanceCounter (the monotonic clock)",
     "crates/hyper-rt/src/machine/facts.rs":

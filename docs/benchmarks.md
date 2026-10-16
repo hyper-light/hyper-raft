@@ -8942,3 +8942,166 @@ cargo test --workspace --all-features --locked --no-run --test cluster --test ki
 target/debug/deps/cluster-<hash> stalled-devices   # then
 target/debug/deps/kill-<hash> member-stopped        # in turn
 ```
+
+## A group's writes out on Linux, and many groups on their members' logs (2026-10-16)
+
+`docs/durable.md` §14 item 1, the two cases the macOS section above left open: Linux, where a
+frame's confirmation is a durable write without a flush of the device's cache (`RWF_DSYNC` on a
+direct file, `LogStats::durable_writes`), and many groups on one log, whose frames gather every
+group's updates. `benches/depth.rs` as above; its `GROUPS` argument puts that many groups of three
+voters on the three logs, member `id` of every group on log `id`, as a node's log holds every
+group it hosts (mantle's ranges), each group's member 1 leading. With many groups a closed loop's
+clients and a run's measured entries are counted a group, so every group commits as many entries
+as one group's run measures, and an open loop's arrivals go to the groups in turn; 16 groups is
+mantle's range bench's (`hyper-durable-compare`, `max_groups: 16`) and 256 its log bench's (`mantle
+bench log --replicas 256`, "Many small appends" above). Six rounds a point, the depths rotated each
+round, so each depth has its noise band (`hyper_measure::stats::band`); a difference is one only
+outside both depths' bands. Latencies pool the rounds, each quantile with its 95% interval; the
+rest are medians of the rounds.
+
+The hosts and their devices, as each described itself:
+
+| host | device | the log's flush | a confirmation |
+|---|---|---|---|
+| GitHub's `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64), 4 vCPUs, 16 GB, Linux 6.17 (Azure), load 1.1–2.8, CI run 38853874714 | Hyper-V's virtual disk, write-through cache, no FUA; ext4 mounted `nobarrier,data=writeback` | `fdatasync` on a direct file, which sends no cache flush (`nobarrier`) to a disk that holds none | `RWF_DSYNC` on a direct file: a durable write without a flush |
+| Docker Desktop's virtual machine on the M5 Max (Linux 6.12.76, aarch64), `--cpus 4`, this machine's other sessions beside it, load 6.2–8.5 (the virtual machine's) | virtio disk, write-back cache, no FUA; ext4 with barriers, the disk an image file on APFS | `fdatasync`, a flush of the virtual disk's cache, which the host takes | `RWF_DSYNC` on a direct file, which the kernel makes a write and a flush on a device without FUA (the log counts a durable write) |
+
+Each cell: p50 / p99 in ms; entries a second; flushes + durable writes an entry over the three
+logs. The last column gives depth 2's and then depth 3's ratio of medians to depth 1's for entries a
+second and each run's p50, marked `*` where it lies outside both depths' bands.
+
+**One group, Linux, the runners' disks.** `ubuntu-24.04`:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 client | 0.35 / 2.9; 2,130; 3.00 + 3.00 | 0.35 / 2.7; 2,182; 3.00 + 3.00 | 0.35 / 2.8; 2,206; 3.00 + 2.79 | ×1.02; ×0.99 / ×1.04; ×1.00 |
+| closed, 4 clients | 0.34 / 1.0; 8,585; 0.75 + 0.75 | 0.34 / 2.7; 9,648; 0.75 + 0.75 | 0.34 / 1.0; 9,470; 0.75 + 0.71 | ×1.12; ×0.96 / ×1.10; ×0.98 |
+| closed, 16 clients | 0.39 / 1.3; 35,094; 0.20 + 0.20 | 0.39 / 1.8; 40,448; 0.20 + 0.17 | 0.37 / 1.2; 42,718; 0.21 + 0.17 | ×1.15; ×1.02 / ×1.22; ×0.99 |
+| closed, 64 clients | 0.88 / 3.9; 74,825; 0.12 + 0.12 | 0.84 / 19.5; 77,393; 0.12 + 0.08 | 0.97 / 1.8; 66,862; 0.16 + 0.09 | ×1.03; ×0.92 / ×0.89; ×1.13* |
+| open, 19,348 a second | 0.87 / 10.0; 17,857; 0.41 + 0.41 | 0.95 / 8.4; 16,191; 0.51 + 0.28 | 1.09 / 21.3; 17,794; 0.49 + 0.25 | ×0.91; ×1.07 / ×1.00; ×1.18* |
+| open, 38,696 a second | 0.94 / 16.5; 38,578; 0.22 + 0.22 | 0.95 / 3.9; 37,671; 0.24 + 0.13 | 1.06 / 18.0; 37,873; 0.25 + 0.13 | ×0.98; ×1.05 / ×0.98; ×1.15* |
+| open, 58,045 a second | 0.92 / 4.9; 59,096; 0.15 + 0.15 | 0.92 / 2.2; 55,711; 0.16 + 0.09 | 1.02 / 3.7; 58,313; 0.16 + 0.09 | ×0.94; ×1.03 / ×0.99; ×1.15* |
+| open, 69,654 a second | 0.97 / 3.6; 69,938; 0.12 + 0.12 | 0.86 / 12.8; 68,973; 0.13 + 0.08 | 0.97 / 1.7; 69,202; 0.15 + 0.08 | ×0.99; ×0.87 / ×0.99; ×1.03 |
+
+`ubuntu-24.04-arm`:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 client | 0.34 / 3.3; 2,191; 3.00 + 3.00 | 0.35 / 3.5; 2,259; 3.00 + 3.00 | 0.36 / 1.5; 2,241; 3.00 + 2.67 | ×1.03; ×1.00 / ×1.02; ×1.03 |
+| closed, 4 clients | 0.35 / 0.6; 10,575; 0.75 + 0.75 | 0.35 / 0.6; 11,008; 0.75 + 0.75 | 0.37 / 0.7; 10,229; 0.75 + 0.68 | ×1.04; ×0.98 / ×0.97; ×1.03 |
+| closed, 16 clients | 0.37 / 0.8; 44,254; 0.19 + 0.19 | 0.36 / 0.6; 43,317; 0.20 + 0.17 | 0.36 / 0.6; 43,726; 0.21 + 0.17 | ×0.98; ×1.01 / ×0.99; ×1.02 |
+| closed, 64 clients | 0.90 / 1.5; 70,947; 0.12 + 0.12 | 0.99 / 3.6; 67,374; 0.13 + 0.08 | 1.04 / 1.5; 64,388; 0.16 + 0.09 | ×0.95; ×1.07 / ×0.91; ×1.10 |
+| open, 17,737 a second | 0.88 / 1.6; 17,595; 0.46 + 0.46 | 0.91 / 1.6; 17,409; 0.55 + 0.29 | 1.00 / 1.7; 17,399; 0.58 + 0.30 | ×0.99; ×1.04 / ×0.99; ×1.13* |
+| open, 35,474 a second | 0.92 / 1.5; 34,942; 0.23 + 0.23 | 0.93 / 1.6; 34,769; 0.27 + 0.15 | 1.04 / 2.4; 35,127; 0.28 + 0.15 | ×0.99; ×1.04 / ×1.00; ×1.15* |
+| open, 53,211 a second | 1.00 / 4.7; 61,875; 0.13 + 0.13 | 0.91 / 3.2; 51,653; 0.19 + 0.10 | 1.09 / 4.4; 56,614; 0.17 + 0.09 | ×0.83; ×0.86 / ×0.92; ×1.10* |
+| open, 63,853 a second | 0.91 / 5.0; 64,465; 0.13 + 0.13 | 0.94 / 1.8; 62,874; 0.14 + 0.08 | 1.05 / 1.9; 62,367; 0.14 + 0.08 | ×0.97; ×1.06 / ×0.97; ×1.12* |
+
+Docker's virtual machine:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 client | 0.52 / 1.0; 1,887; 3.00 + 3.00 | 0.52 / 2.2; 1,962; 3.00 + 3.00 | 0.51 / 1.5; 1,820; 3.00 + 2.61 | ×1.04; ×0.99 / ×0.96; ×1.05 |
+| closed, 4 clients | 0.46 / 0.8; 8,067; 0.75 + 0.75 | 0.48 / 1.0; 7,559; 0.75 + 0.75 | 0.46 / 1.1; 7,863; 0.75 + 0.66 | ×0.94; ×1.05 / ×0.97; ×1.01 |
+| closed, 16 clients | 0.50 / 2.3; 29,851; 0.20 + 0.20 | 0.48 / 0.8; 31,840; 0.18 + 0.16 | 0.52 / 1.5; 30,220; 0.21 + 0.17 | ×1.07; ×0.96 / ×1.01; ×1.04 |
+| closed, 64 clients | 1.28 / 2.0; 50,318; 0.12 + 0.12 | 1.35 / 2.6; 45,579; 0.14 + 0.08 | 1.58 / 2.8; 38,576; 0.17 + 0.09 | ×0.91; ×1.02 / ×0.77*; ×1.24 |
+| open, 12,580 a second | 1.12 / 2.2; 12,344; 0.51 + 0.51 | 1.30 / 2.3; 12,305; 0.56 + 0.29 | 1.35 / 2.4; 12,162; 0.59 + 0.30 | ×1.00; ×1.18* / ×0.98; ×1.25* |
+| open, 25,159 a second | 1.16 / 2.9; 25,001; 0.25 + 0.26 | 1.30 / 2.3; 24,253; 0.28 + 0.14 | 1.39 / 3.8; 25,360; 0.28 + 0.15 | ×0.97; ×1.12 / ×1.01; ×1.16* |
+| open, 37,739 a second | 1.25 / 2.2; 39,120; 0.17 + 0.17 | 1.29 / 2.5; 36,093; 0.20 + 0.11 | 1.37 / 2.4; 36,435; 0.19 + 0.10 | ×0.92*; ×1.08 / ×0.93*; ×1.14 |
+| open, 45,286 a second | 1.21 / 2.4; 44,387; 0.14 + 0.14 | 1.12 / 2.0; 43,825; 0.17 + 0.09 | 1.43 / 2.9; 41,641; 0.15 + 0.08 | ×0.99; ×0.91 / ×0.94; ×1.19 |
+
+**Sixteen groups.** `ubuntu-24.04`:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 a group | 0.47 / 1.2; 31,040; 0.19 + 0.19 | 0.47 / 1.2; 30,582; 0.19 + 0.19 | 0.47 / 1.2; 30,875; 0.19 + 0.19 | ×0.98; ×0.99 / ×0.99; ×1.00 |
+| closed, 4 a group | 0.62 / 1.3; 96,965; 0.05 + 0.05 | 0.64 / 1.8; 92,736; 0.07 + 0.05 | 0.65 / 1.6; 89,588; 0.06 + 0.05 | ×0.96; ×1.03 / ×0.92; ×1.08 |
+| open, 24,241 a second | 1.17 / 14.7; 24,102; 0.31 + 0.15 | 1.12 / 5.1; 24,224; 0.30 + 0.06 | 1.13 / 4.4; 24,267; 0.29 + 0.05 | ×1.00; ×0.97* / ×1.01; ×0.98 |
+| open, 48,482 a second | 1.16 / 15.8; 48,463; 0.13 + 0.12 | 1.39 / 15.0; 48,470; 0.15 + 0.04 | 1.36 / 12.0; 48,433; 0.16 + 0.04 | ×1.00; ×1.22* / ×1.00; ×1.20* |
+| open, 72,723 a second | 1.13 / 17.5; 72,615; 0.09 + 0.09 | 1.49 / 8.7; 72,706; 0.10 + 0.04 | 1.63 / 14.5; 73,207; 0.11 + 0.04 | ×1.00; ×1.32* / ×1.01; ×1.45* |
+| open, 87,268 a second | 1.14 / 13.6; 87,452; 0.08 + 0.07 | 1.61 / 11.3; 87,468; 0.09 + 0.03 | 1.69 / 12.8; 87,324; 0.09 + 0.04 | ×1.00; ×1.40* / ×1.00; ×1.50* |
+
+`ubuntu-24.04-arm`:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 a group | 0.42 / 0.9; 34,578; 0.19 + 0.19 | 0.42 / 0.9; 37,072; 0.19 + 0.19 | 0.42 / 0.9; 36,045; 0.19 + 0.19 | ×1.07; ×0.99 / ×1.04; ×1.02 |
+| closed, 4 a group | 0.60 / 1.2; 101,609; 0.08 + 0.05 | 0.59 / 1.2; 103,556; 0.07 + 0.05 | 0.59 / 1.3; 101,875; 0.08 + 0.04 | ×1.02; ×0.99 / ×1.00; ×0.98 |
+| open, 25,889 a second | 0.84 / 16.7; 25,771; 0.33 + 0.12 | 0.77 / 11.6; 25,849; 0.36 + 0.05 | 0.77 / 7.1; 25,971; 0.36 + 0.05 | ×1.00; ×0.88* / ×1.01; ×0.89* |
+| open, 51,778 a second | 0.95 / 21.2; 51,640; 0.14 + 0.12 | 1.01 / 19.3; 51,535; 0.17 + 0.04 | 0.95 / 18.7; 51,755; 0.16 + 0.04 | ×1.00; ×1.05* / ×1.00; ×0.99 |
+| open, 77,667 a second | 0.90 / 14.7; 77,373; 0.10 + 0.09 | 1.18 / 19.8; 77,091; 0.10 + 0.03 | 1.18 / 27.2; 77,505; 0.11 + 0.04 | ×1.00; ×1.33* / ×1.00; ×1.32* |
+| open, 93,200 a second | 0.96 / 23.9; 90,141; 0.07 + 0.07 | 1.18 / 15.3; 91,180; 0.10 + 0.03 | 1.25 / 20.2; 90,339; 0.10 + 0.04 | ×1.01; ×1.22* / ×1.00; ×1.30* |
+
+**256 groups.** `ubuntu-24.04`:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 a group | 3.19 / 5.4; 79,760; 0.06 + 0.02 | 3.17 / 5.5; 79,142; 0.06 + 0.02 | 3.17 / 5.3; 80,008; 0.06 + 0.02 | ×0.99; ×1.00 / ×1.00; ×1.00 |
+| closed, 4 a group | 5.08 / 8.7; 194,277; 0.02 + 0.01 | 5.10 / 8.5; 193,087; 0.01 + 0.01 | 5.10 / 8.8; 191,263; 0.02 + 0.01 | ×0.99; ×1.01 / ×0.98; ×1.01 |
+| open, 48,569 a second | 1.80 / 9.1; 48,611; 0.11 + 0.01 | 1.86 / 9.5; 48,590; 0.11 + 0.01 | 1.93 / 30.4; 48,610; 0.11 + 0.01 | ×1.00; ×1.04 / ×1.00; ×1.08* |
+| open, 97,138 a second | 18.89 / 32.4; 97,827; 0.05 + 0.01 | 18.89 / 37.2; 97,895; 0.04 + 0.01 | 19.14 / 35.8; 97,767; 0.05 + 0.01 | ×1.00; ×0.99 / ×1.00; ×1.03 |
+| open, 145,707 a second | 24.85 / 42.4; 147,171; 0.03 + 0.01 | 25.03 / 41.0; 146,425; 0.03 + 0.01 | 27.53 / 49.2; 146,596; 0.02 + 0.01 | ×0.99; ×0.99 / ×1.00; ×1.06 |
+| open, 174,849 a second | 28.65 / 43.5; 177,483; 0.02 + 0.01 | 30.62 / 46.7; 177,239; 0.02 + 0.01 | 30.27 / 45.9; 175,420; 0.02 + 0.00 | ×1.00; ×1.15 / ×0.99; ×1.10 |
+
+`ubuntu-24.04-arm`:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 a group | 3.05 / 4.9; 80,116; 0.07 + 0.02 | 2.98 / 4.7; 83,963; 0.06 + 0.02 | 3.03 / 4.9; 80,316; 0.07 + 0.02 | ×1.05; ×0.97 / ×1.00; ×1.00 |
+| closed, 4 a group | 4.62 / 8.0; 212,967; 0.02 + 0.01 | 4.92 / 8.8; 203,176; 0.02 + 0.01 | 4.86 / 8.3; 204,596; 0.02 + 0.01 | ×0.95; ×1.04 / ×0.96; ×1.06* |
+| open, 53,242 a second | 1.02 / 3.0; 53,272; 0.15 + 0.00 | 1.05 / 3.3; 53,273; 0.15 + 0.00 | 1.01 / 2.0; 53,270; 0.16 + 0.00 | ×1.00; ×1.00 / ×1.00; ×0.99 |
+| open, 106,483 a second | 21.17 / 28.1; 107,317; 0.04 + 0.01 | 20.10 / 28.8; 107,039; 0.04 + 0.01 | 21.37 / 27.7; 107,134; 0.04 + 0.01 | ×1.00; ×0.98 / ×1.00; ×1.00 |
+| open, 159,725 a second | 23.19 / 38.5; 161,555; 0.03 + 0.01 | 23.86 / 38.2; 161,638; 0.02 + 0.01 | 22.98 / 37.0; 161,401; 0.02 + 0.01 | ×1.00; ×1.04 / ×1.00; ×0.97 |
+| open, 191,670 a second | 17.93 / 26.8; 193,141; 0.03 + 0.01 | 18.86 / 26.5; 193,701; 0.02 + 0.01 | 18.41 / 25.7; 193,680; 0.02 + 0.01 | ×1.00; ×0.99 / ×1.00; ×0.98 |
+
+**Docker's virtual machine**, 16 groups:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 a group | 0.77 / 1.4; 20,327; 0.19 + 0.19 | 0.78 / 1.3; 20,296; 0.19 + 0.19 | 0.73 / 1.2; 20,945; 0.19 + 0.18 | ×1.00; ×0.97 / ×1.03; ×0.96 |
+| closed, 4 a group | 0.65 / 1.6; 91,480; 0.05 + 0.05 | 0.68 / 1.6; 91,229; 0.05 + 0.05 | 0.64 / 1.7; 92,444; 0.05 + 0.05 | ×1.00; ×1.02 / ×1.01; ×0.98 |
+| open, 23,111 a second | 1.89 / 6.1; 23,062; 0.17 + 0.15 | 2.45 / 79.7; 23,045; 0.15 + 0.06 | 1.87 / 4.0; 23,004; 0.19 + 0.07 | ×1.00; ×1.40* / ×1.00; ×1.02 |
+| open, 46,222 a second | 1.55 / 3.3; 46,182; 0.11 + 0.11 | 2.11 / 29.9; 46,201; 0.10 + 0.04 | 2.08 / 4.3; 45,906; 0.12 + 0.06 | ×1.00; ×1.42* / ×0.99; ×1.35* |
+| open, 69,333 a second | 1.87 / 5.2; 69,117; 0.06 + 0.06 | 2.09 / 4.9; 69,484; 0.07 + 0.03 | 2.47 / 4.2; 69,062; 0.07 + 0.04 | ×1.00; ×1.04 / ×1.00; ×1.26 |
+| open, 83,199 a second | 1.40 / 61.2; 82,833; 0.06 + 0.06 | 1.56 / 3.4; 82,679; 0.07 + 0.04 | 1.81 / 25.2; 82,819; 0.08 + 0.04 | ×1.00; ×1.11 / ×1.00; ×1.26* |
+
+256 groups:
+
+| point | depth 1 | depth 2 | depth 3 | depth 2, 3 against 1: rate; p50 |
+|---|---|---|---|---|
+| closed, 1 a group | 2.02 / 3.7; 121,436; 0.03 + 0.01 | 2.07 / 4.3; 116,727; 0.03 + 0.01 | 2.16 / 4.5; 106,058; 0.03 + 0.01 | ×0.96; ×1.05 / ×0.87; ×1.07 |
+| closed, 4 a group | 2.96 / 5.2; 335,612; 0.01 + 0.00 | 3.03 / 22.9; 313,858; 0.01 + 0.00 | 3.12 / 21.3; 299,134; 0.01 + 0.00 | ×0.94; ×1.02 / ×0.89; ×1.06 |
+| open, 83,903 a second | 4.69 / 997.2; 83,938; 0.03 + 0.01 | 5.50 / 584.4; 83,906; 0.02 + 0.00 | 6.01 / 1818.9; 83,930; 0.02 + 0.00 | ×1.00; ×1.49 / ×1.00; ×1.39 |
+| open, 167,806 a second | 37.70 / 3132.2; 170,649; 0.00 + 0.00 | 15.29 / 77.8; 169,046; 0.01 + 0.00 | 20.61 / 558.9; 168,981; 0.01 + 0.00 | ×0.99; ×0.39 / ×0.99; ×0.57 |
+| open, 251,709 a second | 19.85 / 162.9; 253,733; 0.01 + 0.00 | 24.17 / 110.0; 256,023; 0.01 + 0.00 | 23.14 / 2551.3; 253,829; 0.01 + 0.00 | ×1.01*; ×1.24 / ×1.00; ×1.21* |
+| open, 302,051 a second | 17.55 / 1360.3; 305,429; 0.01 + 0.00 | 18.89 / 29.5; 306,890; 0.01 + 0.00 | 16.30 / 62.7; 304,533; 0.01 + 0.00 | ×1.00; ×1.10 / ×1.00; ×1.00 |
+
+- **One group on Linux: no depth beyond one earns its place**, as on macOS. No closed-loop point
+  raised entries a second outside both bands, and one fell (Docker, 64 clients, depth 3 at ×0.77);
+  the open loop carries its arrivals at every depth. Depth 3's p50 is ×1.03–1.25 of depth 1's under
+  the open loads, outside both bands at 9 of 12 points; depth 2's outside at one (Docker's lightest,
+  ×1.18).
+- **A confirmation is a durable write.** A lone entry costs three flushes and three durable writes
+  over the three logs, where macOS paid six flushes. Depth 3 confirms some frames by the next
+  frame's record (2.61–2.79 durable writes an entry at one client) and under load writes more,
+  smaller frames (0.16–0.17 flushes an entry at 64 clients against 0.12).
+- **Sixteen groups: the frames gather the groups, and depth costs the median.** Every closed-loop
+  point is within the noise. Under the three heavier open loads depth 2 or 3 raised each run's p50
+  at 14 of 18 points, outside both bands (×1.05–1.50), while their confirmations rode the next
+  frames (durable writes an entry a third to two thirds of depth one's); at the lightest load depth
+  2 and 3 lowered it on the runners (×0.88–0.97) and depth 2 raised it in Docker (×1.40).
+- **256 groups: depth changes nothing.** Every frame is full of other groups' updates; 4 of the 72
+  comparisons lie outside both bands. Docker's open loops held tails of seconds (p99 up to 3.1 s)
+  at every depth: its virtual disk's flushes, which the E2E sections above found holding every
+  member's flush at once.
+- **Where a flush costs nothing, depth earns throughput.** On the simulated device a deeper group
+  raised entries a second at 16 and 64 clients (×1.06–1.35, outside both bands at 4 of 12): a group
+  with writes out keeps the log's pipeline fuller once nothing waits on the device. Every device
+  measured costs a flush, and on none did depth raise a group's throughput.
+- **Open:** the many groups on macOS, where a confirmation is a full flush and a deeper group's
+  saved confirmations are worth most (a run there was stopped before it finished and is not
+  counted).
+
+```sh
+cargo bench -p hyper-durable --bench depth -- DIR 1,4,16,64 25,50,75,90 6 file,sim          # one group
+cargo bench -p hyper-durable --bench depth -- DIR 1,4 25,50,75,90 6 file 615 16,256         # 16 and 256 groups
+```

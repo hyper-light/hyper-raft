@@ -1147,13 +1147,29 @@ directory once, at create.
 
 1. **Depth.** The flushes a committed entry costs, and the latency, at depths 1–3 on hyper-log,
    closed and open loop: whether the third pipeline frame earns its place for one group as it does
-   for the log. Measured on macOS's APFS (`benches/depth.rs`; `docs/benchmarks.md`, "A group's writes
-   out, depth one to three on hyper-log"): it does not. No depth raised one group's throughput beyond
-   the noise in a way that held across runs, and depth 3 raised each run's p50 by 8–14% at light open
-   load, where arrivals that wait for a write to finish batch into the next; what depth saves is a
-   few confirmation flushes at low concurrency (5–6%), what it costs at high concurrency is smaller
-   frames. Open: Linux, where a confirmation is a durable write without a flush, and many groups on
-   one log.
+   for the log. Measured on macOS's APFS (`benches/depth.rs`; `docs/benchmarks.md`, "A group's
+   writes out, depth one to three on hyper-log"): it does not. No depth raised one group's
+   throughput beyond the noise in a way that held across runs, and depth 3 raised each run's p50 by
+   8–14% at light open load, where arrivals that wait for a write to finish batch into the next;
+   what depth saves is a few confirmation flushes at low concurrency (5–6%), what it costs at high
+   concurrency is smaller frames. On Linux, where a frame's confirmation is a durable write without
+   a flush of the device's cache, and with many groups on each member's log, it does not either (the
+   bench's `GROUPS`; `docs/benchmarks.md`, "A group's writes out on Linux, and many groups on their
+   members' logs"): on two CI runners' disks and Docker's virtual machine on this machine a lone
+   entry costs three flushes and three durable writes over the three logs where macOS's six were
+   flushes; no depth beyond one raised one group's throughput outside the noise (one point fell,
+   ×0.77), and depth 3 raised each run's p50 under the open loads (×1.03–1.25), outside both bands
+   at 9 of 12 points. With 16 groups on each log, under the three heavier open loads depth 2 or 3
+   raised each run's p50 at 14 of 18 points, outside both bands (×1.05–1.50), while the next frames
+   carried their confirmations (durable writes an entry a third to two thirds of depth one's); at
+   the lightest it lowered it on the runners (×0.88–0.97) and raised it in Docker (×1.40). With 256
+   groups every frame is full of other groups' updates, and 4 of the 72 comparisons lie outside both
+   bands. Where a flush costs nothing (the simulated device) a deeper group raised entries a second
+   at 16 and 64 clients (×1.06–1.35, outside both bands at 4 of 12); on no device whose flush costs
+   something did it. Open: the same many groups on macOS, where a confirmation is a full flush that
+   a deeper group saves; and with it the shell's depth on hyper-log, which §6 bounds at the log's
+   three, where on Linux one did as well or better at every point measured but the runners' lightest
+   open load with 16 groups.
 2. **Apply before local durability.** p99 commit-to-answer on a leader whose disk is the slowest of
    its quorum, with and without §4.2, on one disk per member and on a shared disk. Measured
    (`benches/apply.rs`; `docs/benchmarks.md`, "A leader applying ahead of its own write"): with the

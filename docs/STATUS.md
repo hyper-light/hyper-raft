@@ -46,6 +46,14 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-16, each in its document: in the end-to-end harnesses' waits
+(`hyper_raft_e2e::quiet`, which all three keep), a member silent past its excuse ends at once only a
+wait on every member's own facts, a wait for what the group answers going on while the members heard
+move, and an operation asked again waits twice its ask before, to sixty seconds (RFC 6298 §5.5,
+§2.5; `docs/timing.md` §2.9, "A member stopped while the others' writes are slow"); in hyper-durable's
+depth bench, many groups on their members' logs, measured on Linux with one group and many
+(`docs/durable.md` §14 item 1).
+
 Landed 2026-10-15, each in its crate's document: in hyper-raft, a candidate's vote for itself counted
 once the hard state naming it is durable (`docs/durable.md` I9, `docs/raft.md` §3.3; the simulation's two
 leaders of one term, below); in hyper-rt, a wake slower than its probe round's share kept, the round
@@ -417,7 +425,7 @@ is worked around.
 | focal | every crate it takes vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`eb6ce081` on its main's `95294367`; focal's gate exit 0, 167 test binaries, 3469 passed, 31 ignored), three of its tests draining until a sole voter leads (I9), which its session lands under its own rules; its `main` vendors twelve at `5007f44` and hyper-transport at `81af6b3`, both on `main` since `3d86b42` | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
 | slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`5f2a76d4` on its main's head `b85b37ea`; fmt, its structural and literal checks, clippy on slates-cluster, its library's 213 tests and the member plane's 10 pass), one commit touching only `vendor/hyper-raft`, which its session lands on the owner's word; its main vendors them at `aa82ada`, their sources the same but for hyper-timing's `independent_interval`, which `43aec4a` removed and slates calls nowhere | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
 
-## What remains (2026-10-15)
+## What remains (2026-10-16)
 
 In the owner's order: red CI first; then every consumer on one revision of `main`; then the shared
 crates' open work; then each consumer's switch-over (mantle note 32 §5, each project's own order).
@@ -426,9 +434,9 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
    green on `main` (green since `3d86b42`, 2026-10-15).
 2. **One revision for every consumer.** mantle is on `80c1f82` on its `main` (`9ccd216`); focal's
    and slates' branches take `80c1f82`, which their sessions land (the Consumers table above). What
-   `main` took since `80c1f82` changes the end-to-end harnesses and the documents (hyper-raft-e2e,
-   hyper-durable-e2e, hyper-multilog-e2e, `docs/`): no crate a consumer vendors, so no consumer
-   re-vendors for it.
+   `main` took since `80c1f82` changes the end-to-end harnesses, hyper-durable's depth bench and the
+   documents (hyper-raft-e2e, hyper-durable-e2e, hyper-multilog-e2e, `crates/hyper-durable/benches`,
+   `docs/`): no code a consumer vendors builds, so no consumer re-vendors for it.
 3. **The shared crates' open work**, each in its own document:
    - hyper-durable: §14's measurements. Items 1 to 8 measured on this machine (2026-10-12 and 13,
      `docs/benchmarks.md` from "A group's writes out, depth one to three on hyper-log"): depth earns
@@ -441,9 +449,15 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      faster past a hundred, the image's bytes costing only on a path, and the bench found a core fault
      (a member trusted again kept a window of what its cut lost; fixed, `b66dc9e`); an `Unbounded`
      budget costs nothing, a counting one 13–15% of an entry's instructions; slates' publication grows
-     with its log where a transition through the shell does not. Open: item 1 on Linux and with many
-     groups; a leader sending its appends before its own write has a slot (item 2); the shell choosing
-     an image by the measured crossover (item 5); item 6's question of PAR's identifiers.
+     with its log where a transition through the shell does not. Item 1 on Linux and with many groups
+     (2026-10-16, `docs/benchmarks.md`, "A group's writes out on Linux, and many groups on their
+     members' logs"; the depth bench's `GROUPS`): on two CI runners' disks and Docker's virtual
+     machine no depth beyond one raised a group's throughput, and depth 3 raised one group's p50 under
+     open load (×1.03–1.25); with 16 groups on each log depth 2 or 3 raised it at 14 of 18 heavier
+     open points (×1.05–1.50), and with 256 it changed nothing. Open: the same many groups on macOS,
+     and with it the shell's depth on hyper-log (§6 bounds it at the log's three); a leader sending
+     its appends before its own write has a slot (item 2); the shell choosing an image by the
+     measured crossover (item 5); item 6's question of PAR's identifiers.
    - hyper-sim and hyper-check: S-6 is built (`docs/sim.md` §17, §18): hyper-durable's schedules in
      the world, on its network and on the typed write queue, judged by hyper-check's oracles, their
      crashes forked, every floor at the same seed counts, 60–69% fewer allocations a step; hyper-raft's

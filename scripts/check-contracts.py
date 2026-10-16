@@ -44,11 +44,18 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/src/attribution.rs":
         "getrusage(RUSAGE_THREAD) through libc (a long poll's voluntary context switches)",
     "crates/hyper-rt/src/epoll.rs":
-        "epoll and eventfd where rustix's wrappers are unsafe by signature",
+        "epoll and eventfd where rustix's wrappers are unsafe by signature, and epoll_pwait2(2) "
+        "through libc::syscall (rustix carries it only behind a feature that fails every wait "
+        "before Linux 5.11)",
     "crates/hyper-rt/src/iocp.rs":
-        "I/O completion ports: CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus",
+        "I/O completion ports: CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus; "
+        "a timed wait's high-resolution waitable timer (CreateWaitableTimerExW, SetWaitableTimer) and "
+        "ntdll's wait completion packet that posts its signal to the port (NtCreateWaitCompletionPacket, "
+        "NtAssociateWaitCompletionPacket, NtCancelWaitCompletionPacket, found through GetProcAddress)",
     "crates/hyper-rt/src/kqueue.rs":
-        "kevent through rustix (unsafe by signature: the udata word) and the EVFILT_USER trigger",
+        "kevent through rustix (unsafe by signature: the udata word) and the EVFILT_USER trigger, "
+        "and a timed wait's kevent through libc (its NOTE_CRITICAL timer, which rustix's timer "
+        "filter does not set)",
     "crates/hyper-rt/src/machine/clock.rs":
         "clock_gettime and mach_absolute_time through libc; QueryPerformanceCounter (the monotonic clock)",
     "crates/hyper-rt/src/machine/facts.rs":
@@ -66,7 +73,11 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/src/tcpsys.rs":
         "Winsock 2 stream calls (socket, accept, connect, recv, send, WSARecv, WSASend over IoSlice's WSABUF layout, shutdown) and the TCP options rustix lacks (TCP_NOTSENT_LOWAT, TCP_RXT_CONNDROPTIME, SO_NOSIGPIPE)",
     "crates/hyper-rt/src/udp/linux.rs":
-        "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1)",
+        "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1); "
+        "getsockopt(SO_MEMINFO), the kernel's account of a receive queue (docs/transport.md §4i)",
+    "crates/hyper-rt/tests/udp_batched.rs":
+        "setsockopt(SO_NO_CHECK) through libc, which the runtime has no call for: a socket whose "
+        "segmented sends the kernel refuses (tests only, docs/transport.md §4h)",
     "crates/hyper-rt/src/udp/macos.rs":
         "recvmsg with SCM_TIMESTAMP_MONOTONIC and mach_absolute_time, which rustix drops (kernel receive stamps, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/retire.rs":
@@ -121,14 +132,15 @@ UNSAFE_ALLOWED = {
         "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
     "crates/hyper-tokio/src/sys/linux.rs":
         "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7)); "
-        "SO_TIMESTAMPNS and its SCM_TIMESTAMPNS control message (socket(7)); clock_gettime(2)",
+        "SO_TIMESTAMPNS and its SCM_TIMESTAMPNS control message (socket(7)); clock_gettime(2); "
+        "FIONREAD (the bytes a receive queue holds); getsockopt(SO_MEMINFO) (its charge)",
     "crates/hyper-tokio/src/sys/macos.rs":
         "recvmsg(2), SO_TIMESTAMP_MONOTONIC and its SCM_TIMESTAMP_MONOTONIC control message (the "
         "kernel's receive stamp, which rustix's recvmsg drops); mach_absolute_time and "
-        "mach_timebase_info (the clock it stamps on)",
+        "mach_timebase_info (the clock it stamps on); FIONREAD (the bytes a receive queue holds)",
     "crates/hyper-tokio/src/sys/windows.rs":
         "QueryPerformanceCounter and QueryPerformanceFrequency through windows-sys (the host's "
-        "monotonic clock)",
+        "monotonic clock); ioctlsocket(FIONREAD) (the bytes a receive queue holds)",
     "crates/hyper-block/src/threads/windows.rs":
         "ToolHelp snapshots and GetThreadTimes (the process's threads and a thread's CPU time)",
     "crates/hyper-timing-trace/src/sys.rs":

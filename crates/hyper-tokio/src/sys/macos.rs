@@ -81,6 +81,98 @@ impl Clock {
     }
 }
 
+/// `MSIZE` (`bsd/arm/param.h`, `bsd/i386/param.h`): an mbuf's own size. A received datagram is
+/// queued as its address's mbuf, its control's and its data's, each charged at least this.
+const MSIZE: u64 = 256;
+/// `M16KCLBYTES` (`bsd/arm/param.h`, `bsd/i386/param.h`): XNU's largest cluster, the "jumbo
+/// cluster", the most storage a receiving driver gives a datagram's data in one mbuf.
+const M16KCLBYTES: u64 = 16_384;
+/// `sb_efficiency` (`bsd/kern/uipc_socket2.c`): a socket buffer's mbuf storage is limited to this
+/// many times its byte limit (`sbreserve`: `sb_mbmax = cc * sb_efficiency`).
+const SB_EFFICIENCY: u64 = 8;
+
+/// The least XNU may charge one queued datagram against its byte limit, beyond what `FIONREAD`
+/// reads: `sbspace` is the smaller of what is left of the byte limit and of the mbuf limit, and a
+/// datagram's mbufs are its address's, its control's and its data's, the data's at most a jumbo
+/// cluster (hyper-rt's `udp/macos.rs` reads the same account).
+pub(crate) fn message_floor() -> u64 {
+    MSIZE
+        .saturating_mul(3)
+        .saturating_add(M16KCLBYTES)
+        .checked_div(SB_EFFICIENCY)
+        .unwrap_or(u64::MAX)
+}
+
+/// The bytes waiting in `fd`'s receive queue as `FIONREAD` counts them: on XNU every queued
+/// datagram's, with their addresses and control (`soioctl`: `so_rcv.sb_cc`).
+pub(crate) fn queued_bytes(fd: RawFd) -> io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one `c_int` through the pointer; `value` is a live local of that size.
+    let status = unsafe { libc::ioctl(fd, libc::FIONREAD, ptr::addr_of_mut!(value)) };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("FIONREAD read back negative"))
+}
+
+/// The receive buffer the kernel reports for `fd` (`SO_RCVBUF`).
+pub(crate) fn recv_buffer(fd: RawFd) -> io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    let mut length = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(0);
+    // SAFETY: `value` and `length` are live locals of the sizes passed; getsockopt writes at most
+    // `length` bytes into `value` and the new length into `length`.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            ptr::addr_of_mut!(value).cast(),
+            &raw mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("SO_RCVBUF read back negative"))
+}
+
+/// Asks the kernel for a receive buffer of `bytes` on `fd` ([`super::set_recv_buffer`]):
+/// `SO_RCVBUF`, which macOS refuses past `kern.ipc.maxsockbuf` (`ENOBUFS`), so a refused size is
+/// halved and asked again, at most [`super::BUFFER_ASKS`] times. The buffer reported after.
+pub(crate) fn set_recv_buffer(fd: RawFd, bytes: usize) -> io::Result<usize> {
+    let mut value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    let length = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(0);
+    let mut refusal = None;
+    for _ in 0..super::BUFFER_ASKS {
+        // SAFETY: `value` is a live `c_int` and the length passed is its size; setsockopt only
+        // reads it.
+        let status = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                ptr::addr_of!(value).cast(),
+                length,
+            )
+        };
+        if status == 0 {
+            return recv_buffer(fd);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOBUFS | libc::EINVAL) => {
+                refusal = Some(error);
+                value = value.checked_div(2).unwrap_or(0);
+                if value == 0 {
+                    break;
+                }
+            }
+            _ => return Err(error),
+        }
+    }
+    Err(refusal.unwrap_or_else(|| io::Error::other("no receive buffer was granted")))
+}
+
 /// Asks the kernel to stamp each datagram `fd` receives. Whether it agreed.
 pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     let on: libc::c_int = 1;

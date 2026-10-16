@@ -1115,3 +1115,155 @@ without the change, at "announced with the response"); hyper-transport's
 `a_pooled_servers_stream_goes_back_with_the_reply` (20 exchanges through a pool of one: 40
 datagrams of each side, where they took 59) and `a_pool_sized_to_nothing_holds_its_peer_until_sized_again`
 (the pool settled before the finish).
+
+## 30. BBR's bandwidth from delivery-rate samples, and three divergences from Chromium (2026-10-15)
+
+Found while measuring focal's event bus, whose publisher's congestion window reached 408,890,985
+bytes on a path of 72 µs, and whose lossless lane, then bound to the window, held seconds of
+messages behind QUIC. That window was CUBIC's, the bus's law, which on a path that loses nothing has
+no bound (hyper-transport's lossless lane is now bound otherwise, `docs/transport.md` §4). Reading
+BBR, focal's law elsewhere, for the same growth found the port diverging from Chromium's
+`bbr_sender.cc` in four places, the first the same unbounded growth in an app-limited startup.
+
+- **Patch Q16: startup grows the window to its target and no further.** Chromium's
+  `CalculateCongestionWindow` grows a window in startup by what is acknowledged while
+  `congestion_window_ < target_window`. The port compared the gain (2.885) with the target in bytes,
+  which is true of any target. A sender that never leaves startup grew its window by every byte
+  acknowledged, without end: one held back by its peer's flow control, or by its application, never
+  sees full bandwidth. RFC 9002 §7.8 says a window not used to its size is not grown.
+- **Patch Q17: the bandwidth filter's rule.** A sample updates the windowed maximum when it was not
+  app-limited, or when it is above the maximum. That is Chromium's `UpdateBandwidthAndMinRtt`: an
+  app-limited rate is a floor of the path's. The port took only samples that were both not
+  app-limited and larger, so a sender that was always app-limited kept an estimate of zero, and an
+  old high sample never aged out.
+- **Patch Q18: the minimum round trip expires ten seconds after it was sampled.** This is Chromium's
+  `min_rtt_timestamp_`.
+  - The port timed the expiry from when ProbeRTT last began, and called it expired before any had.
+    So every connection entered ProbeRTT (a window of four datagrams, for 200 ms) at its first
+    acknowledgement that was not app-limited. §24's "BBR's window sat at its floor of four datagrams"
+    on loopback and 5 ms paths was this.
+  - The minimum started at zero, and `min_rtt > sample` is never true from zero, so only that expiry
+    ever set it. On expiry the port took the connection's lifetime minimum; Chromium takes the
+    latest sample.
+  - A sample from a phase the application limited does not expire it. Such a sender keeps no queue of
+    its own to drain; this is Chromium's option `probe_rtt_disabled_if_app_limited_`.
+- **Patch Q19: delivery-rate samples** (draft-cheng-iccrg-delivery-rate-estimation-02 §3; Linux's
+  `net/ipv4/tcp_rate.c`; Chromium's `BandwidthSampler`).
+  - **What the port measured.** It divided each acknowledged packet's bytes by the time since the
+    previous acknowledgement, and the latest packet sent by the time since the one before, whichever
+    packets those were. On a pair at 100 Mbit/s and 40 µs one way it estimated 357 MB/s. BBR's
+    window grew to 147 kB, 65 times the path's bandwidth-delay product, and the queue it kept
+    lengthened the round trip from 143 µs to 5 ms.
+  - **The per-packet snapshot.** Each path now keeps what it has delivered (`connection::Delivery`).
+    Each packet in flight carries what had been delivered when it was sent, and when (`Snapshot`).
+  - **The sample.** An acknowledgement's newest packet gives the sample. Its rate is the bytes
+    delivered since that packet's snapshot, over the longer of its flight's send phase and its
+    acknowledgement phase. ACKs that come together shorten only the second phase; packets sent
+    together shorten only the first. An interval shorter than the path's least round trip is no
+    sample, since no flight is delivered faster than it crosses the path.
+  - **App-limited phases.** A `poll_transmit` that finds nothing to send, with neither window nor
+    pacer holding anything back, marks a phase the application limits. It lasts until what is in
+    flight is delivered (§3.4).
+  - **Size.** The snapshot is sixteen bytes in the sent packet's record: its times are nanoseconds
+    before the send, and a flight older than 4.29 s gives no rate. The app-limited flag takes a byte
+    the record's other flags leave free. `largest_acked` is now eight bytes, held as one more than
+    the packet number in a `NonZeroU64`. So the record stays within the 128 bytes
+    `sent_packet_size` holds it to.
+- **The order of an acknowledgement.** The round trip is sampled before the controller hears that the
+  acknowledgement is done, as in Chromium. The controller takes the delivery sample through
+  `Controller::on_delivered` and folds it into its model in `on_end_acks`, in Chromium's
+  `OnCongestionEvent` order: the round, then bandwidth and minimum round trip, then recovery, ack
+  aggregation and the modes. Its full-bandwidth check reads the sample's app-limited flag, not the
+  connection's at the time of the acknowledgement.
+- **Measured.** slates' bake-off (`docs/benchmarks.md`), the branch before and after:
+  - NewReno, CUBIC and Copa wrote the same 495 rows byte for byte.
+  - BBR's goodput shortfall went from 1.075 to 1.020. Its share of the link rose on most paths:
+    64 kbit/s at 300 ms from 62% to 91%, and 100 Mbit/s at 300 ms with 1% loss from 21% to 143%. A
+    share past 100% counts what the path held when the warm-up ended.
+  - Its ping p99 went from 1.467 to 1.497 of the best law's, its worst from 2.77 to 3.95 (a buffer of
+    four products: 206 → 430 ms). Its Jain index at 20 and 100 ms went from 0.714 to 0.515.
+  - BBR states no pacing rate, so the connection paces it at five quarters of its window a round trip.
+    Drain's gain (0.35) and ProbeBW's cycle therefore move nothing. A sender the window holds keeps
+    its window in flight, about a product of queue standing, and its ping p99 is twice the round
+    trip on most paths. Chromium paces at the model's rate. That is the next change, with how two
+    warm-ups at once yield to each other: paced, the pair at 5 ms ended at its budget in 17 of 40
+    runs with both sides warming up, and 3 of 40 unpaced.
+- **Tests.**
+  - `connection::delivery::tests`: a burst through a bottleneck measures the bottleneck; ACKs that
+    come together measure no faster than the packets were sent; an interval below the least round
+    trip is no rate; an app-limited phase ends once its flight is delivered; an idle gap is in
+    neither phase; a packet sent after a stall gives no rate.
+  - `congestion::bbr::tests::a_bulk_sender_measures_its_bottleneck_and_keeps_a_window_of_a_few_bandwidth_delay_products`
+    drives the controller and a sampler over a 100 Mbit/s bottleneck: its estimate within 10% of
+    the bottleneck, its window within four products, its round trips within four times the path's.
+  - `an_app_limited_sender_in_startup_grows_its_window_to_the_target_and_no_further`, now driven
+    through the sampler; without Q16 the window reached 9,612,000 bytes.
+  - `tests::a_warm_up_keeps_what_its_last_round_trip_measures` runs at 5 ms one way, with the client
+    alone warming up. At 40 µs, the path it ran on, the warm-up now ends at its plateau
+    (`a_warm_up_on_a_path_shorter_than_its_target_ends_at_a_plateau`). Each passed 40 runs of 40.
+
+## 31. What a receiver's socket is charged for: the window consumed, the packets a peer may acknowledge (2026-10-16)
+
+Patch Q20 adds two getters and changes no behaviour. A driver learns what its socket's queue is
+charged for each stream byte a peer sends (hyper-transport's receive charge, `docs/transport.md`
+§4i), so it needs two counts:
+- what each message it read carried against the connection's window;
+- what the peer may send unprompted by any window.
+
+- `Connection::stream_bytes_received` counts the bytes of every STREAM frame received, each as it
+  arrived, repeats and frames past a gap included: what the datagrams carried. It is a counter
+  beside the frame's processing and changes nothing else. The first version returned flow
+  control's `data_recvd`, every receive stream's end offset summed. That moves by a gap's bytes when
+  a frame lands past one, so a datagram read alone after a loss seemed to carry more stream bytes
+  than its whole payload, and the room told from it passed its socket's buffer (`docs/transport.md`
+  §4i).
+- `Connection::ack_eliciting_in_flight` is the current path's `in_flight.ack_eliciting`: the packets
+  the peer may acknowledge, one acknowledgement each at the most (RFC 9000 §13.2).
+
+## 32. A packet space's sent packets in a deque (2026-10-16)
+
+Patch Q21 holds a packet space's sent packets in `SentPackets`, a `VecDeque` of `(number, packet)` in
+packet number order, where upstream holds a `BTreeMap<u64, SentPacket>`. Packet numbers only grow
+(RFC 9000 §12.3), so each packet sent is pushed at the back, and acknowledgements come oldest
+first, so most packets leave from the front in constant time. The map moved the rest of a leaf's
+packets on each take: a `SentPacket` is 128 bytes and a leaf holds eleven. The take was the receive
+path's largest copy after its own data (`BTreeMap::remove` and its `memmove`, about 1.5 % of a bus
+node's busy samples at 100,000 messages a second, macOS `sample`, 2026-10-16). Chromium holds its
+unacknowledged packets the same way, in a deque from the least unacknowledged
+(`QuicUnackedPacketMap`).
+
+A take from the middle (an acknowledgement past a loss, or a forgotten acknowledgement-only packet)
+moves the shorter side. A lookup is a binary search that asks the newest packet first. The
+methods are the map's, so every use reads as it did. Test:
+`spaces::test::sent_packets_answer_as_the_map_they_replaced` runs the deque against the map over
+20,000 of a space's own operations from a seed: sends, takes from either end and the middle,
+lookups, and every range shape the uses ask.
+
+## 33. Acknowledgements decimated as Google QUIC's (2026-10-16)
+
+Patch Q22 lets a sender ask its peer, through the acknowledgement frequency extension it already
+carried (draft-ietf-quic-ack-frequency), to acknowledge as Google QUIC's receivers do (quiche,
+`quic_constants.h`): an ACK for every 10 ack-eliciting packets (`kMaxRetransmittablePacketsBeforeAck`),
+else a quarter of the round trip after the first one waiting (`kPeerAckDecimationDelay`), from the
+100th packet on (`kMinReceivedBeforeAckDecimation`, "to avoid the beginning of slow start, when
+CWNDs may be rapidly increasing"). `AckFrequencyConfig::decimation(packet_threshold)` builds the
+request and `TransportConfig::decimate_acks` asks it with the configuration's own packet threshold.
+Upstream's request is static, a fixed delay or the peer's own (25 ms on most paths), sent at once:
+- the delay asked is the smoothed round trip over four (`AckFrequencyConfig::rtt_divisor`), the
+  smoothed round trip and not the least (draft-ietf-quic-ack-frequency-14 §8.1; quiche takes the
+  least), never below the peer's `min_ack_delay`, which hyper-quic advertises as its 1 ms timer
+  granularity (RFC 9002 §6.1.2): on a path under 4 ms the delay is 1 ms;
+- the first request waits until the application data space has numbered 100 packets
+  (`AckFrequencyConfig::after_packets`), so slow start's packets are acknowledged as RFC 9000
+  §13.2.2 asks; a request is sent again as before, once the delay it would ask differs by a fifth;
+- the reordering threshold is the loss detector's packet threshold (§9), so a reordering elicits an
+  immediate ACK only where it would let the sender declare a loss.
+
+RFC 9000 §13.2.2's default, an ACK for every other ack-eliciting packet, cost each delivery of a
+one-packet message half a packet back, with its system calls and the sender's wake: at 100,000 bus
+messages a second a node handled 3.4 datagrams a message, a third of them acknowledgements
+(`docs/transport.md` §4k).
+
+Test: `tests::decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on`
+(no request before the 100th packet; then a lone ping is acknowledged a quarter of a 20 ms round
+trip later, 5 ms and not 4, and the tenth of ten pings at once).

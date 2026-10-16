@@ -295,7 +295,20 @@ it moves (focal's residency, priced by the path's round trip, refused an 8 MiB r
 on a loaded runner; `src/progress.rs`); and a period
 that moved nothing through this side's own doing (an owner not reading a body, or bytes the peer's
 credit would take but this side has not sent) is no evidence against the peer and is not judged. Replication frames travel on lanes, unidirectional streams as wide as the core's
-window, always read; a frame its class or the budget cannot take is skipped and counted. Admission
+window, always read; a frame its class or the budget cannot take is skipped and counted. A class
+may instead be lossless (`Classes::lossless`, 2026-10-15), for frames that are their sender's only
+copy (focal's event bus; Raft sends its messages again, a bus does not). Its frame waits for the
+budget, its lane unread so QUIC's flow control holds the sender, and asks again whenever bytes come
+back (`Reading::Reserving`, `Endpoint::retry_reserving`); a frame past its class bound is still
+refused. Its lane holds one frame beyond what QUIC took and then refuses `LaneFull`: QUIC's stream
+holds what the peer's credit allows, as a socket's send buffer does, whose writer waits once it is
+full, and the sender waits at the sender. Counted in frames alone, focal's bus held 64 MiB behind
+a path of about 100 kB, 2.6 s at the median; bounded by the congestion window (TCP Small Queues'
+rule, Dumazet 2012) it held as much as CUBIC's window, which on loopback, where nothing is lost,
+grew to 1.55 GB: a publisher the node held queued 470 ms in its own lane. And an owner that cannot take more holds the
+peer's lane (`Endpoint::hold_lane`, `release_lane`): read no further past its opening, the peer is
+held at QUIC's flow control and its own lane fills, where it would otherwise queue in the owner
+without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median). Admission
 bounds pending handshakes (Retry under load), identities, connections per identity (the idle one
 used longest ago replaced, below) and connections in all; every exchange and lane has a table bound.
 Every refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
@@ -715,6 +728,15 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   and sixteen initial windows, scaled with it to 3.84 MB of padding a connection. BBR now starts
   at RFC 9002's window by the datagram size, as CUBIC, NewReno and Copa do
   (`crates/hyper-quic/VENDORED.md` §21).
+- **BBR's model from delivery-rate samples** (2026-10-15). Each path keeps what it delivered, and
+  each packet in flight what had been delivered when it went (draft-cheng-iccrg-delivery-rate-
+  estimation, Linux's `tcp_rate.c`). An acknowledgement's newest packet gives the delivery rate over
+  the longer of its flight's send and ack phases, and BBR's bandwidth is the windowed maximum of
+  those (`Controller::on_delivered`). Three other divergences from Chromium went with the old
+  estimator: startup compared the gain with its target, so an app-limited sender's window grew
+  without end; the bandwidth filter took no app-limited sample; and the minimum round trip expired
+  before it was ever measured, so every connection began in ProbeRTT
+  (`crates/hyper-quic/VENDORED.md` §30).
 
 ## 4g. Admission credit: a stream pool (2026-10-13)
 
@@ -795,6 +817,258 @@ RFC 9000 §4.6), and an exchange is a stream.
   - `tests/exchange.rs`: `a_pooled_peer_holds_back_what_the_pool_cannot_take` (ten exchanges asked
     at once against a pool of three: never more than three open at the server, every one answered)
     and `a_pool_sized_to_nothing_holds_its_peer_until_sized_again`.
+
+## 4h. A connection's batch in one call, and one set of receive buffers (2026-10-15)
+
+focal's event bus, measured against NATS (each node on one CPU, Linux 6.x in Docker), carried 45,000
+to 56,000 messages a second whatever was offered from 100,000 to 100,000,000 a second, where NATS
+carried about 250,000. Diagnostic builds of the bus at 1,000,000 a second offered (three runs each)
+traced it to the driver's sends, which two bounds held to a datagram or two a system call:
+
+- hyper-transport asked hyper-quic for one datagram at a time (`poll_transmit(now, 1, ..)`), so each
+  datagram cost its own pass through the connection's packet assembly and a copy into an outbox
+  slot; and
+- a peer's socket (hyper-rt-transport's socket a peer, its driver's module doc) batched two datagrams a call, because each socket held its
+  own receive buffers, 64 KiB each, for as long as its peer was connected. A peer's bulk therefore
+  left two datagrams a `sendmmsg`, never enough to segment.
+
+A peer batch of 64 in place of 2 took the bus from 118,000 to 144,000 a second. With the kernel's
+charge counted at twice the payload rather than four times (the socket room, still open, below), it
+reached 257,000, with nothing dropped in either.
+
+The design is quinn's (its endpoint driver and `quinn-udp`):
+
+- **A batch at a time.** The endpoint makes up to `SEGMENTS_A_TRANSMIT` (64, `UDP_MAX_SEGMENTS`) of
+  one connection's datagrams at once (`Endpoint::poll_transmit_batch`). They go into the driver's one
+  buffer, each but the last of the transmit's segment size; hyper-quic already built such batches for
+  any caller that asked (`enable_segmentation_offload`, on by default).
+- **Sent from the driver's buffer.** The socket sends a batch with no copy (`Batched::send_segments`).
+  Where the kernel segments, it uses one `sendmmsg` of one message carrying `UDP_SEGMENT`, as many
+  messages as the kernel's bounds need (64 segments, 65,507 bytes). Elsewhere it sends a datagram a
+  call. What a socket's outbox already holds leaves first, so datagrams leave in the order they were
+  made.
+- **Nothing dropped for room.** When the socket takes only part of a transmit, the driver holds the
+  transmit with its progress. It awaits that socket's writability and sends nothing the endpoint
+  makes until the transmit is done.
+- **One set of receive buffers.** Every socket receives into one `Ring` that the driver lends to
+  whichever socket it reads (`Batched::receive_with`). The ring holds `Io::batch` buffers of 64 KiB on
+  Linux and one elsewhere, where each peer's socket had held its own. A peer's socket
+  (`Batched::lent`) holds only its descriptor and the headers of a one-message call; its own
+  `receive` is refused `BadConfig`, since it has nothing to receive into.
+- **When the path cannot segment.** A segmented message refused EIO (udp(7): a device without
+  checksum offload) or EINVAL turns segmentation off for the socket, and the message goes again a
+  datagram a call. The kernel returns EINVAL to a socket sending without checksums (`udp_send_skb`),
+  and quinn-udp turns segmentation off on EINVAL because drivers have returned it. A one-datagram
+  message was not segmented, so its error is its own. This applies to the outbox's batched sends
+  too. Before, they turned segmentation off only on EIO: a socket refused EINVAL dropped every
+  segmented message, counted as send errors, so its connection lost its bulk until it timed out.
+
+**Bounds.**
+- The ring: `Ring::held_bound`, a batch of 64 KiB buffers and their headers on Linux.
+- One transmit buffer: 64 of the path's datagrams, 93 KB at 1,452 bytes.
+- Per peer socket: the headers of a one-message call and an empty one-slot outbox. A thousand peers
+  had held 128 MiB of receive buffers between them; they now hold none of their own.
+- Each turn sends at most `MAX_BATCH` datagrams before its other work, as before.
+- `send_segments`' loop ends within three passes a datagram, plus two. Each pass sends a message,
+  returns, marks one astray report, or turns segmentation off once.
+
+**Tests.**
+- hyper-rt `tests/udp_batched.rs`:
+  - `a_segmented_send_crosses_whole_and_in_order_from_the_callers_buffer`: 150 datagrams of
+    100 bytes (64 a message) and 60 of 1,200 (54 a message), each last one shorter, over IPv4 and
+    IPv6. Each arrives once, in order, at its own length. On Linux the batch takes exactly as many
+    calls as the bounds need; elsewhere, one a datagram.
+  - `what_the_outbox_holds_leaves_before_a_segmented_send`.
+  - `a_segmented_send_the_socket_does_not_take_is_done_by_none_and_sent_again`: on the simulation
+    fabric, whose sends can be blocked.
+  - `one_ring_serves_every_lent_socket_and_none_holds_its_buffers`.
+  - `a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone`: `SO_NO_CHECK`. It fails
+    under the EIO-only rule, with all ten datagrams refused.
+- hyper-rt-transport `each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection`:
+  on Linux, the client's peer socket sent 1,459 datagrams in 92 calls, where it had been held to two
+  a call. macOS took 1,449 calls for 1,449 datagrams, since it has no segmentation.
+
+**A drain takes what was queued when it began.** Batching made each of the driver's receive calls
+carry up to its ring's batch: ten messages for focal's bus, each possibly a 64 KiB coalesced train.
+A drain read a socket until it emptied, or until it had made `TURNS` calls (tokio's cooperative
+budget). A peer that kept sending therefore kept the driver reading, up to 1,280 messages a turn
+where a peer socket's two-slot batch had allowed 256. The driver sends nothing while it reads: not
+the frames it forwards, and not the credit its peers wait for. In an interleaved A/B (three runs
+each, node on one CPU) the batched build carried 14% more at 1M/s offered on 14% less CPU. But its
+p99 rose from 0.21 to 1.00 ms at 10k/s and from 0.23 to 0.82 ms at 100k/s. Its publisher was held
+for up to 12 ms at a time (base: 1.3 ms) with nothing lost: the room of 106 KB lasts 1.5 ms of
+publishing at 100k/s. A drain now takes the backlog it found (`Batched::receive_queued`) and leaves
+what arrives meanwhile for the next turn, as an event loop runs the callbacks queued when its phase
+began. What was queued is told by:
+- the kernel's receive stamps where the socket has them (Linux `SO_TIMESTAMPNS`, macOS
+  `SO_TIMESTAMP_MONOTONIC`): a datagram stamped after the drain began arrived since. A stamp is
+  late, never early, so a busy machine can end a drain sooner, never later;
+- elsewhere, the bytes the socket held at the first call (`UdpSocket::queued_bytes`, `FIONREAD`).
+  Winsock counts every queued datagram ("Winsock IOCTLs": "the total number of bytes available to
+  read, not the size of the first datagram"); XNU counts them with their addresses and control
+  (`soioctl`: `so_rcv.sb_cc`); the fabric counts its own.
+
+The endpoint is still told when each datagram was read (`Arrival::read_ns`), as hyper-tokio's driver
+tells it. hyper-tokio's driver drained to empty on purpose ("so that the socket's receive buffer is
+drained before anything is surfaced"), a guard the socket room has made needless. It now takes the
+same rule: its socket is bound with the kernel's stamps, and on Windows it counts `FIONREAD` bytes.
+tokio's readiness stays set until a read would block, so a datagram left for the next turn is read
+at once. `socket::tests::fionread_counts_the_queue_as_the_platform_does` holds each platform to the
+count its source states:
+- Linux: the next datagram's alone (100 of three datagrams' 600 bytes);
+- XNU: every one's with its address (past 600);
+- Winsock: every one's (600).
+
+**A socket left holding datagrams is work now.** A drain that stops with datagrams waiting marks
+its socket for the next turn. Readiness is one-shot (epoll's `EPOLLONESHOT`, kqueue's `EV_ONESHOT`)
+and fires when a datagram arrives, not for one already waiting, and the driver did not count a
+marked socket as fired. A driver whose only work was such a socket therefore parked until its next
+timer or another arrival woke it. Now a marked socket, the listener's or a peer's, keeps the turn
+loop going (up to `TURNS` turns before it yields to the shard and wakes itself, counted by
+`Driver::yields`). `Driver::backlogged` counts the sockets left holding datagrams. Test:
+`a_peer_socket_left_holding_datagrams_is_drained_without_another_wake`. More datagrams than two
+drains take wait in a peer socket, and whenever the server's poll ends pending without having woken
+itself, no socket may be left holding any. Under the old rule it parked after one drain, 128 of 257
+read; under load it passed 40 of 40 runs, with every core held by busy loops. Its first version
+asserted instead that no timer fired before every datagram was read. That failed under the gate's
+parallel load, where a timer 65 ms away came due first: a test that rests on timing is not one a
+busy machine passes.
+
+The socket room's charge was then a fixed four times a datagram's payload. §4i replaces it with
+the kernel's own account, measured.
+
+## 4i. A socket's room, from what the kernel is measured to charge (2026-10-16)
+
+The windows a socket's peers are granted, summed, never pass what its receive queue holds (§4a's
+socket room, `credit.rs`), so a reader the machine stops drops nothing. What the queue holds
+depends on what the kernel charges each queued message. The room used to assume four times its
+payload on Linux and twice elsewhere. That rule was an arbitrary constant: three loopback
+measurements on one kernel, rounded up. It was wrong in both directions. Linux charges a GRO train
+little more than its payload, a 1,252-byte datagram 1.84 times, and a 100-byte one about nine
+times. The rule is gone. The room is now learned from the kernel's own account, as Linux TCP
+learns its `scaling_ratio` from each segment's length over its truesize (`tcp_measure_rcv_mss`,
+Linux 6.6), and nothing in it is assumed.
+
+- **The account** (hyper-rt `UdpSocket::queue_charge`, hyper-tokio's own):
+  - Linux's `SO_MEMINFO` (`sk_get_meminfo`): what the queue is charged
+    (`SK_MEMINFO_RMEM_ALLOC`), its buffer and its drops. A quarter of the buffer may stay charged
+    for datagrams already read while others wait: `udp_rmem_release` releases in batches of
+    `forward_threshold = sk_rcvbuf >> 2`.
+  - macOS's `FIONREAD`, which is `sb_cc`: each datagram's payload, address and control, against
+    `sb_hiwat` (`soioctl`, `sbappendaddr`). XNU also limits mbuf storage to `sb_efficiency`, 8,
+    times the byte limit (`sbspace`, `sbreserve`), which nothing reads. So a message is charged at
+    least its mbufs over 8: its address's, control's and data's, the data's at most XNU's largest
+    (jumbo) cluster (`MSIZE` 256 and `M16KCLBYTES` 16,384, `bsd/arm/param.h`), 2,144 bytes.
+  - The simulation fabric's own account: each datagram its payload, admitted only while it fits.
+  - Windows exposes none. Its room stays at the first windows admission lets in until a
+    measurement of AFD's capacity replaces it (open, below).
+- **A sample** is a message read as the only one queued (the singleton rule; hyper-transport's
+  `SocketCharge`). The account is read before a drain that starts with nothing behind it. If the
+  drain took exactly one message and emptied the socket, and the account after it is nothing, the
+  account before was that message's charge exactly. A datagram that came between the two reads
+  shows as a second message, or as a charge after. The stream bytes it carried are the difference
+  in the STREAM frame bytes its connection received (hyper-quic patch Q20,
+  `stream_bytes_received`).
+  - The first build took the difference in flow control's count instead, the receive streams' end
+    offsets summed, which moves by a gap's bytes when a frame lands past one. A datagram read
+    alone after a loss then seemed to carry more stream bytes than its whole payload. In one busy
+    run at 100k/s the room told reached 1.98 MB against a buffer of 426 KB, and the node's sockets
+    dropped 376,148 datagrams.
+  - A sample past the message's own bounds is not taken: more stream bytes than its payload, or a
+    charge below its payload, which no kernel makes.
+  - Tests: `stream_bytes_received_count_what_frames_carried` (hyper-quic) and
+    `a_sample_past_the_messages_own_bytes_is_not_taken`.
+- **The room** (`ReceiveCharge::room`): the buffer, less the release lag, less what peers may send
+  unprompted by any window, at the costliest stream byte sampled. The unprompted messages are an
+  acknowledgement for each of this side's ack-eliciting packets in flight (RFC 9000 §13.2: a
+  receiver may acknowledge every one) and the loss probes of the idle timeout: two at each probe
+  timeout (RFC 9002 §6.2.4), the timeouts doubling (§6.2.1) from `kGranularity`, 32 for a 30-second
+  timeout. Each is one datagram that comes alone. A probe is charged as the costliest datagram that
+  came alone, an acknowledgement as the costliest alone without stream data; retransmissions take
+  no new window, so they count here. A GRO train is one message of many datagrams and gives only
+  its charge per stream byte. Its share a datagram stands in until a datagram has come alone. The
+  first build charged probes as the costliest message: one train sampled made 32 probes cost 32
+  trains, past the whole queue, and the room fell to nothing. In the busy A/B the publisher was
+  then held 56 times at 10k/s, against 8 (`a_train_is_no_probes_charge`).
+- **What the worst is taken over:** the current window epoch and the last that brought a sample.
+  An epoch ends once the peers have consumed the room it began with, so every window still granted
+  was granted within the two. An epoch without a sample keeps the worst it had: under load a socket
+  is read behind a backlog, where no read is a sample. A drop the kernel reports
+  (`SK_MEMINFO_DROPS`) forgets the samples, and the room falls back to the first window until new
+  ones come.
+- **Before anything is measured:** the queue is asked for the windows' demand, the least it could
+  need, a byte charged a byte. The kernel grants what it will; Linux caps an unprivileged ask at
+  `rmem_max`. The room is the first windows admission lets in. What a peer sends before this side
+  first acknowledges it is bounded by the protocol: RFC 9000 §8.1's three times what it was sent
+  before its address is validated, and RFC 9002 §7.2's initial window. On Linux an empty queue
+  admits any one datagram, so the first datagram read is the first sample. A peer's socket starts
+  from what the listener learned of the host's receive path.
+- **Tests.**
+  - hyper-transport `charge::tests`: the room at the costliest stream byte; unprompted messages
+    reserved first; the worst held for the epoch after its own; epochs without samples keep what
+    was learned; a drop forgets; probes doubling to the idle timeout.
+  - hyper-rt `a_socket_tells_what_its_queue_is_charged` (Linux: charged past the payload, a
+    quarter of the buffer the lag, nothing once read; macOS: 1,016 bytes for a 1,000-byte datagram,
+    the payload and a 16-byte `sockaddr_in`, as `sbappendaddr` counts it) and
+    `a_simulated_socket_is_charged_its_payload`.
+  - hyper-rt-transport `a_socket_holds_the_room_told_from_its_measured_charge`, end to end on the
+    real kernel: one datagram's charge sampled, the room told from it, and that room's worth sent
+    unread, every one there to read and none dropped.
+    - Linux 6.x in Docker: a 1,252-byte datagram charged 2,304; a 32 KiB buffer less its 8 KiB lag
+      held a room of 13,354 bytes, 10 datagrams.
+    - macOS: 1,268 bytes counted, the mbuf floor of 2,144 ruling; a room of 19,135, 15 datagrams.
+- **Open:** Windows. Winsock's `FIONREAD` counts every queued datagram's bytes, but AFD's charge per
+  datagram against `SO_RCVBUF` is documented nowhere. A self-probe at the driver's start can
+  measure it: fill a probe socket of the same buffer until its count stops growing.
+
+## 4j. A frame that carries its own checksum is summed once (2026-10-16)
+
+Every message's prefix carries a CRC-32C of the prefix and the head, mantle's rule that a network
+payload carries a checksum verified on read, which catches a framing bug the AEAD cannot. A bus
+batch carries its producer's CRC-32C too (Kafka's record batch CRC, KIP-98), which its broker checks
+as it appends and its consumer as it takes it, end to end (Hochschild et al., HotOS 2021). So a bus
+node summed each batch three times, its prefix's on receipt, the batch's, and its prefix's again
+to deliver it, and a subscriber twice: CRC-32C was 3.6 % of the node's busy samples at 100,000
+messages a second (macOS, `sample`, 2026-10-16).
+
+`Classes::embedded_checksum(kind)` says where a lane frame of a kind carries its own CRC-32C
+(`Embedded { covered_from, at }`: of the bytes from `covered_from`, little-endian at `at..at + 4`,
+which lies before `covered_from`). For those kinds the prefix's checksum covers the prefix and the
+frame only before `covered_from`, and the receiver verifies the frame's own checksum where it would
+have summed the same bytes again; each byte is covered by exactly one checksum, verified on read.
+A frame whose own checksum fails is refused as corrupt, as one whose prefix's fails is, and its
+lane stops (`Stats::lanes_refused`, which counts every lane a refused frame stopped). The bus
+declares it for publishes and deliveries (`focal_bus::batch::EMBEDDED`, the 24 bytes before it
+holding the length, the CRC and the fields its owner stamps), so a node sums each batch once and
+skips the batch's own pass where the transport made it (`Batch::parse_verified`). Tests:
+`frame::tests::a_frame_s_own_checksum_and_its_prefix_cover_every_byte_once`,
+`a_frame_of_its_own_checksum_is_checked_by_it`.
+
+## 4k. Acknowledgements decimated (2026-10-16)
+
+Every connection asks its peer to acknowledge as Google QUIC's receivers do
+(`TransportConfig::decimate_acks`, hyper-quic patch Q22): an ACK for every 10 ack-eliciting packets
+or a quarter of the smoothed round trip after the first one waiting, at least the peer's 1 ms
+granularity, from the 100th packet on; a reordering elicits one at once only where it would let the
+sender declare a loss. Every peer is hyper-quic, which takes the extension, so the request always
+holds.
+
+RFC 9000 §13.2.2's default, an ACK for every other ack-eliciting packet, was a third of what a bus
+node handled. On the bare-metal bench (Ryzen 9 9950X3D2, the node alone on one core, the claim
+corpus's 1,150-byte messages, each a batch of its own at 100,000 a second), a node took 1.21
+datagrams of a message's publish and 0.50 of acknowledgements from its subscriber, and sent 1.15 of
+its delivery and 0.50 of acknowledgements to its publisher: 3.4 datagrams a message, each a system
+call's share, a wake and, for each it sent, the receiver's path through the kernel. Decimated, the
+acknowledgements fell to 0.14 and 0.15 (2.7 datagrams a message) and the node's CPU a message by 6 %
+(6.10 µs against 6.50, three interleaved pairs): an acknowledgement is a small packet, and what a
+message costs is mostly its own wake and its two datagrams.
+
+What changes for loss recovery: the probe timeout covers the delay the peer was asked
+(RFC 9002 §6.2.1), so on a path of a few milliseconds or less it is the round trip and 2 ms, where
+the default's 25 ms delay held it past 25 ms; a tail loss is probed sooner. The extension's own
+bounds hold: the delay asked stays under the smoothed round trip wherever the peer's granularity
+allows (draft-ietf-quic-ack-frequency-14 §8.1), and the pacer, not the acknowledgements, spaces a
+sender's bursts (§8.2).
 
 ## 5. Consumers
 

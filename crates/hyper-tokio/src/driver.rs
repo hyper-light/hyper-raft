@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness};
+use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness, SocketCharge};
 use tokio::time::Sleep;
 
 use crate::socket::{Io, IoStats, Sent, Socket, registered};
@@ -37,6 +37,9 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     late: Lateness,
     /// The instant the lateness fold's nanoseconds count from.
     epoch: Instant,
+    /// What the socket's queue is learned to charge, and the room in force (hyper-transport's
+    /// `SocketCharge`; `docs/transport.md` §4i).
+    measure: SocketCharge,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -53,11 +56,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
     )]
     pub fn new(
-        endpoint: Endpoint<C, B, D>,
+        mut endpoint: Endpoint<C, B, D>,
         socket: std::net::UdpSocket,
         io: Io,
     ) -> Result<Self, Error> {
-        let socket = Socket::new(socket, io, false)?;
+        // The socket's queue holds what the endpoint's windows may grant (hyper-transport's socket
+        // room): asked for their sum, and the endpoint told what the kernel gave, so what its peers
+        // may send unread never passes what the queue takes while the owner does not read.
+        // The queue is asked for the windows' demand, the least it could need, and the room is
+        // told from what the kernel granted and what it is measured to charge: until a message is
+        // measured, the first windows admission lets in.
+        let ask = hyper_transport::socket_buffer_ask(endpoint.receive_demand());
+        crate::sys::set_recv_buffer(&socket, usize::try_from(ask).unwrap_or(usize::MAX))?;
+        let unmeasured = endpoint.unmeasured_room();
+        endpoint.set_receive_capacity(unmeasured);
+        // Stamped where the kernel stamps, so a drain knows what was queued when it began.
+        let socket = Socket::new(socket, io, true)?;
         // The fold reads std's `Instant`, which is the clock `Clock` reads: `CLOCK_MONOTONIC`,
         // `CLOCK_UPTIME_RAW` and `QueryPerformanceCounter` (std's `Instant` documentation).
         let resolution = Clock::new()?.resolution();
@@ -73,6 +87,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             armed: None,
             late: Lateness::new(resolution),
             epoch: Instant::now(),
+            measure: SocketCharge::new(unmeasured),
         })
     }
 
@@ -113,9 +128,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     }
 
     /// [`Driver::event`] as a poll. An event already queued is handed out at once. Otherwise
-    /// each turn takes what has arrived, up to [`TURNS`] batches, so that the socket's receive
-    /// buffer is drained before anything is surfaced; then fires the timers due, sends, and hands
-    /// out the next event, or parks.
+    /// each turn takes what had arrived when it began (`drain`), then fires the timers due, sends,
+    /// and hands out the next event, or parks. What arrives meanwhile is the next turn's: the
+    /// socket's room holds whatever its peers' windows let them send unread (hyper-transport's
+    /// socket room), so taking it later loses nothing, and the sends wait behind the backlog the
+    /// turn found, not behind whatever more its peers kept sending.
     #[allow(
         clippy::disallowed_methods,
         reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
@@ -183,28 +200,83 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         }
     }
 
-    /// Takes the datagrams that have arrived, a batch at a time, until the socket has none or
-    /// [`TURNS`] batches are taken.
+    /// Takes, a batch at a time, the datagrams that were queued when the drain began, the rest of
+    /// the batch that reached the first that was not, until the socket has none or [`TURNS`]
+    /// batches are taken. What was queued is told by the kernel's receive stamps where the socket
+    /// has them: one stamped after the drain began arrived since, and a stamp is late, never
+    /// early. A socket without counts bytes: as many as it held at the start
+    /// ([`Socket::queued_bytes`]: every queued datagram's on Windows, so the drain ends once it
+    /// has taken them). Where the platform says neither, [`TURNS`] batches bound it. A drain to
+    /// empty kept the driver reading while a peer kept sending, its sends, the peer's credit among
+    /// them, waiting behind (hyper-rt-transport's driver measured it: `docs/transport.md` §4h).
     #[allow(
         clippy::disallowed_methods,
         reason = "hyper-tokio is the runtime adapter: it reads the host's clock for the sans-io crates it drives"
     )]
     fn drain(&mut self, context: &mut Context<'_>) -> Result<(), Error> {
+        let began = self.socket.clock().now_ns();
+        let held = if self.socket.stats().kernel_stamps {
+            None
+        } else {
+            self.socket.queued_bytes().ok()
+        };
+        // The queue's account before the drain, and the window its peers had consumed: a drain
+        // that took exactly one datagram and left the queue charged nothing read that datagram's
+        // charge (hyper-transport's `SocketCharge`, the singleton rule).
+        let before = self.socket.account()?;
+        if let Some(before) = before {
+            self.measure.before(before);
+        }
+        let stream_before = self.endpoint.stream_bytes_received_shared();
+        let mut read = 0usize;
+        let mut datagrams = 0usize;
+        let mut emptied = false;
         for _ in 0..TURNS {
             let Poll::Ready(ready) = self.socket.poll_ready(context, false) else {
-                return Ok(());
+                emptied = true;
+                break;
             };
             if !ready.readable {
-                return Ok(());
+                emptied = true;
+                break;
             }
             let endpoint = &mut self.endpoint;
+            let mut past = false;
             let taken = self.socket.receive(|arrival, bytes| {
+                past |= arrival.kernel && arrival.at_ns > began;
+                read = read.saturating_add(bytes.len());
                 endpoint.handle_datagram(Instant::now(), arrival.from, None, bytes);
             })?;
+            datagrams = datagrams.saturating_add(taken);
             if taken == 0 {
-                return Ok(());
+                emptied = true;
+                break;
+            }
+            if past || held.is_some_and(|held| read >= held) {
+                break;
             }
         }
+        let consumed = self
+            .endpoint
+            .stream_bytes_received_shared()
+            .saturating_sub(stream_before);
+        let after = match before {
+            Some(before) if self.measure.wants_after(&before, datagrams, emptied) => {
+                self.socket.account()?
+            }
+            _ => None,
+        };
+        let taken = (
+            u64::try_from(datagrams).unwrap_or(u64::MAX),
+            u64::try_from(read).unwrap_or(u64::MAX),
+        );
+        self.measure.after(before, after, consumed, taken, emptied);
+        let room = self
+            .measure
+            .room(self.endpoint.unprompted_shared())
+            .unwrap_or_else(|| self.endpoint.unmeasured_room());
+        self.endpoint.set_receive_capacity(room);
+        self.measure.set_room(room);
         Ok(())
     }
 

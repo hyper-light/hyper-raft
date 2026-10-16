@@ -107,6 +107,14 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once, Linux 6.x in
+  Docker (`rust:1.98.1`, 4 CPUs) on a loaded host, `cargo test -p hyper-tokio` on the tree of the
+  socket room (above): `a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` failed at
+  `tests/stamps.rs:103` ("stamped before it was sent") and its standard-socket twin at line 189; the
+  same tests passed on `main` and on that tree three times after, alone and with the whole suite.
+  `SO_TIMESTAMPNS` stamps on `CLOCK_REALTIME`, which the adapter carries to the monotonic clock by
+  an offset: a realtime clock slewed between the offset's reading and the stamp would put a stamp
+  before the send. Not yet traced to that or ruled out.
 - **hyper-liveness: a link whose sender's floor keeps moving measures its evidence minutes late, and
   a node with only such links suspects no one meanwhile (found 2026-10-16).** A scratch fault in
   hyper-durable-e2e's `member-stopped` (branch `diag/slow-flush-repro`, never landed) holds every
@@ -137,6 +145,69 @@ is worked around.
   5.8 s on Windows' timer against 2.5 s, the interval standing up to twice its floor.
 
 ### Closed (2026-10-16)
+
+- **hyper-quic, hyper-transport: a third of a bus node's datagrams were acknowledgements.** Every
+  connection acknowledged every other ack-eliciting packet (RFC 9000 §13.2.2's default), so at
+  100,000 one-packet messages a second a node handled 3.4 datagrams a message, 1.0 of them
+  acknowledgements (the bare-metal bench, `docs/transport.md` §4k). Every connection now asks its
+  peer, through the acknowledgement frequency extension, for Google QUIC's decimation (quiche's
+  `kMaxRetransmittablePacketsBeforeAck` 10, `kPeerAckDecimationDelay` a quarter of the round trip,
+  from `kMinReceivedBeforeAckDecimation`'s 100th packet), the smoothed round trip per the draft
+  (§8.1) and the reordering threshold the loss detector's (§9): hyper-quic patch Q22,
+  `TransportConfig::decimate_acks`. Measured: 2.7 datagrams a message, the node's CPU a message 6 %
+  less. A path's probe timeout now covers the delay asked, 1 ms on a short path, not the default's
+  25 ms. Test: `tests::decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on`.
+
+- **hyper-rt: a parked shard's timed wait ended at the next millisecond.** The epoll driver handed
+  rustix a timespec, which rustix (without its `linux_5_11` feature) rounds up to whole milliseconds
+  for `epoll_pwait`: a timer the wheel had due in 200 µs fired after a millisecond or more on every
+  Linux host, whatever the kernel's timers keep. The driver now asks the kernel once for
+  `epoll_pwait2` (Linux 5.11, a timespec) and, where it is refused, arms a timerfd at each timed
+  wait's timeout, the wait untimed (libevent's precise timer). Test:
+  `epoll::tests::a_timed_wait_ends_at_its_timeout_not_the_next_millisecond` (its ends asked only of
+  a kernel with high-resolution timers; Docker Desktop's has none). The OS's coalescing is held to
+  the shard's tick: the shard thread's timer slack on Linux, restored when the driver goes. macOS
+  coalesced a `kevent` timeout too (a 5 ms wait ended at 6.3 ms at the median); a timed wait there
+  is now a one-shot `NOTE_CRITICAL` timer in the wait's own call (5.03 ms). Tests beside it, in
+  `epoll` and `kqueue`. Windows rounded to milliseconds and then to its 15.6 ms timer interrupt; a
+  timed wait there now arms a high-resolution waitable timer whose signal ntdll's wait completion
+  packet posts to the port, the wait's own timeout backing it (Go's netpoller since 1.23), and an
+  untimed wait cancels what a timed one left. Tests: `iocp::tests::a_timed_wait_ends_at_its_timeout_not_the_clock_s_interrupt`,
+  `iocp::tests::an_untimed_wait_disarms_the_timer_a_timed_one_left`; clippy-checked here, their run
+  owed to the Windows CI lanes.
+- **hyper-block on overlayfs: AIO reads spun for good, and a handle said it read from memory where it
+  could not.** overlayfs (Linux 6.12, a container's own file system) refuses `RWF_NOWAIT` with
+  `EOPNOTSUPP`, where ext4 takes it (measured: `preadv2` on the overlay and on a volume, 2026-10-16).
+  An AIO submission of reads asked the flag, the kernel refused it, and the context took the refusal
+  for an error rather than the flag's (it knew only `EINVAL`, a kernel before 4.14); `pump` then
+  returned before putting the submission's transfers back, so `fail_waiting` found none and their
+  batches were never answered: five of `tests/aio.rs` ran 14 minutes at 100% CPU each (traced: two
+  `io_submit` answered `EOPNOTSUPP`, then no system call at all). The context now sends reads again
+  without the flag on `EOPNOTSUPP`, and a refused submission's transfers go back to the queue first,
+  so each fails typed (`aio::tests::a_submission_the_kernel_refuses_fails_its_batch`). And a
+  buffered handle said it read from memory until a read found otherwise (`reads_resident` read
+  neither the refusal nor, for a segmented file, any segment but the first); it now asks the kernel
+  as it opens, one byte at the file's end, and says so (`segmented`'s
+  `a_segment_written_whole_holds_its_fill_and_takes_no_memory`, which failed on overlayfs).
+
+- **hyper-transport: a socket's room rested on an assumed charge.** The windows a socket's peers
+  were granted were held to its buffer over a fixed four times a datagram's payload (Linux) or
+  twice (elsewhere): three loopback measurements on one kernel, rounded up, and wrong both ways
+  (GRO trains about 1.1 times, a full datagram 1.84, a 100-byte one about 9). The room is now told
+  from the kernel's own account:
+  - Linux `SO_MEMINFO`;
+  - macOS `FIONREAD` (`sb_cc`), with XNU's mbuf limit as a floor;
+  - the fabric's own account.
+
+  Each socket learns from exact samples: a message read as the only one queued, whose charge
+  before the read is the account and nothing after it. The worst charge per stream byte is held
+  over two window epochs. Acknowledgements and probes the peers may send unprompted are reserved
+  first, the release lag Linux keeps is taken off, and a drop forgets the samples.
+  `SOCKET_OVERHEAD` and `socket_room` are gone (`docs/transport.md` §4i; hyper-quic patch Q20).
+  Tests: `charge::tests`, `a_socket_tells_what_its_queue_is_charged`,
+  `a_socket_holds_the_room_told_from_its_measured_charge`, end to end on Linux and macOS. Open:
+  Windows, which exposes no account. Its room stays at the first windows until AFD's capacity is
+  measured.
 
 - **hyper-durable-e2e `kill` `member-stopped`, ubuntu-24.04 CI (`36e01cd`, run 37152765895): the
   harness's rules, not the group.** Member 1 stopped at term 2; members 2 and 3 went through three
@@ -193,6 +264,130 @@ is worked around.
   (diagnostic run 38850875933); every run passed.
 
 ### Closed (2026-10-15)
+
+- **hyper-rt-transport: a peer's socket carried two datagrams a system call.** Found by focal's
+  event bus, which carried 45,000–56,000 messages a second at every rate offered past 100,000, where
+  NATS carried 250,000. Two bounds caused it:
+  - the endpoint asked hyper-quic for one datagram at a time;
+  - each peer's socket batched two datagrams, because it held its own 64 KiB receive buffers.
+
+  Now, as quinn's driver does:
+  - the endpoint makes up to 64 of a connection's datagrams at once
+    (`Endpoint::poll_transmit_batch`);
+  - the socket sends them from the driver's buffer, segmented where the kernel segments
+    (`Batched::send_segments`);
+  - every socket receives into one ring the driver lends it (`Ring`, `Batched::receive_with`);
+  - a transmit a socket took only part of is held until the socket can write, nothing sent past it.
+
+  On Linux the bulk test's peer socket sent 1,459 datagrams in 92 calls (`docs/transport.md` §4h).
+- **hyper-rt-transport: a drain read whatever its peers kept sending, the driver's sends held
+  behind it.** A drain read each socket until it emptied or made `TURNS` calls (up to 1,280 messages
+  at focal's batch of ten). It sends nothing while it reads, so a peer that kept sending kept its
+  own credit waiting. With batching, focal's publisher was held for up to 12 ms at a time, and its
+  p99 at 10k/s rose from 0.21 to 1.00 ms. A drain now takes what was queued when it began
+  (`Batched::receive_queued`): by the kernel's receive stamps where the socket has them, else by the
+  bytes it held (`FIONREAD`, which Winsock and the BSDs count over every queued datagram).
+  Tests: `a_queued_receive_takes_what_was_queued_when_it_began`,
+  `a_socket_without_stamps_takes_the_bytes_it_held` (`docs/transport.md` §4h). hyper-tokio's driver
+  had the same drain to empty, and now takes the same rule. It binds its socket with stamps and
+  counts `FIONREAD` on Windows; its test holds Linux, XNU and Winsock each to the count their
+  sources state.
+- **hyper-rt-transport: a peer socket left holding datagrams waited for the driver's next timer.**
+  Readiness is one-shot and fires on arrival, and a socket marked for the next turn was not counted
+  as work, so a driver with only that to do parked. A marked socket now keeps the turn loop going.
+  Test: `a_peer_socket_left_holding_datagrams_is_drained_without_another_wake`. A poll that ends
+  pending without waking itself (`Driver::yields`) leaves no socket holding datagrams
+  (`Driver::backlogged`). Under the old rule it parked with 128 of 257 read; 40 of 40 runs pass
+  with every core busy.
+- **hyper-rt: a socket whose segmented sends the kernel refused with EINVAL dropped every one.** The
+  batched send turned segmentation off on EIO alone. EINVAL, which the kernel returns to a socket
+  sending without checksums and which quinn-udp has met from drivers, was counted as a refusal each
+  time, so the connection lost every batch until it timed out. A segmented message refused either
+  way now turns segmentation off and goes again a datagram a call. Test:
+  `a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone` (`SO_NO_CHECK`), in which ten
+  datagrams were all refused before the fix.
+
+- **hyper-transport: a stalled reader's socket dropped what its windows let peers send.** Found by
+  focal's event-bus comparison (a node on one CPU, Linux 6.x in Docker on a loaded host): at 50,000
+  messages a second the node's socket counted 1,202 `RcvbufErrors` in 25 s (69 at 10,000), its
+  clients' 583, each loss a retransmission and a congestion event, the run's tail. The cause: the
+  windows an endpoint grants are what peers may send before its owner reads, and they wait in the
+  socket's queue while the owner does not, but nothing tied the windows to the queue: the bus
+  granted windows to 8 MiB on a socket Linux had left at its default 208 KiB, and a reader the host
+  stopped for 3.5 ms overflowed it (TCP's receive window is its kernel's queue; UDP has none). Now
+  the windows granted, summed, never pass what the queue holds (`credit`'s socket room): each driver
+  (hyper-rt-transport's, hyper-tokio's) asks its socket for the endpoint's `receive_demand`
+  (`SO_RCVBUFFORCE` where the process may, else `SO_RCVBUF`, a refused size halved) and tells the
+  endpoint the room the kernel granted (`socket_room`: the buffer reported less the kernel's
+  overhead, measured on Linux 6.x at 895, 1,275 and 2,290 bytes a datagram by size class, at most
+  four times the payload from 320 bytes up); a window grows only while what is left holds the first
+  windows of the handshakes admission lets wait, and a connection whose first window does not fit is
+  refused `Refusal::ReceiveBuffer` (wire code 15). Tests: hyper-transport's
+  `a_socket_that_holds_no_first_window_refuses_the_connection` and
+  `the_windows_granted_never_pass_what_the_socket_holds`, hyper-rt-transport's
+  `a_socket_holds_the_room_the_transport_counts_in_it` (full packets sent unread up to the room,
+  every one read back, on macOS and Linux). One shared socket of Linux's default 208 KiB holds about
+  three connections' first windows, so where a port can be shared (Linux, the BSDs) each connection
+  the endpoint identifies now receives on a socket of its own, bound to the listener's port and
+  connected to its peer (`UdpSocket::bind_shared`, `connect`; measured on both: the connected socket
+  takes its peer's datagrams, the listener everyone else's), its windows funded from that socket's
+  room alone (`Endpoint::set_peer_room`): a node's receive capacity grows with its connections at the
+  kernel's default each, nothing tuned, no privilege asked, as TCP's sockets do. The driver matches its
+  sockets to the endpoint's connections whenever they change (`connection_generation`,
+  `established`); Windows and the simulation fabric keep one socket. Test: hyper-rt-transport's
+  `each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection`.
+- **hyper-transport: a lane frame the budget could not hold was skipped, even where it was its
+  sender's only copy.** A lane skips (and counts) a frame its class bound or budget cannot take, so one
+  full range never stalls a shard's stream: right for consensus messages, which Raft sends again,
+  and a silent loss for focal's event bus, whose messages a lane carries once. A class may now be
+  lossless (`Classes::lossless`): its frame waits for the budget (`Reading::Reserving`), its lane
+  unread so QUIC's flow control holds the sender, and asks again whenever bytes come back
+  (`Endpoint::release`, a timeout, or `retry_reserving` from an owner whose budget freed elsewhere);
+  a frame past its class's bound is still refused. `frame_grant` states what an outgoing frame asks
+  of the budget (the frame and its prefix), from which an owner sizes its buffers: focal's bus had
+  sized its largest at its batch bound, and a batch at the bound, plus the prefix, was refused
+  `Budget`. Tests: `a_lossless_frame_waits_for_the_budget_and_is_never_skipped`,
+  `a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted`.
+- **hyper-transport: a lossless lane held seconds of frames behind QUIC.** A lane bounds its queue
+  in frames, the core's window, and a frame may be a class's bound: for focal's bus 256 frames of
+  up to 256 KiB, 64 MiB behind a path that holds about 100 kB, so a publisher past what the path
+  carried met 2.6 s of delay at the median before its sender was held. A lossless class's lane
+  first refused `LaneFull` past the connection's congestion window (TCP Small Queues' rule), but a
+  loss-based law's window on a path that loses nothing has no bound: the bus runs CUBIC, whose
+  window on loopback reached 1.55 GB, and a publisher the node held queued 470 ms of messages in
+  its own lane. The lane now holds one frame beyond what QUIC took: QUIC's stream holds what the
+  peer's credit allows, a socket's send buffer whose writer waits once it is full
+  (`docs/transport.md` §4). Tests: `a_lossless_lane_holds_one_frame_past_what_quic_took_and_its_sender_waits`
+  (what QUIC took and one frame, where a lossy lane takes its 128-frame window and three);
+  `a_lossless_frame_waits_for_the_budget_and_is_never_skipped`, the sender held while its receiver
+  polls nothing, every frame arriving once it does.
+- **hyper-quic: BBR's model diverged from Chromium's in four places.** Found while measuring focal's
+  event bus, whose publisher's window reached 409 MB on a 72 µs path; that window was CUBIC's, the
+  bus's law, whose lane bound is now one frame (above), but BBR, focal's law elsewhere, had the
+  same unbounded growth in an app-limited startup. The port's BBR diverged from Chromium's in four places
+  (`crates/hyper-quic/VENDORED.md` §30):
+  - its startup compared the gain with the target;
+  - its bandwidth filter took no app-limited sample;
+  - its minimum round trip expired before it was ever measured, so every connection began in
+    ProbeRTT at four datagrams;
+  - and its bandwidth estimate divided bytes by the gaps between unrelated acknowledgements and
+    sends: 357 MB/s on a 12.5 MB/s pair, a window 65 times the path's product.
+
+  Each path now keeps delivery-rate samples (draft-cheng-iccrg-delivery-rate-estimation; Linux's
+  `tcp_rate.c`): a 16-byte snapshot a packet, and the sent packet's record stays within its 128
+  bytes. BBR takes them through `Controller::on_delivered`, in Chromium's order. NewReno, CUBIC and
+  Copa wrote the same 495 rows of slates' bake-off byte for byte. BBR's goodput shortfall went from
+  1.075 to 1.020.
+
+  Open: BBR states no pacing rate. A sender its window holds therefore keeps about a product of queue
+  (ping p99 about twice the round trip); Chromium paces at its model's rate.
+- **hyper-transport: a consumer that could not take more queued its producers' frames without
+  bound.** A bus node whose subscriber fell behind took every publish into memory, its subscriber's
+  lag growing for as long as the publisher outran it (2.5 s at the median). `Endpoint::hold_lane`
+  reads a peer's lane no further past its opening, so the peer is held at QUIC's flow control and
+  its own lane says `LaneFull`; `release_lane` reads on from where it stopped. A hold is the peer's,
+  at most one a lane it may open, so a lane not yet opened is held from its opening. Test:
+  `an_owner_that_holds_a_peers_lane_holds_the_peer_and_loses_nothing`.
 
 - **hyper-durable-e2e `founder`/`founder-fenced`: a read a sole voter held for good.** CI run
   38523559088 (ubuntu-24.04-arm, `71992ae`: "founder: an answered write of before/3 did not read
@@ -437,12 +632,21 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
 
 1. **Red CI.** The open defects above, each traced to its cause and fixed at it, and every target
    green on `main` (green since `3d86b42`, 2026-10-15).
-2. **One revision for every consumer.** mantle is on `80c1f82` on its `main` (`9ccd216`); focal's
-   and slates' branches take `80c1f82`, which their sessions land (the Consumers table above). What
-   `main` took since `80c1f82` changes the end-to-end harnesses, hyper-durable's depth bench and the
-   documents (hyper-raft-e2e, hyper-durable-e2e, hyper-multilog-e2e, `crates/hyper-durable/benches`,
-   `docs/`): no code a consumer vendors builds, so no consumer re-vendors for it.
-3. **The shared crates' open work**, each in its own document:
+2. **One revision for every consumer.** mantle is on `80c1f82` on its `main` (`9ccd216`); slates'
+   branch takes `80c1f82`, which its session lands (the Consumers table above). Merged on
+   2026-10-16 at the owner's word, `focal-bus-receive` brings the event bus's transport, which focal
+   vendors at this merge: hyper-rt (each connection's own socket, batched receives that end on a
+   short batch, precise timed waits on Linux, macOS and Windows, a shard's counters), hyper-rt-transport
+   (a connection's batch in one call, one ring of receive buffers, a drain of what was queued),
+   hyper-transport (the measured socket room, one CRC pass a frame, the lossless lane and its hold),
+   hyper-quic (BBR's delivery-rate bandwidth, the sent-packet deque, decimated acknowledgements),
+   hyper-tokio (its drain) and hyper-block (overlayfs reads). mantle and slates take it as landings
+   of their own; their suites have not yet run against it. What `main` took besides since `80c1f82`
+   changes the end-to-end harnesses, hyper-durable's depth bench and the documents.
+3. **The shared crates' open work**, each in its own document, and one of the socket room's
+   (`credit.rs`): a window that grew stays granted while its peer is idle, so a node of many
+   connections can find its room held by peers that no longer send; a window shrinks only as its
+   peer consumes it, which a quiet peer never does. In their documents:
    - hyper-durable: §14's measurements. Items 1 to 8 measured on this machine (2026-10-12 and 13,
      `docs/benchmarks.md` from "A group's writes out, depth one to three on hyper-log"): depth earns
      no place for one group, nor makes a lone frame's confirmation rare; applying ahead halves a

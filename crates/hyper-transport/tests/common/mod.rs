@@ -157,6 +157,41 @@ impl Classes for Mantle {
     }
 }
 
+/// Where an [`Embedding`] append carries its own CRC-32C: of its bytes from 8 on, stated
+/// little-endian in its first four (a bus batch's shape).
+pub const EMBEDDED: hyper_transport::Embedded = hyper_transport::Embedded {
+    covered_from: 8,
+    at: 0,
+};
+
+/// [`Mantle`] whose appends carry their own checksum ([`Classes::embedded_checksum`]).
+pub struct Embedding;
+
+impl Classes for Embedding {
+    type Class = Class;
+    type Kind = Kind;
+    type Role = Role;
+    const RANKS: u8 = 3;
+    fn rank(class: Class) -> u8 {
+        rank(class)
+    }
+    fn class_of(kind: Kind, role: Role) -> Option<Class> {
+        mantle_class(kind, role)
+    }
+    fn frame_bound(class: Class) -> u64 {
+        Mantle::frame_bound(class)
+    }
+    fn kind_code(kind: Kind) -> u16 {
+        kind_code(kind)
+    }
+    fn kind_of(code: u16) -> Option<Kind> {
+        kind_of(code)
+    }
+    fn embedded_checksum(kind: Kind) -> Option<hyper_transport::Embedded> {
+        (kind == Kind::Append).then_some(EMBEDDED)
+    }
+}
+
 /// [`Mantle`] with a request bound of [`STRICT_REQUEST_BOUND`]: a receiver whose bound is below its
 /// sender's.
 pub struct Strict;

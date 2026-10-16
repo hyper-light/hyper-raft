@@ -238,10 +238,13 @@ fn a_request_and_its_reply_cross_in_every_class_with_streaming_bodies() {
     );
     let path = net.a.path(2).unwrap();
     assert!(path.cwnd > 0 && path.max_datagram >= 1_200, "{path:?}");
-    // The probe timeout covers the round trip and the peer's acknowledgement delay (RFC 9002
-    // §6.2.1): what an answer sent at its peer's deadline takes to be known delivered.
+    // The probe timeout covers the round trip, its variation's floor and the acknowledgement delay
+    // the peer was asked for (RFC 9002 §6.2.1): what an answer sent at its peer's deadline takes
+    // to be known delivered. Acknowledgements are decimated (`TransportConfig::decimate_acks`), so
+    // the delay asked is a quarter of the round trip, at least the 1 ms granularity (kGranularity)
+    // the peer advertised as its least, and the floor and the delay are 1 ms each at the least.
     assert!(
-        path.probe_timeout > path.rtt && path.probe_timeout >= Duration::from_millis(25),
+        path.probe_timeout >= path.rtt + Duration::from_millis(2),
         "{path:?}"
     );
     let mut one = [0u8; 32];
@@ -1030,6 +1033,43 @@ fn frames_on_a_lane_arrive_in_order() {
         assert_eq!(order, sorted, "lane {lane} kept its order");
         assert_eq!(order.len(), 320);
     }
+}
+
+/// A lane frame of a kind that carries its own CRC-32C is checked by it as it arrives
+/// (`Classes::embedded_checksum`): the prefix's checksum covers only the bytes before the frame's
+/// covered span, so each byte is summed once, and a frame whose covered bytes changed after they
+/// were summed never reaches its owner: its lane stops there, and the stop is counted.
+#[test]
+fn a_frame_of_its_own_checksum_is_checked_by_it() {
+    let pair = Pair::new();
+    let mut net = connected::<Embedding, Embedding>(&pair, limits(), 256 << 20);
+    let mut server = Server::new();
+    let summed = |fill: u8| {
+        let mut frame = vec![0u8; 8];
+        frame.extend_from_slice(&[fill; 64]);
+        let sum = crc32c::crc32c(&frame[8..]);
+        frame[..4].copy_from_slice(&sum.to_le_bytes());
+        frame
+    };
+    let good = summed(1);
+    net.a.send_frame(2, 0, Kind::Append, &good).unwrap();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        server.frames.len() == 1
+    });
+    let mut lying = summed(2);
+    lying[40] ^= 1;
+    net.a.send_frame(2, 0, Kind::Append, &lying).unwrap();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        net.b.stats().lanes_refused == 1
+    });
+    assert_eq!(
+        server.frames.len(),
+        1,
+        "the changed frame reached its owner"
+    );
+    assert_eq!(server.frames[0].2, good);
 }
 
 /// A lane's queue holds the core's window and no more.
@@ -2640,5 +2680,404 @@ fn an_owner_refused_a_write_finishes_writing_on_writable_alone() {
     assert_eq!(
         writable, refused_writes,
         "each refused write was answered by one Writable"
+    );
+}
+
+/// A connection's first window and the reserve on top of it: what a node grants at a handshake.
+fn first_window() -> u64 {
+    use hyper_transport::Classes;
+    hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM)
+        + hyper_transport::class_reserve(<Mantle as Classes>::RANKS - 1)
+}
+
+/// A node whose socket's receive queue cannot hold a connection's first window refuses the
+/// connection, typed, and grants nothing: what peers may send it unread never passes what the
+/// queue takes (credit's socket room).
+#[test]
+fn a_socket_that_holds_no_first_window_refuses_the_connection() {
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let book = || pair.book(Role::Node, Role::Node);
+    let a = pair.node::<Mantle>(1, Role::Node, book(), limits(), 256 << 20, now);
+    let mut b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 256 << 20, now);
+    assert_eq!(b.stats().receive_capacity, u64::MAX, "unbounded until told");
+    b.set_receive_capacity(first_window() - 1);
+    let mut net = Net::of(now, a, b, hyper_sim::Source::Seed(0));
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| net.b.stats().receive_refused > 0);
+    net.exchange();
+    let stats = net.b.stats();
+    assert!(stats.receive_refused >= 1);
+    assert_eq!(stats.receive_granted, 0, "nothing granted");
+    assert_eq!(stats.connections, 0);
+    assert!(
+        events(&mut net.a)
+            .iter()
+            .all(|event| !matches!(event, Event::Connected { .. })),
+        "the dialer never connected"
+    );
+}
+
+/// The windows a node grants, summed, never pass what its socket's receive queue holds: a peer
+/// whose frames are polled as fast as they come grows its window, and only into the room left once
+/// the first windows of the handshakes admission may let wait are kept; when the connection goes,
+/// what it held comes back.
+#[test]
+fn the_windows_granted_never_pass_what_the_socket_holds() {
+    let pair = Pair::new();
+    let first = first_window();
+    // The test limits let 8 handshakes wait: their first windows are kept, and four windows'
+    // worth beside the connection's own is what it may grow into.
+    let kept = 8 * first;
+    let capacity = first + kept + 4 * first;
+    let mut net = connected_from::<Mantle, Mantle>(
+        &pair,
+        limits(),
+        256 << 20,
+        hyper_sim::Source::Seed(0),
+        |b| b.set_receive_capacity(capacity),
+    );
+    let mut most = 0;
+    let frame = [7u8; 1_000];
+    for _ in 0..400 {
+        for _ in 0..64 {
+            match net.a.send_frame(2, 0, Kind::Append, &frame) {
+                Ok(()) => {}
+                Err(Refusal::LaneFull) => break,
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        net.exchange();
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                net.b.release(frame);
+            }
+        }
+        let granted = net.b.stats().receive_granted;
+        assert!(granted <= capacity, "{granted} granted past {capacity}");
+        most = most.max(granted);
+    }
+    assert!(most > first, "the window grew within the room: {most}");
+    assert!(
+        most + kept <= capacity,
+        "the handshakes' first windows were kept: {most} of {capacity}"
+    );
+    let now = net.now;
+    net.a.disconnect(now, 2);
+    net.until(TURNS, |net| net.b.stats().connections == 0);
+    assert_eq!(net.b.stats().receive_granted, 0, "what it held came back");
+}
+
+/// Node 1 and node 2 connected, node 1 with `sender` bytes of budget and node 2 with `receiver`.
+fn connected_budgets<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    sender: u64,
+    receiver: u64,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let book = || pair.book(Role::Node, Role::Node);
+    let a = pair.node::<A>(1, Role::Node, book(), limits, sender, now);
+    let b = pair.node::<B>(2, Role::Node, book(), limits, receiver, now);
+    let mut net = Net::of(now, a, b, hyper_sim::Source::Seed(0));
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let (mut one, mut two) = (false, false);
+    net.until(TURNS, |net| {
+        for event in events(&mut net.a) {
+            one |= matches!(event, Event::Connected { peer: 2, .. });
+        }
+        for event in events(&mut net.b) {
+            two |= matches!(event, Event::Connected { peer: 1, .. });
+        }
+        one && two
+    });
+    net
+}
+
+/// [`Mantle`] whose lane frames are lossless (`Classes::lossless`): a bus's messages, the only
+/// copy their sender holds.
+struct Kept;
+
+impl hyper_transport::Classes for Kept {
+    type Class = Class;
+    type Kind = Kind;
+    type Role = Role;
+    const RANKS: u8 = <Mantle as hyper_transport::Classes>::RANKS;
+    fn rank(class: Class) -> u8 {
+        <Mantle as hyper_transport::Classes>::rank(class)
+    }
+    fn class_of(kind: Kind, role: Role) -> Option<Class> {
+        <Mantle as hyper_transport::Classes>::class_of(kind, role)
+    }
+    fn frame_bound(class: Class) -> u64 {
+        <Mantle as hyper_transport::Classes>::frame_bound(class)
+    }
+    fn kind_code(kind: Kind) -> u16 {
+        <Mantle as hyper_transport::Classes>::kind_code(kind)
+    }
+    fn kind_of(code: u16) -> Option<Kind> {
+        <Mantle as hyper_transport::Classes>::kind_of(code)
+    }
+    fn lossless(_class: Class) -> bool {
+        true
+    }
+}
+
+/// A frame of a lossless class the receiver's budget cannot hold waits for it, its lane unread, and
+/// is never skipped: the receiver that polls nothing holds what its budget takes, the next frame
+/// waits, QUIC's flow control holds the sender behind it, and the sender's own lane, one frame past
+/// what QUIC took, says `LaneFull` until it moves. Once the receiver polls and gives the frames
+/// back, every frame arrives, in order, none dropped. The same budget skips frames of a lossy class
+/// (a consensus message the protocol above sends again).
+#[test]
+fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
+    const FRAMES: u32 = 60;
+    const FRAME: usize = 1_000;
+    // Room for the connection's first window and its streams' heads, and a dozen frames.
+    let budget = first_window() * 2 + 12 * FRAME as u64;
+    let pair = Pair::new();
+    let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
+    let body = [9u8; FRAME];
+    let mut sent = 0u32;
+    // The receiver polls nothing: the sender is held once the receiver's budget is full.
+    let mut held = 0;
+    while held < 8 {
+        match net.a.send_frame(2, 0, Kind::Append, &body) {
+            Ok(()) => {
+                sent += 1;
+                held = 0;
+            }
+            Err(Refusal::LaneFull) => {
+                held += 1;
+                net.exchange();
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(sent < FRAMES, "the sender was never held");
+    }
+    let stats = net.b.stats();
+    assert_eq!(stats.frames_dropped, 0, "nothing skipped");
+    assert_eq!(
+        stats.frames_reserving, 1,
+        "the next frame waits for the budget"
+    );
+    // The receiver gives its frames back: the sender sends the rest as room comes.
+    let mut order = Vec::new();
+    for _ in 0..10_000 {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(frame.bytes().len());
+                net.b.release(frame);
+            }
+        }
+        while sent < FRAMES && net.a.send_frame(2, 0, Kind::Append, &body).is_ok() {
+            sent += 1;
+        }
+        if order.len() == FRAMES as usize {
+            break;
+        }
+        net.exchange();
+    }
+    assert_eq!(order.len(), FRAMES as usize, "every frame arrived");
+    assert!(order.iter().all(|bytes| *bytes == FRAME));
+    let stats = net.b.stats();
+    assert_eq!(stats.frames_dropped, 0, "none dropped");
+    assert_eq!(stats.frames_reserving, 0);
+}
+
+/// The same receiver, its frames' class lossy, skips what its budget cannot hold, and counts it.
+#[test]
+fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {
+    const FRAMES: u32 = 60;
+    const FRAME: usize = 1_000;
+    let budget = first_window() * 2 + 12 * FRAME as u64;
+    let pair = Pair::new();
+    let mut net = connected_budgets::<Mantle, Mantle>(&pair, limits(), 256 << 20, budget);
+    let body = [9u8; FRAME];
+    let mut sent = 0u32;
+    while sent < FRAMES {
+        match net.a.send_frame(2, 0, Kind::Append, &body) {
+            Ok(()) => sent += 1,
+            Err(Refusal::LaneFull) => {
+                net.exchange();
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    net.exchange();
+    assert!(
+        net.b.stats().frames_dropped > 0,
+        "the budget's overflow skipped"
+    );
+    assert_eq!(net.b.stats().frames_reserving, 0);
+}
+
+/// Frames queued on a lane before it says it is full, the network held still.
+fn queued_until_full<A>(net: &mut Net<Node<A>, Node<A>>, frame: &[u8]) -> u32
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    let mut queued = 0;
+    for _ in 0..10_000 {
+        match net.a.send_frame(2, 0, Kind::Append, frame) {
+            Ok(()) => queued += 1,
+            Err(Refusal::LaneFull) => return queued,
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    panic!("the lane never filled");
+}
+
+/// A lossless class's lane holds one frame beyond what QUIC took, its sender then held, where a
+/// lossy class's holds a window of frames (the core's, T37): QUIC's stream holds what the peer's
+/// credit allows, as a socket's send buffer does, and a sender past what its path carries waits at
+/// the sender, not in megabytes behind QUIC. Every frame still arrives.
+#[test]
+fn a_lossless_lane_holds_one_frame_past_what_quic_took_and_its_sender_waits() {
+    let frame = [5u8; 4_096];
+    let pair = Pair::new();
+    let mut lossy = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let mut kept = connected::<Kept, Kept>(&pair, limits(), 256 << 20);
+    let lossy_queued = queued_until_full(&mut lossy, &frame);
+    let kept_queued = queued_until_full(&mut kept, &frame);
+
+    assert!(
+        lossy_queued >= limits().lane_window as u32,
+        "a lossy lane holds its window of frames: {lossy_queued}"
+    );
+    // What QUIC took, the peer's first window, in whole frames and the one it took part of, and
+    // the one frame the lane holds past it
+    let grant = hyper_transport::frame_grant(frame.len() as u64);
+    let most = first_window() / grant + 2;
+    assert!(
+        u64::from(kept_queued) <= most,
+        "a lossless lane holds one frame past what QUIC took ({most} frames at most), not {kept_queued}"
+    );
+    assert!(kept_queued < lossy_queued);
+    // Held, not dropped: every frame queued arrives once the network moves.
+    let mut arrived = 0;
+    for _ in 0..10_000 {
+        kept.exchange();
+        while let Some(event) = kept.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                arrived += 1;
+                kept.b.release(frame);
+            }
+        }
+        if arrived == kept_queued {
+            break;
+        }
+    }
+    assert_eq!(arrived, kept_queued);
+}
+
+/// An owner that holds a peer's lane reads nothing more of it until it lets it go: what the peer
+/// sends waits in QUIC, flow control holds the peer (its own lane fills and it is told `LaneFull`),
+/// and once let go every frame arrives, in order. A lane held before its peer opens it is held from
+/// its opening; one held mid-stream stops where it is.
+#[test]
+fn an_owner_that_holds_a_peers_lane_holds_the_peer_and_loses_nothing() {
+    let pair = Pair::new();
+    let mut net = connected::<Kept, Kept>(&pair, limits(), 256 << 20);
+    net.b.hold_lane(1, 0).unwrap();
+    let mut sent = 0u32;
+    let mut full = false;
+    for _ in 0..10_000 {
+        match net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes()) {
+            Ok(()) => sent += 1,
+            Err(Refusal::LaneFull) => {
+                net.exchange();
+                if net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes())
+                    == Err(Refusal::LaneFull)
+                {
+                    full = true;
+                    break;
+                }
+                sent += 1;
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    net.exchange();
+    assert!(full, "the sender was held");
+    let mut order: Vec<u32> = Vec::new();
+    while let Some(event) = net.b.poll_event() {
+        if let Event::Frame { frame, .. } = event {
+            order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+            net.b.release(frame);
+        }
+    }
+    assert!(
+        order.is_empty(),
+        "nothing read of a held lane: {}",
+        order.len()
+    );
+    // Let go: every frame, in order.
+    net.b.release_lane(1, 0).unwrap();
+    for _ in 0..10_000 {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+                net.b.release(frame);
+            }
+        }
+        if order.len() == sent as usize {
+            break;
+        }
+        net.exchange();
+        while sent < 2_000 {
+            match net.a.send_frame(2, 0, Kind::Append, &sent.to_be_bytes()) {
+                Ok(()) => sent += 1,
+                Err(Refusal::LaneFull) => break,
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        order,
+        (0..sent).collect::<Vec<_>>(),
+        "every frame, in order"
+    );
+    // Held mid-stream: it stops where it is, and goes on when let go.
+    net.b.hold_lane(1, 0).unwrap();
+    let before = order.len();
+    for at in 0..50u32 {
+        let next = sent + at;
+        while net.a.send_frame(2, 0, Kind::Append, &next.to_be_bytes()) == Err(Refusal::LaneFull) {
+            net.exchange();
+        }
+    }
+    sent += 50;
+    net.exchange();
+    while let Some(event) = net.b.poll_event() {
+        if let Event::Frame { frame, .. } = event {
+            order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+            net.b.release(frame);
+        }
+    }
+    assert_eq!(order.len(), before, "a lane held mid-stream stops");
+    net.b.release_lane(1, 0).unwrap();
+    for _ in 0..10_000 {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+                net.b.release(frame);
+            }
+        }
+        if order.len() == sent as usize {
+            break;
+        }
+        net.exchange();
+    }
+    assert_eq!(
+        order,
+        (0..sent).collect::<Vec<_>>(),
+        "and goes on, in order"
     );
 }

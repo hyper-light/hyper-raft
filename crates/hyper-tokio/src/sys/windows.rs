@@ -8,7 +8,11 @@
 #![allow(unsafe_code)]
 
 use std::io;
+use std::mem::size_of;
 
+use windows_sys::Win32::Networking::WinSock::{
+    FIONREAD, SO_RCVBUF, SOCKET, SOCKET_ERROR, SOL_SOCKET, getsockopt, ioctlsocket, setsockopt,
+};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 /// Nanoseconds in a second.
@@ -57,4 +61,71 @@ impl Clock {
             .unwrap_or(u128::MAX);
         u64::try_from(ns).unwrap_or(u64::MAX)
     }
+}
+
+/// The bytes waiting in `socket`'s receive queue: for a datagram socket every queued datagram's
+/// ("Winsock IOCTLs", `FIONREAD`: "the total number of bytes available to read, not the size of
+/// the first datagram").
+pub(crate) fn queued_bytes(socket: u64) -> io::Result<usize> {
+    let socket = SOCKET::try_from(socket).map_err(|_| io::Error::other("a socket handle"))?;
+    let mut value: u32 = 0;
+    // SAFETY: FIONREAD writes one u32 through the pointer; `value` is a live local of that size.
+    if unsafe { ioctlsocket(socket, FIONREAD, &raw mut value) } == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("FIONREAD past usize"))
+}
+
+/// The receive buffer Winsock reports for `socket` (`SO_RCVBUF`).
+pub(crate) fn recv_buffer(socket: u64) -> io::Result<usize> {
+    let socket = SOCKET::try_from(socket).map_err(|_| io::Error::other("a socket handle"))?;
+    let mut value: i32 = 0;
+    let mut length = i32::try_from(size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: `value` and `length` are live locals of the sizes passed; getsockopt writes at most
+    // `length` bytes into `value` and the new length into `length`.
+    let status = unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (&raw mut value).cast::<u8>(),
+            &raw mut length,
+        )
+    };
+    if status == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(value).map_err(|_| io::Error::other("SO_RCVBUF read back negative"))
+}
+
+/// Asks Winsock for a receive buffer of `bytes` on `socket` ([`super::set_recv_buffer`]):
+/// `SO_RCVBUF`, a size it refuses halved and asked again, at most [`super::BUFFER_ASKS`] times.
+/// The buffer reported after.
+pub(crate) fn set_recv_buffer(socket: u64, bytes: usize) -> io::Result<usize> {
+    let handle = SOCKET::try_from(socket).map_err(|_| io::Error::other("a socket handle"))?;
+    let mut value = i32::try_from(bytes).unwrap_or(i32::MAX);
+    let length = i32::try_from(size_of::<i32>()).unwrap_or(i32::MAX);
+    let mut refusal = None;
+    for _ in 0..super::BUFFER_ASKS {
+        // SAFETY: `value` is a live `i32` and the length passed is its size; setsockopt only
+        // reads it.
+        let status = unsafe {
+            setsockopt(
+                handle,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                (&raw const value).cast::<u8>(),
+                length,
+            )
+        };
+        if status != SOCKET_ERROR {
+            return recv_buffer(socket);
+        }
+        refusal = Some(io::Error::last_os_error());
+        value = value.checked_div(2).unwrap_or(0);
+        if value == 0 {
+            break;
+        }
+    }
+    Err(refusal.unwrap_or_else(|| io::Error::other("no receive buffer was granted")))
 }

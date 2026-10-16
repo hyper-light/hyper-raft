@@ -2791,8 +2791,9 @@ impl hyper_transport::Classes for Kept {
 
 /// A frame of a lossless class the receiver's budget cannot hold waits for it, its lane unread, and
 /// is never skipped: the receiver that polls nothing holds what its budget takes, the next frame
-/// waits (QUIC's flow control holds the sender behind it), and once it polls and gives the frames
-/// back every frame arrives, in order, none dropped. The same budget skips frames of a lossy class
+/// waits, QUIC's flow control holds the sender behind it, and the sender's own lane, one frame past
+/// what QUIC took, says `LaneFull` until it moves. Once the receiver polls and gives the frames
+/// back, every frame arrives, in order, none dropped. The same budget skips frames of a lossy class
 /// (a consensus message the protocol above sends again).
 #[test]
 fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
@@ -2804,22 +2805,29 @@ fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
     let body = [9u8; FRAME];
     let mut sent = 0u32;
-    while sent < FRAMES {
+    // The receiver polls nothing: the sender is held once the receiver's budget is full.
+    let mut held = 0;
+    while held < 8 {
         match net.a.send_frame(2, 0, Kind::Append, &body) {
-            Ok(()) => sent += 1,
+            Ok(()) => {
+                sent += 1;
+                held = 0;
+            }
             Err(Refusal::LaneFull) => {
+                held += 1;
                 net.exchange();
             }
             Err(other) => panic!("{other:?}"),
         }
+        assert!(sent < FRAMES, "the sender was never held");
     }
-    net.exchange();
     let stats = net.b.stats();
     assert_eq!(stats.frames_dropped, 0, "nothing skipped");
     assert_eq!(
         stats.frames_reserving, 1,
         "the next frame waits for the budget"
     );
+    // The receiver gives its frames back: the sender sends the rest as room comes.
     let mut order = Vec::new();
     for _ in 0..10_000 {
         while let Some(event) = net.b.poll_event() {
@@ -2827,6 +2835,9 @@ fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
                 order.push(frame.bytes().len());
                 net.b.release(frame);
             }
+        }
+        while sent < FRAMES && net.a.send_frame(2, 0, Kind::Append, &body).is_ok() {
+            sent += 1;
         }
         if order.len() == FRAMES as usize {
             break;
@@ -2883,29 +2894,30 @@ where
     panic!("the lane never filled");
 }
 
-/// A lossless class's lane holds about a congestion window of bytes behind QUIC, its sender then
-/// held, where a lossy class's holds a window of frames (the core's, T37): a sender past what its
-/// path carries waits a round trip's bytes behind it, not megabytes. Every frame still arrives.
+/// A lossless class's lane holds one frame beyond what QUIC took, its sender then held, where a
+/// lossy class's holds a window of frames (the core's, T37): QUIC's stream holds what the peer's
+/// credit allows, as a socket's send buffer does, and a sender past what its path carries waits at
+/// the sender, not in megabytes behind QUIC. Every frame still arrives.
 #[test]
-fn a_lossless_lane_holds_a_congestion_window_of_bytes_and_its_sender_waits() {
+fn a_lossless_lane_holds_one_frame_past_what_quic_took_and_its_sender_waits() {
     let frame = [5u8; 4_096];
     let pair = Pair::new();
     let mut lossy = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
     let mut kept = connected::<Kept, Kept>(&pair, limits(), 256 << 20);
     let lossy_queued = queued_until_full(&mut lossy, &frame);
     let kept_queued = queued_until_full(&mut kept, &frame);
-    let window = kept.a.path(2).unwrap().cwnd;
 
     assert!(
         lossy_queued >= limits().lane_window as u32,
         "a lossy lane holds its window of frames: {lossy_queued}"
     );
-    // What the lane holds, a window and the frame that crossed it, and what QUIC took past it, the
-    // peer's first window.
-    let most = window + frame.len() as u64 + first_window();
+    // What QUIC took, the peer's first window, in whole frames and the one it took part of, and
+    // the one frame the lane holds past it
+    let grant = hyper_transport::frame_grant(frame.len() as u64);
+    let most = first_window() / grant + 2;
     assert!(
-        u64::from(kept_queued) * frame.len() as u64 <= most,
-        "a lossless lane holds about a congestion window ({window} B), not {kept_queued} frames"
+        u64::from(kept_queued) <= most,
+        "a lossless lane holds one frame past what QUIC took ({most} frames at most), not {kept_queued}"
     );
     assert!(kept_queued < lossy_queued);
     // Held, not dropped: every frame queued arrives once the network moves.

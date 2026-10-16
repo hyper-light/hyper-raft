@@ -46,8 +46,6 @@ pub(crate) struct LaneOut {
     pub(crate) opener_written: usize,
     /// Frames waiting, each its prefix and bytes, with the rank of its class.
     pub(crate) queue: VecDeque<(u8, Reservation)>,
-    /// The bytes of the frames waiting.
-    pub(crate) bytes: u64,
     /// What of the front frame was written.
     pub(crate) written: usize,
     /// A frame was refused for the queue being full since it last had room: once it has, the
@@ -64,7 +62,6 @@ impl LaneOut {
             stream: None,
             opener_written: 0,
             queue: VecDeque::with_capacity(window),
-            bytes: 0,
             written: 0,
             refused: false,
             room_waiting: false,

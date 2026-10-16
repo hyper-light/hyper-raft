@@ -300,11 +300,12 @@ may instead be lossless (`Classes::lossless`, 2026-10-15), for frames that are t
 copy (focal's event bus; Raft sends its messages again, a bus does not). Its frame waits for the
 budget, its lane unread so QUIC's flow control holds the sender, and asks again whenever bytes come
 back (`Reading::Reserving`, `Endpoint::retry_reserving`); a frame past its class bound is still
-refused. Its lane refuses `LaneFull` once its queued bytes and the next frame would pass the
-connection's congestion window (one frame always fits an empty lane), so about a round trip's bytes
-wait behind QUIC and the rest at the sender, as Linux's TCP Small Queues keep a socket's queued
-bytes to what its path drains (Dumazet, 2012): counted in frames alone, focal's bus held 64 MiB
-behind a path of about 100 kB, 2.6 s at the median. And an owner that cannot take more holds the
+refused. Its lane holds one frame beyond what QUIC took and then refuses `LaneFull`: QUIC's stream
+holds what the peer's credit allows, as a socket's send buffer does, whose writer waits once it is
+full, and the sender waits at the sender. Counted in frames alone, focal's bus held 64 MiB behind
+a path of about 100 kB, 2.6 s at the median; bounded by the congestion window (TCP Small Queues'
+rule, Dumazet 2012) it held as much as CUBIC's window, which on loopback, where nothing is lost,
+grew to 1.55 GB: a publisher the node held queued 470 ms in its own lane. And an owner that cannot take more holds the
 peer's lane (`Endpoint::hold_lane`, `release_lane`): read no further past its opening, the peer is
 held at QUIC's flow control and its own lane fills, where it would otherwise queue in the owner
 without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median). Admission
@@ -734,8 +735,8 @@ the numbers are `docs/benchmarks.md`, "Probe timeouts, tickets and Careful Resum
   those (`Controller::on_delivered`). Three other divergences from Chromium went with the old
   estimator: startup compared the gain with its target, so an app-limited sender's window grew
   without end; the bandwidth filter took no app-limited sample; and the minimum round trip expired
-  before it was ever measured, so every connection began in ProbeRTT. A bus publisher's window had
-  reached 409 MB on a 72 µs path (`crates/hyper-quic/VENDORED.md` §30).
+  before it was ever measured, so every connection began in ProbeRTT
+  (`crates/hyper-quic/VENDORED.md` §30).
 
 ## 4g. Admission credit: a stream pool (2026-10-13)
 

@@ -199,15 +199,20 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
 - **hyper-transport: a lossless lane held seconds of frames behind QUIC.** A lane bounds its queue
   in frames, the core's window, and a frame may be a class's bound: for focal's bus 256 frames of
   up to 256 KiB, 64 MiB behind a path that holds about 100 kB, so a publisher past what the path
-  carried met 2.6 s of delay at the median before its sender was held. A lossless class's lane now
-  also refuses `LaneFull` once its queued bytes and the next frame would pass the connection's
-  congestion window (`docs/transport.md` §4). Test:
-  `a_lossless_lane_holds_a_congestion_window_of_bytes_and_its_sender_waits`
-  (54 frames of 4 KiB at a 210 kB window, where a lossy lane takes its 128-frame window and three).
-  That bound is the controller's window, and BBR's had grown without bound (below).
-- **hyper-quic: BBR's window grew without bound.** Found by focal's event bus: under overload a
-  publisher's window reached 409 MB on a 72 µs path, and the lossless lane bound to it (above) held
-  1.7 s of messages at the median. The port's BBR diverged from Chromium's in four places
+  carried met 2.6 s of delay at the median before its sender was held. A lossless class's lane
+  first refused `LaneFull` past the connection's congestion window (TCP Small Queues' rule), but a
+  loss-based law's window on a path that loses nothing has no bound: the bus runs CUBIC, whose
+  window on loopback reached 1.55 GB, and a publisher the node held queued 470 ms of messages in
+  its own lane. The lane now holds one frame beyond what QUIC took: QUIC's stream holds what the
+  peer's credit allows, a socket's send buffer whose writer waits once it is full
+  (`docs/transport.md` §4). Tests: `a_lossless_lane_holds_one_frame_past_what_quic_took_and_its_sender_waits`
+  (what QUIC took and one frame, where a lossy lane takes its 128-frame window and three);
+  `a_lossless_frame_waits_for_the_budget_and_is_never_skipped`, the sender held while its receiver
+  polls nothing, every frame arriving once it does.
+- **hyper-quic: BBR's model diverged from Chromium's in four places.** Found while measuring focal's
+  event bus, whose publisher's window reached 409 MB on a 72 µs path; that window was CUBIC's, the
+  bus's law, whose lane bound is now one frame (above), but BBR, focal's law elsewhere, had the
+  same unbounded growth in an app-limited startup. The port's BBR diverged from Chromium's in four places
   (`crates/hyper-quic/VENDORED.md` §30):
   - its startup compared the gain with the target;
   - its bandwidth filter took no app-limited sample;

@@ -1118,10 +1118,12 @@ datagrams of each side, where they took 59) and `a_pool_sized_to_nothing_holds_i
 
 ## 30. BBR's bandwidth from delivery-rate samples, and three divergences from Chromium (2026-10-15)
 
-Found by focal's event bus. Under overload a publisher's BBR window reached 408,890,985 bytes on a
-path of 72 µs. hyper-transport's lossless lane is bound to the window, so it then held seconds of
-messages behind QUIC: 1.7 s of delay at the median. The port diverged from Chromium's `bbr_sender.cc`
-in four places.
+Found while measuring focal's event bus, whose publisher's congestion window reached 408,890,985
+bytes on a path of 72 µs, and whose lossless lane, then bound to the window, held seconds of
+messages behind QUIC. That window was CUBIC's, the bus's law, which on a path that loses nothing has
+no bound (hyper-transport's lossless lane is now bound otherwise, `docs/transport.md` §4). Reading
+BBR, focal's law elsewhere, for the same growth found the port diverging from Chromium's
+`bbr_sender.cc` in four places, the first the same unbounded growth in an app-limited startup.
 
 - **Patch Q16: startup grows the window to its target and no further.** Chromium's
   `CalculateCongestionWindow` grows a window in startup by what is acknowledged while

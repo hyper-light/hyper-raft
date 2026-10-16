@@ -54,6 +54,10 @@ static HELD_UNTIL: AtomicU64 = AtomicU64::new(0);
     reason = "the harness's device keeps the host's clock for a hold the test asked for"
 )]
 pub fn hold_flushes(hold: Duration) {
+    if std::env::var_os("HDE_HOLD_EACH").is_some() {
+        EACH_NS.store(u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX), Ordering::Release);
+        return;
+    }
     let origin = *ORIGIN.get_or_init(Instant::now);
     let until = Instant::now()
         .saturating_duration_since(origin)
@@ -63,6 +67,9 @@ pub fn hold_flushes(hold: Duration) {
         Ordering::Release,
     );
 }
+
+/// SCRATCH: every flush held this long once ordered (HDE_HOLD_EACH).
+static EACH_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Holds the calling thread, the one doing a flush, until the hold the test ordered ends, if one
 /// was ordered and has not.
@@ -113,6 +120,10 @@ impl BlockFile for FaultFile {
             std::thread::park();
         }
         held();
+        let each = EACH_NS.load(Ordering::Acquire);
+        if each > 0 {
+            std::thread::sleep(Duration::from_nanos(each));
+        }
         if FAIL_NEXT_FLUSH.swap(false, Ordering::AcqRel) {
             return Err(DiskError::Io {
                 op: "flush",

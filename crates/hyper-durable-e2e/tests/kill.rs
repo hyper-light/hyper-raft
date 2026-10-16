@@ -539,6 +539,15 @@ impl Cluster {
     )]
     fn moving(&mut self, watch: &mut Watch) -> bool {
         let looked = Instant::now();
+        {
+            use std::sync::Mutex;
+            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut last = LAST.lock().unwrap();
+            if last.is_none_or(|at| at.elapsed() > Duration::from_secs(10)) {
+                *last = Some(Instant::now());
+                eprintln!("SCRATCH STATE {}", self.state());
+            }
+        }
         let mut heard = Vec::new();
         let mut unheard = Vec::new();
         for id in self.up() {
@@ -1193,10 +1202,29 @@ fn member_stopped() -> String {
     let mut cluster = Cluster::start(name, 3);
     cluster.write_some("before", WRITES);
     let lead = cluster.leader().expect("a leader");
-    let stopped = cluster.up().into_iter().find(|&id| id != lead).unwrap();
+    let stopped = if std::env::var_os("HDE_FREEZE_LEADER").is_some() {
+        lead
+    } else {
+        cluster.up().into_iter().find(|&id| id != lead).unwrap()
+    };
+    if std::env::var_os("HDE_JUDGED").is_some() {
+        let voters = cluster.voters.len();
+        assert!(cluster.until(|r| r.len() == voters && r.values().all(|r| r.unjudged == 0)));
+        eprintln!("SCRATCH every pair judged");
+    }
     cluster.freeze(stopped);
+    let slowed: Vec<u64> = cluster.up().into_iter().filter(|&id| id != stopped).collect();
+    if let Ok(slow) = std::env::var("HDE_SLOW_MS") {
+        let ms: Vec<u64> = slow.split(',').map(|v| v.parse().unwrap()).collect();
+        for (k, id) in slowed.iter().enumerate() {
+            cluster.hold_flushes(*id, Duration::from_millis(ms[k % ms.len()]));
+        }
+    }
     // The leader and the other follower commit it; the member stopped cannot apply it.
-    let Some(index) = cluster.put(b"after", b"stopped") else {
+    let put_at = std::time::Instant::now();
+    let put = cluster.put(b"after", b"stopped");
+    eprintln!("SCRATCH put {:?} in {:?}; {}", put, put_at.elapsed(), cluster.state());
+    let Some(index) = put else {
         panic!(
             "{name}: the two members up took no write; {}",
             cluster.state()
@@ -1225,6 +1253,12 @@ fn member_stopped() -> String {
         member, stopped,
         "{name}: the wait named member {member}, not member {stopped}, which was stopped"
     );
+    if std::env::var("HDE_SLOW_MS").is_ok() {
+        for id in &slowed {
+            cluster.hold_flushes(*id, Duration::ZERO);
+        }
+    }
+    eprintln!("SCRATCH until ended {:?}", cluster.state());
     cluster.thaw(stopped);
     cluster.verify();
     format!(

@@ -830,7 +830,15 @@ impl Pair {
         // refuse without them: a link refused for want of `τ_int` waits at its interval until a longer
         // Allan level measures it (`docs/timing.md` §2.8, "The interval the evidence needs"), judged
         // by its node's evidence meanwhile, and a configured one by its configuration.
-        if link.estimator.arrivals().is_err() {
+        if let Err(r) = link.estimator.arrivals() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 25 == 0 {
+                let e = link.estimator.estimates();
+                eprintln!(
+                    "SCRATCH pair arrivals refused {r:?}: received {} correlation {:?} window {:?} arrivals {} interval {:?}",
+                    e.received, e.correlation, e.window, e.arrivals, link.estimator.interval()
+                );
+            }
             return false;
         }
         let Some(costs) = self
@@ -842,6 +850,10 @@ impl Pair {
         };
         let floor = Duration::from_nanos(floor_ns).max(granularity);
         match link.estimator.configure(&costs, granularity, floor) {
+            Err(r) => {
+                eprintln!("SCRATCH pair configure refused {r:?} interval {:?}", link.estimator.interval());
+                false
+            }
             Ok(configured) => {
                 self.received.pooled_ask_ns = 0;
                 self.received.configuration = Some(configured);
@@ -849,7 +861,6 @@ impl Pair {
                 self.counts.configurations = self.counts.configurations.saturating_add(1);
                 true
             }
-            Err(_) => false,
         }
     }
 }

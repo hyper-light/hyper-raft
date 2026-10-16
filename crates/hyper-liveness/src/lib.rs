@@ -462,9 +462,20 @@ impl Liveness {
         // A lateness past what a window can sum is refused, as any estimator refuses such an
         // offset.
         let _ = pool.on_lateness(self.pool_seq, lateness);
-        if let Ok(measured) = pool.arrivals() {
-            self.pool_measured = Some(measured);
-            self.renew_evidence();
+        match pool.arrivals() {
+            Ok(measured) => {
+                self.pool_measured = Some(measured);
+                self.renew_evidence();
+            }
+            Err(r) => {
+                if self.pool_seq % 25 == 0 {
+                    let e = pool.estimates();
+                    eprintln!(
+                        "SCRATCH pool refused {r:?}: seq {} correlation {:?} window {:?} arrivals {}",
+                        self.pool_seq, e.correlation, e.window, e.arrivals
+                    );
+                }
+            }
         }
     }
 

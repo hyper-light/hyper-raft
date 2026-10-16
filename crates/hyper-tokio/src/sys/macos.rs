@@ -81,6 +81,28 @@ impl Clock {
     }
 }
 
+/// `MSIZE` (`bsd/arm/param.h`, `bsd/i386/param.h`): an mbuf's own size. A received datagram is
+/// queued as its address's mbuf, its control's and its data's, each charged at least this.
+const MSIZE: u64 = 256;
+/// `M16KCLBYTES` (`bsd/arm/param.h`, `bsd/i386/param.h`): XNU's largest cluster, the "jumbo
+/// cluster", the most storage a receiving driver gives a datagram's data in one mbuf.
+const M16KCLBYTES: u64 = 16_384;
+/// `sb_efficiency` (`bsd/kern/uipc_socket2.c`): a socket buffer's mbuf storage is limited to this
+/// many times its byte limit (`sbreserve`: `sb_mbmax = cc * sb_efficiency`).
+const SB_EFFICIENCY: u64 = 8;
+
+/// The least XNU may charge one queued datagram against its byte limit, beyond what `FIONREAD`
+/// reads: `sbspace` is the smaller of what is left of the byte limit and of the mbuf limit, and a
+/// datagram's mbufs are its address's, its control's and its data's, the data's at most a jumbo
+/// cluster (hyper-rt's `udp/macos.rs` reads the same account).
+pub(crate) fn message_floor() -> u64 {
+    MSIZE
+        .saturating_mul(3)
+        .saturating_add(M16KCLBYTES)
+        .checked_div(SB_EFFICIENCY)
+        .unwrap_or(u64::MAX)
+}
+
 /// The bytes waiting in `fd`'s receive queue as `FIONREAD` counts them: on XNU every queued
 /// datagram's, with their addresses and control (`soioctl`: `so_rcv.sb_cc`).
 pub(crate) fn queued_bytes(fd: RawFd) -> io::Result<usize> {

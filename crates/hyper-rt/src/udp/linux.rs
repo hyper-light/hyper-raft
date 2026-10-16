@@ -82,6 +82,49 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     status == 0
 }
 
+/// Format: `SK_MEMINFO_VARS` (`include/uapi/linux/sock_diag.h`), the words `SO_MEMINFO` fills on a
+/// kernel that reports drops, the last of them `SK_MEMINFO_DROPS`. An older kernel fills fewer and
+/// says so in the length it returns (`sk_getsockopt` copies the smaller).
+const MEMINFO_WORDS: usize = 9;
+
+/// What the kernel charges `fd`'s receive queue now (`SO_MEMINFO`, `sk_get_meminfo`): the bytes
+/// charged for the datagrams queued (`SK_MEMINFO_RMEM_ALLOC`, each its allocation's truesize), the
+/// buffer they count against (`SK_MEMINFO_RCVBUF`) and, where the kernel reports them, the
+/// datagrams it has dropped for want of room (`SK_MEMINFO_DROPS`).
+pub(crate) fn queue_charge(fd: RawFd) -> io::Result<(u32, u32, Option<u32>)> {
+    let mut info = [0u32; MEMINFO_WORDS];
+    let mut length = socklen(size_of::<[u32; MEMINFO_WORDS]>());
+    // SAFETY: `info` and `length` are live locals of the sizes passed; getsockopt writes at most
+    // `length` bytes into `info` and the length it wrote into `length`.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            info.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let filled = usize::try_from(length)
+        .unwrap_or(0)
+        .checked_div(size_of::<u32>())
+        .unwrap_or(0);
+    let word = |index: libc::c_int| {
+        usize::try_from(index)
+            .ok()
+            .filter(|at| *at < filled)
+            .and_then(|at| info.get(at).copied())
+    };
+    let charged = word(libc::SK_MEMINFO_RMEM_ALLOC)
+        .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive queue's charge"))?;
+    let buffer = word(libc::SK_MEMINFO_RCVBUF)
+        .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive buffer"))?;
+    Ok((charged, buffer, word(libc::SK_MEMINFO_DROPS)))
+}
+
 /// What the kernel offers this socket.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Offload {

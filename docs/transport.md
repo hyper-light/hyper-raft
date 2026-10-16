@@ -934,10 +934,77 @@ asserted instead that no timer fired before every datagram was read. That failed
 parallel load, where a timer 65 ms away came due first: a test that rests on timing is not one a
 busy machine passes.
 
-Open: the socket room counts the kernel's charge at four times a datagram's payload, the worst case
-measured on Linux 6.x; MTU-sized datagrams are charged 1.58 times. With room for twice as many
-datagrams, the bus nearly doubled its throughput (above) without a drop. The charge should be
-learned per socket, not assumed, and 64 KiB-page kernels differ.
+The socket room's charge was then a fixed four times a datagram's payload. §4i replaces it with
+the kernel's own account, measured.
+
+## 4i. A socket's room, from what the kernel is measured to charge (2026-10-16)
+
+The windows a socket's peers are granted, summed, never pass what its receive queue holds (§4a's
+socket room, `credit.rs`), so a reader the machine stops drops nothing. What the queue holds
+depends on what the kernel charges each queued message. The room used to assume four times its
+payload on Linux and twice elsewhere. That rule was an arbitrary constant: three loopback
+measurements on one kernel, rounded up. It was wrong in both directions. Linux charges a GRO train
+little more than its payload, a 1,252-byte datagram 1.84 times, and a 100-byte one about nine
+times. The rule is gone. The room is now learned from the kernel's own account, as Linux TCP
+learns its `scaling_ratio` from each segment's length over its truesize (`tcp_measure_rcv_mss`,
+Linux 6.6), and nothing in it is assumed.
+
+- **The account** (hyper-rt `UdpSocket::queue_charge`, hyper-tokio's own):
+  - Linux's `SO_MEMINFO` (`sk_get_meminfo`): what the queue is charged
+    (`SK_MEMINFO_RMEM_ALLOC`), its buffer and its drops. A quarter of the buffer may stay charged
+    for datagrams already read while others wait: `udp_rmem_release` releases in batches of
+    `forward_threshold = sk_rcvbuf >> 2`.
+  - macOS's `FIONREAD`, which is `sb_cc`: each datagram's payload, address and control, against
+    `sb_hiwat` (`soioctl`, `sbappendaddr`). XNU also limits mbuf storage to `sb_efficiency`, 8,
+    times the byte limit (`sbspace`, `sbreserve`), which nothing reads. So a message is charged at
+    least its mbufs over 8: its address's, control's and data's, the data's at most XNU's largest
+    (jumbo) cluster (`MSIZE` 256 and `M16KCLBYTES` 16,384, `bsd/arm/param.h`), 2,144 bytes.
+  - The simulation fabric's own account: each datagram its payload, admitted only while it fits.
+  - Windows exposes none. Its room stays at the first windows admission lets in until a
+    measurement of AFD's capacity replaces it (open, below).
+- **A sample** is a message read as the only one queued (the singleton rule; hyper-transport's
+  `SocketCharge`). The account is read before a drain that starts with nothing behind it. If the
+  drain took exactly one message and emptied the socket, and the account after it is nothing, the
+  account before was that message's charge exactly. A datagram that came between the two reads
+  shows as a second message, or as a charge after. The stream bytes it carried are the difference
+  in the window its peers had consumed (hyper-quic patch Q20, `stream_bytes_received`).
+- **The room** (`ReceiveCharge::room`): the buffer, less the release lag, less what peers may send
+  unprompted by any window, at the costliest stream byte sampled. The unprompted messages are an
+  acknowledgement for each of this side's ack-eliciting packets in flight (RFC 9000 §13.2: a
+  receiver may acknowledge every one) and the loss probes of the idle timeout: two at each probe
+  timeout (RFC 9002 §6.2.4), the timeouts doubling (§6.2.1) from `kGranularity`, 32 for a 30-second
+  timeout. Acknowledgements are counted at the costliest message without stream data, probes at
+  the costliest of any, since retransmissions take no new window.
+- **What the worst is taken over:** the current window epoch and the last that brought a sample.
+  An epoch ends once the peers have consumed the room it began with, so every window still granted
+  was granted within the two. An epoch without a sample keeps the worst it had: under load a socket
+  is read behind a backlog, where no read is a sample. A drop the kernel reports
+  (`SK_MEMINFO_DROPS`) forgets the samples, and the room falls back to the first window until new
+  ones come.
+- **Before anything is measured:** the queue is asked for the windows' demand, the least it could
+  need, a byte charged a byte. The kernel grants what it will; Linux caps an unprivileged ask at
+  `rmem_max`. The room is the first windows admission lets in. What a peer sends before this side
+  first acknowledges it is bounded by the protocol: RFC 9000 §8.1's three times what it was sent
+  before its address is validated, and RFC 9002 §7.2's initial window. On Linux an empty queue
+  admits any one datagram, so the first datagram read is the first sample. A peer's socket starts
+  from what the listener learned of the host's receive path.
+- **Tests.**
+  - hyper-transport `charge::tests`: the room at the costliest stream byte; unprompted messages
+    reserved first; the worst held for the epoch after its own; epochs without samples keep what
+    was learned; a drop forgets; probes doubling to the idle timeout.
+  - hyper-rt `a_socket_tells_what_its_queue_is_charged` (Linux: charged past the payload, a
+    quarter of the buffer the lag, nothing once read; macOS: 1,016 bytes for a 1,000-byte datagram,
+    the payload and a 16-byte `sockaddr_in`, as `sbappendaddr` counts it) and
+    `a_simulated_socket_is_charged_its_payload`.
+  - hyper-rt-transport `a_socket_holds_the_room_told_from_its_measured_charge`, end to end on the
+    real kernel: one datagram's charge sampled, the room told from it, and that room's worth sent
+    unread, every one there to read and none dropped.
+    - Linux 6.x in Docker: a 1,252-byte datagram charged 2,304; a 32 KiB buffer less its 8 KiB lag
+      held a room of 13,354 bytes, 10 datagrams.
+    - macOS: 1,268 bytes counted, the mbuf floor of 2,144 ruling; a room of 19,135, 15 datagrams.
+- **Open:** Windows. Winsock's `FIONREAD` counts every queued datagram's bytes, but AFD's charge per
+  datagram against `SO_RCVBUF` is documented nowhere. A self-probe at the driver's start can
+  measure it: fill a probe socket of the same buffer until its count stops growing.
 
 ## 5. Consumers
 

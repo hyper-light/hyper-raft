@@ -813,6 +813,12 @@ pub(crate) fn sim_send(index: u16, dest: u16, bytes: &[u8]) -> Result<Option<usi
     .unwrap_or(Err(RtError::NotOnShardThread))
 }
 
+/// What the fabric charges simulated socket `index`'s mailbox: each datagram its payload, against
+/// [`SIM_RECV_BUFFER_BYTES`], admitted only while it fits (`SimRuntime::deliver`).
+pub(crate) fn sim_queue_charge(index: u16) -> (usize, usize) {
+    (sim_queued(index), SIM_RECV_BUFFER_BYTES)
+}
+
 /// The bytes of every datagram waiting for simulated socket `index`.
 pub(crate) fn sim_queued(index: u16) -> usize {
     with_sockets(|_, sockets| sockets.socket(index).map_or(0, |socket| socket.held.get()))

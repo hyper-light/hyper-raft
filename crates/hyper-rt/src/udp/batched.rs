@@ -142,6 +142,18 @@ pub struct Arrival {
     pub read_ns: u64,
 }
 
+/// What [`Batched::receive_queued`] took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Taken {
+    /// Datagrams handed over, each of a coalesced message counted.
+    pub datagrams: usize,
+    /// Messages the kernel handed up: a coalesced one (`UDP_GRO`) is one message of many
+    /// datagrams, which the kernel charges as one.
+    pub messages: usize,
+    /// Their payload bytes.
+    pub bytes: usize,
+}
+
 /// How [`Batched::receive_queued`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Queued {
@@ -259,8 +271,9 @@ enum SendStep {
 
 /// One call's worth of a receive.
 enum ReceiveStep {
-    /// This many datagrams were handed over.
-    Delivered(usize),
+    /// This many datagrams were handed over, in this many messages (a coalesced one, `UDP_GRO`,
+    /// many datagrams).
+    Delivered { datagrams: usize, messages: usize },
     /// A datagram was consumed with nothing to hand over (truncated, or from a non-internet address).
     Skipped,
     /// Nothing waits (or the call was interrupted): await readability.
@@ -838,7 +851,7 @@ impl Batched {
         began_ns: u64,
         calls: usize,
         deliver: impl FnMut(Arrival, &mut [u8]),
-    ) -> Result<(usize, Queued), RtError> {
+    ) -> Result<(Taken, Queued), RtError> {
         self.lend(ring);
         let received = self.receive_until_past(began_ns, calls, deliver);
         self.lend(ring);
@@ -850,7 +863,7 @@ impl Batched {
         began_ns: u64,
         calls: usize,
         mut deliver: impl FnMut(Arrival, &mut [u8]),
-    ) -> Result<(usize, Queued), RtError> {
+    ) -> Result<(Taken, Queued), RtError> {
         let stamped = self.stats.kernel_stamps;
         let held = if stamped {
             None
@@ -858,19 +871,25 @@ impl Batched {
             Some(self.udp.queued_bytes()?)
         };
         let past = Cell::new(false);
-        let taken = Cell::new(0usize);
+        let bytes_taken = Cell::new(0usize);
         let mut handed = |arrival: Arrival, bytes: &mut [u8]| {
             if stamped && arrival.at_ns > began_ns {
                 past.set(true);
             }
-            taken.set(taken.get().saturating_add(bytes.len()));
+            bytes_taken.set(bytes_taken.get().saturating_add(bytes.len()));
             deliver(arrival, bytes);
         };
-        let mut delivered = 0usize;
+        let mut taken = Taken::default();
         let mut ended = Queued::More;
         for _ in 0..calls {
             match self.receive_some(&mut handed)? {
-                ReceiveStep::Delivered(count) => delivered = delivered.saturating_add(count),
+                ReceiveStep::Delivered {
+                    datagrams,
+                    messages,
+                } => {
+                    taken.datagrams = taken.datagrams.saturating_add(datagrams);
+                    taken.messages = taken.messages.saturating_add(messages);
+                }
                 ReceiveStep::Skipped => {}
                 ReceiveStep::Empty => {
                     ended = Queued::Emptied;
@@ -879,12 +898,13 @@ impl Batched {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 ReceiveStep::Astray => self.stats.astray = self.stats.astray.saturating_add(1),
             }
-            if past.get() || held.is_some_and(|held| taken.get() >= held) {
+            if past.get() || held.is_some_and(|held| bytes_taken.get() >= held) {
                 break;
             }
         }
-        self.stats.received = self.stats.received.saturating_add(as_u64(delivered));
-        Ok((delivered, ended))
+        taken.bytes = bytes_taken.get();
+        self.stats.received = self.stats.received.saturating_add(as_u64(taken.datagrams));
+        Ok((taken, ended))
     }
 
     /// Exchanges the socket's receive buffers and headers with `ring`'s (twice restores them).
@@ -905,8 +925,8 @@ impl Batched {
         let mut delivered = 0usize;
         for _ in 0..turns {
             match self.receive_some(&mut deliver)? {
-                ReceiveStep::Delivered(count) => {
-                    delivered = delivered.saturating_add(count);
+                ReceiveStep::Delivered { datagrams, .. } => {
+                    delivered = delivered.saturating_add(datagrams);
                     if self.one_call_takes_the_batch() {
                         break;
                     }
@@ -983,7 +1003,10 @@ impl Batched {
                 }
             }
         }
-        Ok(ReceiveStep::Delivered(delivered))
+        Ok(ReceiveStep::Delivered {
+            datagrams: delivered,
+            messages: linux.received.len(),
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -1017,7 +1040,10 @@ impl Batched {
             return Ok(ReceiveStep::Skipped);
         };
         deliver(arrived, bytes);
-        Ok(ReceiveStep::Delivered(1))
+        Ok(ReceiveStep::Delivered {
+            datagrams: 1,
+            messages: 1,
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1046,7 +1072,10 @@ impl Batched {
                     return Ok(ReceiveStep::Skipped);
                 };
                 deliver(arrived, bytes);
-                Ok(ReceiveStep::Delivered(1))
+                Ok(ReceiveStep::Delivered {
+                    datagrams: 1,
+                    messages: 1,
+                })
             }
             // The socket counted the report itself; the step only keeps the batch going.
             Outcome::NotNow if self.udp.astray_reports() != astray_before => {

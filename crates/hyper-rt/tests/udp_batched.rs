@@ -701,10 +701,11 @@ fn a_queued_receive_takes_what_was_queued_when_it_began() {
             }
             let start = if first.is_none() { began } else { now_ns() };
             let mut taken = Vec::new();
-            let (count, ended) = receiver
+            let (got, ended) = receiver
                 .receive_queued(&mut ring, start, 16, |_, bytes| taken.push(bytes[0]))
                 .unwrap();
-            assert_eq!(count, taken.len());
+            assert_eq!(got.datagrams, taken.len());
+            assert_eq!(got.bytes, taken.len(), "one byte each");
             first.get_or_insert_with(|| taken.clone());
             order.extend_from_slice(&taken);
             emptied = ended == Queued::Emptied;
@@ -763,6 +764,106 @@ fn a_socket_without_stamps_takes_the_bytes_it_held() {
     assert!(!stats.kernel_stamps, "no kernel on the fabric");
     assert_eq!(held, 6, "three datagrams of two bytes held");
     assert_eq!(taken, vec![0, 1, 2]);
-    assert_eq!(first, (3, Queued::More));
-    assert_eq!(second, (0, Queued::Emptied));
+    assert_eq!(
+        (first.0.datagrams, first.0.messages, first.0.bytes),
+        (3, 3, 6)
+    );
+    assert_eq!(first.1, Queued::More);
+    assert_eq!((second.0.datagrams, second.1), (0, Queued::Emptied));
+}
+
+/// Do: one datagram of 1,000 bytes queued, its charge read, then the datagram read and the charge
+/// read again. Expect: on Linux (`SO_MEMINFO`) the queue charged more than the payload, its
+/// allocation's truesize, against the buffer `SO_RCVBUF` reports, a quarter of it the release
+/// lag, and nothing once read; on macOS (`FIONREAD`, `sb_cc`) the payload and the address XNU
+/// counts beside it, with its mbuf limit as a floor, and nothing once read; on Windows no account
+/// a process may read.
+#[test]
+fn a_socket_tells_what_its_queue_is_charged() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let receiver = UdpSocket::bind(loopback).unwrap();
+        let to = receiver.local_addr().unwrap();
+        sender.send_to(&[5u8; 1_000], to).unwrap();
+        let mut buffer = [0u8; 2_000];
+        let charge = loop {
+            let charge = receiver.queue_charge().unwrap();
+            match charge {
+                Some(charge) if charge.charged == 0 => receiver.readable().await.unwrap(),
+                other => break other,
+            }
+        };
+        let (length, _) = receiver.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(length, 1_000);
+        if cfg!(target_os = "linux") {
+            let charge = charge.expect("Linux tells the queue's charge");
+            assert!(
+                charge.charged > 1_000,
+                "the allocation, past the payload: {charge:?}"
+            );
+            assert_eq!(charge.buffer, receiver.recv_buffer_bytes().unwrap() as u64);
+            assert_eq!(charge.release_lag, charge.buffer >> 2);
+            assert_eq!(charge.message_floor, 0, "SO_MEMINFO is the whole account");
+            assert_eq!(
+                receiver.queue_charge().unwrap().unwrap().charged,
+                0,
+                "released once read"
+            );
+        } else if cfg!(target_os = "macos") {
+            let charge = charge.expect("macOS tells the queue's byte count");
+            // `sbappendaddr`: the payload and the sender's address (`sockaddr_in`, 16 bytes).
+            assert_eq!(charge.charged, 1_016, "{charge:?}");
+            assert_eq!(charge.buffer, receiver.recv_buffer_bytes().unwrap() as u64);
+            assert_eq!(charge.release_lag, 0);
+            assert_eq!(
+                charge.message_floor,
+                (3 * 256 + 16_384) / 8,
+                "XNU's mbuf limit"
+            );
+            assert_eq!(
+                receiver.queue_charge().unwrap().unwrap().charged,
+                0,
+                "released once read"
+            );
+        } else {
+            assert_eq!(charge, None, "no account a process may read");
+        }
+    })
+    .unwrap();
+}
+
+/// Do: on the simulation fabric, one datagram of 1,000 bytes queued, its charge read, then the
+/// datagram read. Expect: the mailbox charged its payload exactly, against the fabric's buffer,
+/// released at once, and nothing once read.
+#[test]
+fn a_simulated_socket_is_charged_its_payload() {
+    let mut sim = SimRuntime::new(&config(), 1).unwrap();
+    let id = sim.shard_ids()[0];
+    let (done_tx, done_rx) = channel();
+    sim.spawn_on(id, async move {
+        let outcome = async {
+            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let sender = UdpSocket::bind(loopback)?;
+            let receiver = UdpSocket::bind(loopback)?;
+            let to = receiver.local_addr()?;
+            sender.send_to(&[5u8; 1_000], to)?;
+            receiver.readable().await?;
+            let queued = receiver.queue_charge()?;
+            let mut buffer = [0u8; 2_000];
+            let _ = receiver.recv_from(&mut buffer).await?;
+            Ok::<_, RtError>((queued, receiver.queue_charge()?))
+        }
+        .await;
+        let _ = done_tx.send(outcome);
+    })
+    .unwrap();
+    sim.run_until_idle();
+    let (queued, read) = done_rx.try_recv().unwrap().unwrap();
+    let queued = queued.unwrap();
+    assert_eq!(queued.charged, 1_000);
+    assert_eq!(queued.buffer, hyper_rt::sim::SIM_RECV_BUFFER_BYTES as u64);
+    assert_eq!(queued.release_lag, 0);
+    assert_eq!(read.unwrap().charged, 0);
 }

@@ -153,6 +153,27 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   here by up to that. 100 runs of it, `founder`, `founder-fenced` and `taken-while-driving` passed on
   `80c1f82` in Docker's Linux beside 8 busy loops (load 10 to 15, 2026-10-15).
 
+### Closed (2026-10-16)
+
+- **hyper-transport: a socket's room rested on an assumed charge.** The windows a socket's peers
+  were granted were held to its buffer over a fixed four times a datagram's payload (Linux) or
+  twice (elsewhere): three loopback measurements on one kernel, rounded up, and wrong both ways
+  (GRO trains about 1.1 times, a full datagram 1.84, a 100-byte one about 9). The room is now told
+  from the kernel's own account:
+  - Linux `SO_MEMINFO`;
+  - macOS `FIONREAD` (`sb_cc`), with XNU's mbuf limit as a floor;
+  - the fabric's own account.
+
+  Each socket learns from exact samples: a message read as the only one queued, whose charge
+  before the read is the account and nothing after it. The worst charge per stream byte is held
+  over two window epochs. Acknowledgements and probes the peers may send unprompted are reserved
+  first, the release lag Linux keeps is taken off, and a drop forgets the samples.
+  `SOCKET_OVERHEAD` and `socket_room` are gone (`docs/transport.md` §4i; hyper-quic patch Q20).
+  Tests: `charge::tests`, `a_socket_tells_what_its_queue_is_charged`,
+  `a_socket_holds_the_room_told_from_its_measured_charge`, end to end on Linux and macOS. Open:
+  Windows, which exposes no account. Its room stays at the first windows until AFD's capacity is
+  measured.
+
 ### Closed (2026-10-15)
 
 - **hyper-rt-transport: a peer's socket carried two datagrams a system call.** Found by focal's

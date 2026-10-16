@@ -66,7 +66,8 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/src/tcpsys.rs":
         "Winsock 2 stream calls (socket, accept, connect, recv, send, WSARecv, WSASend over IoSlice's WSABUF layout, shutdown) and the TCP options rustix lacks (TCP_NOTSENT_LOWAT, TCP_RXT_CONNDROPTIME, SO_NOSIGPIPE)",
     "crates/hyper-rt/src/udp/linux.rs":
-        "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1)",
+        "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1); "
+        "getsockopt(SO_MEMINFO), the kernel's account of a receive queue (docs/transport.md §4i)",
     "crates/hyper-rt/tests/udp_batched.rs":
         "setsockopt(SO_NO_CHECK) through libc, which the runtime has no call for: a socket whose "
         "segmented sends the kernel refuses (tests only, docs/transport.md §4h)",
@@ -125,7 +126,7 @@ UNSAFE_ALLOWED = {
     "crates/hyper-tokio/src/sys/linux.rs":
         "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7)); "
         "SO_TIMESTAMPNS and its SCM_TIMESTAMPNS control message (socket(7)); clock_gettime(2); "
-        "FIONREAD (the bytes a receive queue holds)",
+        "FIONREAD (the bytes a receive queue holds); getsockopt(SO_MEMINFO) (its charge)",
     "crates/hyper-tokio/src/sys/macos.rs":
         "recvmsg(2), SO_TIMESTAMP_MONOTONIC and its SCM_TIMESTAMP_MONOTONIC control message (the "
         "kernel's receive stamp, which rustix's recvmsg drops); mach_absolute_time and "

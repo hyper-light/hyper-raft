@@ -40,6 +40,7 @@ use hyper_quic::{
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
 use crate::budget::{Budget, Lane, Reservation};
+use crate::charge::{Unprompted, probes_within};
 use crate::credit::{
     K_GRANULARITY, MIN_DATAGRAM, Room, Window, class_reserve, initial_window, stream_window_ceiling,
 };
@@ -1423,10 +1424,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .saturating_add(reserve)
     }
 
-    /// The socket's receive queue holds `bytes` of datagram payload ([`crate::socket_room`] of the
-    /// buffer the socket reports once its driver asked it for [`crate::socket_buffer_ask`] of the
-    /// endpoint's [`Endpoint::receive_demand`]): from now the windows granted,
-    /// summed, never pass it, a window grows only while what is left holds the first windows of the
+    /// The socket's receive queue holds `bytes` of its peers' stream data: what its driver's
+    /// [`crate::ReceiveCharge`] tells of the buffer the socket reports, or before anything is
+    /// measured [`Endpoint::unmeasured_room`]. From now the windows granted, summed, never pass
+    /// it, a window grows only while what is left holds the first windows of the
     /// handshakes that may come, and a connection whose first window it cannot hold is refused
     /// [`Refusal::ReceiveBuffer`] (`credit`'s socket room). Windows granted already stand until they
     /// are given back.
@@ -1515,6 +1516,82 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 out.push((peer, conn.quic.remote_address()));
             }
         }
+    }
+
+    /// The connection window `peer` has consumed, summed over its streams as flow control counts
+    /// it: what a message read from its socket carried, as the difference across the read
+    /// (hyper-quic patch Q20). `None` for a peer with no connection.
+    pub fn stream_bytes_received(&self, peer: PeerId) -> Option<u64> {
+        let key = self.core.connection_of(peer)?;
+        let conn = self.conns.get(key).and_then(Option::as_ref)?;
+        Some(conn.quic.stream_bytes_received())
+    }
+
+    /// The connection window consumed, summed over the connections that receive on the shared
+    /// socket (those without a socket of their own, [`Endpoint::set_peer_room`]).
+    pub fn stream_bytes_received_shared(&self) -> u64 {
+        self.conns
+            .iter()
+            .flatten()
+            .filter(|conn| conn.room.is_none())
+            .fold(0u64, |sum, conn| {
+                sum.saturating_add(conn.quic.stream_bytes_received())
+            })
+    }
+
+    /// What `peer` may send its socket unprompted by any window while this side does not read: an
+    /// acknowledgement for each of this side's ack-eliciting packets in flight to it, and the loss
+    /// probes it may send within the idle timeout ([`crate::probes_within`]). `None` for a peer with
+    /// no connection.
+    pub fn unprompted(&self, peer: PeerId) -> Option<Unprompted> {
+        let key = self.core.connection_of(peer)?;
+        let conn = self.conns.get(key).and_then(Option::as_ref)?;
+        Some(Unprompted {
+            acknowledgements: conn.quic.ack_eliciting_in_flight(),
+            probes: probes_within(self.core.limits.idle_timeout),
+        })
+    }
+
+    /// What the shared socket's peers may send it unprompted: each connection without a socket of
+    /// its own, as [`Endpoint::unprompted`], and the probes of each handshake admission lets wait.
+    pub fn unprompted_shared(&self) -> Unprompted {
+        let probes = probes_within(self.core.limits.idle_timeout);
+        let pending = u64::try_from(self.core.limits.admission.pending).unwrap_or(u64::MAX);
+        self.conns
+            .iter()
+            .flatten()
+            .filter(|conn| conn.room.is_none())
+            .fold(
+                Unprompted {
+                    acknowledgements: 0,
+                    probes: pending.saturating_mul(probes),
+                },
+                |sum, conn| Unprompted {
+                    acknowledgements: sum
+                        .acknowledgements
+                        .saturating_add(conn.quic.ack_eliciting_in_flight()),
+                    probes: sum.probes.saturating_add(probes),
+                },
+            )
+    }
+
+    /// The room the shared socket must hold before anything is measured: the first window of every
+    /// connection and handshake admission lets in at once. What each sends before this side first
+    /// acknowledges it is bounded by the protocol (RFC 9000 §8.1's three times what it was sent
+    /// before its address is validated, RFC 9002 §7.2's initial window), and the first datagram the
+    /// socket reads is the first sample.
+    pub fn unmeasured_room(&self) -> u64 {
+        let admission = self.core.limits.admission;
+        let held = admission.connections.saturating_add(admission.pending);
+        u64::try_from(held)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(Core::<C, B, D>::first_window())
+    }
+
+    /// One connection's first window, the room a socket of its own must hold before anything is
+    /// measured ([`Endpoint::unmeasured_room`]).
+    pub fn unmeasured_peer_room(&self) -> u64 {
+        Core::<C, B, D>::first_window()
     }
 
     /// `peer`'s connection receives on a socket of its own from now, whose queue holds `bytes` of

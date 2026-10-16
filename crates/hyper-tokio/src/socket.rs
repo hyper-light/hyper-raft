@@ -210,6 +210,43 @@ impl Socket {
         self.stats
     }
 
+    /// What the kernel charges its receive queue now, where it says (the accounts hyper-rt's
+    /// `UdpSocket::queue_charge` reads): Linux's `SO_MEMINFO`, each queued datagram its allocation
+    /// against the buffer `SO_RCVBUF` reports, a quarter of the buffer still charged for datagrams
+    /// read until it is released (`udp_rmem_release`); macOS's byte count (`FIONREAD`, each
+    /// datagram's payload, address and control) with its mbuf limit as a floor a message. `None`
+    /// where no such account may be read (Windows).
+    pub(crate) fn account(&self) -> io::Result<Option<hyper_transport::Account>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let (charged, buffer, drops) = linux::queue_charge(self.udp.as_raw_fd())?;
+            Ok(Some(hyper_transport::Account {
+                charged: u64::from(charged),
+                buffer: u64::from(buffer),
+                drops: drops.map(u64::from),
+                release_lag: u64::from(buffer >> 2),
+                message_floor: 0,
+            }))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = self.udp.as_raw_fd();
+            Ok(Some(hyper_transport::Account {
+                charged: u64::try_from(macos::queued_bytes(fd)?).unwrap_or(u64::MAX),
+                buffer: u64::try_from(macos::recv_buffer(fd)?).unwrap_or(u64::MAX),
+                drops: None,
+                release_lag: 0,
+                message_floor: macos::message_floor(),
+            }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Ok(None)
+        }
+    }
+
     /// The bytes waiting in its receive queue as the platform counts them (`FIONREAD`): every
     /// queued datagram's on Windows and macOS, only the next one's on Linux.
     pub(crate) fn queued_bytes(&self) -> io::Result<usize> {

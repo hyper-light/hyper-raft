@@ -207,6 +207,12 @@ impl StreamsState {
         this
     }
 
+    /// Every receive stream's end offset, summed, gaps included: the connection window the peer
+    /// has consumed, as flow control counts it (RFC 9000 §4.1).
+    pub(crate) fn data_received(&self) -> u64 {
+        self.data_recvd
+    }
+
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;

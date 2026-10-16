@@ -16,7 +16,7 @@
 //!   limited the transfer (Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize`, slates
 //!   `flow.rs`). Each growth is reserved from the node's budget first, so the window is
 //!   `min(BDP, share)`: it follows the path's bandwidth-delay product while the budget funds it.
-//! - **The socket's room** ([`Room`], [`socket_room`]): the windows granted, summed, never pass what the socket's
+//! - **The socket's room** ([`Room`], [`crate::ReceiveCharge`]): the windows granted, summed, never pass what the socket's
 //!   receive queue holds, so a peer never has more in flight unread than the queue takes while the
 //!   owner does not read, and a stalled owner drops nothing (TCP's receive window is its kernel's
 //!   queue; a UDP socket has no window of its own). Measured before the rule: a focal bus node on a
@@ -91,36 +91,17 @@ pub fn initial_window(max_datagram: u64) -> u64 {
     ten.min(INITIAL_WINDOW_FLOOR.max(two))
 }
 
-/// Derived: what a socket's receive queue counts against its buffer for each byte of datagram it
-/// holds, at the most, for a datagram of 320 bytes or more ([`socket_room`]). Linux charges each
-/// queued datagram its allocation, a slab and its `sk_buff`, against `SO_RCVBUF` as reported:
-/// measured on Linux 6.x over loopback and a veth pair alike, 895 bytes for a datagram of up to about
-/// 250 bytes of payload, 1,275 bytes to about 650, and 2,290 bytes to a full one (1.83 times a
-/// 1,252-byte datagram); four holds from 320 bytes up, the least a sender with a window's worth to
-/// send packs. BSD's `sbspace` and Winsock count payload and an address of at most 28 bytes beside
-/// each datagram, so two holds with room to spare.
-pub const SOCKET_OVERHEAD: u64 = if cfg!(target_os = "linux") { 4 } else { 2 };
-
 /// What the kernel makes of a receive buffer asked: Linux doubles it for its bookkeeping and
 /// reports the doubled size (`socket(7)`, `SO_RCVBUF`); BSD and Winsock keep what was asked.
 const KERNEL_DOUBLES: u64 = if cfg!(target_os = "linux") { 2 } else { 1 };
 
-/// The receive buffer to ask a socket for, for its queue to hold `payload` bytes of datagrams:
-/// `payload` times the kernel's overhead, less the doubling Linux adds of its own.
-pub fn socket_buffer_ask(payload: u64) -> u64 {
-    payload
-        .saturating_mul(SOCKET_OVERHEAD)
-        .checked_div(KERNEL_DOUBLES)
-        .unwrap_or(u64::MAX)
-}
-
-/// The datagram payload a socket's receive queue holds, at the least, before it drops one, for the
-/// buffer the socket `reported` (`SO_RCVBUF` read back): what an endpoint may let its peers send it
-/// unread and lose nothing while its owner does not read ([`Endpoint::set_receive_capacity`]).
-///
-/// [`Endpoint::set_receive_capacity`]: crate::Endpoint::set_receive_capacity
-pub fn socket_room(reported: u64) -> u64 {
-    reported.checked_div(SOCKET_OVERHEAD).unwrap_or(0)
+/// The receive buffer to ask a socket for, for its queue to hold `bytes`, less the doubling Linux
+/// adds of its own: what an owner asks for its windows' demand, the least that demand could need
+/// (a byte charged a byte). The kernel grants what it will (Linux caps an unprivileged ask at
+/// `net.core.rmem_max`), and the room is told from what it granted and what it is measured to
+/// charge ([`crate::ReceiveCharge`]).
+pub fn socket_buffer_ask(bytes: u64) -> u64 {
+    bytes.checked_div(KERNEL_DOUBLES).unwrap_or(u64::MAX)
 }
 
 /// What the socket's receive queue holds of the windows its connections grant (the module's third

@@ -765,6 +765,17 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   - A segmented message refused EIO or EINVAL turns segmentation off, and the message goes again
     unsegmented, in both the outbox's sends and `send_segments` (docs/transport.md §4h; before, only
     EIO did, and a socket refused EINVAL dropped every segmented message).
+- **What a queue is charged** (2026-10-16). `UdpSocket::queue_charge` reads the kernel's account
+  of a receive queue where it keeps one a process may read:
+  - Linux `SO_MEMINFO`: the queue's charge, its buffer, its drops, and a quarter of the buffer
+    still charged for datagrams read (`udp_rmem_release`);
+  - macOS `FIONREAD`, which is `sb_cc`: payload, address and control, with XNU's mbuf limit as a
+    floor a message (`QueueCharge::message_floor`);
+  - the fabric's own account.
+
+  Windows keeps none. `Batched::receive_queued` reports the messages it took beside the datagrams
+  (`Taken`), since a GRO train is one message of many datagrams. hyper-transport learns a socket's
+  room from these (`docs/transport.md` §4i).
 - **What was queued, and when it was read** (2026-10-16).
   - `Batched::receive_queued` takes the datagrams that were queued when it began, plus the rest of
     the call that reached the first that was not. It judges by the kernel's receive stamps where the

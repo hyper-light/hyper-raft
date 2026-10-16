@@ -1934,6 +1934,19 @@ impl Connection {
         self.pto(SpaceId::Data)
     }
 
+    /// The ack-eliciting packets in flight on the current path: what the peer may acknowledge,
+    /// one acknowledgement each at the most (RFC 9000 §13.2), unprompted by any window (patch
+    /// Q20).
+    pub fn ack_eliciting_in_flight(&self) -> u64 {
+        self.path.in_flight.ack_eliciting
+    }
+
+    /// The connection window the peer has consumed: every receive stream's end offset, summed,
+    /// gaps included, as flow control counts it (RFC 9000 §4.1; patch Q20).
+    pub fn stream_bytes_received(&self) -> u64 {
+        self.streams.data_received()
+    }
+
     /// Minimum RTT seen on this path, ignoring ack delay
     pub fn min_rtt(&self) -> Duration {
         self.path.rtt.min()

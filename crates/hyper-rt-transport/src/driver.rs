@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use hyper_rt::RtError;
 use hyper_rt::futures::{Sleep, sleep};
 use hyper_rt::readiness::Ready;
-use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, Queued, Ring, UdpSocket};
+use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, Ring, UdpSocket};
+use hyper_transport::{Account, SocketCharge};
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness, PeerId};
 
 /// Derived: the turns one poll of [`Driver::event`] takes before it yields to the shard, the bound
@@ -62,6 +63,17 @@ struct Held {
     segment: usize,
 }
 
+/// The kernel's account of a queue, as hyper-transport takes it.
+fn account(charge: QueueCharge) -> Account {
+    Account {
+        charged: charge.charged,
+        buffer: charge.buffer,
+        drops: charge.drops,
+        release_lag: charge.release_lag,
+        message_floor: charge.message_floor,
+    }
+}
+
 /// A socket connected to one of the endpoint's peers, sharing the listener's port.
 struct PeerSocket {
     peer: PeerId,
@@ -71,6 +83,8 @@ struct PeerSocket {
     writable: Option<Ready>,
     /// Its readiness fired, or it was just made: drained at the next turn.
     ready: bool,
+    /// What its queue is learned to charge (`docs/transport.md` §4i).
+    measure: SocketCharge,
 }
 
 /// Drives an [`Endpoint`] on a hyper-rt shard (module doc of the crate).
@@ -105,6 +119,8 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     listener_ready: bool,
     /// Polls that spent their turns with work still to do and woke their task to come back.
     yields: u64,
+    /// What the listener's queue is learned to charge (`docs/transport.md` §4i).
+    measure: SocketCharge,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -149,13 +165,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         // The socket's queue holds what the endpoint's windows may grant (hyper-transport's socket
         // room): asked for their sum, and the endpoint told what the kernel gave, so what its peers
         // may send unread never passes what the queue takes while the owner does not read.
+        // The queue is asked for the windows' demand, the least it could need, and the room is
+        // told from what the kernel granted and what it is measured to charge (`SocketCharge`): until a
+        // message is measured, the first windows admission lets in.
         let ask = hyper_transport::socket_buffer_ask(endpoint.receive_demand());
-        let reported = socket
+        socket
             .socket()
             .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
-        endpoint.set_receive_capacity(hyper_transport::socket_room(
-            u64::try_from(reported).unwrap_or(u64::MAX),
-        ));
+        let unmeasured = endpoint.unmeasured_room();
+        endpoint.set_receive_capacity(unmeasured);
         let anchor = (shard_now()?, Instant::now());
         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
         Ok(Self {
@@ -175,6 +193,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             ring,
             listener_ready: true,
             yields: 0,
+            measure: SocketCharge::new(unmeasured),
         })
     }
 
@@ -399,9 +418,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             if socket.connect(remote).is_err() {
                 continue;
             }
-            let reported = socket.socket().set_recv_buffer_bytes(ask)?;
-            let room = hyper_transport::socket_room(u64::try_from(reported).unwrap_or(u64::MAX));
-            if self.endpoint.set_peer_room(peer, room).is_err() {
+            socket.socket().set_recv_buffer_bytes(ask)?;
+            // Seeded with what the listener learned of the host's receive path, its room the first
+            // window until its own queue's account is read at its first drain.
+            let measure =
+                SocketCharge::seeded(self.endpoint.unmeasured_peer_room(), self.measure.charge());
+            if self
+                .endpoint
+                .set_peer_room(peer, measure.room_in_force())
+                .is_err()
+            {
                 continue;
             }
             let at = self
@@ -417,6 +443,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                     readable: None,
                     writable: None,
                     ready: true,
+                    measure,
                 },
             );
         }
@@ -468,34 +495,93 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// most [`TURNS`] receive calls a socket.
     fn drain(&mut self) -> Result<(), RtError> {
         let began = shard_now()?;
-        let (anchor_ns, anchor) = self.anchor;
-        let endpoint = &mut self.endpoint;
+        if self.listener_ready {
+            let ended = Self::drain_measured(
+                &mut self.socket,
+                &mut self.ring,
+                &mut self.endpoint,
+                (began, self.anchor),
+                &mut self.measure,
+                |endpoint| Some(endpoint.stream_bytes_received_shared()),
+            )?;
+            self.listener_ready = ended == Queued::More;
+            let unprompted = self.endpoint.unprompted_shared();
+            let room = self
+                .measure
+                .room(unprompted)
+                .unwrap_or_else(|| self.endpoint.unmeasured_room());
+            self.endpoint.set_receive_capacity(room);
+            self.measure.set_room(room);
+        }
+        for peer in &mut self.peers {
+            if !peer.ready {
+                continue;
+            }
+            let id = peer.peer;
+            let ended = Self::drain_measured(
+                &mut peer.socket,
+                &mut self.ring,
+                &mut self.endpoint,
+                (began, self.anchor),
+                &mut peer.measure,
+                |endpoint| endpoint.stream_bytes_received(id),
+            )?;
+            peer.ready = ended == Queued::More;
+            let room = self
+                .endpoint
+                .unprompted(id)
+                .and_then(|unprompted| peer.measure.room(unprompted))
+                .unwrap_or_else(|| self.endpoint.unmeasured_peer_room());
+            let _ = self.endpoint.set_peer_room(id, room);
+            peer.measure.set_room(room);
+        }
+        Ok(())
+    }
+
+    /// Takes from `socket` what was queued when the drain began, `began` the shard clock's reading
+    /// (with the endpoint's anchor), and learns what its queue is charged (`Measure`). Before the
+    /// receive the kernel's account of the queue is read, and the window its peers had consumed;
+    /// after it, the window consumed since. A receive that took exactly one message, from a queue
+    /// it found with nothing behind it and left empty, the kernel's charge nothing after it, read
+    /// that message's charge exactly before it: a sample, with the stream bytes it carried (the
+    /// singleton rule; a datagram that came between the two reads shows as a second message, or as
+    /// a charge after). A drop the kernel tells forgets the samples.
+    fn drain_measured(
+        socket: &mut Batched,
+        ring: &mut Ring,
+        endpoint: &mut Endpoint<C, B, D>,
+        (began, (anchor_ns, anchor)): (u64, (u64, Instant)),
+        measure: &mut SocketCharge,
+        stream: impl Fn(&Endpoint<C, B, D>) -> Option<u64>,
+    ) -> Result<Queued, RtError> {
+        let before = socket.socket().queue_charge()?.map(account);
+        if let Some(before) = before {
+            measure.before(before);
+        }
+        let stream_before = stream(endpoint);
         // The endpoint is told when each datagram was read, as hyper-tokio's driver tells it; the
         // kernel's stamp only says what was queued when the drain began.
-        let mut deliver = |arrival: hyper_rt::udp::Arrival, bytes: &mut [u8]| {
+        let (taken, ended) = socket.receive_queued(ring, began, TURNS, |arrival, bytes| {
             let at = anchor
                 .checked_add(Duration::from_nanos(
                     arrival.read_ns.saturating_sub(anchor_ns),
                 ))
                 .unwrap_or(anchor);
             endpoint.handle_datagram(at, arrival.from, None, bytes);
+        })?;
+        let consumed = match (stream_before, stream(endpoint)) {
+            (Some(before), Some(after)) => after.saturating_sub(before),
+            _ => 0,
         };
-        if self.listener_ready {
-            let (_, ended) =
-                self.socket
-                    .receive_queued(&mut self.ring, began, TURNS, &mut deliver)?;
-            self.listener_ready = ended == Queued::More;
-        }
-        for peer in &mut self.peers {
-            if !peer.ready {
-                continue;
+        let emptied = ended == Queued::Emptied;
+        let after = match before {
+            Some(before) if measure.wants_after(&before, taken.messages, emptied) => {
+                socket.socket().queue_charge()?.map(account)
             }
-            let (_, ended) =
-                peer.socket
-                    .receive_queued(&mut self.ring, began, TURNS, &mut deliver)?;
-            peer.ready = ended == Queued::More;
-        }
-        Ok(())
+            _ => None,
+        };
+        measure.after(before, after, consumed, emptied);
+        Ok(ended)
     }
 
     /// Sends what the endpoint transmits, each transmit straight from the driver's buffer on its

@@ -1201,3 +1201,17 @@ BBR, focal's law elsewhere, for the same growth found the port diverging from Ch
   - `tests::a_warm_up_keeps_what_its_last_round_trip_measures` runs at 5 ms one way, with the client
     alone warming up. At 40 µs, the path it ran on, the warm-up now ends at its plateau
     (`a_warm_up_on_a_path_shorter_than_its_target_ends_at_a_plateau`). Each passed 40 runs of 40.
+
+## 31. What a receiver's socket is charged for: the window consumed, the packets a peer may acknowledge (2026-10-16)
+
+Patch Q20 adds two getters and changes no behaviour. A driver learns what its socket's queue is
+charged for each stream byte a peer sends (hyper-transport's receive charge, `docs/transport.md`
+§4i), so it needs two counts:
+- what each message it read carried against the connection's window;
+- what the peer may send unprompted by any window.
+
+- `Connection::stream_bytes_received` is the connection's `data_recvd`: every receive stream's end
+  offset, summed, gaps included, as flow control counts it (RFC 9000 §4.1).
+- `Connection::ack_eliciting_in_flight` is the current path's `in_flight.ack_eliciting`: the packets
+  the peer may acknowledge, one acknowledgement each at the most (RFC 9000 §13.2).
+

@@ -35,7 +35,7 @@ mod batched;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use batched::{
-    Arrival, Batched, Io, IoStats, MAX_BATCH, Queued, RECEIVE_BYTES, Ring, Sent, Slot,
+    Arrival, Batched, Io, IoStats, MAX_BATCH, Queued, RECEIVE_BYTES, Ring, Sent, Slot, Taken,
 };
 
 use crate::error::RtError;
@@ -50,6 +50,25 @@ pub use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 /// The owned OS handle [`UdpSocket::adopt`] takes — a file descriptor on Unix, a Winsock socket on
 /// Windows; `std::net::UdpSocket` converts into either with `.into()`.
 pub type OwnedDatagram = netsys::OwnedDatagram;
+
+/// What the kernel charges a socket's receive queue at one moment ([`UdpSocket::queue_charge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueCharge {
+    /// Bytes charged for the datagrams the queue holds.
+    pub charged: u64,
+    /// The buffer they are charged against: what `SO_RCVBUF` reports (Linux's, doubled).
+    pub buffer: u64,
+    /// The datagrams dropped for want of room since the socket was made, where the kernel says.
+    pub drops: Option<u64>,
+    /// The most the kernel may still charge for datagrams already read: Linux releases a reader's
+    /// charge in batches, up to a quarter of the buffer while datagrams wait unread
+    /// (`udp_rmem_release`, `forward_threshold = sk_rcvbuf >> 2`); the fabric releases at once.
+    pub release_lag: u64,
+    /// The least the queue may be charged one message beyond what `charged` tells: on macOS the
+    /// mbuf limit `charged` does not read, a datagram's mbufs over `sb_efficiency`; nothing where
+    /// `charged` is the kernel's whole account.
+    pub message_floor: u64,
+}
 
 /// An async UDP socket: a real OS datagram socket, or a port on the simulation's in-memory fabric.
 /// The representation is hidden (the real/sim choice is the driver's, R8); a caller drives it through
@@ -226,6 +245,57 @@ impl UdpSocket {
         match &self.inner {
             Inner::Real { socket } => netsys::recv_buffer_bytes(socket),
             Inner::Sim { .. } => Ok(crate::sim::SIM_RECV_BUFFER_BYTES),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// What its receive queue is charged now, as the kernel counts it, where it says: Linux's
+    /// `SO_MEMINFO` (each queued datagram its allocation, against the buffer `SO_RCVBUF` reports,
+    /// and the drops for want of room); macOS's byte count (`FIONREAD`, each datagram's payload,
+    /// address and control) with its mbuf limit as a floor a message; the simulation fabric's own
+    /// account (each datagram its payload). `None` where no such account may be read (Windows).
+    pub fn queue_charge(&self) -> Result<Option<QueueCharge>, RtError> {
+        match &self.inner {
+            #[cfg(target_os = "linux")]
+            Inner::Real { socket } => {
+                let (charged, buffer, drops) =
+                    linux::queue_charge(socket.raw_id()).map_err(|error| {
+                        RtError::DriverRefused {
+                            call: "getsockopt(SO_MEMINFO)",
+                            code: error.raw_os_error(),
+                        }
+                    })?;
+                Ok(Some(QueueCharge {
+                    charged: u64::from(charged),
+                    buffer: u64::from(buffer),
+                    drops: drops.map(u64::from),
+                    release_lag: u64::from(buffer >> 2),
+                    message_floor: 0,
+                }))
+            }
+            // XNU's byte limit counts each datagram's payload, address and control (`sbappendaddr`)
+            // against `sb_hiwat` (what `SO_RCVBUF` reports), and `FIONREAD` reads what it has
+            // counted (`soioctl`: `so_rcv.sb_cc`); it releases a datagram's count as it is read.
+            #[cfg(target_os = "macos")]
+            Inner::Real { socket } => Ok(Some(QueueCharge {
+                charged: u64::try_from(netsys::queued_bytes(socket)?).unwrap_or(u64::MAX),
+                buffer: u64::try_from(netsys::recv_buffer_bytes(socket)?).unwrap_or(u64::MAX),
+                drops: None,
+                release_lag: 0,
+                message_floor: macos::message_floor(),
+            })),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Inner::Real { .. } => Ok(None),
+            Inner::Sim { index, .. } => {
+                let (charged, buffer) = crate::sim::sim_queue_charge(*index);
+                Ok(Some(QueueCharge {
+                    charged: u64::try_from(charged).unwrap_or(u64::MAX),
+                    buffer: u64::try_from(buffer).unwrap_or(u64::MAX),
+                    drops: None,
+                    release_lag: 0,
+                    message_floor: 0,
+                }))
+            }
             Inner::Moved => Err(moved()),
         }
     }

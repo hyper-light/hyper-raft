@@ -74,6 +74,33 @@ fn account(charge: QueueCharge) -> Account {
     }
 }
 
+/// The rooms a driver's peers' sockets were told for their peers' stream data since it began
+/// ([`Driver::rooms`]), counted as they are told: each drain tells its socket's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rooms {
+    /// The least room told from a measurement.
+    pub least: Option<u64>,
+    /// The most room told from a measurement.
+    pub most: Option<u64>,
+    /// Drains whose socket's room was told from a measurement.
+    pub measured: u64,
+    /// Drains whose socket's room was the first window, nothing measured yet.
+    pub unmeasured: u64,
+}
+
+impl Rooms {
+    /// A peer socket's drain told it `room`, from a measurement or not.
+    fn told(&mut self, room: u64, measured: bool) {
+        if measured {
+            self.least = Some(self.least.map_or(room, |least| least.min(room)));
+            self.most = Some(self.most.map_or(room, |most| most.max(room)));
+            self.measured = self.measured.saturating_add(1);
+        } else {
+            self.unmeasured = self.unmeasured.saturating_add(1);
+        }
+    }
+}
+
 /// A socket connected to one of the endpoint's peers, sharing the listener's port.
 struct PeerSocket {
     peer: PeerId,
@@ -121,6 +148,8 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     yields: u64,
     /// What the listener's queue is learned to charge (`docs/transport.md` §4i).
     measure: SocketCharge,
+    /// The rooms its peers' sockets were told.
+    rooms: Rooms,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -194,6 +223,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             listener_ready: true,
             yields: 0,
             measure: SocketCharge::new(unmeasured),
+            rooms: Rooms::default(),
         })
     }
 
@@ -244,6 +274,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// The sockets the driver holds connected to its peers (the module's doc).
     pub fn peer_sockets(&self) -> usize {
         self.peers.len()
+    }
+
+    /// The rooms its peers' sockets were told since it began (`docs/transport.md` §4i).
+    pub fn rooms(&self) -> Rooms {
+        self.rooms
     }
 
     /// Polls that spent all their [`TURNS`] with work still to do and woke their own task to come
@@ -527,13 +562,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 |endpoint| endpoint.stream_bytes_received(id),
             )?;
             peer.ready = ended == Queued::More;
-            let room = self
+            let told = self
                 .endpoint
                 .unprompted(id)
-                .and_then(|unprompted| peer.measure.room(unprompted))
-                .unwrap_or_else(|| self.endpoint.unmeasured_peer_room());
+                .and_then(|unprompted| peer.measure.room(unprompted));
+            let room = told.unwrap_or_else(|| self.endpoint.unmeasured_peer_room());
             let _ = self.endpoint.set_peer_room(id, room);
             peer.measure.set_room(room);
+            self.rooms.told(room, told.is_some());
         }
         Ok(())
     }
@@ -580,7 +616,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             }
             _ => None,
         };
-        measure.after(before, after, consumed, emptied);
+        let datagrams = u64::try_from(taken.datagrams).unwrap_or(u64::MAX);
+        measure.after(before, after, consumed, datagrams, emptied);
         Ok(ended)
     }
 

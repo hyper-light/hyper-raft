@@ -39,6 +39,9 @@ pub struct Charged {
     pub charged: u64,
     /// The flow-controlled stream bytes it carried, the window it consumed.
     pub stream: u64,
+    /// The datagrams it held: one, or a coalesced train's (`UDP_GRO`), which the kernel charges as
+    /// one message.
+    pub datagrams: u64,
 }
 
 /// A socket's queue as the kernel accounts it.
@@ -123,12 +126,17 @@ fn greater(a: u64, b: u64) -> bool {
 /// module's doc).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReceiveCharge {
-    /// The greatest charge a stream byte of a message carrying stream data, as `(charged, stream)`.
+    /// The greatest charge a stream byte of a message carrying stream data, as `(charged, stream)`:
+    /// a datagram's or a coalesced train's.
     data: Worst<(u64, u64)>,
-    /// The greatest charge of a message carrying none.
+    /// The greatest charge of a datagram that came alone: what a probe, one datagram, may cost.
+    lone: Worst<u64>,
+    /// The greatest charge of a datagram that came alone carrying no stream data: what an
+    /// acknowledgement costs.
     control: Worst<u64>,
-    /// The greatest charge of any message.
-    largest: Worst<u64>,
+    /// The greatest charge a datagram of a coalesced train, its charge over its datagrams: what a
+    /// datagram is taken to cost until one has come alone.
+    share: Worst<u64>,
     /// Stream bytes the peers consumed in the current epoch.
     consumed: u64,
     /// The room the current epoch began with: it ends once that much is consumed.
@@ -143,11 +151,15 @@ impl ReceiveCharge {
                 now: None,
                 last: None,
             },
+            lone: Worst {
+                now: None,
+                last: None,
+            },
             control: Worst {
                 now: None,
                 last: None,
             },
-            largest: Worst {
+            share: Worst {
                 now: None,
                 last: None,
             },
@@ -158,15 +170,21 @@ impl ReceiveCharge {
 
     /// One message the kernel charged, read as the only one queued.
     pub fn sample(&mut self, message: Charged) {
-        if message.charged == 0 {
+        if message.charged == 0 || message.datagrams == 0 {
             return;
         }
         if message.stream > 0 {
             self.data.take((message.charged, message.stream), costlier);
-        } else {
-            self.control.take(message.charged, greater);
         }
-        self.largest.take(message.charged, greater);
+        if message.datagrams == 1 {
+            self.lone.take(message.charged, greater);
+            if message.stream == 0 {
+                self.control.take(message.charged, greater);
+            }
+        } else {
+            let share = message.charged.div_ceil(message.datagrams);
+            self.share.take(share, greater);
+        }
     }
 
     /// The peers consumed `stream` bytes more of their windows; `room` is the room in force. An
@@ -178,8 +196,9 @@ impl ReceiveCharge {
         self.consumed = self.consumed.saturating_add(stream);
         if self.consumed >= self.epoch {
             self.data.next_epoch();
+            self.lone.next_epoch();
             self.control.next_epoch();
-            self.largest.next_epoch();
+            self.share.next_epoch();
             self.consumed = 0;
             self.epoch = room.max(1);
         }
@@ -197,17 +216,23 @@ impl ReceiveCharge {
     }
 
     /// The stream bytes the queue holds for the peers' windows, `unprompted` messages on top:
-    /// `None` until a message carrying stream data has been sampled. Acknowledgements are counted
-    /// at the greatest charge of a message carrying no stream data (or of any, before one has
-    /// been sampled), probes at the greatest of any.
+    /// `None` until a message carrying stream data has been sampled. Each unprompted message is a
+    /// datagram that comes alone: a probe is charged as the costliest datagram that came alone,
+    /// an acknowledgement as the costliest that carried no stream data (or as a probe before one
+    /// has been sampled). Before any datagram has come alone, a coalesced train's share a
+    /// datagram stands in; a train is never a probe's charge, whose datagrams it holds many of.
     pub fn room(&self, queue: Queue, unprompted: Unprompted) -> Option<u64> {
         let (charged, stream) = self.data.get(costlier)?;
-        let largest = self.largest.get(greater).unwrap_or(charged);
-        let control = self.control.get(greater).unwrap_or(largest);
+        let lone = self
+            .lone
+            .get(greater)
+            .or_else(|| self.share.get(greater))
+            .unwrap_or(charged);
+        let acknowledgement = self.control.get(greater).unwrap_or(lone);
         let reserved = unprompted
             .acknowledgements
-            .saturating_mul(control)
-            .saturating_add(unprompted.probes.saturating_mul(largest));
+            .saturating_mul(acknowledgement)
+            .saturating_add(unprompted.probes.saturating_mul(lone));
         let usable = queue
             .buffer
             .saturating_sub(queue.release_lag)
@@ -280,6 +305,11 @@ impl SocketCharge {
         self.room
     }
 
+    /// Whether its room is told from what it measured, not the first windows before anything was.
+    pub fn measured(&self) -> bool {
+        self.queue.is_some() && self.charge.measured()
+    }
+
     /// A drain begins with the queue's account `before`: the queue's buffer and lag are taken, and
     /// a drop since the last account forgets the samples.
     pub fn before(&mut self, before: Account) {
@@ -305,13 +335,14 @@ impl SocketCharge {
     }
 
     /// A drain ended: it began with `before`, the account after it was `after` (when
-    /// [`SocketCharge::wants_after`] said to read it), it consumed `consumed` stream bytes of the
-    /// peers' windows, and it left the socket `emptied` or not.
+    /// [`SocketCharge::wants_after`] said to read it), it took `datagrams` and consumed `consumed`
+    /// stream bytes of the peers' windows, and it left the socket `emptied` or not.
     pub fn after(
         &mut self,
         before: Option<Account>,
         after: Option<Account>,
         consumed: u64,
+        datagrams: u64,
         emptied: bool,
     ) {
         if let (Some(before), Some(after)) = (before, after)
@@ -320,6 +351,7 @@ impl SocketCharge {
             self.charge.sample(Charged {
                 charged: before.charged.max(before.message_floor),
                 stream: consumed,
+                datagrams,
             });
         }
         self.charge.consumed(consumed, self.room);
@@ -355,11 +387,45 @@ mod tests {
         charge.sample(Charged {
             charged: 895,
             stream: 0,
+            datagrams: 1,
         });
         assert_eq!(charge.room(QUEUE, Unprompted::default()), None);
         assert!(!charge.measured());
     }
 
+    /// A coalesced train is never a probe's charge: probes are charged at its share a datagram
+    /// until a datagram comes alone, then at that datagram's.
+    #[test]
+    fn a_train_is_no_probes_charge() {
+        let mut charge = ReceiveCharge::new();
+        charge.sample(Charged {
+            charged: 70_000,
+            stream: 64_000,
+            datagrams: 45,
+        });
+        let unprompted = Unprompted {
+            acknowledgements: 0,
+            probes: 32,
+        };
+        let share = 70_000u64.div_ceil(45);
+        let usable = QUEUE.buffer - QUEUE.release_lag - 32 * share;
+        assert_eq!(
+            charge.room(QUEUE, unprompted),
+            Some(usable * 64_000 / 70_000),
+            "probes at the train's share a datagram until a datagram comes alone"
+        );
+        charge.sample(Charged {
+            charged: 2_304,
+            stream: 1_200,
+            datagrams: 1,
+        });
+        let usable = QUEUE.buffer - QUEUE.release_lag - 32 * 2_304;
+        assert_eq!(
+            charge.room(QUEUE, unprompted),
+            Some(usable * 1_200 / 2_304),
+            "then at the datagram's that came alone"
+        );
+    }
     /// The room is the usable queue at the worst charge a stream byte: a GRO train of 64,000
     /// stream bytes charged 70,000 and a 100-byte datagram charged 895 leave the room at the
     /// small one's cost.
@@ -369,6 +435,7 @@ mod tests {
         charge.sample(Charged {
             charged: 70_000,
             stream: 64_000,
+            datagrams: 1,
         });
         let usable = QUEUE.buffer - QUEUE.release_lag;
         assert_eq!(
@@ -378,6 +445,7 @@ mod tests {
         charge.sample(Charged {
             charged: 895,
             stream: 100,
+            datagrams: 1,
         });
         assert_eq!(
             charge.room(QUEUE, Unprompted::default()),
@@ -393,10 +461,12 @@ mod tests {
         charge.sample(Charged {
             charged: 2_290,
             stream: 1_400,
+            datagrams: 1,
         });
         charge.sample(Charged {
             charged: 768,
             stream: 0,
+            datagrams: 1,
         });
         let unprompted = Unprompted {
             acknowledgements: 10,
@@ -415,11 +485,13 @@ mod tests {
         charge.sample(Charged {
             charged: 895,
             stream: 100,
+            datagrams: 1,
         });
         charge.consumed(room, room);
         charge.sample(Charged {
             charged: 70_000,
             stream: 64_000,
+            datagrams: 1,
         });
         let usable = QUEUE.buffer - QUEUE.release_lag;
         assert_eq!(
@@ -443,6 +515,7 @@ mod tests {
         charge.sample(Charged {
             charged: 2_290,
             stream: 1_400,
+            datagrams: 1,
         });
         let before = charge.room(QUEUE, Unprompted::default());
         for _ in 0..8 {
@@ -458,6 +531,7 @@ mod tests {
         charge.sample(Charged {
             charged: 2_290,
             stream: 1_400,
+            datagrams: 1,
         });
         charge.forget();
         assert_eq!(charge.room(QUEUE, Unprompted::default()), None);

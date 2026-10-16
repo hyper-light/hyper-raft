@@ -1220,3 +1220,21 @@ charged for each stream byte a peer sends (hyper-transport's receive charge, `do
 - `Connection::ack_eliciting_in_flight` is the current path's `in_flight.ack_eliciting`: the packets
   the peer may acknowledge, one acknowledgement each at the most (RFC 9000 §13.2).
 
+## 32. A packet space's sent packets in a deque (2026-10-16)
+
+Patch Q21 holds a packet space's sent packets in `SentPackets`, a `VecDeque` of `(number, packet)` in
+packet number order, where upstream holds a `BTreeMap<u64, SentPacket>`. Packet numbers only grow
+(RFC 9000 §12.3), so each packet sent is pushed at the back, and acknowledgements come oldest
+first, so most packets leave from the front in constant time. The map moved the rest of a leaf's
+packets on each take: a `SentPacket` is 128 bytes and a leaf holds eleven. The take was the receive
+path's largest copy after its own data (`BTreeMap::remove` and its `memmove`, about 1.5 % of a bus
+node's busy samples at 100,000 messages a second, macOS `sample`, 2026-10-16). Chromium holds its
+unacknowledged packets the same way, in a deque from the least unacknowledged
+(`QuicUnackedPacketMap`).
+
+A take from the middle (an acknowledgement past a loss, or a forgotten acknowledgement-only packet)
+moves the shorter side. A lookup is a binary search that asks the newest packet first. The
+methods are the map's, so every use reads as it did. Test:
+`spaces::test::sent_packets_answer_as_the_map_they_replaced` runs the deque against the map over
+20,000 of a space's own operations from a seed: sends, takes from either end and the middle,
+lookups, and every range shape the uses ask.

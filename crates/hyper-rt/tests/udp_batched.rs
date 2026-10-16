@@ -674,8 +674,10 @@ fn a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone() {
 /// until all six are taken. Expect: the receive begun at that reading hands over at most one
 /// datagram sent after it, the one whose call ends it; every datagram arrives once and in order;
 /// the receive that finds the socket empty says so. A stamp is late, never early (`arrival`), so
-/// a busy machine can end a receive sooner, never later. A platform without stamps counts the
-/// bytes queued instead (Windows' `FIONREAD` counts every datagram), and the same holds.
+/// a busy machine can end a receive sooner, never later. A socket without stamps (Windows) counts
+/// the bytes queued when the receive is called instead (`FIONREAD`, every datagram on Winsock), the
+/// reading aside: all six were queued by then, so the bound on what came after the reading is a
+/// stamped socket's alone; the order, and the receive that finds the socket empty, hold for both.
 #[test]
 fn a_queued_receive_takes_what_was_queued_when_it_began() {
     let mut rt = LocalRuntime::new(&config()).unwrap();
@@ -719,10 +721,12 @@ fn a_queued_receive_takes_what_was_queued_when_it_began() {
             "every datagram once, in order"
         );
         let first = first.unwrap();
-        assert!(
-            first.iter().filter(|index| **index >= 3).count() <= 1,
-            "the first receive took more than one datagram sent after it began: {first:?}"
-        );
+        if receiver.stats().kernel_stamps {
+            assert!(
+                first.iter().filter(|index| **index >= 3).count() <= 1,
+                "the first receive took more than one datagram sent after it began: {first:?}"
+            );
+        }
         assert!(emptied, "the last receive found the socket empty");
     })
     .unwrap();

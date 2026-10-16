@@ -74,7 +74,7 @@ use hyper_durable_e2e::control::{self, Order, Point, Report};
 use hyper_raft::proto::ConfChangeType;
 use hyper_raft_e2e::device::{self, Probe};
 use hyper_raft_e2e::history::Recorder;
-use hyper_raft_e2e::quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Watch};
+use hyper_raft_e2e::quiet::{self, Heard, Progress, Quiet, RTO, Stuck, Waits, Watch};
 use hyper_raft_e2e::wire::{self, Control, Kind, Op, Outcome};
 use hyper_raft_e2e::{run, stream};
 
@@ -263,22 +263,29 @@ impl Cluster {
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
     fn exchange(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
-        let sent = Instant::now();
-        let answer = self.answer(id, ask);
-        self.quiet
-            .asked(id, sent, answer.is_none().then(Instant::now));
-        answer
+        self.exchange_within(id, ask, RTO)
     }
-
-    /// Sends what is in the buffer to `id` and waits for its answer to `ask`, one retransmission
-    /// timeout at most.
+    /// Sends what is in the buffer to `id` and waits for its answer to `ask`, `wait` at most; an
+    /// ask left unanswered counts toward the member's silence from its sending.
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn answer(&mut self, id: u64, ask: u64) -> Option<Vec<u8>> {
+    fn exchange_within(&mut self, id: u64, ask: u64, wait: Duration) -> Option<Vec<u8>> {
+        let sent = Instant::now();
+        let answer = self.answer(id, ask, wait);
+        self.quiet.asked(id, sent, answer.is_some());
+        answer
+    }
+
+    /// Sends what is in the buffer to `id` and waits for its answer to `ask`, `wait` at most.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
+    )]
+    fn answer(&mut self, id: u64, ask: u64, wait: Duration) -> Option<Vec<u8>> {
         self.send(id)?;
-        self.answer_by(ask, Instant::now() + RTO)
+        self.answer_by(ask, Instant::now() + wait)
     }
 
     /// Sends what is in the buffer to `id`, waiting for nothing.
@@ -328,13 +335,14 @@ impl Cluster {
         }
     }
 
-    fn ask(&mut self, id: u64, op: &Op<'_>) -> Option<Outcome> {
+    /// Asks `id` for `op` and waits for its answer, `wait` at most; what it answered.
+    fn ask(&mut self, id: u64, op: &Op<'_>, wait: Duration) -> Option<Outcome> {
         self.next_id += 1;
         let ask = self.next_id;
         wire::put_request(&mut self.buffer, ask, op);
         let call = self.clients.clock();
         let outcome = self
-            .exchange(id, ask)
+            .exchange_within(id, ask, wait)
             .and_then(|body| wire::read_response(&body).map(|(_, outcome)| outcome));
         self.clients.record(op, call, outcome.as_ref());
         outcome
@@ -510,9 +518,9 @@ impl Cluster {
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
     )]
-    fn watch(&mut self) -> Watch {
+    fn watch(&mut self, waits: Waits) -> Watch {
         self.stuck = None;
-        self.quiet.watch(Instant::now())
+        self.quiet.watch(Instant::now(), waits)
     }
 
     /// Whether the group is still moving: asks every member up and not stopped for its report, and
@@ -523,7 +531,8 @@ impl Cluster {
     /// movement; the time each member says it had a write of its log out since the watch last
     /// heard it extends the watch by the most any one had; and a member silent past the longest
     /// one write any member has reported (or the hold the test ordered) and the quiet period ends
-    /// the wait, named in the state a failure prints.
+    /// a wait on every member's own facts at once, and a wait for what the group answers once the
+    /// others are quiet (`Waits`), named in the state a failure prints.
     #[allow(
         clippy::disallowed_methods,
         reason = "real processes on the host's clock, threads and environment (CLAUDE.md §1a, end to end)"
@@ -597,7 +606,7 @@ impl Cluster {
 
     /// Waits while the group moves until `fact` holds of the members' reports; whether it did.
     fn until(&mut self, fact: impl Fn(&BTreeMap<u64, Report>) -> bool) -> bool {
-        let mut watch = self.watch();
+        let mut watch = self.watch(Waits::OnEvery);
         loop {
             let asked: Vec<u64> = self
                 .up()
@@ -619,7 +628,7 @@ impl Cluster {
 
     /// A line `id` prints that starts with `prefix`, waited for while the group moves.
     fn line_while_moving(&mut self, id: u64, prefix: &str) -> Option<String> {
-        let mut watch = self.watch();
+        let mut watch = self.watch(Waits::OnEvery);
         loop {
             let quiet = self.quiet();
             if let Some(line) = self.line(id, prefix, quiet) {
@@ -653,7 +662,7 @@ impl Cluster {
     /// The member that leads, once one does, waited for while the group moves: the members up
     /// are asked in turn, and the group is looked at only when none leads.
     fn leader(&mut self) -> Option<u64> {
-        let mut watch = self.watch();
+        let mut watch = self.watch(Waits::OnGroup);
         loop {
             for id in self.up() {
                 if self.stopped.contains(&id) {
@@ -673,7 +682,8 @@ impl Cluster {
     /// turn, until a member answers it, while the group moves; the index it was applied at. The
     /// group is looked at only when no answer came.
     fn put(&mut self, key: &[u8], value: &[u8]) -> Option<u64> {
-        let mut watch = self.watch();
+        let mut watch = self.watch(Waits::OnGroup);
+        let mut wait = RTO;
         loop {
             let to = if self.fast {
                 let up: Vec<u64> = self
@@ -686,9 +696,15 @@ impl Cluster {
             } else {
                 self.leader()?
             };
-            if let Some(Outcome::Put(index)) = self.ask(to, &Op::Put { key, value }) {
-                self.acked.insert(key.to_vec(), value.to_vec());
-                return Some(index);
+            match self.ask(to, &Op::Put { key, value }, wait) {
+                Some(Outcome::Put(index)) => {
+                    self.acked.insert(key.to_vec(), value.to_vec());
+                    return Some(index);
+                }
+                // Asked again, it waits twice as long (RFC 6298 §5.5): its commit may take
+                // longer than an ask.
+                None => wait = quiet::backoff(wait),
+                Some(_) => {}
             }
             if !self.moving(&mut watch) {
                 return None;
@@ -698,11 +714,15 @@ impl Cluster {
 
     /// Reads `key` linearizably through the leader.
     fn get(&mut self, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        let mut watch = self.watch();
+        let mut watch = self.watch(Waits::OnGroup);
+        let mut wait = RTO;
         loop {
             let leader = self.leader()?;
-            if let Some(Outcome::Value(value)) = self.ask(leader, &Op::Get { key }) {
-                return Some(value);
+            match self.ask(leader, &Op::Get { key }, wait) {
+                Some(Outcome::Value(value)) => return Some(value),
+                // Asked again, it waits twice as long (RFC 6298 §5.5).
+                None => wait = quiet::backoff(wait),
+                Some(_) => {}
             }
             if !self.moving(&mut watch) {
                 return None;
@@ -1163,10 +1183,11 @@ fn stalled_devices() -> String {
 }
 
 /// A follower stopped mid-scenario, answering nothing outside any write of its log (`SIGSTOP`; on
-/// Windows, which has no stop signal, it holds its thread until the test releases it): the wait for
-/// a write it cannot apply fails, naming it, once its silence passes what the members' longest
-/// write and the quiet period excuse, rather than waiting for good. Let go, it applies the same
-/// history as the others.
+/// Windows, which has no stop signal, it holds its thread until the test releases it): the two
+/// members up commit a write without it, however long their writes make that, and the wait for it
+/// to apply the write fails, naming it, once its silence passes what the members' longest write
+/// and the quiet period excuse, rather than waiting for good. Let go, it applies the same history
+/// as the others.
 fn member_stopped() -> String {
     let name = "member-stopped";
     let mut cluster = Cluster::start(name, 3);
@@ -1277,7 +1298,7 @@ fn founder_fenced() -> String {
     assert_eq!(stopped.as_deref(), Some("stopped fenced"));
     cluster.kill(founder);
     cluster.restart(founder, true);
-    let mut watch = cluster.watch();
+    let mut watch = cluster.watch(Waits::OnGroup);
     let mut asked = Instant::now();
     loop {
         if let Some(leader) = cluster.leader()

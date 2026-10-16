@@ -1644,7 +1644,9 @@ retransmission timeout (RFC 6298:
 one second before a round trip is measured and never less after, §2.1, §2.4). Quiet is only time in
 which the test heard every member, by hyper-raft-e2e's rule, one module both harnesses' waits keep
 (`hyper_raft_e2e::quiet`; "The same rule in the other harnesses", below). An ask is resent at
-that timeout. A member just started is waited on while its process runs. Its count bounds are the
+that timeout, and an operation asked again waits twice as long as the ask before, to sixty seconds
+(RFC 6298 §5.5, §2.5; "A member stopped while the others' writes are slow", below). A member just
+started is waited on while its process runs. Its count bounds are the
 protocol's: a member passes each durability point at least once for each turn of writes it takes
 (the most a turn takes, `max_pending + voters + 1`), so a target that has not stopped after that
 many answered writes is a failure. New scenarios: a stalled disk (the member's file stops
@@ -1688,12 +1690,18 @@ nothing (its answer after counts as movement); and the time the members report t
 spent in their logs' writes since the watch last heard them extends the watch by the most any one
 spent. A member's silence is excused only as far as the members' own measures go: the longest one
 write of a log any member has reported (or the stall the test ordered) and the quiet period,
-against its silence counted from its first unanswered ask to its latest, less the retransmission
-timeout the test waited on the latest (a lost ask costs the test, not the member). Past it the wait
-fails, naming the member, with the group's state: `member-stopped` stops a follower (`SIGSTOP`
-on Unix; on Windows, which has no stop signal, the member holds its thread outside any write) and
-asserts the wait fails naming it, then lets it go and the group converges. The rule is one module,
-`hyper_raft_e2e::quiet`, which hyper-durable-e2e's waits keep as well. The partition is also seen by the
+against its silence counted from the sending of its first unanswered ask to the sending of its
+latest (a lost ask costs the test the time it waited, not the member). Past it a wait for a fact of
+every member's own (what each applied, a line one prints) fails at once, naming the member, with
+the group's state; a wait for what the group answers through whichever members lead (a write, a
+read, a leader) waits on it no longer, goes on while the members heard move, and fails naming it
+once they are quiet (`Waits`, below). `member-stopped` stops a follower (`SIGSTOP` on Unix; on
+Windows, which has no stop signal, the member holds its thread outside any write), lets the two
+members up commit a write without it, and asserts the wait for it to apply the write fails naming
+it, then lets it go and the group converges. An operation asked again after an ask went unanswered
+waits twice as long as the ask before, to sixty seconds (RFC 6298 §5.5 and §2.5), so a commit
+slower than one retransmission timeout is still answered. The rule is one module,
+`hyper_raft_e2e::quiet`, which hyper-durable-e2e's and hyper-multilog-e2e's waits keep as well. The partition is also seen by the
 detectors: the member cut off suspects every other and every other suspects it. Its bounds stay the
 scenario's: the keys it writes, the asks it keeps waiting, and a log of one entry a write and one a
 term, for a leader proposes no write its log already holds and each term's leader appends one
@@ -1855,6 +1863,36 @@ hyper-raft-e2e's had, each failing on CI once in a way a re-run passed:
   both tests hold every report's count to zero, exactly. On `09e8316`'s loops the count failed both
   tests on macOS in `member-stopped`: 35 in hyper-raft-e2e's member stopped 3 s, 4 in
   hyper-durable-e2e's; with the loops so, both tests passed whole, every count zero.
+- **A member stopped while the others' writes are slow** (2026-10-16; CI's ubuntu-24.04, run
+  37152765895 on `36e01cd`). hyper-durable-e2e's `member-stopped` failed "the two members up took
+  no write": member 1 stopped, members 2 and 3 went through three elections to term 5 (3 leading,
+  commit 7) with writes of 597 and 741 ms against detections of 54 and 107 ms, and the write they
+  were committing was given up when the stopped member's silence reached 3.08 s against 2.88 s
+  excused. Two rules of the harness, not of the group, decided it. A member silent past its excuse
+  ended every wait at once, whatever else moved, though the write needed only the two members up,
+  which were moving. And every ask waited one second, the operation then asked again with a new
+  ask, so a commit that takes longer than a second, as one does through writes of that length, was
+  never answered: each answer came after its ask was given up. A scratch fault (not committed)
+  holds every flush of the two members up 741 and 597 ms more from the stop on: on `main` the
+  scenario failed 3 of 3 with CI's message on macOS, with no election, the write in both members'
+  logs and not yet committed when the wait gave up, the longest write 2.4–2.5 s. With only the first
+  rule changed the write was never answered: the leader committed it 29 times more in 85 s, an
+  entry an ask, each answer after its ask had given up. Now a member silent past its excuse ends at once only a wait for a fact of every
+  member's own (`Waits::OnEvery`: what each applied, a line one prints); a wait for what the group
+  answers through whichever members lead (`Waits::OnGroup`: a write, a read, a leader) waits on it
+  no longer, goes on while the members heard move, and fails naming it once they are quiet. An
+  operation asked again waits twice as long as its ask before (RFC 6298 §5.5, "back off the timer"),
+  to sixty seconds, the least maximum §2.5 allows (`quiet::backoff`), and a member's silence runs
+  between the sendings of its asks, whatever each waited. With both, under the same fault the
+  scenario passed 2 of 2 with the links young at the stop (the write answered in 11.1 and 16.3 s,
+  asked three and four times), and 2 of 2 with every pair judged before it (the write answered in
+  26 and 91 s). With every pair judged, the two members elected again and again: from term 4 to 6
+  and to 11 in the two runs, and to 13 in a third under the first rule, each new leader's writes
+  suspected in turn until their detectors had the device's evidence (detection from 0.4–0.7 s to
+  7–17 s); every election moved the group, so no wait went quiet. With the links young at the stop,
+  they never configured under that fault (390 s, 216 heartbeats taken), and no member suspected
+  another: with the leader stopped instead, the two members up suspected no one and elected no one
+  in 291 s (the open defect in `docs/STATUS.md`).
 
 **What the runs measured of the detectors** (every scenario prints, for each member, its floors,
 longest flush and longest time between two reads of its socket, and for each pair what the

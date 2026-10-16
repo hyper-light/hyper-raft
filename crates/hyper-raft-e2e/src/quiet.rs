@@ -11,21 +11,27 @@
 //! - **The time in writes.** The time the members report spending in their writes since the watch
 //!   last heard them extends the watch by the most any one of them spent: a member whose write is
 //!   out moves nothing through itself, whatever its thread does meanwhile.
-//! - **Silence.** A member's silence, from its first unanswered ask to its latest less the
-//!   retransmission timeout the test waited on the latest (an ask whose answer was lost costs the
-//!   test, not the member), is excused only up to the longest one write any member has reported, or
-//!   the stall the test ordered, and the quiet period. Past it the member answers nothing, whatever
-//!   holds it, and the wait fails naming it rather than waiting for good. So is a member that
-//!   answers while its oldest write has been out that long, less the same timeout
-//!   (hyper-durable-e2e's, whose log's threads do its writes): its group moves through it only once
-//!   the write is durable, a write that never ends would otherwise extend the watch for good, and
-//!   the timeout keeps the write judged as a member's thread held in it would be, by a look whose
-//!   ask waits that long for its answer.
+//! - **Silence.** A member's silence, from the sending of its first unanswered ask to the sending
+//!   of its latest (an ask whose answer was lost costs the test the time it waited, not the
+//!   member), is excused only up to the longest one write any member has reported, or the stall the
+//!   test ordered, and the quiet period. Past it the member answers nothing, whatever holds it. A
+//!   wait for a fact of every member's own ([`Waits::OnEvery`]) then fails at once, naming it,
+//!   rather than waiting for good. A wait for what the group answers through whichever members lead
+//!   ([`Waits::OnGroup`]) waits on it no longer: it goes on while the members heard move, and once
+//!   they are quiet it fails, naming the member it could not hear.
+//! - **A write out.** A member that answers with its oldest write out (hyper-durable-e2e's, whose
+//!   log's threads do its writes) moves its group through it only once the write is durable, and a
+//!   write that never ends would extend the watch for good: one out past the kernel's own bound on
+//!   a flush ([`crate::device::FLUSH_BOUND`]) ends the wait, naming the member ([`Stuck::Held`]).
 //! - **The device.** Before a member is judged held, the harness flushes its own file on the
 //!   members' device ([`crate::device::Probe`]) and states the flush's time ([`Quiet::device`]),
 //!   which joins what excuses a write: a write slower than any before it is a member's only if the
 //!   device answers the test's flush faster. A device that answers no flush within the kernel's
 //!   own bound has failed ([`Stuck::Device`]).
+//!
+//! An ask waits a retransmission timeout for its answer; an operation asked again after an ask went
+//! unanswered waits twice as long as the ask before ([`backoff`], RFC 6298 §5.5), so an answer
+//! that takes longer than a timeout, a commit on a slow device, is still taken.
 //!
 //! The harnesses feed it what their looks saw ([`Quiet::look`]) and the asks they made
 //! ([`Quiet::asked`]); it reads no clock of its own.
@@ -39,6 +45,9 @@ use crate::wire::Status;
 /// period is shorter: past it the test could not tell a member that did not move from an answer it
 /// did not wait for.
 pub const RTO: Duration = Duration::from_secs(1);
+/// RFC 6298 §2.5: the least a maximum on the retransmission timeout may be, sixty seconds; the
+/// most an ask backed off ([`backoff`]) waits.
+pub const RTO_MAX: Duration = Duration::from_secs(60);
 /// The rounds an ask and its answer take beside an election: the ask, the broadcast that commits
 /// it, and the answer.
 pub const ANSWER_ROUNDS: u32 = 3;
@@ -70,6 +79,27 @@ pub fn law(
     )
     .saturating_add(Duration::from_nanos(span_ns))
     .saturating_add(rounds)
+}
+
+/// How long an operation's next ask waits once its ask that waited `waited` went unanswered: twice
+/// as long (RFC 6298 §5.5, "back off the timer"), at most [`RTO_MAX`] (§2.5). An operation asked
+/// again is a retransmission; an answer that takes longer than every ask waits, as a write's
+/// commit through writes slower than a timeout does, is otherwise never taken, each ask given up
+/// before its answer comes and the operation asked again.
+pub fn backoff(waited: Duration) -> Duration {
+    waited.saturating_mul(2).min(RTO_MAX)
+}
+
+/// What a wait waits for, which decides what a member silent past its excuse does to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waits {
+    /// A fact of every member's own, such as what each one applied or a line one prints: a member
+    /// silent past its excuse can do nothing toward it, and ends the wait at once, named.
+    OnEvery,
+    /// What the group answers through whichever of its members lead: a write, a read, a leader. A
+    /// member silent past its excuse is waited on no longer: the wait goes on while the members
+    /// heard move, and ends, naming the member, once they are quiet.
+    OnGroup,
 }
 
 /// What a wait watches move in one member's report.
@@ -125,6 +155,8 @@ pub struct Heard {
 /// What a wait last saw of each member, and until when it waits without seeing more.
 #[derive(Debug)]
 pub struct Watch {
+    /// What the wait waits for.
+    waits: Waits,
     seen: BTreeMap<u64, Progress>,
     /// What each member said it had spent in its writes when this watch last heard it.
     blocked: BTreeMap<u64, u64>,
@@ -222,7 +254,7 @@ pub struct Seen {
 pub struct Quiet {
     law: BTreeMap<u64, Duration>,
     /// For each member that left asks unanswered since it last answered: when the first of them
-    /// was sent, and when the latest gave up.
+    /// was sent, and when the latest was.
     unanswered: BTreeMap<u64, (Instant, Instant)>,
     /// The longest one write any member has reported, nanoseconds.
     write_most: u64,
@@ -243,19 +275,16 @@ impl Quiet {
         Self::default()
     }
 
-    /// An ask to `id` sent at `sent` was answered (`gave_up` none), or given up at `gave_up`
-    /// without its answer.
-    pub fn asked(&mut self, id: u64, sent: Instant, gave_up: Option<Instant>) {
-        match gave_up {
-            None => {
-                self.unanswered.remove(&id);
-            }
-            Some(gave_up) => {
-                self.unanswered
-                    .entry(id)
-                    .and_modify(|(_, latest)| *latest = gave_up)
-                    .or_insert((sent, gave_up));
-            }
+    /// An ask to `id` sent at `sent` was answered, or given up without its answer: whatever it
+    /// waited, the member's silence runs to its sending.
+    pub fn asked(&mut self, id: u64, sent: Instant, answered: bool) {
+        if answered {
+            self.unanswered.remove(&id);
+        } else {
+            self.unanswered
+                .entry(id)
+                .and_modify(|(_, latest)| *latest = sent)
+                .or_insert((sent, sent));
         }
     }
 
@@ -300,9 +329,10 @@ impl Quiet {
         self.seen
     }
 
-    /// A fresh watch over the group's progress, from `now`.
-    pub fn watch(&self, now: Instant) -> Watch {
+    /// A fresh watch over the group's progress, from `now`, for a wait for what `waits` says.
+    pub fn watch(&self, now: Instant, waits: Waits) -> Watch {
         Watch {
+            waits,
             seen: BTreeMap::new(),
             blocked: BTreeMap::new(),
             unheard: BTreeSet::new(),
@@ -314,10 +344,12 @@ impl Quiet {
     /// not those in `unheard`, whose processes run. The watch is extended by a quiet period from
     /// `now` when any member heard moved, or answered after a look that did not hear it; by the
     /// most any member heard spent in its writes since the watch last heard it otherwise. The look
-    /// decides only if it heard every member and began after the watch's end: a look begun before
-    /// counts as movement unseen, for an ask whose answer was lost spends the test's own timeout,
-    /// not the group's. A member unheard, or heard with its oldest write out, past what the
-    /// members' measures excuse ends the wait.
+    /// decides only if it began after the watch's end and heard every member but those silent past
+    /// what the members' measures excuse: a look begun before counts as movement unseen, for an
+    /// ask whose answer was lost spends the test's own timeout, not the group's. A member silent
+    /// past its excuse ends a wait [`Waits::OnEvery`] at once, and a wait [`Waits::OnGroup`] once a
+    /// look decides, naming it; a member heard with its oldest write out past the kernel's bound
+    /// on a flush ends the wait.
     pub fn look(
         &mut self,
         watch: &mut Watch,
@@ -347,7 +379,7 @@ impl Quiet {
         watch.unheard.extend(unheard.iter().copied());
         let period = self.period();
         let excuse = period.saturating_add(self.write_most().max(self.stall).max(self.device));
-        let silent = self.silence(unheard, excuse);
+        let (silent, within) = self.silence(unheard, excuse);
         // A member inside its write waits on the kernel: on a busy machine one write on a
         // contended device, its thread competing for the CPU, stays out for seconds while another
         // flush, the members' or the test's own, returns at once (hyper-durable-e2e's kill
@@ -365,7 +397,9 @@ impl Quiet {
         } else {
             later(watch.until, Duration::from_nanos(excused))
         };
-        if let Some((member, silence)) = silent {
+        if watch.waits == Waits::OnEvery
+            && let Some((member, silence)) = silent
+        {
             return Err(Stuck::Silent {
                 member,
                 silence,
@@ -379,33 +413,47 @@ impl Quiet {
                 excuse,
             });
         }
-        if looked < watch.until || !unheard.is_empty() {
-            Ok(())
-        } else {
-            Err(Stuck::Quiet(period))
+        // A member unheard within its excuse may be in a write: the look decides nothing. One
+        // silent past it, in a wait for what the group answers, is waited on no longer and
+        // decides nothing either: the wait goes on while the members heard move, as it would
+        // without it, and ends naming it once they are quiet.
+        if looked < watch.until || within {
+            return Ok(());
+        }
+        match silent {
+            Some((member, silence)) => Err(Stuck::Silent {
+                member,
+                silence,
+                excuse,
+            }),
+            None => Err(Stuck::Quiet(period)),
         }
     }
 
-    /// The first of the members in `unheard` silent past `excuse`, and how long. A member's
-    /// silence runs from its first unanswered ask to its latest, less the retransmission timeout
-    /// the test waited on the latest: one lost ask is no silence, and each ask after it adds the
-    /// time between them.
-    fn silence(&mut self, unheard: &[u64], excuse: Duration) -> Option<(u64, Duration)> {
+    /// The first of the members in `unheard` silent past `excuse`, and how long; and whether any
+    /// of them is unheard within it. A member's silence runs from the sending of its first
+    /// unanswered ask to the sending of its latest: one lost ask is no silence, and each ask after
+    /// it adds the time between them.
+    fn silence(&mut self, unheard: &[u64], excuse: Duration) -> (Option<(u64, Duration)>, bool) {
         let mut silent = None;
+        let mut within = false;
         for id in unheard {
             let Some((first, latest)) = self.unanswered.get(id) else {
+                within = true;
                 continue;
             };
-            let silence = latest.saturating_duration_since(*first).saturating_sub(RTO);
+            let silence = latest.saturating_duration_since(*first);
             if silence > self.seen.silence_most {
                 self.seen.silence_most = silence;
                 self.seen.excused_then = excuse;
             }
-            if silence > excuse && silent.is_none() {
+            if silence <= excuse {
+                within = true;
+            } else if silent.is_none() {
                 silent = Some((*id, silence));
             }
         }
-        silent
+        (silent, within)
     }
 }
 
@@ -445,7 +493,7 @@ mod tests {
         let mut quiet = Quiet::new();
         // One member, its law one second, its longest write 100 ms: the excuse is 1.1 s.
         quiet.reported(1, Duration::from_secs(1), 100_000_000);
-        let mut watch = quiet.watch(start);
+        let mut watch = quiet.watch(start, Waits::OnGroup);
         // A first look sets the member's progress; nothing is out yet.
         assert!(
             quiet
@@ -487,6 +535,107 @@ mod tests {
             matches!(held, Err(Stuck::Held { member: 1, .. })),
             "{held:?}"
         );
+    }
+
+    /// Member `id` heard at `term`, no write out.
+    fn heard_at(id: u64, term: u64) -> Heard {
+        let mut heard = heard(id, Duration::ZERO);
+        heard.progress.term = term;
+        heard
+    }
+
+    /// A member silent past its excuse, in a wait for what the group answers, is waited on no
+    /// longer, and the wait goes on while the members heard move (hyper-durable-e2e's
+    /// `member-stopped`, CI's ubuntu-24.04: the two members up elected three times through writes of
+    /// 597 and 741 ms, and the write they were committing was given up at the stopped member's
+    /// 3.08 s of silence against 2.88 s excused). Once they are quiet past the watch's end, the wait
+    /// ends naming the member it could not hear; a member unheard within its excuse leaves a quiet
+    /// look undecided.
+    #[test]
+    fn a_silent_member_ends_a_wait_for_the_group_only_once_the_members_heard_are_quiet() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut quiet = Quiet::new();
+        // Two members, each's law one second, the longest write 100 ms: 1.1 s excused.
+        quiet.reported(1, Duration::from_secs(1), 100_000_000);
+        quiet.reported(2, Duration::from_secs(1), 100_000_000);
+        let mut watch = quiet.watch(start, Waits::OnGroup);
+        let out = quiet.look(&mut watch, at(0), at(100), &[heard_at(1, 1)], &[]);
+        assert!(out.is_ok(), "{out:?}");
+        // Member 2 silent 1 s between the sendings of its asks, within its excuse: a quiet look
+        // past the watch's end decides nothing.
+        quiet.asked(2, at(100), false);
+        quiet.asked(2, at(1_100), false);
+        let out = quiet.look(&mut watch, at(1_200), at(2_100), &[heard_at(1, 1)], &[2]);
+        assert!(out.is_ok(), "{out:?}");
+        // Silent 2 s, past its excuse, while member 1 moves: the wait goes on.
+        quiet.asked(2, at(2_100), false);
+        let out = quiet.look(&mut watch, at(2_200), at(3_100), &[heard_at(1, 2)], &[2]);
+        assert!(out.is_ok(), "{out:?}");
+        // Member 1 still, but the look began before the watch's end: undecided.
+        quiet.asked(2, at(3_100), false);
+        let out = quiet.look(&mut watch, at(3_200), at(4_100), &[heard_at(1, 2)], &[2]);
+        assert!(out.is_ok(), "{out:?}");
+        // Member 1 quiet past the watch's end: the wait ends, naming member 2.
+        quiet.asked(2, at(4_100), false);
+        let out = quiet.look(&mut watch, at(4_200), at(5_100), &[heard_at(1, 2)], &[2]);
+        assert!(
+            matches!(
+                out,
+                Err(Stuck::Silent {
+                    member: 2,
+                    silence,
+                    excuse,
+                }) if silence == Duration::from_millis(4_000) && excuse == Duration::from_millis(1_100)
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// A wait for a fact of every member's own ends at once when a member is silent past its
+    /// excuse, however the others move: it can do nothing toward the fact.
+    #[test]
+    fn a_silent_member_ends_a_wait_on_every_member_at_once() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut quiet = Quiet::new();
+        quiet.reported(1, Duration::from_secs(1), 100_000_000);
+        quiet.reported(2, Duration::from_secs(1), 100_000_000);
+        let mut watch = quiet.watch(start, Waits::OnEvery);
+        quiet.asked(2, at(0), false);
+        quiet.asked(2, at(2_000), false);
+        let out = quiet.look(&mut watch, at(1_900), at(3_000), &[heard_at(1, 1)], &[2]);
+        assert!(
+            matches!(out, Err(Stuck::Silent { member: 2, silence, .. }) if silence == Duration::from_secs(2)),
+            "{out:?}"
+        );
+    }
+
+    /// A member answered is silent no longer: its next unanswered ask starts its silence again.
+    #[test]
+    fn an_answer_ends_a_members_silence() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut quiet = Quiet::new();
+        quiet.reported(1, Duration::from_secs(1), 0);
+        quiet.reported(2, Duration::from_secs(1), 0);
+        let mut watch = quiet.watch(start, Waits::OnEvery);
+        quiet.asked(2, at(0), false);
+        quiet.asked(2, at(900), true);
+        quiet.asked(2, at(1_000), false);
+        quiet.asked(2, at(1_900), false);
+        // 0.9 s since its latest silence began, within the 1 s excused.
+        let out = quiet.look(&mut watch, at(1_950), at(2_000), &[heard_at(1, 1)], &[2]);
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// An operation asked again waits twice the ask before, up to RFC 6298's least maximum.
+    #[test]
+    fn an_ask_backs_off_to_rfc_6298s_maximum() {
+        assert_eq!(backoff(RTO), Duration::from_secs(2));
+        assert_eq!(backoff(Duration::from_secs(16)), Duration::from_secs(32));
+        assert_eq!(backoff(Duration::from_secs(32)), RTO_MAX);
+        assert_eq!(backoff(RTO_MAX), RTO_MAX);
     }
 
     /// A member's law covers the interval its own heartbeats go at: until a heartbeat at that

@@ -65,14 +65,17 @@ fn workers() -> NonZeroUsize {
     std::thread::available_parallelism().unwrap()
 }
 
+/// A budget every worker's fingerprint table fits in whatever the host's width: each starts at 1,024
+/// slots of a 16-byte fingerprint (16 KiB a worker, the explorer's `PrintSet::new`), and 64 MiB
+/// holds 4,096 of them beside the model's four states. A budget is a bound, not an allocation: the
+/// run is charged what it holds. A fixed 1 MiB was spent by a 32-thread host's tables before the
+/// model's third step, so the run answered `Unknown` rather than the unwind.
+const BUDGET: Budget = Budget { memory: 64 << 20 };
+
 #[test]
 fn a_model_that_unwinds_is_answered_typed() {
     for bomb in [false, true] {
-        let found = explore(
-            &Unwinds { at: 3, bomb },
-            workers(),
-            Budget { memory: 1 << 20 },
-        );
+        let found = explore(&Unwinds { at: 3, bomb }, workers(), BUDGET);
         assert!(
             matches!(found, Err(ExploreError::Worker)),
             "bomb {bomb}: {found:?}"

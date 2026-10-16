@@ -33,6 +33,6 @@ jobs:
       - run: |
           mkdir -p "$RUNNER_TEMP/depth"
           uptime
-          cargo bench -p hyper-durable --bench depth --locked -- "$RUNNER_TEMP/depth" 1,4,16,64 25,50,75,90 3 file,sim
-          cargo bench -p hyper-durable --bench depth --locked -- "$RUNNER_TEMP/depth" 1,4 25,50,75,90 3 file 1230 16,256
+          cargo bench -p hyper-durable --bench depth --locked -- "$RUNNER_TEMP/depth" 1,4,16,64 25,50,75,90 6 file,sim
+          cargo bench -p hyper-durable --bench depth --locked -- "$RUNNER_TEMP/depth" 1,4 25,50,75,90 6 file 615 16,256
         shell: bash

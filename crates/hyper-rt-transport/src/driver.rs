@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use hyper_rt::RtError;
 use hyper_rt::futures::{Sleep, sleep};
 use hyper_rt::readiness::Ready;
-use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, Ring, UdpSocket};
+use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, Queued, Ring, UdpSocket};
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness, PeerId};
 
 /// Derived: the turns one poll of [`Driver::event`] takes before it yields to the shard, the bound
@@ -101,6 +101,10 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     outgoing: Vec<u8>,
     /// The receive buffers every socket is lent as it is read.
     ring: Ring,
+    /// Whether the listener may hold datagrams: its readiness fired, or its last drain left some.
+    listener_ready: bool,
+    /// Polls that spent their turns with work still to do and woke their task to come back.
+    yields: u64,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -108,7 +112,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// each peer where the platform lets it (the module's doc). Called on a shard thread.
     pub fn bind(endpoint: Endpoint<C, B, D>, address: SocketAddr, io: Io) -> Result<Self, RtError> {
         let ring = Ring::new(io)?;
-        match Batched::bind_shared_lent(address, false) {
+        match Batched::bind_shared_lent(address, true) {
             Ok(socket) => {
                 let local = socket.local_addr()?;
                 let mut driver = Self::with_ring(endpoint, socket, ring)?;
@@ -117,7 +121,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             }
             Err(RtError::BadConfig { .. }) => Self::with_ring(
                 endpoint,
-                Batched::lent(UdpSocket::bind(address)?, false)?,
+                Batched::lent(UdpSocket::bind(address)?, true)?,
                 ring,
             ),
             Err(error) => Err(error),
@@ -169,6 +173,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             held: None,
             outgoing: Vec::new(),
             ring,
+            listener_ready: true,
+            yields: 0,
         })
     }
 
@@ -219,6 +225,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// The sockets the driver holds connected to its peers (the module's doc).
     pub fn peer_sockets(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Polls that spent all their [`TURNS`] with work still to do and woke their own task to come
+    /// back after the shard's other tasks: how often the driver had more than a poll's work.
+    pub fn yields(&self) -> u64 {
+        self.yields
+    }
+
+    /// The sockets whose last drain left datagrams for the next turn, the listener among them: the
+    /// backlog the driver is behind on. It never parks with one: it turns again, or wakes itself
+    /// once its turns are spent ([`Driver::yields`]).
+    pub fn backlogged(&self) -> usize {
+        let peers = self.peers.iter().filter(|peer| peer.ready).count();
+        peers.saturating_add(usize::from(self.listener_ready))
     }
 
     /// Now on the endpoint's clock: the instant the owner passes to the endpoint's calls (`connect`,
@@ -282,18 +302,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             }
         }
         // The budget is spent with work still to do: come back after the shard's other tasks.
+        self.yields = self.yields.saturating_add(1);
         context.waker().wake_by_ref();
         Poll::Pending
     }
 
     /// Polls the sockets' readiness waits, arming them as needed; whether one fired.
     fn poll_ready(&mut self, context: &mut Context<'_>) -> Result<bool, RtError> {
-        let mut fired = false;
-        let readable = self.readable.get_or_insert_with(|| self.socket.readable());
-        if let Poll::Ready(outcome) = Pin::new(readable).poll(context) {
-            self.readable = None;
-            outcome?;
-            fired = true;
+        // A socket that may hold datagrams is work now: its readiness, one-shot, fires when a
+        // datagram arrives, not for one already waiting, so a driver that awaited it would park
+        // with them unread.
+        let mut fired = self.listener_ready || self.peers.iter().any(|peer| peer.ready);
+        if !self.listener_ready {
+            let readable = self.readable.get_or_insert_with(|| self.socket.readable());
+            if let Poll::Ready(outcome) = Pin::new(readable).poll(context) {
+                self.readable = None;
+                outcome?;
+                self.listener_ready = true;
+                fired = true;
+            }
         }
         // A socket is awaited writable while its outbox holds datagrams or it holds the transmit
         // the driver waits on.
@@ -366,7 +393,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             {
                 continue;
             }
-            let Ok(mut socket) = Batched::bind_shared_lent(local, false) else {
+            let Ok(mut socket) = Batched::bind_shared_lent(local, true) else {
                 continue;
             };
             if socket.connect(remote).is_err() {
@@ -433,37 +460,40 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         Ok(())
     }
 
-    /// Takes the datagrams that have arrived, a batch at a time, until none or [`TURNS`] batches: the
-    /// listener's, and each peer socket's whose readiness fired.
+    /// Takes, from the listener and each peer socket that may hold datagrams, what was queued
+    /// when the drain began ([`Batched::receive_queued`]), what arrives meanwhile left for the next
+    /// turn: the turn then sends, the peers' credit among what it sends, after the backlog it found
+    /// and not after whatever more its peers kept sending, which a drain to empty had read first.
+    /// A socket left holding datagrams is drained at the next turn without awaiting readiness. At
+    /// most [`TURNS`] receive calls a socket.
     fn drain(&mut self) -> Result<(), RtError> {
+        let began = shard_now()?;
         let (anchor_ns, anchor) = self.anchor;
         let endpoint = &mut self.endpoint;
+        // The endpoint is told when each datagram was read, as hyper-tokio's driver tells it; the
+        // kernel's stamp only says what was queued when the drain began.
         let mut deliver = |arrival: hyper_rt::udp::Arrival, bytes: &mut [u8]| {
             let at = anchor
                 .checked_add(Duration::from_nanos(
-                    arrival.at_ns.saturating_sub(anchor_ns),
+                    arrival.read_ns.saturating_sub(anchor_ns),
                 ))
                 .unwrap_or(anchor);
             endpoint.handle_datagram(at, arrival.from, None, bytes);
         };
-        for _ in 0..TURNS {
-            if self.socket.receive_with(&mut self.ring, &mut deliver)? == 0 {
-                break;
-            }
+        if self.listener_ready {
+            let (_, ended) =
+                self.socket
+                    .receive_queued(&mut self.ring, began, TURNS, &mut deliver)?;
+            self.listener_ready = ended == Queued::More;
         }
         for peer in &mut self.peers {
             if !peer.ready {
                 continue;
             }
-            let mut emptied = false;
-            for _ in 0..TURNS {
-                if peer.socket.receive_with(&mut self.ring, &mut deliver)? == 0 {
-                    emptied = true;
-                    break;
-                }
-            }
-            // A socket left holding datagrams is drained again at the next turn without a wait.
-            peer.ready = !emptied;
+            let (_, ended) =
+                peer.socket
+                    .receive_queued(&mut self.ring, began, TURNS, &mut deliver)?;
+            peer.ready = ended == Queued::More;
         }
         Ok(())
     }

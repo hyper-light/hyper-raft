@@ -34,7 +34,9 @@ mod batched;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use batched::{Arrival, Batched, Io, IoStats, MAX_BATCH, RECEIVE_BYTES, Ring, Sent, Slot};
+pub use batched::{
+    Arrival, Batched, Io, IoStats, MAX_BATCH, Queued, RECEIVE_BYTES, Ring, Sent, Slot,
+};
 
 use crate::error::RtError;
 use crate::netsys::{self, Family, Socket};
@@ -224,6 +226,17 @@ impl UdpSocket {
         match &self.inner {
             Inner::Real { socket } => netsys::recv_buffer_bytes(socket),
             Inner::Sim { .. } => Ok(crate::sim::SIM_RECV_BUFFER_BYTES),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// The bytes waiting in its receive queue as the platform counts them: every queued datagram's
+    /// on Windows and the BSDs (the BSDs with their addresses and control), only the next one's on
+    /// Linux (`FIONREAD`), every one's on the simulation fabric.
+    pub fn queued_bytes(&self) -> Result<usize, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::queued_bytes(socket),
+            Inner::Sim { index, .. } => Ok(crate::sim::sim_queued(*index)),
             Inner::Moved => Err(moved()),
         }
     }

@@ -104,6 +104,15 @@ mod imp {
             .map_err(|e| refused("getsockopt", e))
     }
 
+    /// The bytes waiting in the socket's receive queue as `FIONREAD` counts them: on XNU and the
+    /// other BSDs every queued datagram's, with their addresses and control (`soioctl`:
+    /// `so_rcv.sb_cc`); on Linux only the next datagram's (udp(7), `SIOCINQ`).
+    pub(crate) fn queued_bytes(socket: &Socket) -> Result<usize, RtError> {
+        let bytes =
+            rustix::io::ioctl_fionread(&socket.fd).map_err(|e| refused("ioctl(FIONREAD)", e))?;
+        Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
+    }
+
     /// Asks for a kernel receive buffer of `bytes`: on Linux `SO_RCVBUFFORCE` first, which passes
     /// `net.core.rmem_max` for a process that may (`CAP_NET_ADMIN`), then `SO_RCVBUF`, which Linux
     /// caps at `rmem_max` without a word; a size the OS refuses outright (macOS past
@@ -353,12 +362,12 @@ pub(crate) mod imp {
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET,
-        IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_DONTFRAG, IPV6_V6ONLY,
-        SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
-        SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAECONNREFUSED,
-        WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
-        WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
+        AF_INET, AF_INET6, FIONBIO, FIONREAD, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
+        INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_DONTFRAG,
+        IPV6_V6ONLY, SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+        SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA,
+        WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET,
+        WSAENETUNREACH, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
         connect as ws_connect, getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom,
         send as ws_send, sendto as ws_sendto, setsockopt, socket as ws_socket,
     };
@@ -561,6 +570,18 @@ pub(crate) mod imp {
             "getsockopt(SO_RCVBUF)",
         )?;
         usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
+    }
+
+    /// The bytes waiting in the socket's receive queue: for a datagram socket every queued
+    /// datagram's ("Winsock IOCTLs", `FIONREAD`: "the total number of bytes available to read, not
+    /// the size of the first datagram").
+    pub(crate) fn queued_bytes(socket: &Socket) -> Result<usize, RtError> {
+        let mut bytes: u32 = 0;
+        // SAFETY: FIONREAD writes one u32 through the pointer; a live local suffices.
+        if unsafe { ioctlsocket(socket.socket, FIONREAD, &mut bytes) } == SOCKET_ERROR {
+            return Err(last("ioctlsocket(FIONREAD)"));
+        }
+        Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
     }
 
     /// Asks for a kernel receive buffer of `bytes` (`SO_RCVBUF`, an `int`); a size Winsock refuses
@@ -871,6 +892,6 @@ pub(crate) use imp as winsock;
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-    adopt, bind, connect, dgram_socket, into_owned, local_addr, recv_buffer_bytes, recv_from, send,
-    send_to, set_recv_buffer, share_port,
+    adopt, bind, connect, dgram_socket, into_owned, local_addr, queued_bytes, recv_buffer_bytes,
+    recv_from, send, send_to, set_recv_buffer, share_port,
 };

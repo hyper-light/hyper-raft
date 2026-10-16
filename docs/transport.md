@@ -888,6 +888,44 @@ The design is quinn's (its endpoint driver and `quinn-udp`):
   on Linux, the client's peer socket sent 1,459 datagrams in 92 calls, where it had been held to two
   a call. macOS took 1,449 calls for 1,449 datagrams, since it has no segmentation.
 
+**A drain takes what was queued when it began.** Batching made each of the driver's receive calls
+carry up to its ring's batch: ten messages for focal's bus, each possibly a 64 KiB coalesced train.
+A drain read a socket until it emptied, or until it had made `TURNS` calls (tokio's cooperative
+budget). A peer that kept sending therefore kept the driver reading, up to 1,280 messages a turn
+where a peer socket's two-slot batch had allowed 256. The driver sends nothing while it reads: not
+the frames it forwards, and not the credit its peers wait for. In an interleaved A/B (three runs
+each, node on one CPU) the batched build carried 14% more at 1M/s offered on 14% less CPU. But its
+p99 rose from 0.21 to 1.00 ms at 10k/s and from 0.23 to 0.82 ms at 100k/s. Its publisher was held
+for up to 12 ms at a time (base: 1.3 ms) with nothing lost: the room of 106 KB lasts 1.5 ms of
+publishing at 100k/s. A drain now takes the backlog it found (`Batched::receive_queued`) and leaves
+what arrives meanwhile for the next turn, as an event loop runs the callbacks queued when its phase
+began. What was queued is told by:
+- the kernel's receive stamps where the socket has them (Linux `SO_TIMESTAMPNS`, macOS
+  `SO_TIMESTAMP_MONOTONIC`): a datagram stamped after the drain began arrived since. A stamp is
+  late, never early, so a busy machine can end a drain sooner, never later;
+- elsewhere, the bytes the socket held at the first call (`UdpSocket::queued_bytes`, `FIONREAD`).
+  Winsock counts every queued datagram ("Winsock IOCTLs": "the total number of bytes available to
+  read, not the size of the first datagram"); XNU counts them with their addresses and control
+  (`soioctl`: `so_rcv.sb_cc`); the fabric counts its own.
+
+The endpoint is still told when each datagram was read (`Arrival::read_ns`), as hyper-tokio's driver
+tells it.
+
+**A socket left holding datagrams is work now.** A drain that stops with datagrams waiting marks
+its socket for the next turn. Readiness is one-shot (epoll's `EPOLLONESHOT`, kqueue's `EV_ONESHOT`)
+and fires when a datagram arrives, not for one already waiting, and the driver did not count a
+marked socket as fired. A driver whose only work was such a socket therefore parked until its next
+timer or another arrival woke it. Now a marked socket, the listener's or a peer's, keeps the turn
+loop going (up to `TURNS` turns before it yields to the shard and wakes itself, counted by
+`Driver::yields`). `Driver::backlogged` counts the sockets left holding datagrams. Test:
+`a_peer_socket_left_holding_datagrams_is_drained_without_another_wake`. More datagrams than two
+drains take wait in a peer socket, and whenever the server's poll ends pending without having woken
+itself, no socket may be left holding any. Under the old rule it parked after one drain, 128 of 257
+read; under load it passed 40 of 40 runs, with every core held by busy loops. Its first version
+asserted instead that no timer fired before every datagram was read. That failed under the gate's
+parallel load, where a timer 65 ms away came due first: a test that rests on timing is not one a
+busy machine passes.
+
 Open: the socket room counts the kernel's charge at four times a datagram's payload, the worst case
 measured on Linux 6.x; MTU-sized datagrams are charged 1.58 times. With room for twice as many
 datagrams, the bus nearly doubled its throughput (above) without a drop. The charge should be

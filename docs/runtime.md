@@ -765,6 +765,15 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   - A segmented message refused EIO or EINVAL turns segmentation off, and the message goes again
     unsegmented, in both the outbox's sends and `send_segments` (docs/transport.md §4h; before, only
     EIO did, and a socket refused EINVAL dropped every segmented message).
+- **What was queued, and when it was read** (2026-10-16).
+  - `Batched::receive_queued` takes the datagrams that were queued when it began, plus the rest of
+    the call that reached the first that was not. It judges by the kernel's receive stamps where the
+    socket has them, else by the bytes the socket held at its first call. It reports whether the
+    socket emptied (`Queued::Emptied`) or may hold more (`Queued::More`), to take at the owner's next
+    turn without awaiting a readiness that fires only on arrival.
+  - `UdpSocket::queued_bytes` is `FIONREAD` as each platform counts it: every queued datagram's on
+    Windows and the BSDs, the next one's on Linux, every one's on the fabric.
+  - `Arrival::read_ns` carries the read time beside the stamp (docs/transport.md §4h).
 - **Done** (2026-10-06): `UdpSocket` and `Batched` on IPv4 and IPv6; the batched calls and stamps moved from
   hyper-tokio's `sys` layer into `udp/linux.rs` and `udp/macos.rs`. Measured by `tests/udp_batched.rs` on
   macOS and on Linux 6.12 (Docker): a 32-datagram batch crosses loopback in fewer calls than datagrams

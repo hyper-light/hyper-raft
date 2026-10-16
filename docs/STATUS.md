@@ -170,6 +170,22 @@ each saw no heartbeat taken through a quiet period shorter than the members' flu
   - a transmit a socket took only part of is held until the socket can write, nothing sent past it.
 
   On Linux the bulk test's peer socket sent 1,459 datagrams in 92 calls (`docs/transport.md` §4h).
+- **hyper-rt-transport: a drain read whatever its peers kept sending, the driver's sends held
+  behind it.** A drain read each socket until it emptied or made `TURNS` calls (up to 1,280 messages
+  at focal's batch of ten). It sends nothing while it reads, so a peer that kept sending kept its
+  own credit waiting. With batching, focal's publisher was held for up to 12 ms at a time, and its
+  p99 at 10k/s rose from 0.21 to 1.00 ms. A drain now takes what was queued when it began
+  (`Batched::receive_queued`): by the kernel's receive stamps where the socket has them, else by the
+  bytes it held (`FIONREAD`, which Winsock and the BSDs count over every queued datagram).
+  Tests: `a_queued_receive_takes_what_was_queued_when_it_began`,
+  `a_socket_without_stamps_takes_the_bytes_it_held` (`docs/transport.md` §4h).
+- **hyper-rt-transport: a peer socket left holding datagrams waited for the driver's next timer.**
+  Readiness is one-shot and fires on arrival, and a socket marked for the next turn was not counted
+  as work, so a driver with only that to do parked. A marked socket now keeps the turn loop going.
+  Test: `a_peer_socket_left_holding_datagrams_is_drained_without_another_wake`. A poll that ends
+  pending without waking itself (`Driver::yields`) leaves no socket holding datagrams
+  (`Driver::backlogged`). Under the old rule it parked with 128 of 257 read; 40 of 40 runs pass
+  with every core busy.
 - **hyper-rt: a socket whose segmented sends the kernel refused with EINVAL dropped every one.** The
   batched send turned segmentation off on EIO alone. EINVAL, which the kernel returns to a socket
   sending without checksums and which quinn-udp has met from drivers, was counted as a refusal each

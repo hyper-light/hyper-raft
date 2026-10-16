@@ -24,8 +24,8 @@ use hyper_rt::RtError;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sim::SimRuntime;
 use hyper_rt::udp::{
-    Arrival, Batched, Io, IoStats, Ipv4Addr, Ipv6Addr, MAX_BATCH, RECEIVE_BYTES, Ring, Sent,
-    SocketAddr, UdpSocket,
+    Arrival, Batched, Io, IoStats, Ipv4Addr, Ipv6Addr, MAX_BATCH, Queued, RECEIVE_BYTES, Ring,
+    Sent, SocketAddr, UdpSocket,
 };
 
 fn config() -> RuntimeConfig {
@@ -667,4 +667,102 @@ fn a_socket_the_kernel_will_not_segment_for_sends_each_datagram_alone() {
         assert_eq!(take(&mut receiver, &mut ring, 10).await.unwrap(), expected);
     })
     .unwrap();
+}
+
+/// Do: on loopback with the kernel's receive stamps, a ring of one buffer (a datagram a call),
+/// three datagrams sent, the shard's clock read, three more sent, then receives of what was queued
+/// until all six are taken. Expect: the receive begun at that reading hands over at most one
+/// datagram sent after it, the one whose call ends it; every datagram arrives once and in order;
+/// the receive that finds the socket empty says so. A stamp is late, never early (`arrival`), so
+/// a busy machine can end a receive sooner, never later. A platform without stamps counts the
+/// bytes queued instead (Windows' `FIONREAD` counts every datagram), and the same holds.
+#[test]
+fn a_queued_receive_takes_what_was_queued_when_it_began() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, true).unwrap();
+        let mut ring = Ring::new(Io { batch: 1 }).unwrap();
+        let to = receiver.local_addr().unwrap();
+        for index in 0..3u8 {
+            sender.send_to(&[index], to).unwrap();
+        }
+        let began = now_ns();
+        for index in 3..6u8 {
+            sender.send_to(&[index], to).unwrap();
+        }
+        let mut order = Vec::new();
+        let mut first = None;
+        let mut emptied = false;
+        for _ in 0..64 {
+            if order.len() == 6 && emptied {
+                break;
+            }
+            let start = if first.is_none() { began } else { now_ns() };
+            let mut taken = Vec::new();
+            let (count, ended) = receiver
+                .receive_queued(&mut ring, start, 16, |_, bytes| taken.push(bytes[0]))
+                .unwrap();
+            assert_eq!(count, taken.len());
+            first.get_or_insert_with(|| taken.clone());
+            order.extend_from_slice(&taken);
+            emptied = ended == Queued::Emptied;
+            if emptied && order.len() < 6 {
+                receiver.readable().await.unwrap();
+            }
+        }
+        assert_eq!(
+            order,
+            vec![0, 1, 2, 3, 4, 5],
+            "every datagram once, in order"
+        );
+        let first = first.unwrap();
+        assert!(
+            first.iter().filter(|index| **index >= 3).count() <= 1,
+            "the first receive took more than one datagram sent after it began: {first:?}"
+        );
+        assert!(emptied, "the last receive found the socket empty");
+    })
+    .unwrap();
+}
+
+/// Do: on the simulation fabric, which stamps nothing, three datagrams queued, then two receives
+/// of what was queued. Expect: the first takes the three, the bytes the socket held when it began
+/// (`UdpSocket::queued_bytes`), and says more may follow; the second finds the socket empty.
+#[test]
+fn a_socket_without_stamps_takes_the_bytes_it_held() {
+    let mut sim = SimRuntime::new(&config(), 1).unwrap();
+    let id = sim.shard_ids()[0];
+    let (done_tx, done_rx) = channel();
+    sim.spawn_on(id, async move {
+        let outcome = async {
+            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let sender = UdpSocket::bind(loopback)?;
+            let mut receiver = Batched::bind_lent(loopback, true)?;
+            let mut ring = Ring::new(Io { batch: 1 })?;
+            let to = receiver.local_addr()?;
+            for index in 0..3u8 {
+                sender.send_to(&[index, index], to)?;
+            }
+            receiver.readable().await?;
+            let held = receiver.socket().queued_bytes()?;
+            let mut taken = Vec::new();
+            let first = receiver.receive_queued(&mut ring, now_ns(), 16, |_, bytes| {
+                taken.push(bytes[0]);
+            })?;
+            let second = receiver.receive_queued(&mut ring, now_ns(), 16, |_, _| {})?;
+            Ok::<_, RtError>((held, taken, first, second, receiver.stats()))
+        }
+        .await;
+        let _ = done_tx.send(outcome);
+    })
+    .unwrap();
+    sim.run_until_idle();
+    let (held, taken, first, second, stats) = done_rx.try_recv().unwrap().unwrap();
+    assert!(!stats.kernel_stamps, "no kernel on the fabric");
+    assert_eq!(held, 6, "three datagrams of two bytes held");
+    assert_eq!(taken, vec![0, 1, 2]);
+    assert_eq!(first, (3, Queued::More));
+    assert_eq!(second, (0, Queued::Emptied));
 }

@@ -210,3 +210,93 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
         .unwrap();
     eprintln!("{report}");
 }
+
+/// Datagrams the stray sender puts in the server's peer socket at once: more than two drains take
+/// when each receive call takes one ([`ONE`]) and a drain makes at most
+/// [`hyper_rt_transport::TURNS`] calls, and few enough that Linux's default receive buffer holds
+/// them all (about 900 bytes charged each).
+const STRAY: usize = 2 * hyper_rt_transport::TURNS + 1;
+/// A ring of one buffer, so a drain takes one datagram a call.
+const ONE: Io = Io { batch: 1 };
+
+/// A socket left holding datagrams after a drain is drained again without another wake: its
+/// readiness is one-shot and fires when a datagram arrives, not for one already waiting, so a
+/// driver that awaited it parked with them unread until something else woke it. Do: connect;
+/// from the client's port (which its sockets share) put more datagrams than two drains take, none
+/// of them a QUIC packet, in the server's socket for the client; poll the server as an executor
+/// would, again only when it is woken. Expect: whenever a poll ends pending without having woken
+/// its own task (`Driver::yields`), no socket is left holding datagrams (`Driver::backlogged`);
+/// and every one is read. Neither rests on timing or on how the kernel delivers them.
+#[test]
+fn a_peer_socket_left_holding_datagrams_is_drained_without_another_wake() {
+    if !cfg!(unix) {
+        return;
+    }
+    let pki = Pki::new();
+    let one = pki.issue(&name(1));
+    let two = pki.issue(&name(2));
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async move {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server: Drv =
+            Driver::bind(endpoint(&pki, &two, &one.0, CLIENT, true), loopback, ONE).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut client: Drv =
+            Driver::bind(endpoint(&pki, &one, &two.0, SERVER, false), loopback, ONE).unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let now = client.clock().unwrap();
+        client.endpoint().connect(now, SERVER, server_addr).unwrap();
+        let mut seen = Seen::default();
+        let began = Instant::now();
+        while seen.connected < 2 || server.peer_sockets() < 1 || client.peer_sockets() < 1 {
+            step(&mut server, &mut client, &mut seen).await;
+            assert!(
+                began.elapsed() < GUARD,
+                "no socket of its own for each side"
+            );
+        }
+        let stray = hyper_rt::udp::UdpSocket::bind_shared(client_addr).unwrap();
+        let before = server.peer_stats().received;
+        for index in 0..STRAY {
+            let mut datagram = [0u8; 32];
+            datagram[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            stray.send_to(&datagram, server_addr).unwrap();
+        }
+        let mut guard = pin!(hyper_rt::futures::sleep(
+            u64::try_from(GUARD.as_nanos()).unwrap()
+        ));
+        let mut parked_holding = 0u64;
+        let read = poll_fn(|context| {
+            let yields = server.yields();
+            loop {
+                match server.poll_event(context) {
+                    Poll::Ready(Ok(_)) => continue,
+                    Poll::Ready(Err(error)) => panic!("{error:?}"),
+                    Poll::Pending => break,
+                }
+            }
+            let woke_itself = server.yields() > yields;
+            if !woke_itself && server.backlogged() > 0 {
+                parked_holding += 1;
+            }
+            let read = server.peer_stats().received - before;
+            if read >= STRAY as u64 || parked_holding > 0 {
+                return Poll::Ready(read);
+            }
+            assert!(
+                guard.as_mut().poll(context).is_pending(),
+                "{read} of {STRAY} read"
+            );
+            Poll::Pending
+        })
+        .await;
+        assert_eq!(
+            parked_holding, 0,
+            "the driver parked with a socket holding datagrams and asked for no wake ({read} of \
+             {STRAY} read)"
+        );
+        // The client's own datagrams still in flight when the strays went may be among those read.
+        assert!(read >= STRAY as u64, "{read} of {STRAY} read");
+    })
+    .unwrap();
+}

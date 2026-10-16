@@ -25,6 +25,7 @@
 //! dropped and counted. A receive takes at most one batch. Receive buffers: [`Io::batch`] of
 //! [`RECEIVE_BYTES`] on Linux, one elsewhere, reserved when the socket is made.
 
+use core::cell::Cell;
 use core::net::{Ipv4Addr, SocketAddr};
 
 #[cfg(target_os = "linux")]
@@ -137,6 +138,19 @@ pub struct Arrival {
     pub at_ns: u64,
     /// Whether `at_ns` is the kernel's stamp.
     pub kernel: bool,
+    /// When it was read, nanoseconds on the shard's clock: `at_ns` or later.
+    pub read_ns: u64,
+}
+
+/// How [`Batched::receive_queued`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Queued {
+    /// The socket held nothing more: await [`Batched::readable`].
+    Emptied,
+    /// It took what was queued when the receive began, or reached its bound on calls: the socket
+    /// may hold more, to take at the owner's next turn without awaiting readiness (which fires
+    /// once a datagram arrives, not for one already waiting).
+    More,
 }
 
 /// A datagram waiting in the outbox.
@@ -322,6 +336,7 @@ fn arrival(latest_ns: &mut u64, from: SocketAddr, stamp_ns: Option<u64>, now_ns:
         from,
         at_ns,
         kernel: stamp_ns.is_some(),
+        read_ns: now_ns.max(at_ns),
     }
 }
 
@@ -805,6 +820,71 @@ impl Batched {
         let received = self.receive_turns(ring.batch, deliver);
         self.lend(ring);
         received
+    }
+
+    /// Takes, into `ring`, the datagrams that were queued when the receive began, with the rest of
+    /// the call that reached the first that was not, handing each to `deliver`; how many, and how
+    /// it ended. A socket with the kernel's receive stamps ([`Arrival::kernel`]) tells them by
+    /// their stamps: one stamped after `began_ns`, on the shard's clock, arrived since. A socket
+    /// without counts bytes: as many as it held at the first call ([`UdpSocket::queued_bytes`],
+    /// every queued datagram's on Windows, the BSDs and the simulation fabric, the next one's on
+    /// Linux, so one call's worth there). An owner so takes, each turn, the backlog the turn found,
+    /// and what arrives meanwhile waits for its next turn: taking until the socket emptied let a
+    /// peer that kept sending hold its owner from sending, the peer's own credit among what waited,
+    /// for as long as it kept on. At most `calls` calls.
+    pub fn receive_queued(
+        &mut self,
+        ring: &mut Ring,
+        began_ns: u64,
+        calls: usize,
+        deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<(usize, Queued), RtError> {
+        self.lend(ring);
+        let received = self.receive_until_past(began_ns, calls, deliver);
+        self.lend(ring);
+        received
+    }
+
+    fn receive_until_past(
+        &mut self,
+        began_ns: u64,
+        calls: usize,
+        mut deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<(usize, Queued), RtError> {
+        let stamped = self.stats.kernel_stamps;
+        let held = if stamped {
+            None
+        } else {
+            Some(self.udp.queued_bytes()?)
+        };
+        let past = Cell::new(false);
+        let taken = Cell::new(0usize);
+        let mut handed = |arrival: Arrival, bytes: &mut [u8]| {
+            if stamped && arrival.at_ns > began_ns {
+                past.set(true);
+            }
+            taken.set(taken.get().saturating_add(bytes.len()));
+            deliver(arrival, bytes);
+        };
+        let mut delivered = 0usize;
+        let mut ended = Queued::More;
+        for _ in 0..calls {
+            match self.receive_some(&mut handed)? {
+                ReceiveStep::Delivered(count) => delivered = delivered.saturating_add(count),
+                ReceiveStep::Skipped => {}
+                ReceiveStep::Empty => {
+                    ended = Queued::Emptied;
+                    break;
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                ReceiveStep::Astray => self.stats.astray = self.stats.astray.saturating_add(1),
+            }
+            if past.get() || held.is_some_and(|held| taken.get() >= held) {
+                break;
+            }
+        }
+        self.stats.received = self.stats.received.saturating_add(as_u64(delivered));
+        Ok((delivered, ended))
     }
 
     /// Exchanges the socket's receive buffers and headers with `ring`'s (twice restores them).

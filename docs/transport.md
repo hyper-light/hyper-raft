@@ -973,8 +973,13 @@ Linux 6.6), and nothing in it is assumed.
   acknowledgement for each of this side's ack-eliciting packets in flight (RFC 9000 §13.2: a
   receiver may acknowledge every one) and the loss probes of the idle timeout: two at each probe
   timeout (RFC 9002 §6.2.4), the timeouts doubling (§6.2.1) from `kGranularity`, 32 for a 30-second
-  timeout. Acknowledgements are counted at the costliest message without stream data, probes at
-  the costliest of any, since retransmissions take no new window.
+  timeout. Each is one datagram that comes alone. A probe is charged as the costliest datagram that
+  came alone, an acknowledgement as the costliest alone without stream data; retransmissions take
+  no new window, so they count here. A GRO train is one message of many datagrams and gives only
+  its charge per stream byte. Its share a datagram stands in until a datagram has come alone. The
+  first build charged probes as the costliest message: one train sampled made 32 probes cost 32
+  trains, past the whole queue, and the room fell to nothing. In the busy A/B the publisher was
+  then held 56 times at 10k/s, against 8 (`a_train_is_no_probes_charge`).
 - **What the worst is taken over:** the current window epoch and the last that brought a sample.
   An epoch ends once the peers have consumed the room it began with, so every window still granted
   was granted within the two. An epoch without a sample keeps the worst it had: under load a socket

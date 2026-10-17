@@ -701,7 +701,21 @@ allocations in release are measured at S-6 with the same schedules. The table an
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.
 6. **hyper-log under the world.** Whether its owner can be driven as a step function with its device
    as world completions without a second code path in production, or whether its simulation keeps a
-   thread and a deterministic hand-off.
+   thread and a deterministic hand-off. Answered by reading the owner at `fd1fefd` (2026-10-17), to be
+   built: a step function. The owner already hears one thing at a time (`owner/mod.rs`: a message, a
+   frame's word or a job back, its agenda flat), and never does I/O: each write, flush, confirmation
+   or look leaves it as a `Carrier`, the job with the device moved into it, which any thread runs
+   (`Carrier::run`) and hands back through the log's returns, waking the owner with `Returned`. What
+   ties it to threads is narrow: the owner's loop (`Owner::lead`) blocks on its inbox with
+   `recv_timeout` to the gathering's deadline, and three clock reads (`Instant::now` in
+   `owner/mod.rs` `next`, `owner/write.rs` at a gather's start and in `deadline`). A world drives it
+   with the loop's body as the step: a message the world delivers, a job's I/O run at the device's
+   completion event (`Carrier::run` on the harness's thread, the same code a caller or the I/O thread
+   runs), the gathering's deadline a world timer, and the clock read through the log's own clock (the
+   world's anchor in a simulation, `Instant::now` in production, docs/sim.md §3.2). Production keeps
+   its threads, calling the same step; no second path through the owner's logic. Its consumer is
+   hyper-durable's `support/device.rs`, whose members then run on the world as `support/cluster.rs`'s
+   do.
 7. **PCT for message passing** (per-member priorities built at S-5, §15.3; chains still unread).
    Reading Ozkan et al.'s construction (only the abstract was reachable) and choosing between
    per-member priorities and chain partitioning by measurement.

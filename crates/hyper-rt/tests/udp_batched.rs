@@ -732,6 +732,66 @@ fn a_queued_receive_takes_what_was_queued_when_it_began() {
     .unwrap();
 }
 
+/// Do: on Linux, more datagrams sent than the receiver's buffer holds, the queue drained, then one
+/// more sent and received. Expect: the drain is told no drop (the datagrams queued before the
+/// overflow carry no count), and the one queued after it says the socket dropped some
+/// (`SO_RXQ_OVFL`): a drop is told by the next datagram, without reading the socket's account.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drop_is_told_by_the_next_datagram() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let sender = UdpSocket::bind(loopback).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, true).unwrap();
+        let mut ring = Ring::new(Io { batch: 64 }).unwrap();
+        let to = receiver.local_addr().unwrap();
+        assert_eq!(receiver.stats().drops, Some(0), "the kernel tells drops");
+        // Twice the buffer the socket reports, in datagrams of 1,200 bytes: loopback queues each
+        // as it is sent, and drops what the queue cannot hold.
+        let buffer = receiver.socket().recv_buffer_bytes().unwrap();
+        let datagrams = buffer * 2 / 1_200 + 1;
+        for _ in 0..datagrams {
+            sender.send_to(&[7u8; 1_200], to).unwrap();
+        }
+        let mut drained = 0usize;
+        loop {
+            let now = now_ns();
+            let (got, ended) = receiver
+                .receive_queued(&mut ring, now, 1_024, |_, _| {})
+                .unwrap();
+            drained += got.datagrams;
+            if ended == Queued::Emptied {
+                break;
+            }
+        }
+        assert!(drained < datagrams, "the queue held fewer than were sent");
+        assert_eq!(receiver.stats().drops, Some(0), "no datagram has told a drop yet");
+        sender.send_to(&[8u8], to).unwrap();
+        let mut told = None;
+        for _ in 0..64 {
+            let mut last = None;
+            let (got, _) = receiver
+                .receive_queued(&mut ring, now_ns(), 16, |_, bytes| last = Some(bytes[0]))
+                .unwrap();
+            if got.datagrams > 0 {
+                told = last;
+                break;
+            }
+            receiver.readable().await.unwrap();
+        }
+        assert_eq!(told, Some(8), "the datagram sent after the overflow arrived");
+        let drops = receiver.stats().drops.unwrap();
+        assert!(drops > 0, "the datagram after the overflow told its drops");
+        assert_eq!(
+            usize::try_from(drops).unwrap(),
+            datagrams - drained,
+            "every datagram the queue could not hold, counted"
+        );
+    })
+    .unwrap();
+}
+
 /// Do: on Linux, a ring of eight places, three datagrams queued, then one receive of what was
 /// queued. Expect: one call takes the three and says the socket is empty. recvmmsg(2) with
 /// `MSG_DONTWAIT` returns what is queued, so a call that fills fewer places than it offers found

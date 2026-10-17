@@ -146,6 +146,17 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-rt, hyper-transport, hyper-rt-transport: a socket's account was read twice a drain.** The
+  measured room read each socket's account (`SO_MEMINFO`, a `getsockopt`) before every drain, and
+  again after a drain that took one message alone. On the bare-metal bench a bus node at 10,000
+  messages a second made 8.3 system calls a message, 2.4 of them these reads. A socket now reads
+  its account at an epoch's drains 0, 2, 6, 14, … (`SocketCharge::wants_before`). A drop is told
+  by the traffic, not by the reads: `SO_RXQ_OVFL`, attached to each datagram once the kernel has
+  dropped one. Measured (interleaved A/B, `docs/transport.md` §4l): CPU a message 2–6 % less at
+  10,000 and 100,000 a second and on a busy core, with p99 and p99.9 no worse. Tests:
+  `charge::tests::the_account_is_read_at_doublings_of_an_epochs_drains`,
+  `a_drop_the_traffic_tells_forgets_the_samples`, `udp_batched::a_drop_is_told_by_the_next_datagram`.
+
 - **hyper-quic, hyper-transport: a third of a bus node's datagrams were acknowledgements.** Every
   connection acknowledged every other ack-eliciting packet (RFC 9000 §13.2.2's default), so at
   100,000 one-packet messages a second a node handled 3.4 datagrams a message, 1.0 of them

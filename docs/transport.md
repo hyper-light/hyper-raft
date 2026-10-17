@@ -1070,6 +1070,48 @@ bounds hold: the delay asked stays under the smoothed round trip wherever the pe
 allows (draft-ietf-quic-ack-frequency-14 §8.1), and the pacer, not the acknowledgements, spaces a
 sender's bursts (§8.2).
 
+## 4l. A socket's account read at an epoch's doublings (2026-10-16)
+
+The measured room (§4i) read each socket's account, `SO_MEMINFO` (a `getsockopt`), before every
+drain, and again after a drain that took one message alone: two system calls a drain wherever the
+traffic comes a datagram at a time. On the bare-metal bench a bus node at 10,000 messages a second
+made 8.3 system calls a message, 2.4 of them these reads (1.7 of 5.3 at 100,000).
+
+The samples were worth taking only as the room needs them. The room is the worst charge a stream
+byte over the current window epoch and the one before (§4i), and an epoch that brings no sample
+keeps the worst it had, so it is enough that each epoch bring one where it can, and that a change
+of traffic within an epoch be read soon. A socket now reads its account at every drain until a
+message carrying stream data is measured, and then at an epoch's drains 0, 2, 6, 14, …, each read at
+twice the drains before it (`SocketCharge::wants_before`): an epoch of `n` drains reads about
+log₂ `n` times, and an epoch's end starts the count again. A read that finds a singleton is a sample
+as before.
+
+The reads also said when the kernel had dropped what the queue could not hold, which forgets the
+samples (§4i). A drop is now told by the traffic itself: each socket asks the kernel for
+`SO_RXQ_OVFL`, the count of datagrams it dropped for want of room, attached to each datagram queued
+once the count is past zero (socket(7)), and the driver gives the socket's latest count to its
+measure after each drain (`SocketCharge::drops`). A drop after the last datagram received is told by
+the next, which is when the room is next used. Linux only; the account on macOS tells no drops, as
+before. hyper-tokio keeps its reads before every drain: its sockets do not parse the count.
+
+Measured on the bare-metal bench, interleaved A/B pairs against the same tree reading before
+every drain:
+
+| Rate, condition | Pairs | CPU a message (median) | p99 | p99.9 |
+|---|---|---|---|---|
+| 100,000/s | 3 | 6,082 ns (6,207 before) | 0.56 ms (0.62) | 1.80 ms (1.91) |
+| 10,000/s | 3 | 7,135 ns (7,434) | 0.04 ms (0.04) | 0.14 ms (0.22) |
+| 10,000/s, busy core | 3 + 6 | 7,767 and 8,057 ns (7,920 and 8,609) | 0.04 ms (0.04) | 0.30 and 0.61 ms (0.11 and 0.85) |
+
+The busy rows are two passes, the second with other work loading the machine. No socket dropped a
+datagram (`RcvbufErrors` 0). The largest room measured rose by about a fifth (1.46 MB to 1.69–1.82
+MB): fewer samples see fewer of an epoch's worst charges.
+
+Tests: `charge::tests::the_account_is_read_at_doublings_of_an_epochs_drains` (the reads' drains,
+through two epochs), `a_drop_the_traffic_tells_forgets_the_samples`, and on Linux
+`udp_batched::a_drop_is_told_by_the_next_datagram` (an overflowed socket's next datagram counts
+every datagram it could not hold).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

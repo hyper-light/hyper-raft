@@ -582,7 +582,7 @@ Every resource the tools use has a bound, derived, with a typed refusal or a cou
 
 | Resource | Bound | Derivation |
 |---|---|---|
-| Messages in flight `C` | the smallest capacity at which overflow losses are fewer than drawn losses over the test's seeds | measured per harness: below it the bound, not the protocol, decides what is lost; hyper-raft's 2,048, hyper-durable's 4,096 and slates' 256 are restated by this rule at S-6 |
+| Messages in flight `C` | the smallest capacity at which overflow losses are fewer than drawn losses over the test's seeds | measured per harness: below it the bound, not the protocol, decides what is lost; hyper-durable's is 21 by it (§17, 2026-10-17); hyper-raft's 2,048, on its own draws until the world's chooser plays a tape (§18), and slates' 256 are restated by it when they move onto the world's network |
 | Event queue | `C` + timers (nodes × timer kinds) + completions (devices × depth) | each term is a bound of its own |
 | Trace | steps × decisions per step, 4 bytes each | the step budget; 4,000 steps of a few decisions each are tens of kilobytes |
 | Rendered diagnosis | the last `T` steps' events | slates' 2,000; stated per test |
@@ -1812,13 +1812,42 @@ pipeline less deeply: every floor holds with room. The leader applying ahead was
 times in four, where the old schedule redirected three of four of its steps to another member.
 
 **The capacity `C` (§7).** The gate's schedules held at most 31 messages in flight (57 at five voters)
-under a bound of 4,096, so it lost none. A sweep found the rule's smallest capacity (fewer lost to the
-bound than to the schedule) near 24, where the five-voter shape lost 517 to the bound against 815 to
-the schedule; and below it, at 8 and 16, the run was refused: a message the network drops for room
-leaves its arrival pending in the world, which then names nothing, and those filled the world's events
-(`SimError::Full`). A bound the network reaches makes the world's event bound depend on how fast the
-strategy takes stale arrivals, so `C` stays 4,096, past what these schedules reach; the network
-cancelling a dropped message's arrival would let `C` be the rule's: open.
+under a bound of 4,096, so it lost none. A sweep found the rule's smallest capacity near 24, and below
+it, at 8 and 16, the run was refused: a message the network drops for room left its arrival pending in
+the world, which then named nothing, and those filled the world's events (`SimError::Full`). So the
+bound the network reached made the world's event bound depend on how fast the strategy took stale
+arrivals, and `C` stayed 4,096.
+
+**A lost message takes its arrival with it** (2026-10-17). `World::schedule` now names the event it
+schedules (`EventId`), and `World::cancel` takes an event back before a step takes it: it enters no
+digest and no trace, and frees its place among the world's events. The network keeps each message's
+arrival with it, and a message it loses to its capacity takes its arrival out of the world
+(`Net::make_room`), so the world holds at most `C` arrivals however much the capacity loses, and the
+event bound is §7's: `C` beside each device's completion (`NET + members`, where it was `2 · NET +
+members`). Tests: hyper-sim's `a_message_lost_to_the_capacity_takes_its_arrival_with_it` (50 messages
+through a capacity of 3 in a world of 4 events: before, the fifth send was refused `Full`; now the world
+never holds more than 3, and no step takes a stale arrival) and
+`an_event_taken_back_is_never_stepped_and_frees_its_place` (both disciplines, and a switch between them).
+
+The sweep again, every run whole (128 schedules of 5,000 steps a shape; lost to the schedule against
+lost to the bound, and the most in flight):
+
+| `C` | three voters, durable | depth two, replayed | control group | applying ahead | five voters |
+|---|---|---|---|---|---|
+| 4,096 | 436 / 0 (31) | 420 / 0 (31) | 301 / 0 (23) | 352 / 0 (29) | 826 / 0 (57) |
+| 32 | 436 / 0 | 420 / 0 | 301 / 0 | 352 / 0 | 837 / 167 |
+| 24 | 444 / 25 | 424 / 16 | 301 / 0 | 350 / 8 | 832 / 439 |
+| 21 | 433 / 47 | 416 / 55 | 302 / 18 | 350 / 13 | 834 / 808 |
+| 20 | 427 / 98 | 405 / 65 | 302 / 14 | 365 / 24 | 799 / 859 |
+| 16 | 426 / 182 | 406 / 160 | 301 / 49 | 347 / 95 | 788 / 1,188 |
+| 8 | 402 / 655 | 376 / 697 | 283 / 257 | 325 / 596 | (not run: the shape before it stopped) |
+
+By the rule, the smallest capacity at which every shape loses fewer to the bound than to the schedule
+is 21, and hyper-durable's `C` is 21 (`tests/support/cluster.rs`, `NET`): the gate's every oracle and
+floor hold there, the five-voter shape losing 808 to the bound and 834 to the schedule. At 8 and 12 the
+runs complete, where the world refused them before, and the shape that applies ahead never sees its
+leader ahead of its disk (its floor): a schedule that loses more to the bound than it draws reaches
+less, which is what the rule keeps `C` above.
 
 **Costs** (`docs/benchmarks.md`, "hyper-durable's schedules in the world, against the harness they
 replace"): at the gate's 5,000 steps, 60–69% fewer allocations a step in every shape and the time within
@@ -1859,7 +1888,22 @@ network the world's.
   network adds nothing the harness's indexed one lacks (any message next, lost, repeated, cut; no
   time). So the harness keeps its draws until the world's chooser can play a tape (a step's words and
   kind, each reduced to its bound), which would give hyper-durable's schedules, now in the world, the
-  same mutation and shrinking; open.
+  same mutation and shrinking.
+- **The world plays a tape** (2026-10-17). The tape, its player and its mutations moved from
+  hyper-check into hyper-sim (`hyper_sim::tape`; hyper-check's `strategy::tape` names them as before
+  and keeps `shrink`), and a world drawn from `Source::Tape` reads every decision from the tape's
+  current step, reduced to its bound by the player's multiply-shift, and from the filler's SplitMix64
+  past the step's own words, so any tape is a feasible run; `World::end_step(kind)` closes the
+  harness's step, and the run's `Record` gives back the tape it took, which replays it exactly. Each
+  value is recorded in the world's trace too, so a played run also replays from its trace. A decision
+  of one option reads no word. Tests: hyper-sim's
+  `a_tape_the_world_plays_replays_its_run_and_every_mutation_is_a_run` (the ring of `tests/world.rs`,
+  a step a world step, both disciplines: its tape and its trace replay it, and ten mutations each run
+  and replay from their own tapes) and hyper-durable's
+  `a_schedule_plays_from_its_tape_and_every_mutation_keeps_every_invariant` (each of the five shapes, 800
+  steps, a step an operation named by its kind: the fresh run's tape replays it, and eight mutations
+  each keep every oracle, settle and replay from their own tapes). hyper-raft's harness moving onto the
+  world's streams and network, its tapes played by the world, is its own step; open.
 - **The gate**: every oracle and every floor at the same seed counts, the differential unchanged, and
   the defects of seeds 9,843 and 54,104 caught as planted mutants (`tests/check.rs`,
   `the_fast_track_without_its_first_rule_is_caught` and `_second_rule_`), their seeds' directed

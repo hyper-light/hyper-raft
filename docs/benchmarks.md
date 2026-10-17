@@ -8136,6 +8136,29 @@ build, main at `506c059`.
   works (`Detector::detection_bound`): the stated bound counts that wait, the budget does not, so an
   owner's `D` leaves room for it (at 10 s on three members, detection came at the budget itself).
 
+## What a server holds for each connection (2026-10-17)
+
+`cargo test --release -p hyper-rt-transport --test connection_memory -- --ignored --nocapture`: the
+server's driver alone on a thread whose allocations are counted (`hyper_measure::alloc`, per thread),
+its `n` clients on another; the server made with admission for `n` connections (what its tables are
+sized to before any connects), then the clients connect and go quiet, each on a socket of its own. Live
+bytes on the server's thread: once the endpoint is made, and once every connection is held and nothing
+has arrived for 300 ms.
+
+| Connections | Endpoint made | Settled | Added a connection |
+|---|---|---|---|
+| macOS (M5 Max), 1 | 152 KB | 325 KB | 174 KB (the first's one-time state) |
+| macOS, 64 | 192 KB | 2.03 MB | 28.7 KB |
+| macOS, 256 | 318 KB | 7.73 MB | 29.0 KB |
+| Linux (9950X3D2), 1 | 746 KB | 922 KB | 176 KB |
+| Linux, 64 | 787 KB | 2.65 MB | 29.1 KB |
+| Linux, 256 (five runs) | 912 KB | 7.91–8.05 MB | 27.3–27.9 KB |
+
+An idle connection holds about 28 KB of the server's heap, `hyper_quic::Connection`'s 8,128 bytes inline
+among it; the tables admission sizes add about 650 bytes for each connection admitted before any comes.
+Its socket's kernel buffer is apart (charged by the kernel as datagrams wait in it). On Linux the run
+first found the port-0 collision of `docs/transport.md` §4v: one to three clients of 256 never connected.
+
 ## An exchange by the server's connections, a socket each (2026-10-17)
 
 The bench of the next section (`cargo bench -p hyper-rt-transport --bench connections`), run again once

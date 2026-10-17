@@ -364,7 +364,9 @@ Kept: the shard announces it is parked, fences, re-checks its inboxes and waits 
 publishes, fences and kicks only a parked shard (`parking.rs`, loom-checked: 27 bounded and 116
 exhaustive interleavings; the model found a lost wake that the fence fixed; NOTE08 §3.1). With §3.2 every
 cross-thread wake takes this path, so a wake to a spinning shard costs no system call (the property
-slates' pair rings broke).
+slates' pair rings broke). On the spinning cross-shard row that saving loses: always-kick runs 14–17 %
+more round trips a second on macOS, its kick's time letting the reply land before the receive asks
+(§15 item 8, measured 2026-10-17); the choice is mantle's run's to decide.
 
 The kick per OS: an eventfd on Linux (epoll), `EVFILT_USER` on macOS and FreeBSD [LEMON],
 `PostQueuedCompletionStatus` on Windows, a flag in simulation.
@@ -1420,6 +1422,23 @@ thread. §12's row runs both drivers the same way.
    mantle's run at 100M confirms it beside its base (the runtime's rule for its wins).
    And why a shard that makes no system call while spinning sees 10–13 µs scheduling gaps that a kick's
    syscall seems to close (slates, inferred): the mechanism, measured, before kick-if-parked is kept.
+   Measured 2026-10-17 on hyper-rt's own spinning row (the two-shard ping-pong of
+   `crates/hyper-rt-compare`, macOS; prototype branch `proto-always-kick`, the sender's step after a
+   send to a shard not parked chosen at start; `docs/benchmarks.md`, "hyper-rt: the kick to a
+   spinning shard, and what it changes"): the kick runs 14–17 % more round trips a second than
+   kick-if-parked at loads 2.7 and 4.3 (ranges disjoint at 2.7) and 9–14 % at load 13. It is not a
+   scheduling gap a system call closes: a `getppid` in its place gains nothing (4 % fewer), and no gap
+   of that size shows at these loads (every mode's p99 under 1 µs). The shards' counters show where
+   it is: as built, each round trip is two foreign wakes and four loop steps, the reply never there
+   when its receiver asks (a one-way hop is about 250 ns), so the receive registers a waker and the
+   shard returns to its loop until the bitmap shows the wake; with the kick's time in the kernel
+   after each send, the reply lands first and the initiator's receive completes in the same poll,
+   its shard draining 6,527 wakes and taking 9,709 steps for 22,000 round trips where as built it
+   drains 21,999 and takes 44,001. A spin of the kick's time in its place converts more of them
+   (1,429 wakes) and gains less (2–6 %), so the kick's delay explains the wakes saved and not all of
+   the gain. On this row kick-if-parked loses and always-kick is the candidate; whether a system call
+   a send pays where a shard has other work to run is a consumer's row, decided by mantle's run at
+   100M beside its base, with Linux measured there.
 9. Closed 2026-10-06 (mantle's review): `Runtime`'s `stop` retried a full control channel with
    `yield_now` and no counted bound (slates' shape). The stop is now a flag on the shard's registry entry
    (`registry::request_stop`), published and kicked like a message but taking no channel slot; the shard's

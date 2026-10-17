@@ -886,7 +886,13 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      overlapping, a candidate that lands with mantle's confirmation. Item 8 was first measured against slates' runtime and tokio: a client that
      pauses 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the spin before a
      park paid in full every time (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates'
-     runtime and tokio").
+     runtime and tokio"). Item 8's second half is measured (2026-10-17, branch `proto-always-kick`):
+     on hyper-rt's spinning ping-pong the kick runs 14–17 % more round trips a second than
+     kick-if-parked on macOS, and not by closing a scheduling gap (a `getppid` in its place gains
+     nothing, and no 10–13 µs gap shows): its time in the kernel lets the reply land before the
+     receive asks, so the initiator's shard drains 6,527 wakes for 22,000 round trips where as built it
+     drains 21,999. Kick-if-parked loses on that row; always-kick is the candidate for mantle's run
+     at 100M, with Linux measured there.
    - Two benches the table's rows name as owed: hyper-rt-transport against hyper-tokio's driver on tokio,
      and hyper-seal against mantle's `seal.rs`.
    - The fast track: note 32 §3.8's tests decide it; no owner enables it until then.

@@ -9359,3 +9359,51 @@ confirms it (§12's rule).
 cargo bench -p hyper-rt --bench rearm
 # Linux: docker run --rm --cpus=4 -v <tree>:/src:ro rust:1.98.1, the same command in /src
 ```
+
+## hyper-rt: the kick to a spinning shard, and what it changes (2026-10-17)
+
+`docs/runtime.md` §15 item 8, its second half: slates found always-kick faster than kick-if-parked
+for spinning shards under load and inferred a scheduling effect. Measured on hyper-rt's own spinning
+row, `hyper-rt-compare hyper pingpong n=20000 warm=2000` (two tasks on two shards bouncing a value
+through two channels of capacity one, both marking activity so both shards spin), built on the
+prototype branch `proto-always-kick`, whose sender, after a send to a shard not parked, does by
+`HYPER_RT_KICK_MODE` nothing (as built), the kick (always-kick), a `getppid` (a system call that
+reaches no one) or a spin of 300 ns (`HYPER_RT_KICK_SPIN_NS`, the kick's time: one `kevent` call
+measured 276–379 ns at the medians by `benches/rearm.rs` under load). One binary (md5
+`f1eca03681778721d3f0f68fbe4b8700`), the modes rotating each of five rounds, medians (ranges). The
+M5 Max at load 2.7:
+
+| The sender's step | round trips a second | CPU a round trip, ns | instructions a round trip | p50 / p99 / p99.9, ns |
+|---|---|---|---|---|
+| nothing, as built | 1,572,837 (1,512,864–1,620,965) | 1,260 (1,238–1,286) | 6,753 (6,446–7,291) | 576 / 704 / 1,120 |
+| the kick | 1,840,117 (1,723,166–2,072,521) | 1,082 (962–1,134) | 6,364 (6,292–6,757) | 456 / 736 / 1,536 |
+| `getppid` | 1,511,692 (1,427,798–1,880,281) | 1,312 (1,061–1,394) | 7,935 (6,256–8,330) | 624 / 832 / 1,184 |
+| a 300 ns spin | 1,662,384 (1,441,996–1,727,339) | 1,198 (1,142–1,255) | 6,689 (6,068–7,069) | 528 / 656 / 832 |
+
+At load 4.3 (the same code but for the counters' print, md5 `71e86e8d5d857c1eb03dbd81751281f6`):
+1,592,927, 1,811,827, 1,492,950 and 1,615,079 round trips a second in the same order. At load 13, the kick built in against the tree
+before it (two binaries, alternating ABBA, five each): 1.51 M against 1.32 M round trips a second
+alone, 1.51 M against 1.38 M beside 18 busy loops.
+
+Each shard's counters at the end of the load 2.7 runs (medians; the initiator's shard, then the
+echo's; 22,000 round trips with the warm-up):
+
+| The sender's step | loop steps | foreign wakes drained | spins that found work | driver waits |
+|---|---|---|---|---|
+| nothing, as built | 44,001 / 44,003 | 21,999 / 22,001 | 21,995 / 21,993 | 5 / 9 |
+| the kick | 9,709 / 35,160 | 6,527 / 18,573 | 3,170 / 16,571 | 16 / 19 |
+| `getppid` | 42,181 / 40,561 | 21,938 / 20,303 | 20,234 / 20,238 | 8 / 9 |
+| a 300 ns spin | 2,848 / 41,163 | 1,429 / 20,588 | 1,413 / 20,567 | 5 / 7 |
+
+As built, every round trip is two foreign wakes and four loop steps: the reply is not there when its
+receiver asks, so the receive registers a waker and the shard goes back to its loop until the bitmap
+shows the wake. With the kick's time in the kernel after each send the reply lands first and the
+receive completes in the same poll. A system call that reaches no one gains nothing, so this is not
+a scheduling gap a system call closes, and no gap of slates' 10–13 µs shows at these loads in any
+mode. A spin of the kick's time saves even more wakes and gains less, so the delay explains the wakes
+saved and not the whole gain.
+
+```sh
+cd crates/hyper-rt-compare && cargo build --release   # on the branch proto-always-kick
+HYPER_RT_KICK_MODE=1 HYPER_RT_KICK_SPIN_NS=300 target/release/hyper-rt-compare hyper pingpong n=20000 warm=2000
+```

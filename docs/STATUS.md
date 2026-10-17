@@ -718,11 +718,14 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      the world, on its network and on the typed write queue, judged by hyper-check's oracles, their
      crashes forked, every floor at the same seed counts, 60–69% fewer allocations a step; hyper-raft's
      judged schedules under swarm configurations, `Lagged` on the write queue, its draws kept for S-5's
-     tapes. Open: the world's chooser playing a tape (§18), hyper-durable's `support/device.rs` with
-     hyper-log under the world (§11 item 6), the rest of S-3
+     tapes. The world's chooser plays a tape (2026-10-17, §18): `Source::Tape`, the tape and its
+     mutations moved into hyper-sim, hyper-durable's schedules played, mutated and replayed from
+     their tapes with every oracle held. Open: hyper-raft's harness onto the world's draws (§18),
+     hyper-durable's `support/device.rs` with hyper-log under the world (§11 item 6), the rest of S-3
      (the block device in the world, its completions' latency and its handles; the namespace model;
-     the fault envelope), the network cancelling a dropped message's arrival (§17, the capacity) and
-     S-8 (the consumers' simulations), `docs/sim.md` §9. S-7 is built (§19): every end-to-end
+     the fault envelope), and S-8 (the consumers' simulations), `docs/sim.md` §9. The network's lost
+     messages take their arrivals with them (2026-10-17, §17): `World::cancel`, the event bound §7's,
+     and hyper-durable's `C` the rule's 21 where it was 4,096. S-7 is built (§19): every end-to-end
      scenario's clients' history held linearizable by hyper-check's search, a planted stale read
      refused.
    - Tails, `docs/tails.md` §7: T-0 (the grid) is built, its sources read and its conditions' values

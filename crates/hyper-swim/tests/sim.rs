@@ -836,6 +836,7 @@ fn run(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, LAN_CLUSTER);
     sim.run("every pair judged", Sim::every_pair_judged);
@@ -920,6 +921,7 @@ fn budgeted(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, BUDGETED_LAN);
     sim.run("every pair judged at the floor", Sim::every_pair_judged);
@@ -973,6 +975,7 @@ fn hourly(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, HOURLY_LAN);
     sim.run("every pair judged", Sim::every_pair_judged);
@@ -1019,6 +1022,7 @@ fn stalled_early(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, THREE);
     let every_pair_answered = |sim: &Sim| {
@@ -1071,6 +1075,7 @@ fn stopped_and_refuted(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, LAN_CLUSTER);
     sim.run("every pair judged", Sim::every_pair_judged);
@@ -1113,6 +1118,7 @@ fn every_peer_dead_early(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, THREE);
     sim.run("every pair answered", |sim| {
@@ -1355,6 +1361,7 @@ fn relayed_only(source: Source) -> Result<Record, SimError> {
     let seed = match &source {
         Source::Seed(seed) => format!("seed {seed}"),
         Source::Trace(_) => "the trace".to_owned(),
+        Source::Tape { .. } => "the tape".to_owned(),
     };
     let mut sim = Sim::new(source, false, SLOW_RELAY);
     sim.run("every pair judged", Sim::every_pair_judged);

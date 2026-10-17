@@ -107,6 +107,22 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-raft: on the swarm's quarter network one group's liveness phase does not converge (found
+  2026-10-17).** With the swarm's losses and repeats narrowed to a quarter (`docs/sim.md` §11 item 4,
+  the setting that reaches the most abstract states and catches every planted defect within the
+  random walk's count), the swarm with no defect planted over 13,585 seeds a harness
+  (`the_swarm_with_no_defect_keeps_every_oracle_and_the_model`, branch `swarm-quarter-network`) met
+  group seed 6,135 (three voters, check-quorum on, pre-vote off, changes and partitions on, losses 24
+  and repeats 3 in a hundred), whose liveness phase passed its bound with every oracle held: terms
+  past 850 and no leader, member 1 holding the configuration {1, 3}, members 2 and 3 holding {2} with
+  3 a learner, member 2 a candidate at term 845 with entries past its commit (85 against 79). On the
+  hostile network the same seed's run settled (its losses 73 in a hundred, the campaign of 9,924 seeds
+  clean). The fast and pipelined harnesses were not run past it. Traced so far (an operation log of the
+  seed's run): member 1 stopped taking entries at step 371 (commit 8); member 2 led term 22 from step
+  1,209 and, at step 1,462, met term 23 from a campaign and stepped down with entries 80–85 past its
+  commit of 79, member 3 at 56; no member led again in the 38,695 operations after, the liveness phase's
+  included. Open: what keeps member 2, whose log is the longest, from being elected (its pending
+  configuration and the votes it needs), before the swarm's network is narrowed.
 - **hyper-transport: on Linux's default receive buffer the shared socket holds two first windows
   (found 2026-10-17).** Docker's VM grants 425,984 bytes (`rmem_max` 212,992), 319,488 past the
   release lag. Charged at its costliest stream byte (896 bytes for a datagram carrying 120), the
@@ -835,9 +851,10 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      alternating with the drawn mix reach 13–24 % more, their length from 125 to 1,000 steps moving
      little. The narrower network catches every planted defect within the random walk's count (the
      fast track's second rule at run 450, which the ranges as drawn miss in 8,868) and each at least as
-     often over the same 1,000 seeds (the read before the first commit 166 times against 72), so it is
-     to replace the drawn ranges, in a step that derives the gate's floors, the liveness bound, the
-     directed seeds and the swarm's recorded catches again on it (`docs/sim.md` §11 item 4).
+     often over the same 1,000 seeds (the read before the first commit 166 times against 72). The step
+     that narrows the swarm's network is built on the unmerged branch `swarm-quarter-network` (the
+     gate's floors derived again on it, every one holding; the swarm's catches recorded) and held back:
+     its swarm with no defect planted met a group that does not converge (the open defect above).
    - Tails, `docs/tails.md` §7: T-0 (the grid) is built, its sources read and its conditions' values
      derived (§2.4); T-1 (the measurement kit: its open-loop schedule and quantile intervals built in
      hyper-measure, the per-process accounts of §1a open), T-2 (the impairment relay), then each crate

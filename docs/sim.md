@@ -751,10 +751,16 @@ allocations in release are measured at S-6 with the same schedules. The table an
    count, the second fast-track rule's, which the ranges as drawn miss in 8,868 runs, at 450, and it
    catches each defect at least as often as the ranges as drawn, the read before the first commit 2.3
    times as often; the first catches of the older-term commit and the first rule, later by 1.4 and 1.7
-   times, are single draws where the rates are equal. So the swarm's network is to be the narrower one:
-   it is taken with the gate's floors (§18), the liveness phase's bound (four times the most a no-defect
-   seed of the swarm took, `support::swarm`'s `LIVENESS`), the swarm's directed seeds and its recorded
-   catches derived again on it, a step of its own; until then the swarm keeps its ranges as drawn. The
+   times, are single draws where the rates are equal. So the swarm's network is to be the narrower one,
+   taken with the gate's floors (§18), the liveness phase's bound (four times the most a no-defect seed
+   of the swarm took, `support::swarm`'s `LIVENESS`), the swarm's directed seeds and its recorded catches
+   derived again on it. That step is built on the unmerged branch `swarm-quarter-network`: every floor
+   held on the narrower network (the pipelined reads served one a seed there, 115 in 48), each of the
+   swarm's catches is clean without its defect, and the directed seeds keep the hostile network they
+   were found on. It is held back by the swarm with no defect planted, over 13,585 seeds a harness (the
+   count for its rarest catch, 4,535, by the rule of `NO_DEFECT_SEEDS`): group seed 6,135 does not
+   converge within the liveness bound, every oracle held (`docs/STATUS.md`, open defects); the hostile
+   network's run of that seed settles. Until it is traced the swarm keeps its ranges as drawn, and the
    hostile networks stay in the gate either way (`tests/check.rs`'s schedules at 25, 50 and 75 in a
    hundred lost and repeated).
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.

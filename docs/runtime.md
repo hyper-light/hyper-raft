@@ -1358,9 +1358,13 @@ thread. §12's row runs both drivers the same way.
    0.61.2 (`docs/research/runtime-sources.md` §2, §3). `sbitmap` keeps no summary level, so §3.2 and
    `wakes.rs` no longer call the wake bitmap's summary its shape; it spreads its words one to a cache line,
    which hyper-rt does not (item 7 measures the difference).
-6. A plain `Release` store of the wake bitmap's pending flag failed loom 0.7.2's parking model: the sender's
-   own later load read the flag's earlier value, which coherence forbids. The flag is published with a swap
-   (the model passes); the execution is to be reduced to a loom report or to an error of this model's.
+6. Closed 2026-10-17: a plain `Release` store of the wake bitmap's pending flag failed loom 0.7.2's
+   parking model. Reduced (`docs/research/runtime-sources.md` §4) to a false alarm of loom's: two threads
+   each store, fence `SeqCst` and load the other's flag, and when the parker's own swap of the flag
+   precedes the sender's store, loom lets the parker's load read the swap's value, which [atomics.fences]
+   forbids once the sender's fence precedes the parker's. The current drain loads before it swaps, and the
+   four parking models pass with a plain store; the swap stays until a measurement shows the store
+   cheaper.
 7. One-shot against edge-triggered registration (§3.7), and packed wake words against one per cache line
    (§3.2), measured on §12's rows.
 8. The spin window from the startup wake probe rarely hit in slates' bench configuration (§3.2), though it

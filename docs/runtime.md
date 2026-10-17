@@ -416,7 +416,11 @@ the wait's own `kevent` call (5 ms ended at 5.03 ms): `kevent64`'s `NOTE_LEEWAY`
 tick, but XNU serves a kqueue one record format and the tick there is a few microseconds. Tests:
 `epoll::tests::a_timed_wait_ends_at_its_timeout_not_the_next_millisecond`,
 `epoll::tests::a_shard_s_slack_is_its_thread_s_until_its_driver_goes`,
-`kqueue::tests::a_timed_wait_ends_at_its_timeout_not_where_xnu_coalesces_it`.
+`kqueue::tests::a_timed_wait_is_a_critical_timer_for_its_own_timeout`, which checks the record a timed
+wait arms (a one-shot `EVFILT_TIMER` in nanoseconds with `NOTE_CRITICAL`) and that the timer ends a wait
+nothing else does; it took a median of 41 waits' ends until 2026-10-17, when a load average of 29 on the
+M5 Max ran the woken thread 8.5–9.4 ms after 5 ms timeouts and failed it, the host's lateness, not the
+timer's.
 
 On Windows `GetQueuedCompletionStatusEx` takes milliseconds and ends on the system's timer
 interrupt, 15.6 ms apart unless some process has raised the rate. A timed wait there arms a

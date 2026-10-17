@@ -1461,6 +1461,32 @@ Test: `peer_sockets::a_driver_given_a_socket_bound_with_its_port_shared_gives_ea
 client gives a server driven on a shared socket a socket of its own where the platform shares ports,
 and one driven on a plain socket none).
 
+## 4v. A shared port is its listener's alone (2026-10-17)
+
+Every driver bound to an address shares its port with a socket for each peer (§4u), and the socket
+asked for its port with the port already shared (`SO_REUSEPORT` set before `bind`). On Linux a socket so
+flagged and asking for port 0 can be given a port that another flagged socket of the same user holds, in
+this process or another: the kernel's search for a free port passes over a port held only by sockets it
+may share with. The two sockets then split the port's datagrams by a hash of each datagram's addresses,
+and one endpoint's peer is heard by the other, which drops what it cannot read. A client whose server's
+replies hashed to the other socket sent its Initial again and again and never heard the server: with
+256 clients connecting to one server, one to three never connected in four runs of five, and every one
+of them shared its port with another client, the server holding up to 17 handshakes for one of them.
+macOS gives no held port to a port-0 bind.
+
+`UdpSocket::bind_shared` now binds first and flags the socket after: the port is one no other socket
+holds (a held port is refused `AddrInUse`, so a second listener on a node's port fails at once), and
+the sockets for its peers join it with the flag set before their bind (`UdpSocket::join_shared`). Linux
+makes the port's group when the first joiner binds, and the BSDs judge each bind by both sockets' flags
+at that bind, so a flag set after the bind serves both (measured on each, a joiner connected to its peer
+taking that peer's datagrams and the listener the rest). A port-0 bind of a socket that is flagged first
+can still be given a port this one holds; hyper-rt binds no socket so.
+
+Tests: `udp_shared_port::every_shared_bind_at_port_zero_is_given_a_port_of_its_own` (1,024 binds at
+port 0; flagged first, 19 ports were given twice on Linux), `a_shared_port_is_refused_to_a_second_listener`
+(flagged first, the second bind succeeded) and `a_joined_port_hands_the_joiner_its_peers_datagrams`;
+hyper-rt-transport's `connection_memory` measurement connects all 256 clients in five runs of five.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

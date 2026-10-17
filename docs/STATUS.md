@@ -190,6 +190,13 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-rt: a shared port bound at port 0 could be given a port another shared socket held.**
+  Flagged `SO_REUSEPORT` before its bind, a socket asking Linux for port 0 could be given a port
+  another of the user's flagged sockets held, in any process, and the two split its datagrams: one to
+  three of 256 clients never heard their server in four runs of five. `UdpSocket::bind_shared` binds
+  first and flags after; peers' sockets join with `UdpSocket::join_shared` (`docs/transport.md` §4v).
+  Tests: `tests/udp_shared_port.rs`.
+
 - **hyper-rt-transport: every park polled every peer socket's readiness wait.** With a socket for
   each connection (§4u), an exchange cost about 11 ns more for each connection the server held (the
   `connections` bench on Linux: 12.8 µs beside one, 18.4–18.9 µs beside 512), and matching sockets to

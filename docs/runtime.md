@@ -821,6 +821,16 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
 - **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.
+- **A shared port is its listener's alone** (2026-10-17). `UdpSocket::bind_shared` binds a port that the
+  sockets a listener connects to its peers then join (`UdpSocket::join_shared`, `SO_REUSEPORT`). It binds
+  before it sets the flag, so the port is one no other socket holds: a held port is refused `AddrInUse`,
+  and port 0 is given a port of its own. Flagged before its bind, a socket asking Linux for port 0 could be
+  given a port another of the user's flagged sockets held, in any process: the kernel's search for a free
+  port passes over a port held by a socket it may share with (`udp_lib_lport_inuse` marks none), and the
+  two sockets then split the port's datagrams by hash. Of 1,024 such binds, 19 ports were given twice;
+  of 256 clients of one server, one to three never heard it in four runs of five, each sharing its port
+  with another client (`tests/udp_shared_port.rs`; hyper-rt-transport's `connection_memory`). macOS gives
+  no held port to a port-0 bind, and both kernels take the flag set after the bind (measured).
 - **What a socket holds, bounded and told.** `Io::held_bound` is the most a batched socket holds while it
   lives, and what its owner charges for it: its receive buffers (`batch` of `RECEIVE_BYTES` on Linux, one
   elsewhere), its outbox (`batch` slots, each one datagram or one segmented send of at most

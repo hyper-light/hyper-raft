@@ -386,7 +386,7 @@ fn a_peer_socket_left_holding_datagrams_is_drained_without_another_wake() {
                 "no socket of its own for each side"
             );
         }
-        let stray = hyper_rt::udp::UdpSocket::bind_shared(client_addr).unwrap();
+        let stray = hyper_rt::udp::UdpSocket::join_shared(client_addr).unwrap();
         let before = server.peer_stats().received;
         for index in 0..STRAY {
             let mut datagram = [0u8; 32];

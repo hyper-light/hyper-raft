@@ -121,8 +121,15 @@ is worked around.
   seed's run): member 1 stopped taking entries at step 371 (commit 8); member 2 led term 22 from step
   1,209 and, at step 1,462, met term 23 from a campaign and stepped down with entries 80–85 past its
   commit of 79, member 3 at 56; no member led again in the 38,695 operations after, the liveness phase's
-  included. Open: what keeps member 2, whose log is the longest, from being elected (its pending
-  configuration and the votes it needs), before the swarm's network is narrowed.
+  included. Member 2's log holds at index 80 (term 22, past its commit) the change that adds member 3 as
+  a voter, so by the newest configuration in its log (`docs/sim.md` §15.12) its quorum is {2, 3} and it
+  needs member 3's vote; member 3 holds the committed {2} with itself a learner, never received index
+  80, and cast no vote in any of the 800 terms that followed (its hard state's vote 0 at steps 1,463,
+  3,000 and 39,000), while member 1, holding {1, 3} with eight entries, campaigned throughout without
+  pre-vote, its terms ahead of member 2's (824 against 820 at step 39,000), and each of its campaigns
+  restarts the others' election timers (`Raft::become_follower` resets the elapsed ticks). Open: why
+  member 3 grants member 2 no vote (`Raft::step_vote` does not refuse a learner), before the swarm's
+  network is narrowed.
 - **hyper-transport: on Linux's default receive buffer the shared socket holds two first windows
   (found 2026-10-17).** Docker's VM grants 425,984 bytes (`rmem_max` 212,992), 319,488 past the
   release lag. Charged at its costliest stream byte (896 bytes for a datagram carrying 120), the

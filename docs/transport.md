@@ -1174,6 +1174,28 @@ Test: `exchange::a_frame_on_an_idle_lane_is_written_straight_into_its_stream` (4
 once the lane is drained: the first opens the lane through its queue, the other 39 go straight in,
 every frame arrives in order).
 
+## 4p. A stream's unacknowledged data read by binary search (2026-10-16)
+
+QUIC keeps a stream's data until it is acknowledged, a piece for each write (`SendBuffer`), and a
+packet's stream frame reads its bytes from them by offset. The read walked the pieces from the front,
+so every packet of new data passed every piece in flight before it: two a lane frame (its prefix and
+its body), and decimated acknowledgements (§4k) keep a millisecond of them in flight, some two
+hundred at 100,000 frames a second. On a busy core the walk was most of `populate_packet`'s time. Each
+piece now carries the stream offset of its first byte, and a read finds its piece by binary search.
+An acknowledgement in order, with none past it, moves the front without the set of ranges
+acknowledged ahead, where each acknowledged frame cost an insertion into that B-tree and its removal.
+
+Busy core, bare-metal box, three interleaved pairs, medians:
+
+| Offered / s | Before: CPU a message | After | p50 before | p50 after |
+|---|---|---|---|---|
+| 100,000 | 3,978 ns | 3,926 ns | 0.34 ms | 0.32 ms |
+| 1,000,000 | 1,196 ns | 1,177 ns | 12.31 ms | 11.08 ms |
+
+Tests: `send_buffer`'s `reads_find_their_piece_among_many` (400 uneven writes, acknowledgements
+trimming the front, every read against the bytes written) and
+`in_order_acknowledgements_leave_the_set_alone`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

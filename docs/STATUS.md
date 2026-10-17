@@ -146,6 +146,14 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-quic: every packet of new stream data walked the stream's unacknowledged pieces.** A
+  read found its bytes by walking the pieces from the front, past every one in flight (some two
+  hundred at 100,000 frames a second, acknowledgements decimated). Pieces now carry their offsets and
+  a read binary-searches them; an in-order acknowledgement skips the B-tree of ranges acknowledged
+  ahead. Busy core: 3,978 → 3,926 ns a message at 100,000 a second, 1,196 → 1,177 at a million
+  (`docs/transport.md` §4p). Tests: `send_buffer::reads_find_their_piece_among_many`,
+  `send_buffer::in_order_acknowledgements_leave_the_set_alone`.
+
 - **hyper-transport: every lane frame was copied twice before QUIC.** `send_frame` copied a frame into
   a buffer of its own and the lane's flush copied it into the stream (1.43 % and 1.36 % of a
   saturated bus node). A frame on a lane that holds none is now written straight from the sender's

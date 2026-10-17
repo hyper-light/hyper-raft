@@ -20,9 +20,23 @@ fn nanos(duration: Duration) -> u64 {
 pub(crate) struct Sender {
     pub(crate) local_run: u64,
     pub(crate) floor: Option<Duration>,
+    /// PROTOTYPE: the latest flush plus `G`, and the rule an up-move follows.
+    pub(crate) latest: Option<Duration>,
+    pub(crate) rule: FloorRule,
     pub(crate) granularity: Option<Duration>,
     pub(crate) durable_count: u64,
     pub(crate) durable_ns: Option<u64>,
+}
+
+/// PROTOTYPE (docs/STATUS.md, the moving floor): where an interval goes when the floor rises past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FloorRule {
+    /// To the floor (as built).
+    Main,
+    /// To the interval doubled until it holds the floor.
+    Doubling,
+    /// To the larger of the floor and the latest flush plus `G`.
+    Latest,
 }
 
 /// What the node gives a pair's receiver with a heartbeat.
@@ -351,6 +365,20 @@ impl Pair {
         let renewed = sender.durable_count >= self.stream.floor_from.saturating_mul(2);
         let (wanted, from_floor) = if asked >= floor {
             (asked, false)
+        } else if floor > current && current != 0 && !renewed {
+            // PROTOTYPE: where an up-move goes.
+            let up = match sender.rule {
+                FloorRule::Main => floor,
+                FloorRule::Doubling => {
+                    let mut up = current;
+                    while up < floor {
+                        up = up.saturating_mul(2);
+                    }
+                    up
+                }
+                FloorRule::Latest => floor.max(sender.latest.map_or(floor, nanos)),
+            };
+            (up, true)
         } else if renewed || floor > current {
             (floor, true)
         } else {
@@ -1017,6 +1045,8 @@ mod tests {
         let sender = Sender {
             local_run: 1,
             floor: Some(Duration::from_millis(1)),
+            latest: None,
+            rule: FloorRule::Main,
             granularity: Some(granularity),
             durable_count: 1,
             durable_ns: Some(now),
@@ -1065,6 +1095,8 @@ mod tests {
             let sender = Sender {
                 local_run: 1,
                 floor: Some(Duration::from_nanos(floor(n))),
+                latest: None,
+                rule: FloorRule::Main,
                 granularity: Some(granularity),
                 durable_count: n,
                 durable_ns: Some(now),

@@ -1,0 +1,66 @@
+== main
+test a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own ... macos: survivors noticed the victim's death 71 ms after the kill at the median, 560 ms at the 90th percentile, 746 ms at the most
+busy: survivors noticed the victim's death 119 ms after the kill at the median, 1102 ms at the 90th percentile, 1933 ms at the most
+linux: survivors noticed the victim's death 48 ms after the kill at the median, 156 ms at the 90th percentile, 276 ms at the most
+windows: survivors noticed the victim's death 313 ms after the kill at the median, 1754 ms at the 90th percentile, 2494 ms at the most
+test links_young_when_every_device_slows_for_good_still_configure ... macos seed 47244640256: every pair configured 414 s after the slowdown; the victim suspected 10 s after its kill
+macos seed 47244640257: every pair configured 324 s after the slowdown; the victim suspected 18 s after its kill
+macos seed 47244640258: every pair configured 345 s after the slowdown; the victim suspected 10 s after its kill
+macos seed 47244640259: every pair configured 424 s after the slowdown; the victim suspected 17 s after its kill
+macos seed 47244640260: every pair configured 618 s after the slowdown; the victim suspected 18 s after its kill
+macos seed 47244640261: every pair configured 257 s after the slowdown; the victim suspected 16 s after its kill
+macos seed 47244640262: every pair configured 395 s after the slowdown; the victim suspected 11 s after its kill
+macos seed 47244640263: every pair configured 335 s after the slowdown; the victim suspected 19 s after its kill
+linux seed 47244640256: every pair configured 280 s after the slowdown; the victim suspected 5 s after its kill
+linux seed 47244640257: every pair configured 301 s after the slowdown; the victim suspected 8 s after its kill
+linux seed 47244640258: every pair configured 403 s after the slowdown; the victim suspected 7 s after its kill
+linux seed 47244640259: every pair configured 493 s after the slowdown; the victim suspected 8 s after its kill
+linux seed 47244640260: every pair configured 465 s after the slowdown; the victim suspected 4 s after its kill
+linux seed 47244640261: every pair configured 458 s after the slowdown; the victim suspected 6 s after its kill
+linux seed 47244640262: every pair configured 282 s after the slowdown; the victim suspected 8 s after its kill
+linux seed 47244640263: every pair configured 461 s after the slowdown; the victim suspected 4 s after its kill
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.09s
+== doubling
+test a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own ... macos: survivors noticed the victim's death 91 ms after the kill at the median, 607 ms at the 90th percentile, 1626 ms at the most
+busy: survivors noticed the victim's death 129 ms after the kill at the median, 984 ms at the 90th percentile, 2268 ms at the most
+linux: survivors noticed the victim's death 58 ms after the kill at the median, 278 ms at the 90th percentile, 608 ms at the most
+windows: survivors noticed the victim's death 369 ms after the kill at the median, 2703 ms at the 90th percentile, 5998 ms at the most
+test links_young_when_every_device_slows_for_good_still_configure ... macos seed 47244640256: every pair configured 167 s after the slowdown; the victim suspected 8 s after its kill
+macos seed 47244640257: every pair configured 264 s after the slowdown; the victim suspected 13 s after its kill
+macos seed 47244640258: every pair configured 347 s after the slowdown; the victim suspected 11 s after its kill
+macos seed 47244640259: every pair configured 188 s after the slowdown; the victim suspected 6 s after its kill
+macos seed 47244640260: every pair configured 169 s after the slowdown; the victim suspected 12 s after its kill
+macos seed 47244640261: every pair configured 274 s after the slowdown; the victim suspected 14 s after its kill
+macos seed 47244640262: every pair configured 170 s after the slowdown; the victim suspected 12 s after its kill
+macos seed 47244640263: every pair configured 275 s after the slowdown; the victim suspected 7 s after its kill
+linux seed 47244640256: every pair configured 264 s after the slowdown; the victim suspected 6 s after its kill
+linux seed 47244640257: every pair configured 170 s after the slowdown; the victim suspected 11 s after its kill
+linux seed 47244640258: every pair configured 348 s after the slowdown; the victim suspected 7 s after its kill
+linux seed 47244640259: every pair configured 246 s after the slowdown; the victim suspected 6 s after its kill
+linux seed 47244640260: every pair configured 169 s after the slowdown; the victim suspected 12 s after its kill
+linux seed 47244640261: every pair configured 168 s after the slowdown; the victim suspected 11 s after its kill
+linux seed 47244640262: every pair configured 170 s after the slowdown; the victim suspected 13 s after its kill
+linux seed 47244640263: every pair configured 345 s after the slowdown; the victim suspected 13 s after its kill
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.10s
+== latest
+test a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own ... macos: survivors noticed the victim's death 77 ms after the kill at the median, 589 ms at the 90th percentile, 1078 ms at the most
+busy: survivors noticed the victim's death 117 ms after the kill at the median, 894 ms at the 90th percentile, 1692 ms at the most
+linux: survivors noticed the victim's death 90 ms after the kill at the median, 788 ms at the 90th percentile, 2184 ms at the most
+windows: survivors noticed the victim's death 622 ms after the kill at the median, 2472 ms at the 90th percentile, 5725 ms at the most
+test links_young_when_every_device_slows_for_good_still_configure ... macos seed 47244640256: every pair configured 378 s after the slowdown; the victim suspected 8 s after its kill
+macos seed 47244640257: every pair configured 205 s after the slowdown; the victim suspected 13 s after its kill
+macos seed 47244640258: every pair configured 231 s after the slowdown; the victim suspected 14 s after its kill
+macos seed 47244640259: every pair configured 291 s after the slowdown; the victim suspected 16 s after its kill
+macos seed 47244640260: every pair configured 362 s after the slowdown; the victim suspected 15 s after its kill
+macos seed 47244640261: every pair configured 156 s after the slowdown; the victim suspected 11 s after its kill
+macos seed 47244640262: every pair configured 173 s after the slowdown; the victim suspected 14 s after its kill
+macos seed 47244640263: every pair configured 153 s after the slowdown; the victim suspected 13 s after its kill
+linux seed 47244640256: every pair configured 120 s after the slowdown; the victim suspected 9 s after its kill
+linux seed 47244640257: every pair configured 181 s after the slowdown; the victim suspected 13 s after its kill
+linux seed 47244640258: every pair configured 207 s after the slowdown; the victim suspected 13 s after its kill
+linux seed 47244640259: every pair configured 285 s after the slowdown; the victim suspected 10 s after its kill
+linux seed 47244640260: every pair configured 199 s after the slowdown; the victim suspected 9 s after its kill
+linux seed 47244640261: every pair configured 158 s after the slowdown; the victim suspected 12 s after its kill
+linux seed 47244640262: every pair configured 251 s after the slowdown; the victim suspected 12 s after its kill
+linux seed 47244640263: every pair configured 186 s after the slowdown; the victim suspected 13 s after its kill
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.10s

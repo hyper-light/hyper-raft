@@ -322,6 +322,9 @@ pub struct Liveness {
     asked: Option<u64>,
     late_most: u64,
     flushes: Flushes,
+    /// PROTOTYPE: the latest flush's length, and the up-move rule.
+    latest_flush: Option<Duration>,
+    floor_rule: pair::FloorRule,
     durable: Durable,
     /// Whether a liveness write is out.
     flushing: bool,
@@ -407,6 +410,13 @@ impl Liveness {
             asked: None,
             late_most: 0,
             flushes: Flushes::new(),
+            latest_flush: None,
+            #[allow(clippy::disallowed_methods)]
+            floor_rule: match std::env::var("HYPER_LIVENESS_FLOOR_RULE").as_deref() {
+                Ok("doubling") => pair::FloorRule::Doubling,
+                Ok("latest") => pair::FloorRule::Latest,
+                _ => pair::FloorRule::Main,
+            },
             durable: Durable::default(),
             flushing: false,
             exposure: settings.history,
@@ -522,6 +532,7 @@ impl Liveness {
         );
         // A full fold keeps its mean.
         let _ = self.flushes.on_flush(started_ns, durable_ns);
+        self.latest_flush = Some(Duration::from_nanos(durable_ns.saturating_sub(started_ns)));
         if write == Write::Liveness {
             self.flushing = false;
         }
@@ -600,6 +611,10 @@ impl Liveness {
         let sender = pair::Sender {
             local_run: self.run,
             floor,
+            latest: self
+                .latest_flush
+                .map(|flush| flush.saturating_add(granularity.unwrap_or(Duration::ZERO))),
+            rule: self.floor_rule,
             granularity,
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,

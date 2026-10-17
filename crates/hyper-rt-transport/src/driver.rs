@@ -152,6 +152,9 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     measure: SocketCharge,
     /// The rooms its peers' sockets were told.
     rooms: Rooms,
+    /// What the sockets of the peers that went did, summed, flags cleared: kept so no count of
+    /// [`Driver::peer_stats`] goes back when a peer goes.
+    retired: IoStats,
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B, D> {
@@ -236,6 +239,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             yields: 0,
             measure: SocketCharge::new(unmeasured),
             rooms: Rooms::default(),
+            retired: IoStats::default(),
         })
     }
 
@@ -275,12 +279,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         self.socket.stats()
     }
 
-    /// What the sockets of the peers it holds now have done, summed; a flag is set where any of
-    /// theirs is.
+    /// What its peers' sockets have done since it began, summed: those it holds now and those of
+    /// peers that went, so no count goes back when a peer goes (a counter read from it never runs
+    /// backwards); a flag is set where a socket it holds now has it.
     pub fn peer_stats(&self) -> IoStats {
-        self.peers.iter().fold(IoStats::default(), |sum, peer| {
-            sum.plus(&peer.socket.stats())
-        })
+        self.peers
+            .iter()
+            .fold(self.retired, |sum, peer| sum.plus(&peer.socket.stats()))
     }
 
     /// The sockets the driver holds connected to its peers (the module's doc).
@@ -448,10 +453,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             return Ok(());
         };
         let listed = &self.listed;
+        let retired = &mut self.retired;
         self.peers.retain(|socket| {
-            listed
+            let kept = listed
                 .iter()
-                .any(|(peer, remote)| *peer == socket.peer && *remote == socket.remote)
+                .any(|(peer, remote)| *peer == socket.peer && *remote == socket.remote);
+            if !kept {
+                *retired = retired.plus(&IoStats {
+                    gso: false,
+                    gro: false,
+                    kernel_stamps: false,
+                    ..socket.socket.stats()
+                });
+            }
+            kept
         });
         let ask = usize::try_from(hyper_transport::socket_buffer_ask(
             self.endpoint.peer_demand(),

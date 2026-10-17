@@ -199,7 +199,11 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
                 );
             }
 
-            // The connection goes, and its socket with it.
+            // The connection goes, and its socket with it; what the socket did stays counted.
+            let held = server.peer_stats();
+            if shared == 1 {
+                assert!(held.received > 0, "the frames came by the peer's socket: {held:?}");
+            }
             let now = client.clock().unwrap();
             client.endpoint().disconnect(now, SERVER);
             while !seen.closed || server.peer_sockets() > 0 {
@@ -207,6 +211,16 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
                 assert!(began.elapsed() < GUARD, "the server kept the client's socket");
             }
             assert_eq!(server.endpoint().stats().receive_rooms, 0);
+            let gone = server.peer_stats();
+            for (what, before, after) in [
+                ("received", held.received, gone.received),
+                ("receive calls", held.receive_calls, gone.receive_calls),
+                ("sent", held.sent, gone.sent),
+                ("send calls", held.send_calls, gone.send_calls),
+            ] {
+                assert!(after >= before, "{what} went back from {before} to {after} as the peer went");
+            }
+            assert!(!gone.gro && !gone.gso, "no socket is held to have a flag: {gone:?}");
             format!(
                 "{FRAMES} frames by the peer's own socket ({shared} a side), {} datagrams in {} calls; \
                  its socket let go with it",

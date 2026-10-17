@@ -993,6 +993,23 @@ impl Shard {
                 continue;
             };
             let desk = &self.desk;
+            if completion.result < 0 {
+                // An arm the kernel refused when it was applied (kqueue's arms ride in its next call):
+                // every wait on the handle is refused with the error.
+                count(&self.desk.live.interests_refused, 1);
+                let refusal = RtError::DriverRefused {
+                    call: "kevent(EV_ADD)",
+                    code: completion.result.checked_neg(),
+                };
+                let _ = self.core.waiting.fire(
+                    raw,
+                    Readiness::READ.union(Readiness::WRITE),
+                    |word, ticket| {
+                        desk.refuse_wait(ticket, Encoded::from_word(word), refusal.clone());
+                    },
+                );
+                continue;
+            }
             let fired = Readiness::from_bits(completion.result);
             let left = self.core.waiting.fire(raw, fired, |word, ticket| {
                 desk.fire_wait(ticket, Encoded::from_word(word));

@@ -100,6 +100,32 @@ fn config() -> RuntimeConfig {
     }
 }
 
+/// A readiness wait on a descriptor the kernel does not know is refused, typed, not left waiting:
+/// epoll's `epoll_ctl` refuses it at once, and kqueue's change, which rides in the shard's next
+/// `kevent`, comes back from that call with `EV_ERROR` and is handed to the wait (kqueue(2)).
+#[cfg(unix)]
+#[test]
+fn a_wait_on_a_descriptor_the_kernel_does_not_know_is_refused() {
+    /// Format: `EBADF` on Linux and macOS.
+    const EBADF: i32 = 9;
+    let rt = Runtime::start(&config()).unwrap();
+    let id = rt.shard_ids()[0];
+    let (tx, rx) = channel();
+    rt.spawn_on(id, async move {
+        // No process holds this many descriptors: RLIMIT_NOFILE is far below it.
+        let _ = tx.send(hyper_rt::readiness::readable(i32::MAX).await);
+    })
+    .unwrap();
+    let outcome = rx.recv().unwrap();
+    shutdown_within(rt, "after the refusal").unwrap();
+    match outcome {
+        Err(hyper_rt::error::RtError::DriverRefused { code, .. }) => {
+            assert_eq!(code, Some(EBADF), "refused as no descriptor")
+        }
+        other => panic!("a wait on an unknown descriptor must be refused: {other:?}"),
+    }
+}
+
 /// A task's `recv_from` awaits through the driver until a datagram arrives; a second task sends it.
 #[test]
 fn a_udp_datagram_is_received_through_the_driver() {

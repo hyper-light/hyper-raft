@@ -45,6 +45,12 @@ const EVENTS_PER_WAIT: usize = 64;
 #[cfg(target_os = "macos")]
 const TIMER_IDENT: usize = 1;
 
+/// Shape: the arms a wait carries in its change list (macOS), half the events it drains, so the
+/// errors of every change and as many events again fit the buffer (kqueue(2): an error is placed
+/// in the event list when there is room, and fails the call when there is none).
+#[cfg(target_os = "macos")]
+const CHANGES_PER_WAIT: usize = EVENTS_PER_WAIT / 2;
+
 /// The driver.
 pub struct KqueueDriver {
     kq: KickFd,
@@ -59,6 +65,16 @@ pub struct KqueueDriver {
     /// A timed wait's timer (macOS).
     #[cfg(target_os = "macos")]
     timer: Timer,
+    /// Arms not yet given to the kernel (macOS): each rides in the change list of the shard's next
+    /// `kevent`, its wait or its harvest, so an arm makes no system call of its own; at most
+    /// `CHANGES_PER_WAIT`, past which they are applied at once.
+    #[cfg(target_os = "macos")]
+    changes: Vec<libc::kevent>,
+    /// Arms the kernel refused when applied ahead of a wait, each a completion of its handle's tag
+    /// with the negated error (macOS), handed to the next wait: at most the arms made between two
+    /// waits, which the shard's readiness table bounds.
+    #[cfg(target_os = "macos")]
+    refused: Vec<Completion>,
 }
 
 /// A timed wait's one-shot timer: whether one a wait armed has not yet fired.
@@ -135,7 +151,64 @@ impl KqueueDriver {
             nops: Vec::new(),
             #[cfg(target_os = "macos")]
             timer: Timer::default(),
+            // One more than the arms, for the timer's change.
+            #[cfg(target_os = "macos")]
+            changes: Vec::with_capacity(CHANGES_PER_WAIT + 1),
+            #[cfg(target_os = "macos")]
+            refused: Vec::new(),
         }
+    }
+
+    /// Applies the arms waiting for a `kevent` now, each with `EV_RECEIPT`, so each comes back with
+    /// its own outcome and no pending event is drained (kqueue(2)); a refused one is kept for the
+    /// next wait to hand to its handle's waiters (macOS).
+    #[cfg(target_os = "macos")]
+    fn apply_changes(&mut self) -> Result<(), RtError> {
+        use std::os::fd::AsRawFd;
+        for change in &mut self.changes {
+            change.flags |= libc::EV_RECEIPT;
+        }
+        let count = libc::c_int::try_from(self.changes.len()).unwrap_or(0);
+        let mut receipts: [libc::kevent; CHANGES_PER_WAIT] = [libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }; CHANGES_PER_WAIT];
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let changes = self.changes.as_ptr();
+        let receipts_at = receipts.as_mut_ptr();
+        let outcome = self
+            .kq
+            .with(|kq| {
+                // SAFETY: the change list is `count` valid records; the receipt buffer has room for
+                // as many, one a change under `EV_RECEIPT`; the zero timeout is a live timespec.
+                unsafe { libc::kevent(kq.as_raw_fd(), changes, count, receipts_at, count, &zero) }
+            })
+            .ok_or(RtError::DriverLost)?;
+        self.changes.clear();
+        if outcome < 0 {
+            let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return match rustix::io::Errno::from_raw_os_error(raw) {
+                rustix::io::Errno::BADF => Err(RtError::DriverLost),
+                other => Err(refused("kevent(EV_ADD)", other)),
+            };
+        }
+        let filled = usize::try_from(outcome).unwrap_or(0);
+        for receipt in receipts.iter().take(filled) {
+            if receipt.flags & libc::EV_ERROR != 0 && receipt.data != 0 {
+                self.refused.push(Completion {
+                    user_data: u64::try_from(receipt.udata.addr()).unwrap_or(0),
+                    result: i32::try_from(receipt.data).map_or(i32::MIN, i32::wrapping_neg),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Waits for events into `out`, for at most `timeout_ns` (none: until one).
@@ -209,8 +282,10 @@ impl KqueueDriver {
         } else {
             std::ptr::null()
         };
-        let changes = change.as_slice();
-        let nchanges = libc::c_int::try_from(changes.len()).unwrap_or(0);
+        // The arms waiting for a call ride in this one, the timer's change after them.
+        self.changes.extend(change);
+        let changes = self.changes.as_ptr();
+        let nchanges = libc::c_int::try_from(self.changes.len()).unwrap_or(0);
         self.events.clear();
         let capacity = libc::c_int::try_from(self.events.capacity()).unwrap_or(libc::c_int::MAX);
         let events = self.events.as_mut_ptr();
@@ -221,18 +296,12 @@ impl KqueueDriver {
                 // for `capacity` records, which the kernel fills at most; the timeout, when given,
                 // is a live timespec read during the call.
                 unsafe {
-                    libc::kevent(
-                        kq.as_raw_fd(),
-                        changes.as_ptr(),
-                        nchanges,
-                        events,
-                        capacity,
-                        timeout,
-                    )
+                    libc::kevent(kq.as_raw_fd(), changes, nchanges, events, capacity, timeout)
                 }
             })
             .ok_or(RtError::DriverLost)?;
         // A change is applied before the call waits, so an interrupted wait applied it too.
+        self.changes.clear();
         match timeout_ns {
             Some(0) => {}
             Some(_) => self.timer.armed = true,
@@ -261,11 +330,12 @@ impl KqueueDriver {
                 continue;
             }
             if ev.flags & libc::EV_ERROR != 0 {
-                // Only the timer is changed here, so an error names nothing else.
-                return Err(refused(
-                    "kevent change",
-                    rustix::io::Errno::from_raw_os_error(i32::try_from(ev.data).unwrap_or(0)),
-                ));
+                // An arm the kernel refused: its handle's waiters are refused with the error.
+                out.push(Completion {
+                    user_data: u64::try_from(ev.udata.addr()).unwrap_or(0),
+                    result: i32::try_from(ev.data).map_or(i32::MIN, i32::wrapping_neg),
+                });
+                continue;
             }
             // Kick events carry nothing; other filters become completions keyed by udata.
             let fired = match ev.filter {
@@ -308,6 +378,12 @@ impl Driver for KqueueDriver {
             }));
             timeout_ns = Some(0);
         }
+        // Arms refused when applied ahead of a wait answer now, and the wait does not block past them.
+        #[cfg(target_os = "macos")]
+        if !self.refused.is_empty() {
+            out.append(&mut self.refused);
+            timeout_ns = Some(0);
+        }
         self.collect(timeout_ns, out)
     }
 
@@ -316,6 +392,46 @@ impl Driver for KqueueDriver {
         Ok(())
     }
 
+    /// One filter per direction, each its own registration (ident and filter), so arming one never
+    /// touches the other; a filter armed earlier and no longer wanted fires once, to no waiter. The
+    /// change waits for the shard's next `kevent` (its wait or its harvest, which the shard makes
+    /// before it blocks), applied at once only when `CHANGES_PER_WAIT` already wait.
+    #[cfg(target_os = "macos")]
+    fn arm(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<(), RtError> {
+        let udata = core::ptr::without_provenance_mut(usize::try_from(tag).unwrap_or(usize::MAX));
+        let ident =
+            usize::try_from(raw).map_err(|_| refused("kevent(EV_ADD)", rustix::io::Errno::BADF))?;
+        for (direction, filter) in [
+            (Readiness::READ, libc::EVFILT_READ),
+            (Readiness::WRITE, libc::EVFILT_WRITE),
+        ] {
+            if !want.contains(direction) {
+                continue;
+            }
+            if self.changes.len() >= CHANGES_PER_WAIT {
+                self.apply_changes()?;
+            }
+            self.changes.push(libc::kevent {
+                ident,
+                filter,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: 0,
+                data: 0,
+                udata,
+            });
+        }
+        Ok(())
+    }
+
+    /// A handle no one waits on: an arm of it still waiting for a call is dropped (macOS).
+    #[cfg(target_os = "macos")]
+    fn disarm(&mut self, raw: i32) {
+        if let Ok(ident) = usize::try_from(raw) {
+            self.changes.retain(|change| change.ident != ident);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn arm(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<(), RtError> {
         // One filter per direction, each its own registration (ident and filter), so arming one never
         // touches the other; a filter armed earlier and no longer wanted fires once, to no waiter.
@@ -348,6 +464,10 @@ impl Driver for KqueueDriver {
     }
 
     fn has_pending(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if !self.refused.is_empty() {
+            return true;
+        }
         !self.nops.is_empty()
     }
 }

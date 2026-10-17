@@ -42,6 +42,9 @@ pub struct Stamped {
     headers: linux::Headers,
     #[cfg(target_os = "linux")]
     received: Vec<linux::Received>,
+    /// The kernel's stamps carried to the monotonic clock.
+    #[cfg(target_os = "linux")]
+    carry: crate::clock::Carry,
 }
 
 impl Stamped {
@@ -67,6 +70,8 @@ impl Stamped {
             headers: linux::Headers::new(1),
             #[cfg(target_os = "linux")]
             received: Vec::with_capacity(1),
+            #[cfg(target_os = "linux")]
+            carry: crate::clock::Carry::new(linux::realtime_ns()?, linux::monotonic_ns()?),
         })
     }
 
@@ -97,26 +102,34 @@ impl Stamped {
     fn take(&mut self, socket: &UdpSocket, buffer: &mut [u8]) -> io::Result<Taken> {
         use std::os::fd::AsRawFd;
         self.received.clear();
-        linux::receive(
+        let taken = linux::receive(
             socket.as_raw_fd(),
             &mut [buffer],
             &mut self.headers,
             &mut self.received,
-        )?;
-        // Both clocks after the receive, the realtime one first, as the plane socket reads them
-        // (`crate::clock`): a stamp is carried over by its age, late and never early.
+        );
+        // Both clocks after the receive, the realtime one first, as the plane socket reads them,
+        // a receive that found the socket empty too (`crate::clock::Carry`).
+        // One datagram a receive: the socket is found empty only by a receive that takes none.
+        if let Err(error) = taken {
+            if self.kernel && error.kind() == ErrorKind::WouldBlock {
+                let realtime_ns = linux::realtime_ns()?;
+                self.carry.read(realtime_ns, linux::monotonic_ns()?);
+                self.carry.emptied();
+            }
+            return Err(error);
+        }
         let realtime_ns = if self.kernel {
             linux::realtime_ns()?
         } else {
             0
         };
         let read_ns = linux::monotonic_ns()?;
+        self.carry.read(realtime_ns, read_ns);
         let Some(taken) = self.received.first().copied() else {
             return Ok(Taken::Unreadable);
         };
-        let stamp = taken
-            .stamp
-            .map(|stamp| read_ns.saturating_sub(realtime_ns.saturating_sub(stamp)));
+        let stamp = taken.stamp.and_then(|stamp| self.carry.carry(stamp));
         Ok(Taken::Datagram(
             taken.length,
             self.arrival(taken.from, stamp, read_ns),

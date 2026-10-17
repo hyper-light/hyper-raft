@@ -9133,3 +9133,49 @@ cargo bench -p hyper-durable --bench depth -- DIR 1,4,16,64 25,50,75,90 6 file,s
 cargo bench -p hyper-durable --bench depth -- DIR 1,4 25,50,75,90 6 file 615 16,256         # 16 and 256 groups
 # Linux on the runners (diagnostic run 38853874714) and in Docker; the many groups on macOS too
 ```
+
+## hyper-tokio: kernel stamps across a realtime step (2026-10-17)
+
+The `stamps` flake (`docs/STATUS.md`, closed 2026-10-17): `a_datagram_is_stamped_when_it_arrived_not_when_it_was_read`
+failed "stamped before it was sent", and its standard-socket twin below its send, once, in Docker on a
+loaded host. Traced by reproduction, not by reading.
+
+**The clock.** A probe in the container (`rust:1.98.1`, `--cpus=4`, four busy loops; Docker Desktop's
+LinuxKit VM, kernel 6.12.76-linuxkit, on the M5 Max) read `CLOCK_MONOTONIC`, `CLOCK_REALTIME`,
+`CLOCK_MONOTONIC` every 100 µs, bracketing the offset between the clocks to the 0–167 ns between the
+monotonic reads, and named every sample whose bracket missed the last one's. The offset moved only in
+steps, every 30.00 s: forward by 0.28–0.85 ms in the first runs, and in a later one forward 0.01–4.5 ms
+and back 0.7–4.2 ms. Between steps it stayed inside the brackets: no slew reaches it, since NTP's
+frequency corrections move both clocks alike (`clock_gettime(2)`).
+
+**The cause.** The adapter carried a stamp by the offset it read after the receive. A forward step
+between a datagram's arrival and its read put the stamp the step early: 0.43 ms in the run quoted
+below, past the send by the step less the loopback delay.
+
+**The repair** (`hyper-tokio` `clock::Carry`, `hyper-rt` `udp/carry.rs`): a stamp is carried by the least
+offset read since the read before the last one that emptied the socket, and to no earlier than that
+read. Late by a step at most, never early; exact when no step came between.
+
+**Measured**, the stamps test binary run back to back beside the probe, the same container, four busy
+loops:
+
+| Tree | Runs | Steps in the run | Failed runs | Of which at a step |
+|---|---|---|---|---|
+| `2f7cadc` (before) | 1,095 (420 s) | 14 | 16 | 15: every step but the last, within 0.03 s of it |
+| the repair | 1,554 (600 s) | 20 (six of them back) | 0 | — |
+
+The sixteenth failure before was the other bound: the standard socket's stamp 6.5 µs past the clock
+read when its blocking peek returned. The carry's offset is read realtime first, so a preemption between
+the two reads makes a stamp late, and the test had bounded it by the peek, not the read. It now bounds a
+kernel stamp by the read's start, as the plane socket's test does, 20 ms after the send.
+
+Unit tests, which fail on the old carry (three of five): `clock::tests` in hyper-tokio and
+`udp::carry::tests` in hyper-rt: a stamp before a forward step, one queued across a full read and a
+step, one behind a read that reported the socket empty from a stale readiness, a backward step, the
+floor of the last empty read.
+
+Commands: `docker run --rm --cpus=4 -v <tree>:/src:ro rust:1.98.1`, inside it four `while :; do :; done`
+loops, the probe (a C loop of `clock_gettime` as above, 100 µs `nanosleep` between samples) for the run's
+length, and `cargo test -p hyper-tokio --test stamps --no-run` once, its binary then run with
+`--test-threads=2` until the deadline, each failure stamped with `/proc/uptime` to set beside the probe's
+steps.

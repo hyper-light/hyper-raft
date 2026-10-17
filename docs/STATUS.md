@@ -859,13 +859,26 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      current models). Item 10 is measured: a calibration costs a command 67 ms, and its error against the
      machine now is the host's load, not the record's age (two rounds 1 to 29 minutes apart differed alike),
      so a record is reused while its key matches; the control ring's depth it derives ranged 32 to 512
-     entries across the rounds, one draw of a p99 deciding it. Item 8's rules are measured on a prototype
+     entries across the rounds, one draw of a p99 deciding it. That depth's rule is read (2026-10-17,
+     §15 item 10) and waits on the consumers: `ring_entries` bounds the control queue, clamps the batch
+     and sizes the completion buffer at once; `control.rs` states the queue's bound as the admission
+     limit, past which a spawn could not be admitted, where the drawn depth refuses a burst admission
+     would take (32 queued and 68 refused of 100 against a limit of 256); and the consumers set it by
+     hand, mantle's ranges bench calibrating at one task a shard, where the admission limit would clamp
+     its batch to one poll. The queue's bound taken apart from the batch's clamp is the change, decided
+     with each consumer and confirmed by mantle's run at 100M. Item 8's rules are measured on a prototype
      (branch `proto-spin-rule`): Karlin-or-park takes 24–28 % less CPU a request from paused clients and
      moves nothing else measured; it lands once mantle's run at 100M confirms it. Item 7's words are
      measured at their mechanism (`benches/wake_lines.rs`): eight wakers of different words past the head
      wake 1.86 times as often when the words sit on lines of their own (1.06–1.18 at one to four), the
-     head's pending flag shared either way; the layout waits on a consumer's foreign-wake row, and the
-     registration's half (one-shot against edge-triggered) is open. Item 8 was first measured against slates' runtime and tokio: a client that
+     head's pending flag shared either way; the layout waits on a consumer's foreign-wake row. The
+     registration's half is closed (2026-10-17, `benches/rearm.rs`): the re-arm a one-shot wait makes,
+     once a UDP echo's round trip, exactly, is 1.2–2.4 % of the shard's CPU a round trip on Linux and
+     2–5 % on macOS, the most an edge-triggered registration could save, against a handle's readiness
+     held past its waiters, a deregistration at every close and a guard against reused descriptors;
+     one-shot is kept. On macOS each arm can instead ride in the wait's own `kevent` (branch
+     `proto-kqueue-batched-arm`): 2–6 % fewer instructions a round trip at the medians, every range
+     overlapping, a candidate that lands with mantle's confirmation. Item 8 was first measured against slates' runtime and tokio: a client that
      pauses 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the spin before a
      park paid in full every time (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates'
      runtime and tokio").

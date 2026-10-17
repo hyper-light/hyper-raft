@@ -78,6 +78,9 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/tests/udp_batched.rs":
         "setsockopt(SO_NO_CHECK) through libc, which the runtime has no call for: a socket whose "
         "segmented sends the kernel refuses (tests only, docs/transport.md §4h)",
+    "crates/hyper-rt/benches/rearm.rs":
+        "one kevent change through rustix (unsafe by signature: the udata word), the kqueue driver's "
+        "re-arm measured alone (measurement only, docs/runtime.md §15 item 7)",
     "crates/hyper-rt/src/udp/macos.rs":
         "recvmsg with SCM_TIMESTAMP_MONOTONIC and mach_absolute_time, which rustix drops (kernel receive stamps, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/retire.rs":

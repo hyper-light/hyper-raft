@@ -9305,3 +9305,57 @@ rounds. Wakes a second over all wakers, median (range):
 Each wake writes its word's line and the head's (the pending flag every wake swaps), so the head's line
 is contended in both layouts, and what packing adds is the word's line shared with other wakers. The
 wakers here wake back to back, the most contended a shard's foreign wakes could be.
+
+## hyper-rt: what re-arming a one-shot registration costs a UDP echo (2026-10-17)
+
+`docs/runtime.md` §15 item 7, the registration's half, and §3.7: every readiness wait that finds its
+socket empty arms the socket again before the shard parks (`EPOLLONESHOT`, kqueue `EV_ONESHOT`), one
+`epoll_ctl(MOD)` on Linux and one `kevent` change a direction on macOS that a persistent, edge-triggered
+registration would not make. `cargo bench -p hyper-rt --bench rearm` measures the call alone (100,000
+back to back on a bound UDP socket, the median of nine rounds, beside `getppid`) and a UDP echo through
+one shard: `clients` threads, each with a task of its own, each sending 8 bytes and blocking for the
+answer, 20,000 round trips a client after 2,000 unmeasured. The shard thread's CPU a round trip is read
+from its own clock, the process's instructions a round trip where the OS counts them (macOS), and the
+re-arms are counted exactly: each take that found the socket empty armed it once.
+
+**Linux** (Docker's VM, `rust:1.98.1`, 4 CPUs of 18, three runs):
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `epoll_ctl(MOD)` alone / `getppid` | 156 / 122 ns | 157 / 122 ns | 153 / 121 ns |
+| 1 client: round trips a second, shard CPU a trip | 32,954, 10,063 ns | 29,878, 13,186 ns | 35,794, 9,359 ns |
+| 8 clients: round trips a second, shard CPU a trip | 153,915, 6,472 ns | 152,630, 6,489 ns | 142,357, 7,000 ns |
+| re-arms a trip (1 / 8 clients) | 0.999 / 0.999 | 0.996 / 0.999 | 0.999 / 0.998 |
+| the re-arm's share of the shard's CPU (1 / 8 clients) | 1.5 / 2.4 % | 1.2 / 2.4 % | 1.6 / 2.2 % |
+
+**macOS** (the M5 Max under its own load), one-shot as built beside the prototype that carries each
+arm in the shard's next `kevent` (branch `proto-kqueue-batched-arm`), alternating ABBA, five runs each,
+medians (ranges): the call alone and the CPU from a first series (load 8.4–12.7; binaries md5
+`02c9781c092f21c04ddeb826c83ca68e` and `2b307e67607057b54a0f0e35ababd4df`), the instructions from a
+second with the bench counting them (load 8.0–10.0; `a845111223c202c85745b609eaec818b` and
+`885530b76d7f038a60109c2c6ea82855`):
+
+| | one-shot | arm in the wait's change list |
+|---|---|---|
+| one `kevent` change alone / `getppid` | 379 (179–875) / 213 (98–372) ns | 346 (179–407) / 179 (99–305) ns |
+| 1 client: shard CPU a trip | 16,061 (9,644–18,368) ns | 14,590 (8,356–17,617) ns |
+| 8 clients: shard CPU a trip | 7,724 (7,280–10,120) ns | 7,680 (6,766–9,404) ns |
+| 1 client: instructions a trip, the process's | 97,306 (90,023–102,072) | 91,706 (89,143–98,302) |
+| 8 clients: instructions a trip, the process's | 67,653 (67,109–69,335) | 66,274 (65,429–69,893) |
+| re-arms a trip | 1.000 | 1.000 |
+
+The re-arm is 1.2–2.4 % of the shard's CPU a round trip on Linux and 2–5 % on macOS: the most an
+edge-triggered registration could take off this row, the busiest a socket's readiness gets. Edge
+triggering would hold a handle's readiness past its last waiter and need a deregistration at every
+close and a guard against a descriptor number reused while its registration stands (epoll(7): the
+registration belongs to the open file description), none of which one-shot holds; one-shot is kept. On
+macOS the arm riding in the wait's own `kevent` (its change list; `EV_RECEIPT` when applied early,
+`EV_ERROR` handed to the handle's waiters, kqueue(2)) keeps one-shot and makes no call of its own; its
+medians are 2–6 % fewer instructions and 1–9 % less shard CPU a round trip, every range overlapping
+its base's, so it is recorded as a candidate, which like any runtime win lands only once mantle's run
+confirms it (§12's rule).
+
+```sh
+cargo bench -p hyper-rt --bench rearm
+# Linux: docker run --rm --cpus=4 -v <tree>:/src:ro rust:1.98.1, the same command in /src
+```

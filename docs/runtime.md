@@ -458,10 +458,14 @@ mode: slates' FUSE requests cost two kernel handoffs each (19,222 across one `pi
 BENCHMARKS 2026-10-06), and FUSE over io_uring (Linux 6.14, **UNVERIFIED**) is the lever that would bring
 it back under that rule.
 
-**To measure: one-shot against edge-triggered.** `EPOLLONESHOT` costs an `epoll_ctl(MOD)` per readiness
-event per descriptor, a syscall per wake on a hot descriptor (a fleet UDP socket, a long-lived TCP
-connection, `/dev/fuse`). Persistent `EPOLLET` with drain-to-`EAGAIN` (kqueue `EV_CLEAR`) is measured
-against it on those rows of §12 before the choice is fixed (slates-dc's review).
+**Measured: one-shot against edge-triggered, one-shot kept** (2026-10-17, §15 item 7). `EPOLLONESHOT`
+costs an `epoll_ctl(MOD)` per readiness event per descriptor, a syscall per wake on a hot descriptor (a
+fleet UDP socket, a long-lived TCP connection, `/dev/fuse`), which persistent `EPOLLET` with
+drain-to-`EAGAIN` (kqueue `EV_CLEAR`) would not make (slates-dc's review). On §12's UDP echo that
+re-arm is 1.2–2.4 % of the shard's CPU a round trip on Linux and 2–5 % on macOS (`benches/rearm.rs`),
+the most edge-triggered registration could save; it would keep a handle's readiness past its last
+waiter and need a deregistration at every close and a guard against a reused descriptor number, which
+one-shot never holds.
 
 **Readiness waits** (mantle's reviews, 2026-10-06):
 - **One registration per handle.** The loop keeps the waiters per handle and direction (`interests.rs`) and
@@ -1384,7 +1388,21 @@ thread. §12's row runs both drivers the same way.
    One word a line for the body (past the head's 896 slots, whose single line serves the common case
    best) would cost `tasks_per_shard / 64 × 128` bytes where it is a sixteenth of that, and a drain one
    line a marked word; whether that pays is for §12's foreign-wake row on a consumer's load, beside its
-   base. The registration's half is open.
+   base. The registration's half measured 2026-10-17 on §12's UDP echo (`benches/rearm.rs`;
+   `docs/benchmarks.md`, "hyper-rt: what re-arming a one-shot registration costs a UDP echo"): every
+   round trip re-armed its socket once, exactly, and the re-arm, 153–157 ns on Linux (`epoll_ctl(MOD)`
+   in Docker's VM, where `getppid` takes 121–122) and 179–875 ns on macOS under its load (one `kevent`
+   change, `getppid` 98–372), was 1.2–2.4 % of the shard's CPU a round trip on Linux (6.5–13.2 µs) and
+   2–5 % on macOS (6.8–18.4 µs). That is the most a persistent, edge-triggered registration could save
+   on the row, and it would cost what one-shot does not keep: a handle's readiness held past its last
+   waiter, a deregistration at every close, and a guard against a descriptor number reused while its
+   registration stands (epoll(7): a registration belongs to the open file description, not the
+   number). One-shot is kept. On macOS the arm can ride in the shard's next `kevent`, its change list,
+   with no call of its own and one-shot kept (`EV_RECEIPT` for a list applied early, `EV_ERROR` handed to
+   the handle's waiters, kqueue(2)); built on the unmerged branch `proto-kqueue-batched-arm` and
+   measured beside one-shot, its medians 2–6 % fewer instructions and 1–9 % less shard CPU a round trip,
+   every range overlapping its base's (five runs each under the host's load 8–13): a candidate, which
+   like any runtime win lands only once mantle's run confirms it (§12).
 8. The spin window from the startup wake probe rarely hit in slates' bench configuration (§3.2), though it
    is not the kick result's cause: measure the startup mean against an online p50/p90 on its own merits
    (spin hits, CPU, p99 under load). Measured beside slates' runtime and tokio (2026-10-13): a client
@@ -1422,6 +1440,22 @@ thread. §12's row runs both drivers the same way.
    `next_power_of_two(wake p99 / syscall median)`, fixed at the build, which ranged from 32 to 512 entries
    across the 30 rounds: one draw of a p99 that moved tenfold with the load decides that depth, whether the
    record is old or fresh. That depth's rule, not the record's age, is what to settle next.
+   Read 2026-10-17: `ring_entries` is three bounds at once, the control queue's
+   (`ShardSeed::register`), the batch's upper clamp (`calibrate_batch`, `[1, ring entries]`) and the
+   completion buffer's first capacity (`shard_loop.rs`, beside drivers that return up to 64 events a
+   wait). `control.rs` states the control queue's bound as the shard's admission limit, since nothing
+   beyond it could be admitted; the derivation instead assumes a producer sending one message a system
+   call, which no sender is held to: a send to an awake shard makes none (kick-if-parked, §3.5), so a
+   burst of foreign spawns past the drawn depth is refused `ControlFull` while admission has room
+   (probed: a shard held inside a task, 100 spawns from a thread against a control queue of 32 and an
+   admission limit of 256, 32 queued and 68 refused).
+   The admission limit costs a slot of 24 bytes (a stamp and a 16-byte message) a task, held from the
+   shard's start. Consumers set `ring_entries` by hand (mantle 1, 2, 64 or its roles; focal 64, its
+   tests asserting the batch within it), all but mantle's ranges bench, which calibrates at one task a
+   shard, where the admission limit as `ring_entries` would clamp its batch to one poll a step. So
+   the rule is a decision with each consumer: the control queue's bound taken apart from the batch's
+   clamp, at the admission limit or at a depth the consumer states, and the batch's clamp no longer the
+   queue's; mantle's run at 100M confirms what reaches its ranges (§12's rule for the runtime's wins).
 
 ## 16. Order of work
 

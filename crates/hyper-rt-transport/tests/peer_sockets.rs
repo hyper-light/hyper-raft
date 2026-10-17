@@ -283,8 +283,9 @@ fn a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own() 
 /// RFC 8899 §5.1.2: a connection's MTU search ends at its path's MTU as the kernel holds it, the
 /// driver telling the connection before its first probe (`Driver::tell_ceilings`): on loopback,
 /// 65,507 bytes on Linux (its 65,536-byte MTU past what IPv4's length field says), macOS's UDP cap
-/// below its 16,384 (9,216 by default), and nothing past it probed. Each side's search is waited for
-/// as a fact; the guard only fails a search that never ends.
+/// below its 16,384 (9,216 by default), and nothing past it probed, each side sending what grows its
+/// window so its probes are afforded. Each side's search is waited for as a fact; the guard only
+/// fails a search that never ends.
 #[test]
 fn a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it() {
     let pki = Pki::new();
@@ -320,9 +321,21 @@ fn a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it() {
             let (Some(to_server), Some(to_client)) = (to_server, to_client) else {
                 return "the kernel does not say: the search is the peer's limit's".to_owned();
             };
+            // A probe waits for its connection's window (RFC 8899 §3, item 7; hyper-quic patch
+            // Q25), and an idle connection's window is its first, which a probe of loopback's MTU
+            // passes: each side sends bursts that fill its lane, so its window grows, and the
+            // searches probe in the pauses between them.
+            let frame = [7u8; 1_000];
             while mtu(&mut client, SERVER) != Some(to_server)
                 || mtu(&mut server, CLIENT) != Some(to_client)
             {
+                for (driver, peer) in [(&mut client, SERVER), (&mut server, CLIENT)] {
+                    for _ in 0..FRAMES {
+                        if driver.endpoint().send_frame(peer, 0, Kind::Append, &frame).is_err() {
+                            break;
+                        }
+                    }
+                }
                 step(&mut server, &mut client, &mut seen).await;
                 assert!(
                     began.elapsed() < GUARD,

@@ -190,6 +190,12 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-quic: a probe of the path's MTU took a slow path whole.** Sent whenever the connection was
+  idle, past the congestion window and the pacer, the search's first step on a loopback's MTU (about
+  33 KB) held a relay of 128 kbit/s two seconds, and focal's three nodes behind such relays elected
+  no leader on Linux. A probe now waits for the window and the pacer (RFC 8899 §3, item 7; patch Q25,
+  `crates/hyper-quic/VENDORED.md` §36). Test: `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path`.
+
 - **hyper-rt: a shared port bound at port 0 could be given a port another shared socket held.**
   Flagged `SO_REUSEPORT` before its bind, a socket asking Linux for port 0 could be given a port
   another of the user's flagged sockets held, in any process, and the two split its datagrams: one to

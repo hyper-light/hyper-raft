@@ -93,3 +93,45 @@ the measurement of exactly that difference.
   `tests/local.rs` (`a_local_streams_accept_reads_and_writes_each_wait_on_readiness`) awaits each of the
   three on the shard's driver, and on Windows the shard would park forever on a readiness AFD never
   reported.
+
+## 4. The wake flag's store against loom 0.7.2
+
+`docs/runtime.md` §15 item 6: on 2026-10-06 a plain `Release` store of the wake bitmap's pending flag
+failed loom 0.7.2's parking model, and the flag has been published with a swap since. The execution is
+reduced here.
+
+**Reproduced at `060f0f6`**, the tree that introduced the swap, with the swap put back to
+`pending.store(true, Release)`: the two parking models fail at their first interleaving, loom reporting
+the shard blocked in its wait and the sender done (`deadlock; threads = [(Id(0), Blocked), (Id(1),
+Terminated)]`).
+
+**Reduced** to two threads and two flags, loom 0.7.2, `loom::model`:
+
+```rust
+// sender                                  // parker
+f.store(true, Release);                    let _ = f.swap(false, AcqRel); // its drain
+fence(SeqCst);                             p.store(true, SeqCst);         // announce
+let saw_parked = p.load(SeqCst);           fence(SeqCst);
+                                           let saw_flag = f.load(Acquire);
+assert!(saw_flag || saw_parked);
+```
+
+loom explores an execution in which both loads read the initial values: the parker's swap reads
+`false`, the sender runs whole (store, fence, load of `p` before the announcement), then the parker
+announces, fences and its load of `f` returns `false`, the value its own swap wrote. The C++ memory
+model forbids it ([atomics.fences]: for seq_cst fences X and Y, an atomic write A sequenced before X
+and a read B sequenced after Y, if X precedes Y in the single total order S then B observes A or a
+later modification). The sender's fence ran before the parker's, so the parker's load must observe the
+sender's store, which is later in the flag's modification order than the swap's write. With the
+parker's swap removed, loom finds no such execution; with the sender's store made `SeqCst`, it still
+does (loom models `SeqCst` accesses as `AcqRel`, its README's first listed limitation, but its fences
+as `SeqCst`, and here the fences alone forbid the outcome). So this is a false alarm of loom 0.7.2's
+fence modelling when the reading thread's own read-modify-write precedes the other thread's store in
+modification order, not an error of the protocol.
+
+**The current tree.** At `2f7cadc` the drain loads the flag before it swaps it (a drain that finds
+nothing pending writes nothing), so the parker's read-modify-write of the reduction no longer precedes
+its park, and the four parking models pass with a plain `Release` store (checked 2026-10-17). The swap
+the bitmap publishes with is therefore not needed for correctness, by the C++ model or by loom. It stays
+until a measurement says a plain store is cheaper on the wake path, which is the runtime's rule for its
+hot paths.

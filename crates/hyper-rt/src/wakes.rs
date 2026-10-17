@@ -128,11 +128,10 @@ impl WakeBitmap {
         {
             summary.fetch_or(mark, Ordering::AcqRel);
         }
-        // A read-modify-write, not a plain store: every wake already pays two, and with a plain `Release` store
-        // loom 0.7.2 explored an execution in which this thread's own later load read the flag's earlier value,
-        // which coherence forbids, and the parking model lost the wake (2026-10-06). With the swap the three
-        // parking models pass (37, 44 and 1,993 interleavings). Reducing that execution to a loom report is
-        // open (docs/runtime.md §15).
+        // A read-modify-write, where a plain `Release` store would do: the parking protocol's `SeqCst` fences
+        // order the store before the shard's re-check ([atomics.fences]), and the parking models pass with it.
+        // The swap was taken for a loom 0.7.2 false alarm, reduced in docs/research/runtime-sources.md §4; it
+        // stays until a measurement shows the store cheaper on this path.
         self.head.pending.swap(true, Ordering::AcqRel);
         true
     }

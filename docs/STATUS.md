@@ -124,17 +124,6 @@ is worked around.
   datagrams its one connection's peer may send unprompted (73 KB) leave its room nothing; its window
   stays at the first. Seen 15 to 18 times in each Docker run above, on `main` as since. Open: an ask that adds
   what the listener has measured.
-- **hyper-transport: a run-twice check of handshakes is exact only while the handshakes' sizes
-  happen to agree (found 2026-10-17).** A three-node check on the in-memory network (the room tests'
-  first version) ran to two digests from one seed on windows-11-arm (CI run 39024340172) and to one
-  everywhere else. The world's digest folds every arrival, and how many datagrams a handshake takes moves
-  with the endpoints' own draws, which the world does not make: QUIC's reserved transport parameter, a
-  random identifier and up to 15 bytes of random length (hyper-quic `transport_parameters.rs`,
-  `ReservedTransportParameter::random`, from the endpoint's RNG, which hyper-transport seeds from the
-  system), and the ECDSA signatures' DER length (70 to 72 bytes). `tests/exchange.rs`'s two-node check
-  rests on the same draws. Exact would take the endpoint's QUIC randomness seeded from the world
-  (hyper-quic's `Endpoint::new` takes a seed) and fixed-length signatures in the tests (Ed25519); until
-  then the room tests carry no check of their own, the mesh (`tests/common`) sharing `Net`'s.
 - **hyper-liveness: a link whose sender's floor keeps moving measures its evidence minutes late, and
   a node with only such links suspects no one meanwhile (found 2026-10-16).** A scratch fault in
   hyper-durable-e2e's `member-stopped` (branch `diag/slow-flush-repro`, never landed) holds every
@@ -206,6 +195,18 @@ is worked around.
   (`docs/transport.md` §4r). Tests: `charge::tests::acknowledgements_and_probes_are_charged_as_small_datagrams`,
   `a_small_datagram_fits_the_smallest_a_path_carries`,
   `exchange::a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection`.
+
+- **hyper-transport: a run-twice check of handshakes was exact only while the handshakes' sizes
+  happened to agree.** A three-node check on the in-memory network ran to two digests from one seed on
+  windows-11-arm (CI run 39024340172), and here 55 times in 300 (the two-node check of `exchange.rs`
+  none in 300). The world's digest folds every arrival, and how many datagrams a handshake takes moved
+  with draws the world does not make: QUIC's reserved transport parameter (a random identifier and up to
+  15 bytes of random length, hyper-quic `ReservedTransportParameter::random`, from the endpoint's RNG,
+  which hyper-transport seeded from the system) and ECDSA signatures' DER length (70 to 72 bytes). The
+  endpoint now takes a seed for its QUIC randomness (`Endpoint::new_seeded`), the tests give each node
+  its own, and the tests' certificates sign with Ed25519, whose signatures are of one length (RFC 8032):
+  the three-node check (`room::the_nodes_connect_the_same_twice`) and the two-node one each ran 300
+  times to one digest.
 
 - **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once in Docker on a loaded
   host (`a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` at `tests/stamps.rs:103`, its

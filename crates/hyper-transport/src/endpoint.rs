@@ -679,6 +679,32 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
     ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, None)
+    }
+
+    /// [`Endpoint::new`], with the QUIC layer's own randomness drawn from `seed` where the
+    /// system's would be: its connection identifiers, reset tokens and the reserved transport
+    /// parameter whose random length moves a handshake's sizes (hyper-quic
+    /// `ReservedTransportParameter::random`). For a simulation whose run must be the same from
+    /// one seed (`docs/sim.md` §3.9); TLS draws its own, which move no size where its signatures
+    /// are of fixed length.
+    pub fn new_seeded(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        seed: [u8; 32],
+    ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, Some(seed))
+    }
+
+    fn build(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self, Refusal> {
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
@@ -690,7 +716,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .map_err(|_| Refusal::Configuration)?;
         endpoint.config_slots(config_slots(&config.limits.admission)?);
         let mut quic =
-            hyper_quic::Endpoint::new(endpoint, server, true, None).map_err(|_| Refusal::Quic)?;
+            hyper_quic::Endpoint::new(endpoint, server, true, seed).map_err(|_| Refusal::Quic)?;
         let client = quic
             .insert_client_config(client)
             .map_err(|_| Refusal::Quic)?;

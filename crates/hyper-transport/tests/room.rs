@@ -56,7 +56,8 @@ fn room_mesh(
     let mut nodes: Vec<Node<Mantle>> = issued
         .issued
         .iter()
-        .map(|(certificate, key)| {
+        .enumerate()
+        .map(|(at, (certificate, key))| {
             let config = Config {
                 tls: Tls::mutual(
                     &common::credentials(&issued.pki.root, certificate, key),
@@ -67,8 +68,15 @@ fn room_mesh(
                 limits: limits(),
                 congestion: Default::default(),
             };
-            let mut node =
-                Endpoint::new(config, Fixed::new(budget, 64), issued.book(), now).unwrap();
+            let peer = at as PeerId + 1;
+            let mut node = Endpoint::new_seeded(
+                config,
+                Fixed::new(budget, 64),
+                issued.book(),
+                now,
+                seed_of(peer),
+            )
+            .unwrap();
             node.set_oracle(true);
             node
         })
@@ -147,6 +155,24 @@ impl Room for Mesh<Node<Mantle>> {
             self.read_frames();
         }
     }
+}
+
+/// The run-twice check (docs/sim.md §3.9) for three nodes: they connect on the zero path to one
+/// digest from a seed twice and from its trace. Each endpoint's QUIC randomness comes from a seed of
+/// its own and its certificates sign with Ed25519, so no draw outside the world moves a handshake's
+/// sizes; with the system's draws and ECDSA a run of this check came to two digests on
+/// windows-11-arm (CI run 39024340172).
+#[test]
+fn the_nodes_connect_the_same_twice() {
+    let issued = Issued::new(3);
+    let record = hyper_sim::twice(0, |source| {
+        let mut mesh = room_mesh(&issued, 256 << 20, source, |_| {});
+        connect(&mut mesh, QUIETED);
+        connect(&mut mesh, ACTIVE);
+        Ok::<_, std::convert::Infallible>(mesh.finish())
+    })
+    .unwrap();
+    assert!(record.steps > 0);
 }
 
 /// A connection's first window and the reserve on top of it: what a node grants at a handshake.

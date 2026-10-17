@@ -38,17 +38,19 @@ impl Pki {
     pub fn new() -> Self {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let key = rcgen::KeyPair::generate().unwrap();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let root = params.self_signed(&key).unwrap().der().to_vec();
         Self {
             issuer: rcgen::Issuer::new(params, key),
             root,
         }
     }
-    /// A certificate for `name` and its PKCS #8 key, both DER.
+    /// A certificate for `name` and its PKCS #8 key, both DER: Ed25519, whose signatures are of
+    /// one length (RFC 8032 §5.1.6), where ECDSA's DER encoding is 70 to 72 bytes and moved a
+    /// handshake's sizes from one run to the next.
     pub fn issue(&self, name: &str) -> (Vec<u8>, Vec<u8>) {
         let params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
-        let key = rcgen::KeyPair::generate().unwrap();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let certificate = params.signed_by(&key, &self.issuer).unwrap();
         (certificate.der().to_vec(), key.serialize_der())
     }
@@ -747,10 +749,20 @@ impl Pair {
             limits,
             congestion: Default::default(),
         };
-        let mut node = Endpoint::new(config, Fixed::new(budget, 64), book, now).unwrap();
+        let mut node =
+            Endpoint::new_seeded(config, Fixed::new(budget, 64), book, now, seed_of(which))
+                .unwrap();
         node.set_default_path_ceiling(u16::try_from(LINK_PAYLOAD).unwrap());
         node
     }
+}
+
+/// The QUIC layer's seed for node `peer` of the tests: its own, the same in every run, so a run's
+/// handshakes take the same sizes from one run to the next (`Endpoint::new_seeded`).
+pub fn seed_of(peer: PeerId) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&peer.to_le_bytes());
+    seed
 }
 
 /// Every event of `endpoint` so far.

@@ -580,7 +580,11 @@ fn case_pingpong(arm: &str, args: &Args) {
             )
             .expect("spawn initiator");
             let out = done_rx.recv().expect("done");
-            let _ = rt.shutdown();
+            if let Ok(counters) = rt.shutdown() {
+                for (shard, c) in counters.iter().enumerate() {
+                    println!("counters shard={shard} steps={} waits={} harvests={} spin_hits={} spin_misses={} completions={} wakes_foreign={} controls={}", c.steps, c.waits, c.harvests, c.spin_hits, c.spin_misses, c.completions, c.wakes_foreign, c.controls);
+                }
+            }
             out
         }
         "hyper-mpsc" => {

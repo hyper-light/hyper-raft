@@ -237,6 +237,19 @@ impl Parking {
                 kick();
             }
         } else {
+            // Prototype (runtime.md §15 item 8), the sender's step after a send to a shard not parked,
+            // by `HYPER_RT_KICK_MODE`: 0 nothing (as built), 1 the kick (always-kick, as slates' pair
+            // rings did), 2 `getppid` (a system call that reaches no one), 3 a spin of
+            // `HYPER_RT_KICK_SPIN_NS` (the kick's time, no system call).
+            match prototype::mode() {
+                1 => kick(),
+                2 => {
+                    #[cfg(unix)]
+                    std::hint::black_box(rustix::process::getppid());
+                }
+                3 => prototype::spin(),
+                _ => {}
+            }
             self.kicks_skipped.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -308,6 +321,38 @@ impl Parking {
 
 // Two attributes rather than `all(test, loom)`: clippy's test-context rule (unwrap allowed in
 // tests) recognizes only a bare `cfg(test)`, and an unwrap here is a failed model, as it should be.
+/// The kick-mode prototype's settings, read once from the environment.
+#[allow(clippy::disallowed_methods)]
+mod prototype {
+    use std::sync::OnceLock;
+
+    static MODE: OnceLock<(u8, u64)> = OnceLock::new();
+
+    fn read() -> (u8, u64) {
+        let mode = std::env::var("HYPER_RT_KICK_MODE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let spin = std::env::var("HYPER_RT_KICK_SPIN_NS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        (mode, spin)
+    }
+
+    pub(super) fn mode() -> u8 {
+        MODE.get_or_init(read).0
+    }
+
+    pub(super) fn spin() {
+        let ns = MODE.get_or_init(read).1;
+        let started = std::time::Instant::now();
+        while u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX) < ns {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(loom)]
 mod loom_tests {

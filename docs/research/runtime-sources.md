@@ -89,10 +89,13 @@ the measurement of exactly that difference.
   reference (learn.microsoft.com, "Winsock IOCTLs", commit `b584d62`) does not list it.
 - **What the runtime relies on, and where it is measured.** `localsys.rs` uses stream sockets only, a
   path in a directory its owner alone may enter, and `SIO_AF_UNIX_GETPEERPID` for the peer. That
-  `IOCTL_AFD_POLL` reports accept, receive and send readiness on these sockets is measured, not read:
-  `tests/local.rs` (`a_local_streams_accept_reads_and_writes_each_wait_on_readiness`) awaits each of the
-  three on the shard's driver, and on Windows the shard would park forever on a readiness AFD never
-  reported.
+  `IOCTL_AFD_POLL` reports accept and receive readiness on these sockets is measured, not read:
+  `tests/local.rs` (`a_local_streams_accept_reads_and_writes_each_wait_on_readiness`) awaits both on the
+  shard's driver, and on Windows the shard would park forever on a readiness AFD never reported. The same
+  test streams 16 MiB to a reader on the shard: Linux and macOS refused the writer until the reader read,
+  while both Windows runners (windows-2025, windows-11-arm; CI run 39015895080) took every byte without a
+  refused write, so no send readiness was asked there, and nothing in the Windows sources read here bounds
+  what an `AF_UNIX` socket holds unread.
 
 ## 4. The wake flag's store against loom 0.7.2
 

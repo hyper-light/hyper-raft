@@ -9179,3 +9179,109 @@ loops, the probe (a C loop of `clock_gettime` as above, 100 µs `nanosleep` betw
 length, and `cargo test -p hyper-tokio --test stamps --no-run` once, its binary then run with
 `--test-threads=2` until the deadline, each failure stamped with `/proc/uptime` to set beside the probe's
 steps.
+
+## hyper-rt: the idle spin's rule, three candidates against Karlin's (2026-10-17)
+
+`docs/runtime.md` §15 item 8. An idle shard spins `B`, what one park and its kick cost in CPU, before it
+parks: 2-competitive against any idle gap [KARLIN], and `2B` an idle period against gaps all longer than
+`B`. Three rules were built as a prototype (branch `proto-spin-rule`, `crates/hyper-rt/src/idle_gaps.rs`,
+not merged), chosen at a shard's build by `HYPER_RT_SPIN_RULE`:
+
+- **learned**: the spin `t` minimizing `E[min(G, t)] + B · P(G > t)` over the last 738 gaps (the
+  Dvoretzky–Kiefer–Wolfowitz size for the empirical distribution within ε = 0.05 everywhere at α = 0.05,
+  ε the stopping rule's half width), over `t = 0` and each gap;
+- **random**: Karlin et al.'s `e/(e−1)`-competitive spin, `t = B · ln(1 + u(e − 1))` an idle period;
+- **karlin-or-park**: `B` as now, or none when the last 738 gaps make parking at once cheaper,
+  `B < E[min(G, B)] + B · P(G > B)`.
+
+A gap is recorded when a spin finds work (not its deadline), or at a kicked park's kick, carried to the
+driver's clock. hyper-rt-compare's `hyper` arm, one binary, the rule from the environment, each (case, rule)
+a process, the rules' order rotated each round (`crates/hyper-rt-compare/spin-rule/run.sh` on the branch),
+Apple M5 Max, 18 cores, under the host's own load; CPU is the process's a request, the clients' included.
+
+First run (5 rounds, load 7.4–10.9):
+
+| Case | Rule | Requests a second | CPU ns a request | rtt p50 / p99 / p99.9 µs |
+|---|---|---|---|---|
+| rtt, the client pausing 200 µs | karlin | 673 | 26,764 | 13.3 / 102.4 / 417.8 |
+| | learned | 665 | 20,255 | 11.8 / 108.5 / 966.7 |
+| | random | 678 | 24,854 | 14.1 / 92.2 / 557.1 |
+| rtt, back to back | karlin | 247,473 | 5,554 | 2.6 / 15.4 / 81.9 |
+| | learned | 249,795 | 5,623 | 2.6 / 17.9 / 73.7 |
+| | random | 149,654 | 7,676 | 6.0 / 24.1 / 73.7 |
+| rtt, 8 clients | karlin | 480,435 | 6,133 | 12.3 / 52.2 / 118.8 |
+| | learned | 469,173 | 5,571 | 12.3 / 51.2 / 139.3 |
+| | random | 448,446 | 5,933 | 12.3 / 56.3 / 143.4 |
+| ping-pong across shards | karlin | 1,746,553 | 1,173 | 0.5 / 0.6 / 14.1 |
+| | learned | 355,213 | 3,451 | 0.5 / 15.1 / 55.3 |
+| | random | 596,833 | 2,601 | 0.5 / 13.8 / 32.8 |
+| rtt, the client pausing 20 µs | karlin | 5,087 | 17,828 | 8.2 / 49.2 / 311.3 |
+| | learned | 4,994 | 13,770 | 7.7 / 100.4 / 368.6 |
+| | random | 5,003 | 16,193 | 8.2 / 90.1 / 409.6 |
+
+Second run (5 rounds, load 6.1–9.4), with karlin-or-park:
+
+| Case | Rule | Requests a second | CPU ns a request | rtt p50 / p99 / p99.9 µs |
+|---|---|---|---|---|
+| rtt, the client pausing 200 µs | karlin | 675 | 25,138 | 12.3 / 86.0 / 426.0 |
+| | karlin-or-park | 673 | 19,064 | 10.8 / 79.9 / 335.9 |
+| | learned | 670 | 19,218 | 11.0 / 75.8 / 360.4 |
+| rtt, back to back | karlin | 273,401 | 4,736 | 2.5 / 13.6 / 41.0 |
+| | karlin-or-park | 239,524 | 5,197 | 2.7 / 17.9 / 58.4 |
+| | learned | 294,361 | 4,802 | 2.5 / 10.5 / 26.1 |
+| rtt, 8 clients | karlin | 461,177 | 6,212 | 12.8 / 41.0 / 151.6 |
+| | karlin-or-park | 475,633 | 6,157 | 12.5 / 36.9 / 110.6 |
+| | learned | 461,196 | 6,363 | 13.1 / 50.2 / 84.0 |
+| ping-pong across shards | karlin | 1,581,231 | 1,250 | 0.5 / 0.7 / 7.4 |
+| | karlin-or-park | 1,563,951 | 1,249 | 0.6 / 0.7 / 8.7 |
+| | learned | 505,323 | 2,442 | 0.5 / 11.5 / 34.8 |
+| rtt, the client pausing 20 µs | karlin | 5,082 | 17,574 | 7.9 / 43.0 / 135.2 |
+| | karlin-or-park | 5,110 | 12,568 | 7.4 / 39.9 / 131.1 |
+| | learned | 5,119 | 12,647 | 7.4 / 41.0 / 118.8 |
+
+The back-to-back row's medians crossed between the runs (ranges 211,796–283,299 and 260,854–376,663), so
+it ran again alone, 20 rounds alternating (load 6.2–6.7): karlin 247,745 a second at 5,352 ns a request
+(p99 19.7 µs), karlin-or-park 251,635 at 5,373 (p99 19.5 µs): no difference.
+
+So: karlin-or-park saves 24 % of the CPU a request at 200 µs pauses and 28 % at 20 µs, and moves nothing
+else measured. The learned spin saves as much on paused clients but loses cross-shard ping-pong three times
+over: two shards spinning for each other each learn the other's gaps, and a short spin on one lengthens the
+other's. The randomized spin parks short gaps it should spin through: 40 % of back-to-back requests lost.
+Medians, ranges in the text where they decide.
+
+Commands: `cargo build --release` in `crates/hyper-rt-compare` on the branch, then `run.sh 5`, `run2.sh 5`,
+`run3.sh` and `summary.py` (all in `crates/hyper-rt-compare/spin-rule/` there).
+
+## hyper-rt: what a calibration costs, and how far it moves with time (2026-10-17)
+
+`docs/runtime.md` §15 item 10. `cargo bench -p hyper-rt --bench calibration_drift` with
+`HYPER_RT_DRIFT_ROUNDS=30 HYPER_RT_DRIFT_GAP_S=60`: `Calibration::measure` at the 40 ms probe budget the
+runtime's own callers give, once a minute for 29 minutes, on the M5 Max (18 cores, macOS) under the
+host's own load (one-minute load average 3.4–25.0 before the rounds; other sessions' work and this
+session's A/B runs among it). The binary was the release build of `crates/hyper-rt/benches/
+calibration_drift.rs` at this commit, md5 `690c9c80ab4f56e23618d418db0c8aee`.
+
+| | median | range |
+|---|---|---|
+| wall time of one calibration | 67 ms | 10–137 ms |
+| process CPU of one calibration | 62 ms | 10–131 ms |
+| wake mean | 3,022 ns | 1,561–4,213 ns |
+| its own 95 % interval, as a share of the mean | 6.5 % | |
+| wake p99 | 8,188 ns | 3,416–34,959 ns |
+| null system call | 125 ns | 62–375 ns |
+| control ring depth derived, `next_power_of_two(p99 / syscall)` | 64 | 32–512 |
+
+How far two rounds' wake means differ, `|m_j − m_i| / m_j`, by how far apart they were:
+
+| apart | pairs | median | 90th percentile |
+|---|---|---|---|
+| 1 minute | 29 | 0.185 | 0.343 |
+| 2 minutes | 28 | 0.103 | 0.539 |
+| 5 minutes | 25 | 0.093 | 0.376 |
+| 10 minutes | 20 | 0.182 | 0.353 |
+| 15 minutes | 15 | 0.153 | 0.635 |
+| 20 minutes | 10 | 0.173 | 0.657 |
+
+The difference does not grow with the time between the rounds: what moves a calibration on this host is
+its load, not the age of the measurement, and the rounds disagree by three times their own intervals. A
+record half an hour old was as near the machine as one a minute old.

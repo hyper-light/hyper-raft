@@ -861,7 +861,11 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      so a record is reused while its key matches; the control ring's depth it derives ranged 32 to 512
      entries across the rounds, one draw of a p99 deciding it. Item 8's rules are measured on a prototype
      (branch `proto-spin-rule`): Karlin-or-park takes 24–28 % less CPU a request from paused clients and
-     moves nothing else measured; it lands once mantle's run at 100M confirms it. Item 8 was first measured against slates' runtime and tokio: a client that
+     moves nothing else measured; it lands once mantle's run at 100M confirms it. Item 7's words are
+     measured at their mechanism (`benches/wake_lines.rs`): eight wakers of different words past the head
+     wake 1.86 times as often when the words sit on lines of their own (1.06–1.18 at one to four), the
+     head's pending flag shared either way; the layout waits on a consumer's foreign-wake row, and the
+     registration's half (one-shot against edge-triggered) is open. Item 8 was first measured against slates' runtime and tokio: a client that
      pauses 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the spin before a
      park paid in full every time (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates'
      runtime and tokio").

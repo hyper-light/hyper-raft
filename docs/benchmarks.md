@@ -9285,3 +9285,23 @@ How far two rounds' wake means differ, `|m_j − m_i| / m_j`, by how far apart t
 The difference does not grow with the time between the rounds: what moves a calibration on this host is
 its load, not the age of the measurement, and the rounds disagree by three times their own intervals. A
 record half an hour old was as near the machine as one a minute old.
+
+## hyper-rt: wakers of different words on one line (2026-10-17)
+
+`docs/runtime.md` §15 item 7, the wake words' half. `cargo bench -p hyper-rt --bench wake_lines`
+(binary md5 `a989d10c40f0307a41461fa1c88ee2bb`), the M5 Max under its own load (load average 4.5–5.7):
+`threads` wakers each wake the 64 slots of a word of its own past the bitmap's head, a million wakes a
+waker a round, while one thread drains; the same bitmap with the wakers' words sixteen words apart
+(each on a 128-byte line of its own) or one word apart (all on one line), the two alternating over five
+rounds. Wakes a second over all wakers, median (range):
+
+| Wakers | words on lines of their own | words sharing one line | ratio |
+|---|---|---|---|
+| 1 | 29.4 M (15.3–43.9) | 27.8 M (20.7–58.8) | 1.06 |
+| 2 | 22.9 M (20.7–30.4) | 20.3 M (15.8–21.9) | 1.13 |
+| 4 | 58.9 M (44.9–67.7) | 49.8 M (33.1–56.6) | 1.18 |
+| 8 | 46.6 M (46.2–48.2) | 25.0 M (24.7–26.1) | 1.86 |
+
+Each wake writes its word's line and the head's (the pending flag every wake swaps), so the head's line
+is contended in both layouts, and what packing adds is the word's line shared with other wakers. The
+wakers here wake back to back, the most contended a shard's foreign wakes could be.

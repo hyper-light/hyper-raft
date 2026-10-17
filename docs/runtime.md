@@ -1375,7 +1375,16 @@ thread. §12's row runs both drivers the same way.
    four parking models pass with a plain store; the swap stays until a measurement shows the store
    cheaper.
 7. One-shot against edge-triggered registration (§3.7), and packed wake words against one per cache line
-   (§3.2), measured on §12's rows.
+   (§3.2), measured on §12's rows. The words' half measured 2026-10-17 at its mechanism
+   (`benches/wake_lines.rs`; `docs/benchmarks.md`, "hyper-rt: wakers of different words on one line"):
+   wakers of different words past the head, each word on a line of its own against all on one, one
+   thread draining, wakes a second over every waker: 1.06 times as many at one waker, 1.13 at two, 1.18
+   at four and 1.86 at eight. Every wake also swaps the head's pending flag, so the head's line is
+   shared either way; what packing costs is the second line, under many wakers of high slots at once.
+   One word a line for the body (past the head's 896 slots, whose single line serves the common case
+   best) would cost `tasks_per_shard / 64 × 128` bytes where it is a sixteenth of that, and a drain one
+   line a marked word; whether that pays is for §12's foreign-wake row on a consumer's load, beside its
+   base. The registration's half is open.
 8. The spin window from the startup wake probe rarely hit in slates' bench configuration (§3.2), though it
    is not the kick result's cause: measure the startup mean against an online p50/p90 on its own merits
    (spin hits, CPU, p99 under load). Measured beside slates' runtime and tokio (2026-10-13): a client

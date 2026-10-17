@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "calibration_drift"
 harness = false
+
+[[bench]]
+name = "wake_lines"
+harness = false

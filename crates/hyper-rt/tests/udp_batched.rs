@@ -766,7 +766,11 @@ fn a_drop_is_told_by_the_next_datagram() {
             }
         }
         assert!(drained < datagrams, "the queue held fewer than were sent");
-        assert_eq!(receiver.stats().drops, Some(0), "no datagram has told a drop yet");
+        assert_eq!(
+            receiver.stats().drops,
+            Some(0),
+            "no datagram has told a drop yet"
+        );
         sender.send_to(&[8u8], to).unwrap();
         let mut told = None;
         for _ in 0..64 {
@@ -780,7 +784,11 @@ fn a_drop_is_told_by_the_next_datagram() {
             }
             receiver.readable().await.unwrap();
         }
-        assert_eq!(told, Some(8), "the datagram sent after the overflow arrived");
+        assert_eq!(
+            told,
+            Some(8),
+            "the datagram sent after the overflow arrived"
+        );
         let drops = receiver.stats().drops.unwrap();
         assert!(drops > 0, "the datagram after the overflow told its drops");
         assert_eq!(

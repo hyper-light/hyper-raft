@@ -2926,10 +2926,18 @@ fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
         }
         assert!(sent < FRAMES, "the sender was never held");
     }
-    assert_eq!(net.b.frames_reserving(), 1, "the next frame waits for the budget");
+    assert_eq!(
+        net.b.frames_reserving(),
+        1,
+        "the next frame waits for the budget"
+    );
     // Held, it waits for its owner: the budget given back moves nothing of it.
     net.b.hold_lane(1, 0).unwrap();
-    assert_eq!(net.b.frames_reserving(), 0, "a held lane waits for its owner");
+    assert_eq!(
+        net.b.frames_reserving(),
+        0,
+        "a held lane waits for its owner"
+    );
     assert_eq!(net.b.stats().frames_reserving, 0);
     let mut order = Vec::new();
     let take = |net: &mut Net<Node<Kept>, Node<Kept>>, order: &mut Vec<u32>| {
@@ -2960,7 +2968,11 @@ fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
         }
         net.exchange();
     }
-    assert_eq!(order, (0..FRAMES).collect::<Vec<_>>(), "every frame, in order");
+    assert_eq!(
+        order,
+        (0..FRAMES).collect::<Vec<_>>(),
+        "every frame, in order"
+    );
     let stats = net.b.stats();
     assert_eq!(stats.frames_dropped, 0, "none dropped");
     assert_eq!(stats.frames_reserving, 0);

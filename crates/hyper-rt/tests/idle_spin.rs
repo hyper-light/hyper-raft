@@ -254,7 +254,11 @@ fn an_idle_shard_parks_without_asking_its_driver_first() {
         after.waits - before.waits >= ticks / 5,
         "the shard did not park at its timers' pace: {after:?}"
     );
-    assert_eq!(spins(&after), spins(&before), "no window, no spin: {after:?}");
+    assert_eq!(
+        spins(&after),
+        spins(&before),
+        "no window, no spin: {after:?}"
+    );
     assert_eq!(
         after.harvests, before.harvests,
         "an idle turn asked the driver before its park: {after:?}"

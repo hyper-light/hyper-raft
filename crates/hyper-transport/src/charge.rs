@@ -334,10 +334,7 @@ impl SocketCharge {
     /// The socket says it has dropped `drops` datagrams for want of room since it was made (as its
     /// receives tell, `SO_RXQ_OVFL`): a drop since the last count forgets the samples.
     pub fn drops(&mut self, drops: Option<u64>) {
-        if drops
-            .zip(self.drops)
-            .is_some_and(|(now, seen)| now > seen)
-        {
+        if drops.zip(self.drops).is_some_and(|(now, seen)| now > seen) {
             self.charge.forget();
         }
         self.drops = drops.or(self.drops);
@@ -654,7 +651,9 @@ mod tests {
         // worth, so it ends at drain 99 and the next begins at 100.
         assert_eq!(
             reads,
-            vec![0, 2, 6, 14, 30, 62, 100, 102, 106, 114, 130, 162, 200, 202, 206, 214],
+            vec![
+                0, 2, 6, 14, 30, 62, 100, 102, 106, 114, 130, 162, 200, 202, 206, 214
+            ],
             "an epoch's doublings"
         );
     }
@@ -679,11 +678,18 @@ mod tests {
         socket.before(before);
         socket.after(Some(before), Some(after), 1_150, (1, 1_200), true);
         assert!(socket.room(Unprompted::default()).is_some());
-        assert!(!socket.wants_before(), "measured: the next read waits for a doubling");
+        assert!(
+            !socket.wants_before(),
+            "measured: the next read waits for a doubling"
+        );
         socket.drops(Some(0));
         assert!(socket.room(Unprompted::default()).is_some(), "no new drop");
         socket.drops(Some(3));
-        assert_eq!(socket.room(Unprompted::default()), None, "the samples forgotten");
+        assert_eq!(
+            socket.room(Unprompted::default()),
+            None,
+            "the samples forgotten"
+        );
         assert!(socket.wants_before(), "every drain reads again");
     }
 }

@@ -15,8 +15,7 @@
 
 mod common;
 
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
 use hyper_transport::tls::Tls;
@@ -29,201 +28,56 @@ const RECEIVER: PeerId = 2;
 const QUIETED: PeerId = 1;
 const ACTIVE: PeerId = 3;
 
-/// What the network schedules: a datagram's arrival.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Arrival {
-    Datagram(hyper_sim::net::Ticket),
+/// The room tests' mesh: the receiver reading every frame as it comes.
+trait Room {
+    fn read_frames(&mut self);
+    fn send(&mut self, peer: PeerId, frames: usize, bytes: usize);
+    fn send_slowly(
+        &mut self,
+        peer: PeerId,
+        frames: usize,
+        bytes: usize,
+        per_turn: usize,
+        gap: Duration,
+    );
+    fn window(&mut self, peer: PeerId) -> u64;
+    fn wait(&mut self, quiet: Duration);
 }
 
-/// A certificate for each of nodes `1..=n` from one authority: made once for every run of a
-/// scenario, so two runs from one seed send datagrams of the same sizes (a signature's DER length
-/// varies with its key).
-struct Credentials {
-    pki: Pki,
-    issued: Vec<(Vec<u8>, Vec<u8>)>,
+/// The nodes `issued` names, each knowing every other, node `RECEIVER` given `prepare` before
+/// any dials it, on a world drawing from `source`.
+fn room_mesh(
+    issued: &Issued,
+    budget: u64,
+    source: hyper_sim::Source,
+    prepare: impl FnOnce(&mut Node<Mantle>),
+) -> Mesh<Node<Mantle>> {
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let mut nodes: Vec<Node<Mantle>> = issued
+        .issued
+        .iter()
+        .map(|(certificate, key)| {
+            let config = Config {
+                tls: Tls::mutual(
+                    &common::credentials(&issued.pki.root, certificate, key),
+                    true,
+                )
+                .unwrap(),
+                role: Role::Node,
+                limits: limits(),
+                congestion: Default::default(),
+            };
+            let mut node =
+                Endpoint::new(config, Fixed::new(budget, 64), issued.book(), now).unwrap();
+            node.set_oracle(true);
+            node
+        })
+        .collect();
+    prepare(&mut nodes[(RECEIVER - 1) as usize]);
+    Mesh::new(nodes, now, source)
 }
 
-impl Credentials {
-    fn new(count: PeerId) -> Self {
-        let pki = Pki::new();
-        let issued = (1..=count).map(|peer| pki.issue(&name(peer))).collect();
-        Self { pki, issued }
-    }
-}
-
-/// Endpoints `1..=n` on hyper-sim's network, node `i` at world node `i - 1`, every path the zero
-/// one: a datagram arrives the instant it is sent, in the order sent.
-struct Mesh {
-    now: Instant,
-    start: Instant,
-    nodes: Vec<Node<Mantle>>,
-    world: hyper_sim::World<Arrival>,
-    wire: hyper_sim::net::Net<Vec<u8>>,
-    out: Vec<u8>,
-}
-
-fn address(peer: PeerId) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 4432 + peer as u16))
-}
-
-fn peer_at(address: SocketAddr) -> PeerId {
-    PeerId::from(address.port() - 4432)
-}
-
-impl Mesh {
-    /// The nodes `credentials` names, each knowing every other, node `RECEIVER` given `prepare`
-    /// before any dials it, on a world drawing from `source`.
-    fn new(
-        credentials: &Credentials,
-        budget: u64,
-        source: hyper_sim::Source,
-        prepare: impl FnOnce(&mut Node<Mantle>),
-    ) -> Self {
-        let now = hyper_sim::Anchor::new().instant(0).unwrap();
-        let (pki, issued) = (&credentials.pki, &credentials.issued);
-        let count = issued.len() as PeerId;
-        let book = || {
-            let mut book = Book::default();
-            for (at, (certificate, _)) in issued.iter().enumerate() {
-                book.add(certificate, at as PeerId + 1, Role::Node);
-            }
-            book
-        };
-        let mut nodes: Vec<Node<Mantle>> = issued
-            .iter()
-            .map(|(certificate, key)| {
-                let config = Config {
-                    tls: Tls::mutual(&common::credentials(&pki.root, certificate, key), true)
-                        .unwrap(),
-                    role: Role::Node,
-                    limits: limits(),
-                    congestion: Default::default(),
-                };
-                let mut node = Endpoint::new(config, Fixed::new(budget, 64), book(), now).unwrap();
-                node.set_oracle(true);
-                node
-            })
-            .collect();
-        prepare(&mut nodes[(RECEIVER - 1) as usize]);
-        let limits = hyper_sim::Limits {
-            events: 1 << 12,
-            nodes: count as usize,
-            streams: 8,
-            steps: u64::MAX,
-            trace_words: 0,
-        };
-        let mut world =
-            hyper_sim::World::new(source, hyper_sim::Discipline::Ordered, limits).unwrap();
-        for _ in 0..count {
-            world.node(hyper_sim::Clock::default()).unwrap();
-        }
-        let wire = hyper_sim::net::Net::new(hyper_sim::net::NetLimits {
-            flows: (count * count) as usize,
-            links: 0,
-            nats: 0,
-            link_messages: 0,
-            messages: 1 << 12,
-            bytes: 1 << 26,
-        });
-        Self {
-            now,
-            start: now,
-            nodes,
-            world,
-            wire,
-            out: Vec::with_capacity(1500),
-        }
-    }
-
-    /// The run's record: the digest of every arrival the world ordered.
-    fn finish(self) -> hyper_sim::Record {
-        self.world.finish()
-    }
-
-    fn node(&mut self, peer: PeerId) -> &mut Node<Mantle> {
-        &mut self.nodes[(peer - 1) as usize]
-    }
-
-    /// Moves every datagram until no node has any.
-    fn exchange(&mut self) {
-        for _ in 0..1_000_000 {
-            let mut moved = false;
-            for at in 0..self.nodes.len() {
-                while let Some(transmit) = self.nodes[at].poll_transmit(self.now, &mut self.out) {
-                    let to = peer_at(transmit.destination) - 1;
-                    let bytes = self.out[..transmit.size].to_vec();
-                    self.wire
-                        .send(
-                            &mut self.world,
-                            (hyper_sim::NodeId(at as u32), hyper_sim::NodeId(to as u32)),
-                            bytes,
-                            transmit.size,
-                            Arrival::Datagram,
-                        )
-                        .unwrap();
-                    moved = true;
-                }
-            }
-            while self
-                .world
-                .earliest()
-                .is_some_and(|due| due <= self.world.now())
-            {
-                let hyper_sim::Step::Event {
-                    event: Arrival::Datagram(ticket),
-                    ..
-                } = self.world.next(&mut hyper_sim::Fifo).unwrap()
-                else {
-                    panic!("only datagrams are scheduled");
-                };
-                let delivery = self
-                    .wire
-                    .deliver(&mut self.world, ticket, Arrival::Datagram)
-                    .unwrap()
-                    .unwrap();
-                let from = address(delivery.from.0 as PeerId + 1);
-                self.nodes[delivery.to.0 as usize].handle_datagram(
-                    self.now,
-                    from,
-                    None,
-                    &delivery.payload,
-                );
-                moved = true;
-            }
-            if !moved {
-                return;
-            }
-        }
-        panic!("the network never went quiet");
-    }
-
-    /// Moves the clock to the earliest timer of any node, or to `limit` if that comes first, and
-    /// fires every node's timers due.
-    fn advance_until(&mut self, limit: Option<Instant>) {
-        let timer = self
-            .nodes
-            .iter_mut()
-            .filter_map(|node| node.poll_timeout())
-            .min();
-        let next = match (timer, limit) {
-            (Some(timer), Some(limit)) => timer.min(limit),
-            (Some(timer), None) => timer,
-            (None, Some(limit)) => limit,
-            (None, None) => panic!("a node keeps a timer: its keep-alive"),
-        };
-        let at = u64::try_from(next.saturating_duration_since(self.start).as_nanos()).unwrap();
-        self.world.advance(at.max(self.world.now())).unwrap();
-        self.now = self.now.max(next);
-        for node in &mut self.nodes {
-            node.handle_timeout(self.now);
-        }
-    }
-
-    /// Moves the clock to the earliest timer of any node and fires every node's timers.
-    fn advance(&mut self) {
-        self.advance_until(None);
-    }
-
+impl Room for Mesh<Node<Mantle>> {
     /// Every frame the receiver has waiting given back as soon as it came: an owner that reads
     /// what arrives at once, whose windows therefore grow.
     fn read_frames(&mut self) {
@@ -302,10 +156,10 @@ fn first_window() -> u64 {
 }
 
 /// Connects `peer` to the receiver.
-fn connect(mesh: &mut Mesh, peer: PeerId) {
+fn connect(mesh: &mut Mesh<Node<Mantle>>, peer: PeerId) {
     let now = mesh.now;
     mesh.node(peer)
-        .connect(now, RECEIVER, address(RECEIVER))
+        .connect(now, RECEIVER, mesh_address(RECEIVER))
         .unwrap();
     for _ in 0..TURNS {
         mesh.exchange();
@@ -330,40 +184,19 @@ fn connect(mesh: &mut Mesh, peer: PeerId) {
 /// back and sent again, each read re-extending the grown window.
 #[test]
 fn a_quiet_peers_grown_window_is_set_back_when_another_wants_the_room() {
-    set_back(&Credentials::new(3));
-}
-
-/// The run-twice check (docs/sim.md §3.9): the three nodes connect on the zero path to one digest
-/// from a seed twice and from its trace, whatever keys and nonces the endpoints draw for
-/// themselves. The scenarios past the handshakes are judged by their exact counts instead: their
-/// datagrams' sizes carry the endpoints' own draws (a signature's DER length, QUIC's greasing),
-/// which move how many datagrams a burst takes.
-#[test]
-fn the_nodes_connect_the_same_twice() {
-    let credentials = Credentials::new(3);
-    let record = hyper_sim::twice(0, |source| {
-        let mut mesh = Mesh::new(&credentials, 256 << 20, source, |_| {});
-        connect(&mut mesh, QUIETED);
-        connect(&mut mesh, ACTIVE);
-        Ok::<_, std::convert::Infallible>(mesh.finish())
-    })
-    .unwrap();
-    assert!(record.steps > 0);
+    set_back(&Issued::new(3));
 }
 
 /// [`a_quiet_peers_grown_window_is_set_back_when_another_wants_the_room`]'s run.
-fn set_back(credentials: &Credentials) {
+fn set_back(issued: &Issued) {
     let first = first_window();
     // The test limits let 8 handshakes wait, their first windows kept; beside the two
     // connections' first windows the room holds four more.
     let kept = 8 * first;
     let capacity = 2 * first + kept + 4 * first;
-    let mut mesh = Mesh::new(
-        credentials,
-        256 << 20,
-        hyper_sim::Source::Seed(0),
-        |receiver| receiver.set_receive_capacity(capacity),
-    );
+    let mut mesh = room_mesh(issued, 256 << 20, hyper_sim::Source::Seed(0), |receiver| {
+        receiver.set_receive_capacity(capacity)
+    });
     connect(&mut mesh, QUIETED);
     connect(&mut mesh, ACTIVE);
     let initial = mesh.window(QUIETED);
@@ -438,8 +271,8 @@ fn a_set_back_peer_that_stays_quiet_is_closed_for_the_room() {
     let first = first_window();
     let kept = 8 * first;
     let capacity = 2 * first + kept + 4 * first;
-    let mut mesh = Mesh::new(
-        &Credentials::new(3),
+    let mut mesh = room_mesh(
+        &Issued::new(3),
         256 << 20,
         hyper_sim::Source::Seed(0),
         |receiver| receiver.set_receive_capacity(capacity),
@@ -522,8 +355,8 @@ fn a_set_back_peer_that_moves_again_is_given_a_quiet_period_afresh() {
     let first = first_window();
     let kept = 8 * first;
     let capacity = 2 * first + kept + 4 * first;
-    let mut mesh = Mesh::new(
-        &Credentials::new(3),
+    let mut mesh = room_mesh(
+        &Issued::new(3),
         256 << 20,
         hyper_sim::Source::Seed(0),
         |receiver| receiver.set_receive_capacity(capacity),

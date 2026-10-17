@@ -107,6 +107,17 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-transport: a run-twice check of handshakes is exact only while the handshakes' sizes
+  happen to agree (found 2026-10-17).** A three-node check on the in-memory network (the room tests'
+  first version) ran to two digests from one seed on windows-11-arm (CI run 39024340172) and to one
+  everywhere else. The world's digest folds every arrival, and how many datagrams a handshake takes moves
+  with the endpoints' own draws, which the world does not make: QUIC's reserved transport parameter, a
+  random identifier and up to 15 bytes of random length (hyper-quic `transport_parameters.rs`,
+  `ReservedTransportParameter::random`, from the endpoint's RNG, which hyper-transport seeds from the
+  system), and the ECDSA signatures' DER length (70 to 72 bytes). `tests/exchange.rs`'s two-node check
+  rests on the same draws. Exact would take the endpoint's QUIC randomness seeded from the world
+  (hyper-quic's `Endpoint::new` takes a seed) and fixed-length signatures in the tests (Ed25519); until
+  then the room tests carry no check of their own, the mesh (`tests/common`) sharing `Net`'s.
 - **hyper-liveness: a link whose sender's floor keeps moving measures its evidence minutes late, and
   a node with only such links suspects no one meanwhile (found 2026-10-16).** A scratch fault in
   hyper-durable-e2e's `member-stopped` (branch `diag/slow-flush-repro`, never landed) holds every

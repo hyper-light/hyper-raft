@@ -1424,6 +1424,24 @@ owes, is set back afresh once idle, and closed only a quiet period after that; a
 of the set back counts as one, which the first build's closed a quiet period early); with the take-back
 removed the first fails, the active window held at 24,000.
 
+**Against focal's suite** (2026-10-17): focal-node's library on focal's branch `bus-land` (`7aa51dda`),
+its vendored shared crates' sources from `b39a889`, the tree before the take-back, or from the take-back's
+tree, nothing else differing; each binary's checksum recorded beside its verdict. On Docker's default
+buffer (`rmem_max` 212,992; `rust:1.98.1`, 6 CPUs of 18), the arms alternating, four runs each, 8 of 414
+failed in every run of both. The tree before failed the same eight in all four; with the take-back five of
+them failed in all four, three in three, and two that never failed before failed in two and in one
+(`placement_agent::tests::the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`,
+`credential_renewal::tests::a_joined_host_renews_its_credential_presents_it_everywhere_and_converges_after_a_crash`).
+Run alone three times with the take-back, the first passed each time, one first window refused and no
+window set back or closed. On macOS each tree passed 413 of 414, the same test failing on both, its
+node's listen port taken by then (`network_service::tests::service_recovers_revocation_before_binding_any_ingress`,
+`AddrInUse`). Over the whole library on Docker's buffer, a diagnostic build of the take-back's tree
+printing every window set back, every connection closed for the room and every first window refused
+found 136 first windows refused and no window set back or closed (7 of 414 failed, of the same set):
+no window there grew and went idle while another wanted the room, so the take-back never acted in
+focal's suite, and what moved between the arms' runs is not its. The eight are the open defect's
+(`docs/STATUS.md`, the shared socket's room on that buffer).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

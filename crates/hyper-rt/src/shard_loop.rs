@@ -291,6 +291,8 @@ struct Core {
     kicks_seen: (u64, u64),
     idle_ratio: u64,
     fixed_spin_ns: u64,
+    /// PROTOTYPE (§15 item 8): the idle gaps seen and the rule that sizes the spin from them.
+    gaps: crate::idle_gaps::IdleGaps,
     /// The absolute deadline the shard last waited for and has not stepped since.
     waited_for_ns: Option<u64>,
     config: RuntimeConfig,
@@ -437,6 +439,15 @@ impl Shard {
                 .map_or(1, |tracking| tracking.idle_ratio),
             fixed_quantum_ns: config.step_budget_ns,
             fixed_spin_ns: config.spin_ns,
+            gaps: crate::idle_gaps::IdleGaps::new(
+                #[allow(clippy::disallowed_methods)]
+                match std::env::var("HYPER_RT_SPIN_RULE").as_deref() {
+                    Ok("learned") => crate::idle_gaps::Rule::Learned,
+                    Ok("random") => crate::idle_gaps::Rule::Random,
+                    Ok("karlin-or-park") => crate::idle_gaps::Rule::KarlinOrPark,
+                    _ => crate::idle_gaps::Rule::Karlin,
+                },
+            ),
             // Only the OS's clock is carried: a simulated or published clock is the driver's to keep.
             counter_scale: match desk.clock {
                 crate::driver::Clock::Since(_) => crate::machine::clock::counter_scale(),
@@ -563,13 +574,17 @@ impl Shard {
     /// Spin-then-block is 2-competitive in CPU when the spin lasts as long as blocking costs [A: Karlin, Li,
     /// Manasse, Owicki, SOSP'91]; sizing it by the wake's latency instead made it as long as the host's
     /// scheduler queue (`crate::park_cost`).
-    fn spin_window_ns(&self) -> u64 {
+    fn spin_window_ns(&mut self) -> u64 {
         if self.core.wake.is_none() {
             return self.core.fixed_spin_ns;
         }
-        self.blocking_cost_ns()
-            .unwrap_or(0)
-            .saturating_mul(self.core.idle_ratio)
+        let blocking = self.blocking_cost_ns().unwrap_or(0);
+        if blocking > 0
+            && let Some(spin) = self.core.gaps.spin_ns(blocking)
+        {
+            return spin;
+        }
+        blocking.saturating_mul(self.core.idle_ratio)
     }
 
     /// What one park/wake cycle costs in CPU, the shard's park and its sender's kick, once a park has been
@@ -1068,9 +1083,16 @@ impl Shard {
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_spinning(true);
         }
+        let deadlines_before = self.desk.live.spin_deadlines.get();
         let found = self.spin_for_work(window_end, deadline_ns);
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_spinning(false);
+        }
+        // PROTOTYPE: a spin that found work (not its deadline) ended an idle gap.
+        if found && self.desk.live.spin_deadlines.get() == deadlines_before {
+            let gap = self.carried_now_ns().saturating_sub(activity);
+            let blocking = self.blocking_cost_ns();
+            self.core.gaps.record(gap, blocking);
         }
         if found {
             // harvest_io already recorded any retrieval; an inbox hit is not one.
@@ -1388,6 +1410,18 @@ impl Shard {
             return (false, lost);
         };
         if let Some(woken) = woken {
+            // PROTOTYPE: a kicked park ended an idle gap at the kick, on the driver's clock: now less the
+            // kick's age on the shard's clock.
+            if let (Some(kicked), Some(activity)) = (woken.kicked_ns, self.desk.activity_ns.get())
+                && !woken.stale()
+            {
+                let age = woken.returned_ns.saturating_sub(kicked);
+                let at = self.now_ns().saturating_sub(age);
+                if at >= activity {
+                    let blocking = self.blocking_cost_ns();
+                    self.core.gaps.record(at - activity, blocking);
+                }
+            }
             self.note_wake(entry, woken, switches_before_wait);
         }
         if let Some(before) = cpu_before {

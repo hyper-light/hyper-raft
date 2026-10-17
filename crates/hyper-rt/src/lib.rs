@@ -60,6 +60,7 @@ pub mod error;
 mod frames;
 pub mod futures;
 mod handoff;
+mod idle_gaps;
 pub mod interests;
 pub mod local;
 mod localsys;

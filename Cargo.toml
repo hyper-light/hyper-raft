@@ -40,6 +40,7 @@ thiserror = "2.0"
 # The log's checksum, CRC-32C, which hyper-log computes with the `crc32c` crate (in place of
 # mantle-crc's `crc-fast`).
 crc32c = "0.6"
+crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }
 # Segment nonces and scratch-file names from the operating system's random source.
 getrandom = "0.4"
 # Positional I/O, direct I/O, the platform's full flush and the thread ceilings (hyper-block).

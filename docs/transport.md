@@ -1137,6 +1137,27 @@ Test: `exchange::a_held_lanes_frame_waits_for_its_owner_not_the_budget`. Holding
 takes it out of the count, and a retry and the budget given back read nothing of it. Let go, it
 is reserved and read on, and every frame arrives in order.
 
+## 4n. CRC-32C chosen at run time (2026-10-16)
+
+Every prefix, opener and frame carries a CRC-32C, and a frame that carries its own (§4j) is
+summed once as it arrives: a bus node sums every message it takes. The crc32c crate reaches its
+hardware path only in a build for the machine's own CPU; a build for the generic target, as the
+release builds are, takes a path eight times slower. crc-fast chooses its widest carry-less
+multiply when it runs. On the bare-metal bench (Ryzen 9 9950X3D2, CPU 15, best of five passes):
+
+| Bytes | crc32c, generic build | crc-fast, generic build | crc32c, native build |
+|---|---|---|---|
+| 1,230 (a message) | 135.5 ns | 18.1 ns | 41.1 ns |
+| 16 KiB | 1,650 ns | 192 ns | 456 ns |
+| 1 MiB (a batch) | 98.4 µs | 12.3 µs | 25.1 µs |
+
+hyper-transport sums with crc-fast (`src/crc.rs`); the function and its values are the same, a
+running sum going on from the inverted register. Its other crates keep the crc32c crate for now.
+
+Tests: `crc::tests::the_checksum_is_crc32c_and_goes_on_from_any_division` (the catalogue's check
+value, and every division of a buffer giving the whole's sum), and `exchange.rs`'s frame whose own
+checksum a producer writes with the crc32c crate.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

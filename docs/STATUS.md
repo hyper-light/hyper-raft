@@ -146,6 +146,14 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-transport: a frame's CRC-32C took the slow path in every release build.** The crc32c crate
+  reaches its hardware path only in a build for the machine's own CPU; built for the generic
+  target, it summed a 1,230-byte message in 135.5 ns and a 1 MiB batch in 98.4 µs on the
+  bare-metal bench, where crc-fast, which chooses its widest carry-less multiply when it runs,
+  takes 18.1 ns and 12.3 µs (`docs/transport.md` §4n). A bus node sums every message it takes.
+  hyper-transport now sums with crc-fast; the values are the same. Test:
+  `crc::tests::the_checksum_is_crc32c_and_goes_on_from_any_division`.
+
 - **hyper-rt: an idle turn asked the driver twice.** A step that found the shard idle with
   readiness waits registered asked its driver at once, a zero-timeout wait, and the park that
   followed asked again in its own wait: two system calls for one answer at every idle moment, one

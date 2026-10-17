@@ -2986,10 +2986,25 @@ impl<S: Storage> Raft<S> {
             // a leader whose group's later configuration made it a learner
             // led its old term for ever (`docs/sim.md` §15.9).
             self.send(proto::message(message.from, MessageType::MsgAppendResponse))?;
-        } else if kind == MessageType::MsgRequestPreVote {
+        } else if matches!(
+            kind,
+            MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+        ) {
             // Answered and not dropped: a candidate of an older term
-            // that hears nothing would ask for ever.
-            let mut answer = proto::message(message.from, MessageType::MsgRequestPreVoteResponse);
+            // that hears nothing would ask for ever. The refusal carries
+            // this member's term, "for candidate to update itself" (thesis
+            // Figure 3.1); raft-rs answers only a pre-vote. Without the
+            // answer to a vote, a candidate whose requests reach only
+            // members of later terms, and that hears no other message of
+            // those terms (the member raising them names it no voter),
+            // campaigned below them for ever: swarm group seed 6,135 on a
+            // quarter network (`docs/sim.md` §11 item 4).
+            let answer_kind = if kind == MessageType::MsgRequestVote {
+                MessageType::MsgRequestVoteResponse
+            } else {
+                MessageType::MsgRequestPreVoteResponse
+            };
+            let mut answer = proto::message(message.from, answer_kind);
             answer.term = self.term;
             answer.reject = true;
             self.send(answer)?;

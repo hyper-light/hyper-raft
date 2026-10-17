@@ -384,11 +384,14 @@ fn every_step_of_the_default_schedules_is_a_step_of_the_model() {
 /// Swarm group seed 9,657 drew raft-rs's precedence of length. Its schedule ends with member 1
 /// holding the longest log, of an older last term (18), and the highest priority; member 3 a
 /// shorter log of term 27 whose last change enters the joint configuration {1,3} / {1,2,3}, by
-/// which it counts (`docs/raft.md` §3.4); member 2 the shortest. Member 1 refuses both
-/// candidates for priority, though it can never be elected itself, member 3 refuses member 2 for
-/// its log, and with every member up the group elected no one within the liveness bound, terms
-/// climbing (`docs/raft.md` §3.3). By the log's precedence, the only rule a consumer can set, the
-/// same schedule elects.
+/// which it counts (`docs/raft.md` §3.4); member 2 the shortest. By raft-rs's rule member 1
+/// refused both candidates for priority, though it can never be elected itself, member 3 refused
+/// member 2 for its log, and with every member up the group elected no one within the liveness
+/// bound, terms climbing (`docs/raft.md` §3.3), until a member answered a vote request of an older
+/// term with its term (2026-10-17,
+/// `a_member_of_a_later_term_answers_a_vote_request_of_an_earlier_one`): with the answer the same
+/// schedule elects by either rule. By the log's precedence, the only rule a consumer can set, it
+/// elects.
 #[test]
 fn swarm_group_seed_9657_elects_by_the_logs_precedence() {
     const SEED: u64 = 9_657;
@@ -398,7 +401,8 @@ fn swarm_group_seed_9657_elects_by_the_logs_precedence() {
     let judged = run(harness, &configuration, SEED, None, &mut Seed(Seeded(SEED)));
     assert_eq!(judged.violation, None);
     assert!(judged.settled, "by the log's precedence the group elects");
-    // The same schedule by raft-rs's rule: the cause, replayed.
+    // The same schedule by raft-rs's rule, which a member's answer to an older term's vote request
+    // now settles too.
     let by_length = Configuration {
         settings: Settings {
             by_length: true,
@@ -407,10 +411,8 @@ fn swarm_group_seed_9657_elects_by_the_logs_precedence() {
         ..configuration
     };
     let judged = run(harness, &by_length, SEED, None, &mut Seed(Seeded(SEED)));
-    assert!(
-        !judged.settled,
-        "by raft-rs's precedence the group elects no one"
-    );
+    assert_eq!(judged.violation, None);
+    assert!(judged.settled, "by raft-rs's precedence the group elects");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -791,33 +793,41 @@ fn check_catches(guided: bool) {
 /// configuration in its log and holds what it holds until a classic commit): strategy, case, and
 /// the seed (for a coverage campaign, the run). On the core that takes an append behind the commit
 /// past it (2026-10-12), the swarm's catch of the older term's commit moved from seed 171 to 532;
-/// every other catch here still catches at its seed. `FastAnyConfiguration` is caught by the random
-/// walk alone (`CASES`): swarm, PCT at either depth and the coverage-guided campaign each ran its
-/// 8,868 runs without a catch; and the coverage-guided campaign ran `FastBesideAnyTerm`'s 102,775
-/// without one.
+/// every other catch here still catches at its seed. On the core that answers a vote request of
+/// an older term with its term (2026-10-17) every swarm campaign, the narrower and the either
+/// network's too (`docs/sim.md` §11 item 4), and the campaigns of the read before the first commit
+/// and the vote before durable, were run again from their first seeds: the swarm's older-term
+/// commit at seed 104 and first fast-track rule at 2,972, the narrower network's at 152, 1,152 and
+/// its second rule at 7,072, the either network's at 104, 1,152 and 7,072, and the coverage-guided
+/// campaign's read before the first commit at run 7; PCT's first-rule catches still catch at their
+/// seeds.
+/// `FastAnyConfiguration` is caught by the random walk alone (`CASES`) among the strategies on the
+/// default network: swarm, PCT at either depth and the coverage-guided campaign each ran its 8,868
+/// runs without a catch; and the coverage-guided campaign ran `FastBesideAnyTerm`'s 102,775 without
+/// one.
 const CATCHES: &[(Strategy, usize, u64)] = &[
-    (Strategy::Swarm, 0, 532),
+    (Strategy::Swarm, 0, 104),
     (Strategy::Swarm, 1, 17),
     (Strategy::Swarm, 2, 0),
-    (Strategy::Swarm, 3, 2_692),
+    (Strategy::Swarm, 3, 2_972),
     (Strategy::Pct(1), 1, 7),
     (Strategy::Pct(1), 2, 0),
     (Strategy::Pct(1), 3, 22_065),
     (Strategy::Pct(2), 1, 7),
     (Strategy::Pct(2), 2, 0),
     (Strategy::Pct(2), 3, 38_860),
-    (Strategy::Guided, 1, 20),
+    (Strategy::Guided, 1, 7),
     (Strategy::Guided, 2, 1),
-    (Strategy::SwarmQuarter, 0, 749),
+    (Strategy::SwarmQuarter, 0, 152),
     (Strategy::SwarmQuarter, 1, 0),
     (Strategy::SwarmQuarter, 2, 0),
-    (Strategy::SwarmQuarter, 3, 4_534),
-    (Strategy::SwarmQuarter, 4, 449),
-    (Strategy::SwarmEither, 0, 902),
+    (Strategy::SwarmQuarter, 3, 1_152),
+    (Strategy::SwarmQuarter, 4, 7_072),
+    (Strategy::SwarmEither, 0, 104),
     (Strategy::SwarmEither, 1, 0),
     (Strategy::SwarmEither, 2, 0),
-    (Strategy::SwarmEither, 3, 3_312),
-    (Strategy::SwarmEither, 4, 449),
+    (Strategy::SwarmEither, 3, 1_152),
+    (Strategy::SwarmEither, 4, 7_072),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -1607,12 +1617,12 @@ fn strategy_costs() {
 // The swarm and the model over the core with no defect planted.
 
 /// The seeds the swarm runs each harness with no defect planted: enough to see, with probability
-/// 0.95, a defect that one seed in 2,693 reaches, ⌈ln 0.05 / ln(1 − 1/2,693)⌉: the rarest a planted
-/// defect the swarm catches was for it, the first fast-track rule's catch at run 2,693 (`CATCHES`).
-/// Run 2026-10-05 at 9,924 seeds (the count for the catch at 3,313 before raft-rs's precedence left
-/// the swarm): no failure on any harness, at most 9,039, 8,472 and 3,396 operations a liveness
-/// phase (group, fast, pipelined).
-const NO_DEFECT_SEEDS: u64 = 8_067;
+/// 0.95, a defect that one seed in 2,973 reaches, ⌈ln 0.05 / ln(1 − 1/2,973)⌉: the rarest a planted
+/// defect the swarm catches was for it, the first fast-track rule's catch at run 2,973 (`CATCHES`,
+/// on the core that answers an older term's vote request). Run 2026-10-17 on that core: no failure
+/// on any harness, at most 9,039, 8,472 and 3,396 operations a liveness phase (group, fast,
+/// pipelined), the most the 9,924 seeds run on 2026-10-05 took.
+const NO_DEFECT_SEEDS: u64 = 8_905;
 
 /// The swarm's configurations of each harness with no defect planted, every step held to the
 /// model: every oracle keeps, every step is a model step, every group settles and every read it
@@ -1742,6 +1752,27 @@ fn the_swarm_seeds_whose_groups_never_converged_settle() {
         assert_eq!(judged.departure, None, "seed {seed}");
         assert!(judged.settled, "seed {seed}: the group did not converge");
     }
+}
+
+/// The swarm's group seed 6,135 with its network's losses and repeats at a quarter of their draw
+/// over `[0, 75]` (`docs/sim.md` §11 item 4: 24 and 3 in a hundred; three voters, check-quorum on,
+/// pre-vote off) did not converge: member 2, whose log was the longest and whose newest configuration
+/// needed member 3's vote, campaigned below the terms member 1 raised (member 1, holding a
+/// configuration that named member 2 no voter, sent it nothing), and member 3 dropped each vote
+/// request of an older term without an answer, as raft-rs does, so member 2 never learned the later
+/// term. A member now answers one with its term (`a_member_of_a_later_term_answers_a_vote_request_of_an_earlier_one`).
+/// The seed's run settles and keeps every oracle and the model.
+#[test]
+fn the_quarter_networks_group_seed_6135_settles() {
+    let seed = 6_135;
+    let mut configuration = Configuration::swarm(Harness::Group, seed);
+    configuration.mix.lose = configuration.mix.lose * 25 / 75;
+    configuration.mix.repeat = configuration.mix.repeat * 25 / 75;
+    let mut driver = Conformed::new(Seed(Seeded(seed)), None);
+    let judged = run(Harness::Group, &configuration, seed, None, &mut driver);
+    assert_eq!(judged.violation, None);
+    assert_eq!(judged.departure, None);
+    assert!(judged.settled, "the group did not converge");
 }
 
 /// The swarm's campaign against the fast track's second rule found, at fast seed 41,345 with no

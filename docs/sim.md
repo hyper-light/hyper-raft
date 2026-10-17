@@ -726,41 +726,55 @@ allocations in release are measured at S-6 with the same schedules. The table an
    its first catch (§15.8's measure, each campaign within the random walk's count, every catch's run
    without its defect keeping every oracle, `each_catch_by_seed_is_its_defects`), for the swarm as
    drawn, with every seed's losses and repeats to 25 in 100, and with each seed's network gentle (to
-   25 in 100) or as drawn by a coin of its own:
+   25 in 100) or as drawn by a coin of its own, every campaign run from its first seed on the core
+   that answers a vote request of an older term with its term (`docs/raft.md`, departures):
 
    | Defect (§4.6) | Random walk | Swarm as drawn | to 25 in 100 | gentle or as drawn |
    |---|---|---|---|---|
-   | a commit counted from an older term's replicas | not in 2,096 | 533 | 750 | 903 |
+   | a commit counted from an older term's replicas | not in 2,096 | 105 | 153 | 105 |
    | a read served before the term's first commit | 4 | 18 | 1 | 1 |
    | a vote sent before it is durable | 1 | 1 | 1 | 1 |
-   | the fast track without its first rule | 102,775 | 2,693 | 4,535 | 3,313 |
-   | the fast track without its second rule | 8,868 | not in 8,868 | **450** | **450** |
+   | the fast track without its first rule | 102,775 | 2,973 | 1,153 | 1,153 |
+   | the fast track without its second rule | 8,868 | not in 8,868 | **7,073** | **7,073** |
+
+   On the core before it (`e9b60d6`) the same campaigns caught at 533, 750 and 903 (the older-term
+   commit), 2,693, 4,535 and 3,313 (the first rule) and, the second rule, not in 8,868, 450 and 450;
+   the answer moved the catches of the older-term commit and of both fast-track rules (the narrower
+   network's second-rule catch at seed 449 no longer catches) and left the read's and the vote's.
 
    A first catch is one draw of a run count, so each defect's catches over the same 1,000 seeds were
-   counted too (`swarm_catch_rates`; the gentle-or-drawn seed's run is one of the other two):
+   counted too (`swarm_catch_rates`, on the same core; the gentle-or-drawn seed's run is one of the
+   other two):
 
    | Defect (§4.6) | as drawn | to 25 in 100 | gentle or as drawn |
    |---|---|---|---|
-   | a commit counted from an older term's replicas | 2 | 2 | 2 |
-   | a read served before the term's first commit | 72 | 166 | 114 |
-   | a vote sent before it is durable | 913 | 936 | 920 |
+   | a commit counted from an older term's replicas | 3 | 1 | 3 |
+   | a read served before the term's first commit | 76 | 180 | 121 |
+   | a vote sent before it is durable | 927 | 945 | 934 |
    | the fast track without its first rule | 0 | 0 | 0 |
-   | the fast track without its second rule | 0 | 1 | 1 |
+   | the fast track without its second rule | 0 | 0 | 0 |
 
-   The narrower network is the first swarm to catch every planted defect within the random walk's
-   count, the second fast-track rule's, which the ranges as drawn miss in 8,868 runs, at 450, and it
-   catches each defect at least as often as the ranges as drawn, the read before the first commit 2.3
-   times as often; the first catches of the older-term commit and the first rule, later by 1.4 and 1.7
-   times, are single draws where the rates are equal. So the swarm's network is to be the narrower one,
-   taken with the gate's floors (§18), the liveness phase's bound (four times the most a no-defect seed
-   of the swarm took, `support::swarm`'s `LIVENESS`), the swarm's directed seeds and its recorded catches
-   derived again on it. That step is built on the unmerged branch `swarm-quarter-network`: every floor
-   held on the narrower network (the pipelined reads served one a seed there, 115 in 48), each of the
-   swarm's catches is clean without its defect, and the directed seeds keep the hostile network they
-   were found on. It is held back by the swarm with no defect planted, over 13,585 seeds a harness (the
-   count for its rarest catch, 4,535, by the rule of `NO_DEFECT_SEEDS`): group seed 6,135 does not
-   converge within the liveness bound, every oracle held (`docs/STATUS.md`, open defects); the hostile
-   network's run of that seed settles. Until it is traced the swarm keeps its ranges as drawn, and the
+   (On the core before it: 2, 2, 2; 72, 166, 114; 913, 936, 920; 0, 0, 0; 0, 1, 1.) The narrower and
+   the either network each catch every planted defect within the random walk's count, the second
+   fast-track rule's, which the ranges as drawn miss in 8,868 runs, at 7,073, and the first rule's 2.6
+   times sooner than the ranges as drawn. Over the 1,000 seeds the narrower network catches the read
+   before the first commit 2.4 times as often as the ranges as drawn and the older-term commit a third
+   as often (1 against 3; its first catch 1.5 times later), a commit that needs an order of elections
+   and partitions; the either network catches every defect at least as often as the ranges as drawn,
+   and first at the same run or sooner. Which of the two the swarm takes, taken with the gate's floors
+   (§18), the liveness phase's bound (four times the most a no-defect seed of the swarm took,
+   `support::swarm`'s `LIVENESS`), the swarm's directed seeds and its recorded catches derived again on
+   it, waits on the states each reaches on this core, the either network's not yet counted. The
+   narrower network's step is built on the unmerged branch `swarm-quarter-network`: every floor held on
+   it (the pipelined reads served one a seed there, 115 in 48), each of the swarm's catches is clean
+   without its defect, and the directed seeds keep the hostile network they were found on. Its swarm
+   with no defect planted, over 13,585 seeds a harness (the count for its rarest catch then, 4,535, by
+   the rule of `NO_DEFECT_SEEDS`), met group seed 6,135, which did not converge within the liveness
+   bound, every oracle held: a candidate below terms it never heard of, as each member it asked dropped
+   an older term's vote request. The core now answers one with its term (`docs/raft.md`, departures;
+   `the_quarter_networks_group_seed_6135_settles`), and on it the narrower network's group harness ran
+   the same 13,585 seeds clean, at most 9,086 operations a liveness phase. The swarm keeps its ranges as
+   drawn until the choice is measured and the chosen network's no-defect campaign runs clean, and the
    hostile networks stay in the gate either way (`tests/check.rs`'s schedules at 25, 50 and 75 in a
    hundred lost and repeated).
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.
@@ -1502,13 +1516,20 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 
 | Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
 |---|---|---|---|---|---|---|
-| a commit counted from an older term's replicas | not in 2,096 | **533** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
-| a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | **13,917** (two rounds, §15.14) |
+| a commit counted from an older term's replicas | not in 2,096 | **105** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
+| a read served before the term's first commit | 4 | 18 | 8 | 8 | 7 | **13,917** (two rounds, §15.14) |
 | a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | **11** (one lagged round, §15.14) |
-| the fast track without its first rule | 102,775 | **2,693** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
+| the fast track without its first rule | 102,775 | **2,973** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
 | the fast track without its second rule | **8,868** | not in 8,868 | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
 
-On the core that takes an append behind its member's commit past it (2026-10-12: what the append
+On the core that answers a vote request of an older term with its term (2026-10-17, `docs/raft.md`,
+departures), the swarm's campaigns of the older term's commit and of the first fast-track rule, whose
+recorded catches at seeds 532 and 2,692 no longer caught there, were run again from their first seeds:
+105 and 2,973. So were the swarm's campaign of the second rule (not in 8,868) and the swarm's, PCT's
+and coverage guidance's of the read before the first commit and of the vote before durable: the
+coverage-guided campaign's catch of the read moved from run 20 to 7, and every other stayed. PCT's
+first-rule catches still catch at their seeds, and the campaigns that caught nothing within their
+counts were not run again on it. On the core that takes an append behind its member's commit past it (2026-10-12: what the append
 carries after the committed entry is appended, where the core answered with the commit and dropped
 it), the swarm's campaign on the older term's commit caught it at run 533 (seed 532), where it had
 at 172; every other catch recorded at its seed still catches there, its run without the defect
@@ -1530,7 +1551,8 @@ defect of depth one, 1 − (4/5)^R, above 0.9999 at every count here but the fir
 0.925 at 26,306 runs and 0.937 at 28,115 (the first rule, on the core of §15.12), 0.194 at 2,096
 (the group's) and 0.185 (the second rule's); for depth three, at most 1.4·10⁻³ (the campaigns' own
 report, 2026-10-05). **What the counts say.** On the first fast-track rule the swarm beats the
-random walk by 38 times and PCT by 8.2 (depth 1) and 14 (depth 2), and coverage guidance does not catch it within the
+random walk by 35 times and PCT by 7.4 (depth 1) and 13 (depth 2) (38, 8.2 and 14 on the core before
+the answer to an older term's vote request), and coverage guidance does not catch it within the
 random walk's count; on the second, under the
 release (§15.13), only the random walk catches it within its count: a member holds a vote now
 until a classic commit covers it, so fewer schedules leave a fast quorum counted across a change. The swarm alone catches the older-term

@@ -107,29 +107,6 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
-- **hyper-raft: on the swarm's quarter network one group's liveness phase does not converge (found
-  2026-10-17).** With the swarm's losses and repeats narrowed to a quarter (`docs/sim.md` §11 item 4,
-  the setting that reaches the most abstract states and catches every planted defect within the
-  random walk's count), the swarm with no defect planted over 13,585 seeds a harness
-  (`the_swarm_with_no_defect_keeps_every_oracle_and_the_model`, branch `swarm-quarter-network`) met
-  group seed 6,135 (three voters, check-quorum on, pre-vote off, changes and partitions on, losses 24
-  and repeats 3 in a hundred), whose liveness phase passed its bound with every oracle held: terms
-  past 850 and no leader, member 1 holding the configuration {1, 3}, members 2 and 3 holding {2} with
-  3 a learner, member 2 a candidate at term 845 with entries past its commit (85 against 79). On the
-  hostile network the same seed's run settled (its losses 73 in a hundred, the campaign of 9,924 seeds
-  clean). The fast and pipelined harnesses were not run past it. Traced so far (an operation log of the
-  seed's run): member 1 stopped taking entries at step 371 (commit 8); member 2 led term 22 from step
-  1,209 and, at step 1,462, met term 23 from a campaign and stepped down with entries 80–85 past its
-  commit of 79, member 3 at 56; no member led again in the 38,695 operations after, the liveness phase's
-  included. Member 2's log holds at index 80 (term 22, past its commit) the change that adds member 3 as
-  a voter, so by the newest configuration in its log (`docs/sim.md` §15.12) its quorum is {2, 3} and it
-  needs member 3's vote; member 3 holds the committed {2} with itself a learner, never received index
-  80, and cast no vote in any of the 800 terms that followed (its hard state's vote 0 at steps 1,463,
-  3,000 and 39,000), while member 1, holding {1, 3} with eight entries, campaigned throughout without
-  pre-vote, its terms ahead of member 2's (824 against 820 at step 39,000), and each of its campaigns
-  restarts the others' election timers (`Raft::become_follower` resets the elapsed ticks). Open: why
-  member 3 grants member 2 no vote (`Raft::step_vote` does not refuse a learner), before the swarm's
-  network is narrowed.
 - **hyper-transport: on Linux's default receive buffer the shared socket holds two first windows
   (found 2026-10-17).** Docker's VM grants 425,984 bytes (`rmem_max` 212,992), 319,488 past the
   release lag. Charged at its costliest stream byte (896 bytes for a datagram carrying 120), the
@@ -189,6 +166,29 @@ is worked around.
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
 ### Closed (2026-10-17)
+
+- **hyper-raft: a candidate below terms it never heard of campaigned for ever.** The swarm with no
+  defect planted on a quarter network (`docs/sim.md` §11 item 4) met group seed 6,135, whose liveness
+  phase passed its bound with every oracle held: member 2, whose log was the longest and whose newest
+  configuration (index 80, adding member 3 as a voter, past its commit) needed member 3's vote,
+  campaigned at terms below member 3's; member 1, holding a configuration that named member 2 no
+  voter, raised member 3's term with every campaign and sent member 2 nothing; and member 3 dropped each
+  vote request of an older term without an answer, as raft-rs does, so member 2 never learned the later
+  term (an operation log of the run: member 3's vote 0 at steps 1,463, 3,000 and 39,000, member 2's
+  requests at terms 23 to 39 against member 3's 24 to 44 by step 2,414). A member now answers an older
+  term's vote request with its term (thesis Figure 3.1: "reply false if term < currentTerm", for the
+  candidate "to update itself"), as it already answered a pre-vote and an older term's append; the seed's
+  run settles. Tests: `group::a_member_of_a_later_term_answers_a_vote_request_of_an_earlier_one`
+  (member 3 answered nothing before), `strategies::the_quarter_networks_group_seed_6135_settles`
+  (unconverged before); the raft-rs differential loses such a request for both cores, raft-rs dropping
+  it (`docs/raft.md`, departures). The swarm's recorded catches of the older term's commit and of the
+  first fast-track rule no longer caught at their seeds and were run again from the first: 105 and
+  2,973 runs, where they were 533 and 2,693 (`docs/sim.md` §15.8), and the coverage-guided campaign's
+  read before the first commit moved from run 20 to 7; on the narrower and the either network of
+  §11 item 4 the first catches and the rates over 1,000 seeds were counted again; swarm group seed 9,657, which by
+  raft-rs's precedence elected no one, now elects by either rule. The swarm with no defect planted ran
+  8,905 seeds a harness on the fixed core (the count for its rarest catch, 2,973) without a failure, at
+  most 9,039, 8,472 and 3,396 operations a liveness phase.
 
 - **hyper-transport, hyper-quic: on Linux's default buffer a measured shared socket refused every
   new connection, and once MTU discovery reached the path a peer's own socket held less than one
@@ -856,12 +856,16 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      network's losses and repeats narrowed to 25 in 100 reach 22–35 % more abstract states, and more
      a CPU-second, than the swarm's ranges as drawn, and widened to all, the fewest; calm stretches
      alternating with the drawn mix reach 13–24 % more, their length from 125 to 1,000 steps moving
-     little. The narrower network catches every planted defect within the random walk's count (the
-     fast track's second rule at run 450, which the ranges as drawn miss in 8,868) and each at least as
-     often over the same 1,000 seeds (the read before the first commit 166 times against 72). The step
-     that narrows the swarm's network is built on the unmerged branch `swarm-quarter-network` (the
-     gate's floors derived again on it, every one holding; the swarm's catches recorded) and held back:
-     its swarm with no defect planted met a group that does not converge (the open defect above).
+     little. On the core that answers an older term's vote request (Closed, 2026-10-17: a candidate below
+     terms it never heard of, found by the narrower network's no-defect campaign), the narrower
+     network and one gentle or as drawn by each seed's coin each catch every planted defect within
+     the random walk's count (the fast track's second rule at run 7,073, which the ranges as drawn
+     miss in 8,868); over the same 1,000 seeds the narrower catches the read before the first commit
+     180 times against 76 and the older-term commit once against 3, and the either network each defect
+     at least as often as the ranges as drawn. Which the swarm takes waits on the states each reaches
+     on that core. The narrower network's step is built on the unmerged branch
+     `swarm-quarter-network` (the gate's floors derived again on it, every one holding; the swarm's
+     catches recorded), whose group harness ran its 13,585 no-defect seeds clean on the fixed core.
    - Tails, `docs/tails.md` §7: T-0 (the grid) is built, its sources read and its conditions' values
      derived (§2.4); T-1 (the measurement kit: its open-loop schedule and quantile intervals built in
      hyper-measure, the per-process accounts of §1a open), T-2 (the impairment relay), then each crate

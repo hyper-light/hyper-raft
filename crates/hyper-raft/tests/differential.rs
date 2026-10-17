@@ -20,7 +20,9 @@
 //! schedule loses that message for both too. An answer to a read round sent
 //! before the read it names was asked again under the same context confirms
 //! nothing here and the read and every one before it there: the schedule
-//! loses that message for both as well. An append behind its member's commit
+//! loses that message for both as well. A member answers a vote request of an
+//! older term with its term here and drops it there: the schedule loses that
+//! message for both too. An append behind its member's commit
 //! that runs past it, naming the committed entry at the commit, is taken past
 //! the commit here (Raft §5.3: a receiver appends any new entries not already
 //! in its log) and answered with the commit and dropped there: the schedule
@@ -66,6 +68,9 @@ struct Reached {
     /// Appends and heartbeats of an older term than their recipients', without check-quorum or
     /// pre-vote: this core answers them, raft-rs does not, and the comparison loses them for both.
     stale_leaders: u64,
+    /// Vote requests of an older term than their recipients': this core answers them with its
+    /// term, raft-rs drops them, and the comparison loses them for both.
+    stale_candidates: u64,
     /// Reads that would have reached a leader before its term's first commit, lost for both.
     held_reads: u64,
     /// Answers to a round sent before the read they name was asked again, lost for both.
@@ -169,6 +174,26 @@ fn stale_leader(group: &Cluster<New>, op: &Op) -> bool {
             message.msg_type,
             MessageType::MsgAppend | MessageType::MsgHeartbeat
         )
+        && group
+            .peek(message.to)
+            .is_some_and(|member| member.view().term > message.term)
+}
+
+/// Whether `op` delivers a vote request of an older term than its recipient's: this core answers it
+/// with its term, so that the candidate learns the newer one (thesis Figure 3.1), and raft-rs drops
+/// it, which left a candidate below the terms it never heard of campaigning for ever (`docs/sim.md`
+/// §11 item 4, the swarm's group seed 6,135 on a quarter network).
+fn stale_candidate(group: &Cluster<New>, op: &Op) -> bool {
+    let Op::Deliver {
+        at, lose: false, ..
+    } = op
+    else {
+        return false;
+    };
+    let Some(message) = group.net.get(*at) else {
+        return false;
+    };
+    message.msg_type == MessageType::MsgRequestVote
         && group
             .peek(message.to)
             .is_some_and(|member| member.view().term > message.term)
@@ -444,6 +469,14 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
             }
             Op::Deliver { at, keep, .. } if stale_leader(&new, &op) => {
                 reached.stale_leaders += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
+            Op::Deliver { at, keep, .. } if stale_candidate(&new, &op) => {
+                reached.stale_candidates += 1;
                 Op::Deliver {
                     at,
                     keep,
@@ -757,8 +790,10 @@ fn the_cores_agree_without_pre_vote_and_check_quorum() {
     };
     let reached = campaign("plain", settings, Mix::everything());
     assert!(reached.committed > 0);
-    // The third decided difference is reached, or the comparison says nothing of it.
+    // The third decided difference is reached, or the comparison says nothing of it; and the
+    // answer to an older term's vote request.
     assert!(reached.stale_leaders > 0, "{reached:?}");
+    assert!(reached.stale_candidates > 0, "{reached:?}");
 }
 
 #[test]

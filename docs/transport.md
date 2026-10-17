@@ -1417,9 +1417,12 @@ come; windows in bytes, reserve excluded):
 
 Before, the quiet peer's sending again changed nothing: each read re-extended its grown window.
 
-Tests: `a_quiet_peers_grown_window_is_set_back_when_another_wants_the_room` and
-`a_set_back_peer_that_stays_quiet_is_closed_for_the_room`; with the take-back removed the first
-fails, the active window held at 24,000.
+Tests: `a_quiet_peers_grown_window_is_set_back_when_another_wants_the_room`,
+`a_set_back_peer_that_stays_quiet_is_closed_for_the_room` and
+`a_set_back_peer_that_moves_again_is_given_a_quiet_period_afresh` (a peer that sends again, less than it
+owes, is set back afresh once idle, and closed only a quiet period after that; a move at the instant
+of the set back counts as one, which the first build's closed a quiet period early); with the take-back
+removed the first fails, the active window held at 24,000.
 
 ## 5. Consumers
 

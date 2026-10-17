@@ -308,7 +308,9 @@ rule, Dumazet 2012) it held as much as CUBIC's window, which on loopback, where 
 grew to 1.55 GB: a publisher the node held queued 470 ms in its own lane. And an owner that cannot take more holds the
 peer's lane (`Endpoint::hold_lane`, `release_lane`): read no further past its opening, the peer is
 held at QUIC's flow control and its own lane fills, where it would otherwise queue in the owner
-without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median). Admission
+without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median); a held
+lane's frame that waited for the budget waits for its owner instead, and leaves the count of frames
+waiting for memory until it is let go (§4m). Admission
 bounds pending handshakes (Retry under load), identities, connections per identity (the idle one
 used longest ago replaced, below) and connections in all; every exchange and lane has a table bound.
 Every refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
@@ -1111,6 +1113,29 @@ Tests: `charge::tests::the_account_is_read_at_doublings_of_an_epochs_drains` (th
 through two epochs), `a_drop_the_traffic_tells_forgets_the_samples`, and on Linux
 `udp_batched::a_drop_is_told_by_the_next_datagram` (an overflowed socket's next datagram counts
 every datagram it could not hold).
+
+## 4m. A held lane's frame waits for its owner (2026-10-16)
+
+A lossless frame the budget cannot hold waits in `Reading::Reserving`, counted in
+`Stats::frames_reserving`, and an owner that can give memory back reads that count: focal's bus
+node gives such a frame the room of its window's oldest batches. A lane its owner holds (§4a) is
+not read, so its waiting frame is not asked again whatever the budget holds, but it stayed
+counted. On the bare-metal bench a node held a publisher whose frame had been refused while its
+memory was short (1,000,000 messages a second on a busy core). From then on it saw a frame
+waiting at every turn and gave it the window: every batch went, the node holding 16 MB of its
+1.5 GiB, and the subscriber the publisher was held for was told a gap of 1,817 offsets.
+
+A held lane's waiting frame now waits for its owner: holding the lane takes the frame out of the
+count, and letting it go puts the frame back and reads it on (`mark_lanes`). The count is also
+kept for each connection, and a retry visits only the connections with a frame waiting
+(`Endpoint::retry_reserving`). It used to take every connection out and put it back, which had
+each one given its turn to transmit and placed again by its deadline at the next poll
+(`read_touched`). `Endpoint::frames_reserving` reads the count without visiting every
+connection, as `stats` does.
+
+Test: `exchange::a_held_lanes_frame_waits_for_its_owner_not_the_budget`. Holding the waiting lane
+takes it out of the count, and a retry and the budget given back read nothing of it. Let go, it
+is reserved and read on, and every frame arrives in order.
 
 ## 5. Consumers
 

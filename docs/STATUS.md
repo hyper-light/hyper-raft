@@ -146,6 +146,17 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-transport: a held lane's frame was counted as waiting for memory.** A lossless frame the
+  budget could not hold stayed in `Stats::frames_reserving` after its owner held its lane, though no
+  memory could move it. Focal's bus node gives such frames the room of its window, so at
+  1,000,000 messages a second on a busy core (the bare-metal bench) it gave the window away at
+  every turn until none was left. It held 16 MB of its 1.5 GiB at the time, and told a subscriber
+  a gap of 1,817 offsets (`docs/transport.md` §4m). Holding a lane now takes its waiting frame out
+  of the count, and letting the lane go puts the frame back and reads it on. A retry visits only
+  the connections with a frame waiting, where it took every connection out and back.
+  `Endpoint::frames_reserving` reads the count without the visit `stats` makes. Test:
+  `exchange::a_held_lanes_frame_waits_for_its_owner_not_the_budget`.
+
 - **hyper-rt, hyper-transport, hyper-rt-transport: a socket's account was read twice a drain.** The
   measured room read each socket's account (`SO_MEMINFO`, a `getsockopt`) before every drain, and
   again after a drain that took one message alone. On the bare-metal bench a bus node at 10,000

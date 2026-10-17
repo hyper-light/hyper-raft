@@ -320,7 +320,8 @@ mod tests {
         run(&mut fresh, 30);
         let tape = fresh.finish();
         let mut draws = Seeded::new(11);
-        for _ in 0..200 {
+        // Under Miri a tenth of the mutations, the same code over fewer runs.
+        for _ in 0..if cfg!(miri) { 20 } else { 200 } {
             let mutated = tape.mutate(&mut draws);
             let mut player = Player::replay(&mutated, 5, BOUNDS);
             let steps = player.left().unwrap();

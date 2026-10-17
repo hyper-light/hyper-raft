@@ -625,14 +625,20 @@ proptest! {
 /// after a delay its link's stream draws, sometimes lost; every node's timer re-armed to inject a
 /// fresh token. Every arrival is observed.
 fn ring(source: Source, discipline: Discipline, leak: u64) -> Result<Record, SimError> {
-    let mut world: World<u64> = World::new(
-        source,
-        discipline,
-        Limits {
-            steps: 5_000,
-            ..LIMITS
-        },
-    )?;
+    ring_of(source, discipline, leak, RING_STEPS)
+}
+
+/// The steps of the ring the run-twice checks take.
+const RING_STEPS: u64 = 5_000;
+
+/// [`ring`] of `steps` steps.
+fn ring_of(
+    source: Source,
+    discipline: Discipline,
+    leak: u64,
+    steps: u64,
+) -> Result<Record, SimError> {
+    let mut world: World<u64> = World::new(source, discipline, Limits { steps, ..LIMITS })?;
     let late = Lateness {
         floor_ns: 10,
         spread_ns: 1_000,
@@ -691,16 +697,25 @@ fn ring(source: Source, discipline: Discipline, leak: u64) -> Result<Record, Sim
     Ok(world.finish())
 }
 
+/// The steps of a played ring: the run-twice checks' ring, or under Miri a twentieth of it, the
+/// same code over fewer steps (a ring of 5,000 steps took 56 s under Miri in CI, 2026-10-17, where
+/// the crate's whole Miri job has 36 minutes).
+const PLAYED_STEPS: u64 = if cfg!(miri) {
+    RING_STEPS / 20
+} else {
+    RING_STEPS
+};
+
 /// What a played ring's tape may hold: a step a world step, and a word a decision, as many as its
 /// trace holds.
 const TAPE: Bounds = Bounds {
-    steps: 5_000,
+    steps: PLAYED_STEPS as usize,
     words: LIMITS.trace_words,
 };
 
 /// A ring played from `tape`, words past a step's own from `filler`.
 fn played(tape: Tape, filler: u64, discipline: Discipline) -> Record {
-    ring(
+    ring_of(
         Source::Tape {
             tape,
             filler,
@@ -708,6 +723,7 @@ fn played(tape: Tape, filler: u64, discipline: Discipline) -> Record {
         },
         discipline,
         0,
+        PLAYED_STEPS,
     )
     .unwrap()
 }
@@ -717,8 +733,8 @@ fn played(tape: Tape, filler: u64, discipline: Discipline) -> Record {
 /// tape replays it. So a world's runs are mutated and shrunk as hyper-check does a harness's own.
 #[test]
 fn a_tape_the_world_plays_replays_its_run_and_every_mutation_is_a_run() {
-    // Under Miri the free discipline alone, and one mutation: the same code over fewer runs, as the
-    // other ring tests are sized there (a debug run of 5,000 steps takes about 0.3 s natively).
+    // Under Miri the free discipline alone, one mutation and a twentieth of the steps: the same code
+    // over fewer runs (a debug run of 5,000 steps takes about 0.3 s natively, 56 s under Miri).
     let (disciplines, mutations): (&[Discipline], usize) = if cfg!(miri) {
         (&[Discipline::Free], 1)
     } else {
@@ -730,12 +746,18 @@ fn a_tape_the_world_plays_replays_its_run_and_every_mutation_is_a_run() {
             .tape
             .clone()
             .expect("a played run gives its tape back");
-        assert_eq!(tape.len(), 5_000, "a step a world step");
+        assert_eq!(tape.len() as u64, PLAYED_STEPS, "a step a world step");
         assert!(tape.kinds().any(|kind| kind == 1) && tape.kinds().any(|kind| kind == 0));
         let again = played(tape.clone(), 99, discipline);
         assert_eq!(again.digest, fresh.digest, "{discipline:?}");
         assert_eq!(again.tape.as_ref(), Some(&tape));
-        let traced = ring(Source::Trace(fresh.trace.clone()), discipline, 0).unwrap();
+        let traced = ring_of(
+            Source::Trace(fresh.trace.clone()),
+            discipline,
+            0,
+            PLAYED_STEPS,
+        )
+        .unwrap();
         assert_eq!(traced.digest, fresh.digest);
         let mut draws = Seeded::new(11);
         let mut differed = 0;

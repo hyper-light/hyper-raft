@@ -682,10 +682,14 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
    hyper-tokio (its drain) and hyper-block (overlayfs reads). mantle and slates take it as landings
    of their own; their suites have not yet run against it. What `main` took besides since `80c1f82`
    changes the end-to-end harnesses, hyper-durable's depth bench and the documents.
-3. **The shared crates' open work**, each in its own document, and one of the socket room's
-   (`credit.rs`): a window that grew stays granted while its peer is idle, so a node of many
-   connections can find its room held by peers that no longer send; a window shrinks only as its
-   peer consumes it, which a quiet peer never does. In their documents:
+3. **The shared crates' open work**, each in its own document. The socket room's (`credit.rs`) is
+   done (2026-10-17, `docs/transport.md` §4n): a window that grew stayed granted while its peer was
+   idle, since QUIC takes back no credit it gave. When a growth or a first window is refused for the
+   room or the budget, an idle connection's grown window is set back to its first, what the growth
+   held going back as the peer's reads pay off the credit already given; one that stays idle a quiet
+   period after, still owing what is wanted, is closed (`Refusal::ReceiveBuffer`). On the
+   in-memory network the active peer's window grew from 24,000 to 48,000 bytes where it had stood,
+   and a silent peer's 50,268 bytes came back at its close. In their documents:
    - hyper-durable: §14's measurements. Items 1 to 8 measured on this machine (2026-10-12 and 13,
      `docs/benchmarks.md` from "A group's writes out, depth one to three on hyper-log"): depth earns
      no place for one group, nor makes a lone frame's confirmation rare; applying ahead halves a

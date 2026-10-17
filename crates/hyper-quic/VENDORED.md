@@ -1267,3 +1267,14 @@ messages a second a node handled 3.4 datagrams a message, a third of them acknow
 Test: `tests::decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on`
 (no request before the 100th packet; then a lone ping is acknowledged a quarter of a 20 ms round
 trip later, 5 ms and not 4, and the tenth of ten pings at once).
+
+## 34. What a shrunk receive window still owes, read (2026-10-17)
+
+Patch Q23 adds a getter and changes no behaviour. `Connection::set_receive_window` shrinks a window
+as upstream does: the credit already given stands (RFC 9000 §4.1: "it is not an error to advertise
+a smaller limit, but the smaller limit has no effect"), so the difference is held as
+`receive_window_shrink_debt`, which the application's reads pay before `local_max_data` moves
+again. `Connection::receive_window_debt` returns that debt. hyper-transport sets an idle
+connection's grown window back to its first and gives back what the growth held as the debt is
+paid (`docs/transport.md` §4n): the peer may still send at most the window and the debt beyond what
+was read, so what is held never falls below that.

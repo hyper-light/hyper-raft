@@ -1143,6 +1143,61 @@ Test: `exchange::a_held_lanes_frame_waits_for_its_owner_not_the_budget`. Holding
 takes it out of the count, and a retry and the budget given back read nothing of it. Let go, it
 is reserved and read on, and every frame arrives in order.
 
+## 4n. A window its peer stopped using (2026-10-17)
+
+A window grows while its owner consumes it within two round trips (§4a), and each growth holds
+room in the socket's queue (§4i) and bytes of the node's budget. QUIC takes back no credit it
+gave: "it is not an error to advertise a smaller limit, but the smaller limit has no effect", and a
+sender "MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do not increase flow control
+limits" (RFC 9000 §4.1). So a window that grew stayed granted while its peer was idle, and a node
+of many connections could find its room and budget held by peers that no longer send. Nothing gave
+it back but the connection's end.
+
+Two rules now take it back, both from what admission already calls idle: no exchange under way
+and nothing begun, ended or carried on the connection for the quiet period, the endpoint's serve
+period (`admission.rs`).
+
+- **Set back when it is wanted.** When a window's growth, or a connection's first window, is
+  refused for want of the shared socket's room or of the budget, every idle connection whose window
+  grew, and that holds what was wanted, is set back to its first window (`Endpoint::take_back_windows`,
+  at the endpoint's next poll). A connection on a socket of its own holds none of the shared room,
+  so only a budget refusal sets it back. A window is set back only when another wants what it
+  holds, never merely because its peer paused: it then grows again from the first by the doubling
+  rule, as TCP restarts its congestion window after an idle period (RFC 5681 §4.1).
+- **Given back as the credit is paid.** The set back is QUIC's shrink: hyper-quic holds the
+  difference as a debt that the application's reads pay before the connection's limit moves again
+  (patch Q23, `Connection::receive_window_debt`). The peer may still send the window and the debt
+  beyond what was read. So the growth's grants go back, the latest first, each whole, while what is
+  held stays at least the window, its reserve and the debt (`Core::repay`): the windows granted
+  never pass the room, however the peer sends.
+- **Closed if it stays quiet.** A peer that sends nothing pays nothing. A connection set back that
+  has moved nothing since, for a quiet period, still owing what is wanted again, is closed with
+  [`Refusal::ReceiveBuffer`], and its room and budget come back when it is gone. Admission closes an
+  idle connection for a newcomer by the same rule; here it is closed only after its peer had a
+  quiet period to send, and only while another wants what it holds.
+
+Counted in `Stats::windows_set_back` and `Stats::windows_closed`.
+
+Measured on the in-memory network (`tests/room.rs`, three nodes on the zero path, the receiver's
+room `14 · first window`, eight handshakes' first windows kept, frames of 1,000 bytes read as they
+come; windows in bytes, reserve excluded):
+
+| Phase | Before | After |
+|---|---|---|
+| quiet peer's window once grown | 48,000 | 48,000 |
+| active peer's window, its growth refused | 24,000 | 24,000 |
+| quiet peer's window once another wanted its room | 48,000 | 12,000 (set back) |
+| granted, before the quiet peer sends again | 76,536 | 76,536 (the credit given stands) |
+| granted, once the quiet peer sent 37 frames slowly | 76,536 | 40,536 (its 36,000 of growth back) |
+| active peer's window after it sends again | 24,000 | 48,000 |
+| quiet peer silent: granted once it is closed and gone | 76,536, never closed | 26,268 (its first window and growth back) |
+
+Before, the quiet peer's sending again changed nothing: each read re-extended its grown window.
+
+Tests: `a_quiet_peers_grown_window_is_set_back_when_another_wants_the_room` and
+`a_set_back_peer_that_stays_quiet_is_closed_for_the_room`; with the take-back removed the first
+fails, the active window held at 24,000.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

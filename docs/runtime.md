@@ -496,8 +496,22 @@ one-shot never holds.
   slot. The shard's next control drain sweeps the marks. A summary bitmap with one bit per slot lets the
   sweep visit only the marked slots, O(slots / 64 + marked), never a pass over tens of thousands of slots
   for one drop (`Counters::abandons_swept` counts the visits).
+- **A group tells what fired alone** (2026-10-17). A task that awaits many handles with a `Ready` each asks
+  every wait whether it fired at each poll: n asks a wake, however few fired. hyper-rt-transport's driver
+  holds a socket for each connection, and on its `connections` bench (Linux) an exchange cost 12.7 µs beside
+  one connection and 18.1–18.4 µs beside 512, about 11 ns for each connection held. A `ReadyGroup` holds one
+  wait slot of its own. Its members are waits like any other: one-shot, a slot each, withdrawn when
+  dropped armed. Each also carries its group and a key its owner chose. When a member fires, or its
+  registration is refused, the loop puts it last on its group's list, a list linked through the wait table
+  itself (`WaitCell::next`, nothing allocated). `ReadyGroup::next_fired` takes the first off, with its key,
+  and frees its slot: a park costs what fired. A member dropped while on the list stays there, abandoned,
+  until the group passes it, since the list's links run through it. A group dropped lets go of the members
+  on its list and of its own slot. A member that fires after its group ended joins no list (the group
+  slot's generation says so). Dropped off its shard, a group's slot ends through the same registry marks
+  as a wait's.
 
-The tests are `tests/readiness_waits.rs`, `tests/duplex.rs` and the table's model test.
+The tests are `tests/readiness_waits.rs`, `tests/ready_group.rs`, `tests/duplex.rs` and the table's model
+test.
 
 **Change: Windows readiness for writes and for TCP.** slates' AFD reactor serves reads and UDP sends;
 hyper-rt registers `AFD_POLL_SEND` for writability and `AFD_POLL_ACCEPT`/`AFD_POLL_CONNECT_FAIL` for

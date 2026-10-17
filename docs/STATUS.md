@@ -190,6 +190,19 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-rt-transport: every park polled every peer socket's readiness wait.** With a socket for
+  each connection (§4u), an exchange cost about 11 ns more for each connection the server held (the
+  `connections` bench on Linux: 12.8 µs beside one, 18.4–18.9 µs beside 512), and matching sockets to
+  connections compared each with each. hyper-rt's `ReadyGroup` tells a task which of its waits fired
+  (`docs/runtime.md` §3.7); the driver's peer sockets wait in one, and it drains and arms only what
+  fired or moved: 13.6–13.8 µs beside 512. Sockets are matched to connections by search. Tests:
+  `tests/ready_group.rs` (hyper-rt); the driver's suites unchanged. `docs/benchmarks.md`, "An exchange
+  by the server's connections, a socket each".
+
+- **hyper-rt-transport: a driver's peer socket counts went back when a peer went.**
+  `Driver::peer_stats` summed only the sockets held at the call; it now keeps what departed peers'
+  sockets did. Test: `peer_sockets::each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_connection`.
+
 - **hyper-rt-transport: a driver given a socket already bound kept every peer on it.** A caller
   that holds its port from the moment it learns it (a supervisor, an adopted socket, a test's
   reservation) hands the socket to `Driver::new`, which never shared its port, so every connection

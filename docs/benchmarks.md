@@ -8082,6 +8082,29 @@ build, main at `506c059`.
   works (`Detector::detection_bound`): the stated bound counts that wait, the budget does not, so an
   owner's `D` leaves room for it (at 10 s on three members, detection came at the budget itself).
 
+## An exchange by the server's connections, a socket each (2026-10-17)
+
+The bench of the next section (`cargo bench -p hyper-rt-transport --bench connections`), run again once
+each connection has a socket of its own (`docs/transport.md` §4u), which that run predates. AMD Ryzen 9
+9950X3D2, Linux 7.2.9, natively, pinned to two cores (`taskset -c 12-13`) beside other sessions' load
+(14–15); base `7fae355` against the readiness group on the same tree, each built once, their runs
+interleaved, three passes a row:
+
+| Connections held | Base | Readiness group | Allocations an exchange |
+|---|---|---|---|
+| 1 | 12.6–12.9 µs | 12.7–12.9 µs | 21.4–21.5 |
+| 16 | 13.6–13.8 µs | 13.5–14.1 µs | 21.4 |
+| 64 | 13.8–14.0 µs | 13.0–13.1 µs | 21.4–21.6 |
+| 128 | 15.0–19.3 µs | 13.7–16.7 µs | 21.4–21.7 |
+| 256 | 16.4–16.9 µs | 13.9–19.0 µs | 21.4–21.6 |
+| 512 | 18.4–18.9 µs | 13.6–13.8 µs | 21.4 |
+
+Base, every park of the server's driver polled every peer socket's readiness wait: about 11 ns an
+exchange for each connection held. With the group the driver learns which sockets fired and touches
+those alone (`docs/runtime.md` §3.7, "A group tells what fired alone"). The single 16.7 and 19.0 µs
+cells of the group's third pass sit beside 13.7–14.1 µs in its other two, as the base's 19.3 µs at 128
+beside 15.0–15.1: the host's load, not the row's.
+
 ## An exchange by the server's connections: one asker timed beside n − 1 idle (2026-10-11)
 
 `cargo bench -p hyper-rt-transport --bench connections` (`CONNECTIONS=n` runs one row): one asker

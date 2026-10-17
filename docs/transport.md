@@ -1442,6 +1442,25 @@ no window there grew and went idle while another wanted the room, so the take-ba
 focal's suite, and what moved between the arms' runs is not its. The eight are the open defect's
 (`docs/STATUS.md`, the shared socket's room on that buffer).
 
+## 4u. A socket a caller holds shares its port where it was bound to (2026-10-17)
+
+A driver bound to an address gives each peer a socket of its own on the listener's port
+(`Driver::bind`, `UdpSocket::bind_shared`). A driver given a socket already bound
+(`Driver::new`) kept every peer on that socket, whatever the socket was. A caller that holds its
+port from the moment it learns it hands over such a socket: a supervisor's, an adopted one
+(`UdpSocket::adopt`), a test's reservation. Each such caller lost every peer's queue of its own.
+focal's nodes bound their listeners so until 2026-10-17. On Linux's default receive buffer (319 KB
+usable) the one queue held four connections' unprompted messages (§4s), and refused every first
+window after.
+
+`Driver::new` now shares the port of a socket bound with its port shared, as `Driver::bind` does
+(`UdpSocket::shares_port`, `SO_REUSEPORT`). A socket bound plainly keeps its peers, as before.
+Windows shares no port so (§4i's note on Winsock), and its sockets always keep their peers.
+
+Test: `peer_sockets::a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own` (a
+client gives a server driven on a shared socket a socket of its own where the platform shares ports,
+and one driven on a plain socket none).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

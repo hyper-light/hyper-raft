@@ -217,6 +217,55 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
     eprintln!("{report}");
 }
 
+/// A driver given a socket already bound shares its port as a bound one does, where the socket was
+/// bound with its port shared: a caller that holds its port from the moment it learns it and hands
+/// the socket over loses no peer's queue of its own. Do: a client connects to a server driven on a
+/// socket bound with its port shared (`UdpSocket::bind_shared`), then to one driven on a plain
+/// socket. Expect: the first gives the client a socket of its own where the platform shares ports,
+/// the second never.
+#[test]
+fn a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own() {
+    let pki = Pki::new();
+    let one = pki.issue(&name(1));
+    let two = pki.issue(&name(2));
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async move {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let shares = usize::from(cfg!(unix));
+        for (socket, apart) in [
+            (hyper_rt::udp::UdpSocket::bind_shared(loopback), shares),
+            (hyper_rt::udp::UdpSocket::bind(loopback), 0),
+        ] {
+            let socket = socket.unwrap();
+            assert_eq!(socket.shares_port().unwrap(), apart == 1);
+            let batched = hyper_rt::udp::Batched::new(socket, IO, false).unwrap();
+            let mut server: Drv =
+                Driver::new(endpoint(&pki, &two, &one.0, CLIENT, true), batched).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let mut client: Drv =
+                Driver::bind(endpoint(&pki, &one, &two.0, SERVER, false), loopback, IO).unwrap();
+            let now = client.clock().unwrap();
+            client.endpoint().connect(now, SERVER, server_addr).unwrap();
+            let mut seen = Seen::default();
+            let began = Instant::now();
+            while seen.connected < 2 || server.peer_sockets() < apart {
+                step(&mut server, &mut client, &mut seen).await;
+                assert!(
+                    began.elapsed() < GUARD,
+                    "never connected, or no socket of its own"
+                );
+            }
+            // Turns more, in which a socket the server should not have made would be.
+            for _ in 0..8 {
+                step(&mut server, &mut client, &mut seen).await;
+            }
+            assert_eq!(server.peer_sockets(), apart);
+            assert_eq!(server.endpoint().stats().receive_rooms, apart);
+        }
+    })
+    .unwrap();
+}
+
 /// RFC 8899 §5.1.2: a connection's MTU search ends at its path's MTU as the kernel holds it, the
 /// driver telling the connection before its first probe (`Driver::tell_ceilings`): on loopback,
 /// 65,507 bytes on Linux (its 65,536-byte MTU past what IPv4's length field says), macOS's UDP cap

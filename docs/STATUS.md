@@ -190,6 +190,13 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-rt-transport: a driver given a socket already bound kept every peer on it.** A caller
+  that holds its port from the moment it learns it (a supervisor, an adopted socket, a test's
+  reservation) hands the socket to `Driver::new`, which never shared its port, so every connection
+  shared the one receive queue; focal's nodes ran so. `Driver::new` now shares the port of a socket
+  bound with its port shared (`UdpSocket::shares_port`), as `Driver::bind` does
+  (`docs/transport.md` §4u). Test: `peer_sockets::a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own`.
+
 - **hyper-transport, hyper-quic: on Linux's default buffer a measured shared socket refused every
   new connection, and once MTU discovery reached the path a peer's own socket held less than one
   first window.** The shared socket reserved for every admission place, taken or not: focal's 32

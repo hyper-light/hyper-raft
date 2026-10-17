@@ -2978,6 +2978,41 @@ fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
     assert_eq!(stats.frames_reserving, 0);
 }
 
+/// A frame sent on an idle lane goes straight from its sender's bytes into the lane's stream: the
+/// first opens the lane through its queue, and every later one, sent once the lane is drained, is
+/// written whole without a buffer of its own; every frame arrives, in order.
+#[test]
+fn a_frame_on_an_idle_lane_is_written_straight_into_its_stream() {
+    const FRAMES: u32 = 40;
+    let pair = Pair::new();
+    let mut net = connected::<Kept, Kept>(&pair, limits(), 256 << 20);
+    let mut order = Vec::new();
+    for sequence in 0..FRAMES {
+        net.a
+            .send_frame(2, 0, Kind::Append, &sequence.to_be_bytes())
+            .unwrap();
+        for _ in 0..1_000 {
+            while let Some(event) = net.b.poll_event() {
+                if let Event::Frame { frame, .. } = event {
+                    order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
+                    net.b.release(frame);
+                }
+            }
+            if order.len() == sequence as usize + 1 {
+                break;
+            }
+            net.exchange();
+        }
+    }
+    assert_eq!(
+        order,
+        (0..FRAMES).collect::<Vec<_>>(),
+        "every frame, in order"
+    );
+    let stats = net.a.stats();
+    assert_eq!(stats.frames_direct, u64::from(FRAMES - 1), "{stats:?}");
+}
+
 /// The same receiver, its frames' class lossy, skips what its budget cannot hold, and counts it.
 #[test]
 fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {

@@ -1158,6 +1158,22 @@ Tests: `crc::tests::the_checksum_is_crc32c_and_goes_on_from_any_division` (the c
 value, and every division of a buffer giving the whole's sum), and `exchange.rs`'s frame whose own
 checksum a producer writes with the crc32c crate.
 
+## 4o. A frame on an idle lane is written straight into its stream (2026-10-16)
+
+`send_frame` copied every frame into a buffer of its own, queued it on its lane, and the lane's
+flush copied it again into QUIC's stream: two copies of each frame before QUIC's own. At saturation
+a bus node spent 1.43 % of its time in the first and 1.36 % in the second (perf, memcpy's callers).
+A frame sent on a lane that holds none, its opening written, is now written straight from the
+sender's bytes into the stream, within what its class may spend (`write_idle`); only what QUIC
+leaves is copied into the frame's buffer and waits in the lane, behind nothing. The buffer is
+reserved before anything is written, so a stream that takes part of a frame always leaves room for
+the rest, and one that takes all of it gives the buffer back unused. `Stats::frames_direct` counts
+the frames written so.
+
+Test: `exchange::a_frame_on_an_idle_lane_is_written_straight_into_its_stream` (40 frames, each sent
+once the lane is drained: the first opens the lane through its queue, the other 39 go straight in,
+every frame arrives in order).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

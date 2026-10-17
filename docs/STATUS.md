@@ -146,6 +146,12 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-transport: every lane frame was copied twice before QUIC.** `send_frame` copied a frame into
+  a buffer of its own and the lane's flush copied it into the stream (1.43 % and 1.36 % of a
+  saturated bus node). A frame on a lane that holds none is now written straight from the sender's
+  bytes, and only what QUIC leaves waits in a buffer (`docs/transport.md` §4o;
+  `Stats::frames_direct`). Test: `exchange::a_frame_on_an_idle_lane_is_written_straight_into_its_stream`.
+
 - **hyper-transport: a frame's CRC-32C took the slow path in every release build.** The crc32c crate
   reaches its hardware path only in a build for the machine's own CPU; built for the generic
   target, it summed a 1,230-byte message in 135.5 ns and a 1 MiB batch in 98.4 µs on the

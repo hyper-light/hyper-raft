@@ -260,6 +260,9 @@ pub struct Stats {
     pub events: usize,
     /// Lane frames skipped because their class or the budget could not take them.
     pub frames_dropped: u64,
+    /// Lane frames written straight from their sender's bytes into an idle lane's stream, never
+    /// copied into a buffer of their own.
+    pub frames_direct: u64,
     /// Lanes whose next frame, of a lossless class, waits for the budget to hold it, and that
     /// their owner does not hold: a held lane's frame waits for its owner, and no memory moves it.
     pub frames_reserving: usize,
@@ -3579,17 +3582,66 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             length(PREFIX_BYTES).saturating_add(length(frame.len())),
             Lane::Class(class),
         )?;
-        bytes.fill(&prefix);
-        bytes.fill(frame);
-        if let Some(out) = conn.lanes_out.get_mut(at) {
-            out.queue.push_back((C::rank(class), bytes));
-        }
         // A connection carrying frames is in use as one carrying exchanges is.
         if let Some((peer, _)) = conn.peer {
             self.admission.carried(peer, conn.key, self.now);
         }
+        // An idle lane writes the frame straight into its stream: what QUIC takes is copied once,
+        // from the caller's bytes, and only what it leaves is copied into the frame's buffer to
+        // wait in the lane, behind nothing. The buffer was reserved first, so a stream that takes
+        // part of the frame always leaves room for the rest; one that takes it all gives it back.
+        let taken = self.write_idle(conn, at, C::rank(class), &prefix, frame);
+        if taken >= PREFIX_BYTES.saturating_add(frame.len()) {
+            self.budget.release(bytes);
+            self.stats.frames_direct = self.stats.frames_direct.saturating_add(1);
+            return Ok(());
+        }
+        bytes.fill(prefix.get(taken..).unwrap_or(&[]));
+        bytes.fill(
+            frame
+                .get(taken.saturating_sub(PREFIX_BYTES)..)
+                .unwrap_or(&[]),
+        );
+        if let Some(out) = conn.lanes_out.get_mut(at) {
+            out.queue.push_back((C::rank(class), bytes));
+        }
         self.flush_lane(conn, at);
         Ok(())
+    }
+
+    /// Writes `prefix` and then `frame` to lane `at`'s stream while the lane holds no frame and its
+    /// opening is written, within what the class may spend; how many of their bytes QUIC took.
+    fn write_idle(
+        &mut self,
+        conn: &mut Conn<C::Role>,
+        at: usize,
+        rank: u8,
+        prefix: &[u8],
+        frame: &[u8],
+    ) -> usize {
+        let Some(stream) = conn.lanes_out.get(at).and_then(|out| {
+            (out.queue.is_empty() && out.opener_written >= crate::lane::OPENER_BYTES)
+                .then_some(out.stream)
+                .flatten()
+        }) else {
+            return 0;
+        };
+        let allowed = self.allowed(conn, rank);
+        let _ = conn
+            .quic
+            .send_stream(stream)
+            .set_priority(priority::<C>(rank));
+        let Pushed::Took(head) = push(&mut conn.quic, stream, prefix, allowed) else {
+            return 0;
+        };
+        if head < prefix.len() {
+            return head;
+        }
+        let left = allowed.saturating_sub(length(head));
+        match push(&mut conn.quic, stream, frame, left) {
+            Pushed::Took(body) => head.saturating_add(body),
+            Pushed::Stopped(_) | Pushed::Closed => head,
+        }
     }
 
     fn flush_lanes(&mut self, conn: &mut Conn<C::Role>) {

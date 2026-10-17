@@ -910,8 +910,10 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
 
 `LocalListener` and `LocalStream`: `AF_UNIX` stream sockets on all three OSes. Windows has had `AF_UNIX`
 stream sockets since Windows 10 1803 [AFUNIX], so one mechanism serves all three, and AFD polls them as
-it polls TCP: measured on the Windows runners (§15 item 1), where `tests/local.rs` awaits an accept, a
-read and a write each on the driver's readiness.
+it polls TCP: measured on the Windows runners (§15 item 1), where `tests/local.rs` awaits an accept and
+reads on the driver's readiness. Windows' `AF_UNIX` sends took 16 MiB unread without refusing a write, so a
+writer there is held back by no kernel buffer at that size, unlike Linux's and macOS's: what a consumer
+writes ahead of a slow local reader is its own budget's to bound.
 
 The peer's identity is read from the kernel, never from the bytes: `SO_PEERCRED` on Linux,
 `LOCAL_PEERCRED` (or `getpeereid`) on macOS, and on Windows `SIO_AF_UNIX_GETPEERPID` then the process
@@ -1338,12 +1340,15 @@ thread. §12's row runs both drivers the same way.
 
 ## 15. Open items, to settle before the part that rests on them
 
-1. Closed 2026-10-17: `IOCTL_AFD_POLL` reports accept, receive and send readiness on Windows `AF_UNIX`
-   sockets (§5.3). `tests/local.rs`, `a_local_streams_accept_reads_and_writes_each_wait_on_readiness`,
-   awaits an accept before any client connects and streams 16 MiB through the sockets' buffers, each of
-   the three waiting on the driver at least once (counted), on windows-2025 and windows-11-arm in CI
-   as on Linux and macOS; a readiness AFD did not report would park the shard forever. No named-pipe
-   fallback is needed.
+1. Closed 2026-10-17: `IOCTL_AFD_POLL` reports accept and receive readiness on Windows `AF_UNIX` sockets
+   (§5.3). `tests/local.rs`, `a_local_streams_accept_reads_and_writes_each_wait_on_readiness`, awaits an
+   accept before any client connects and streams 16 MiB to a reader on the same shard, the accept and the
+   reads each counted waiting on the driver, on windows-2025 and windows-11-arm in CI as on Linux and macOS;
+   a readiness AFD did not report would park the shard forever. No named-pipe fallback is needed. Send
+   readiness was never asked on Windows: both runners took the 16 MiB without refusing a write (CI run
+   39015895080), where Linux and macOS made the writer wait for the reader. A local stream's writer on
+   Windows is therefore not held back by its kernel at that size, and what a consumer writes ahead of a
+   slow local reader there is bounded only by its own budget (§5.3).
 2. Closed 2026-10-17: macOS `TCP_NOTSENT_LOWAT` against Linux's, read at `xnu-12377.121.6` and Linux
    `v6.12` (§5.2, `docs/research/runtime-sources.md` §1): both count the bytes not yet sent; Linux holds a
    write to the mark and wakes under half of it, XNU holds only the wake, at or under it.
@@ -1373,7 +1378,15 @@ thread. §12's row runs both drivers the same way.
    pausing 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the deterministic
    spin-then-block rule at its worst case, a spin as long as blocking costs paid in full before every park
    [KARLIN]. A rule that learns the idle gaps it sees, or a randomized threshold (Karlin et al.'s
-   e/(e−1)), is what to measure against it.
+   e/(e−1)), is what to measure against it. Measured 2026-10-17 as a prototype (branch `proto-spin-rule`,
+   not merged; `docs/benchmarks.md`, "hyper-rt: the idle spin's rule, three candidates against Karlin's"):
+   Karlin-or-park, which spins `B` as now or parks at once when the last 738 idle gaps (DKW at α = ε = 0.05)
+   make parking cheaper, took 24 % less of the shard's CPU a request when the client paused 200 µs and 28 %
+   less at 20 µs, and moved nothing measurable at back-to-back requests, eight clients or cross-shard
+   ping-pong. The spin that is optimal over the gaps seen, and the randomized one, each lost cross-shard
+   ping-pong three to five times over (two shards spinning for each other learn each other's gaps), and the
+   randomized one 40 % of back-to-back requests. Karlin-or-park is the candidate; it lands only once
+   mantle's run at 100M confirms it beside its base (the runtime's rule for its wins).
    And why a shard that makes no system call while spinning sees 10–13 µs scheduling gaps that a kick's
    syscall seems to close (slates, inferred): the mechanism, measured, before kick-if-parked is kept.
 9. Closed 2026-10-06 (mantle's review): `Runtime`'s `stop` retried a full control channel with
@@ -1381,8 +1394,21 @@ thread. §12's row runs both drivers the same way.
    (`registry::request_stop`), published and kicked like a message but taking no channel slot; the shard's
    next drain applies it after that batch. `tests/admission.rs` holds the shard until it sees the stop,
    with the channel full: the old send never found room and hung.
-10. The calibration record's key and its age bound for focal's short commands (§10.2): what a stale record
-   costs (a mis-sized spin) against what a fresh one costs (the probes' budget per command).
+10. Measured 2026-10-17 (`docs/benchmarks.md`, "hyper-rt: what a calibration costs, and how far it moves
+   with time"): the calibration record's key and its age bound for focal's short commands (§10.2). A fresh
+   calibration cost a command 67 ms of wall time and 62 ms of CPU at the median (10–137 ms) on the M5 Max.
+   Over 30 rounds a minute apart its wake mean moved 1.6–4.2 µs with the host's load, each round's own 95 %
+   interval a twentieth of the mean wide, and two rounds a minute apart differed by 18.5 % at the median
+   while two rounds 10 to 29 minutes apart differed by 15–20 %: a record's error against the machine now
+   does not grow with its age at that scale, it is the load's, and a fresh measurement is no nearer the
+   next minute's machine than one from half an hour before. So, on this evidence, a record is reused while
+   its key matches; an age bound buys no accuracy within 30 minutes (longer spans are unmeasured), and the
+   consumer's bound guards only what the key does not name. As built, the record no longer sizes the spin
+   (a tracking shard spins what its parks are measured to cost); it sets the timer tick (the wake mean),
+   the step quantum's prior (followed online over the estimate's window) and the control ring's depth,
+   `next_power_of_two(wake p99 / syscall median)`, fixed at the build, which ranged from 32 to 512 entries
+   across the 30 rounds: one draw of a p99 that moved tenfold with the load decides that depth, whether the
+   record is old or fresh. That depth's rule, not the record's age, is what to settle next.
 
 ## 16. Order of work
 

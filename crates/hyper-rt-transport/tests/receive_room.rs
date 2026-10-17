@@ -76,6 +76,7 @@ fn a_socket_holds_the_room_told_from_its_measured_charge() {
         charged: before.charged.max(before.message_floor),
         stream: DATAGRAM as u64,
         datagrams: 1,
+        bytes: DATAGRAM as u64,
     });
     let queue = Queue {
         buffer: before.buffer,

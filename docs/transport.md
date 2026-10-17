@@ -986,8 +986,8 @@ Linux 6.6), and nothing in it is assumed.
   receiver may acknowledge every one) and the loss probes of the idle timeout: two at each probe
   timeout (RFC 9002 §6.2.4), the timeouts doubling (§6.2.1) from `kGranularity`, 32 for a 30-second
   timeout. Each is one datagram that comes alone. A probe is charged as the costliest datagram that
-  came alone, an acknowledgement as the costliest alone without stream data; retransmissions take
-  no new window, so they count here. A GRO train is one message of many datagrams and gives only
+  came alone, an acknowledgement and a handshake's probe as the costliest alone of the smallest
+  datagram's size (§4r); retransmissions take no new window, so they count here. A GRO train is one message of many datagrams and gives only
   its charge per stream byte. Its share a datagram stands in until a datagram has come alone. The
   first build charged probes as the costliest message: one train sampled made 32 probes cost 32
   trains, past the whole queue, and the room fell to nothing. In the busy A/B the publisher was
@@ -1250,6 +1250,62 @@ have their own) and `a_listener_reads_the_path_to_a_peer_as_a_connected_socket_w
 on loopback, each search ending at the kernel's payload with no probe lost); `mtud`'s four;
 `pacing::an_mtu_rise_leaves_a_datagram_of_the_new_size_free_to_go`; the exchange tests' network now
 drops a datagram past Ethernet's payload and tells each node so (`common::LINK_PAYLOAD`).
+
+## 4r. A small datagram's charge, and each handshake counted once (2026-10-17)
+
+Once MTU discovery reached each path's MTU (§4q), focal's cluster tests on macOS refused new
+connections: 9 of focal-node's 414 failed (`credential_renewal`, `liveness_tests`,
+`network_service`, `placement_agent`). A search's probes are the largest datagrams a peer sends,
+and each comes alone. So a 9,216-byte probe (macOS's UDP cap), charged 9,248 bytes, became the
+costliest datagram sampled (§4i), and the room charged every unprompted datagram as one. focal's
+shared socket reserves for 32 handshake places (a quarter of 128 connections) of 30 probes each
+(a 10-second idle timeout) and for two connections without sockets of their own: 1,020 probes,
+which with two acknowledgements reserved 9,451,456 bytes of an 8 MiB queue. The room was nothing:
+every first window was refused (`Room::first`) and every dial ended in CONNECTION_REFUSED
+(`Refusal::Pending`), 1,696 times in one run.
+
+The kernel charges a datagram by its size, and a sample now carries its payload (`Charged::bytes`).
+So each kind of unprompted datagram is charged as the costliest datagram seen alone of the size it
+can have:
+
+- **An acknowledgement fits the smallest datagram.** hyper-quic acknowledges at most 64 ranges
+  (`MAX_ACK_BLOCKS`; upstream's reason: "we can always fit all our ACKs in a single minimum-MTU
+  packet"). That bounds an ACK frame at 1,065 bytes (RFC 9000 §19.3, each integer at most 8 bytes,
+  ECN counts included), or 1,106 with a short header and the AEAD's tag. So an acknowledgement is
+  charged as the costliest datagram alone of at most `MIN_DATAGRAM` (1,200 bytes).
+- **So does a handshake's probe.** hyper-quic sends nothing larger than its initial MTU (1,200)
+  until its handshake is done; it probes for more only once established
+  (`Connection::send_when_idle`).
+- **An established connection's probe** may be full-sized, and is charged as the costliest datagram
+  alone, as before.
+- **An MTU probe** is now counted: one for each peer that is or may be established. A search has
+  one probe in flight, and a probe is declared lost only once a later packet is acknowledged
+  (RFC 9002 §6.1). So a peer this side has stopped acknowledging sends no second probe.
+- **A handshake place** holds a handshake's probes and one MTU probe. A client is established once
+  it sends its Finished, its server only once it reads it (RFC 9001 §4.1.1), so a client may be
+  probing while its server waits. A handshake that waited in a place was also counted as a
+  connection, its probes at the costliest datagram, so every handshake admission let wait was
+  charged twice. Now only its acknowledgements are counted beside its place. A dial's probes are a
+  handshake's, and its server, established only after it, sends no MTU probe.
+
+On the same tree, focal-node's library passes on macOS: 414 of 414, against 405 and 9 failed.
+
+**Measured on Linux, not yet fixed.** Docker's VM grants the default buffer (`rmem_max` 212,992, so
+425,984 with Linux's doubling, 319,488 usable past the release lag). There, focal-node fails 12
+tests with this change and 13 on focal's `main` before any of §4o–§4q, the same tests. Both runs
+refuse first windows on the shared socket (2,206 and 2,285 times), because the reservation for
+every place and connection passes the queue in both: 960 handshake probes at 896 bytes each already
+take 860 KB. That refusal is older than this change. focal's Linux CI passes on `main`; what its
+runners grant is not known (their image sets no `rmem_max`). What MTU discovery added on that buffer is a smaller room on each peer's own socket.
+A datagram there now carries up to the path's MTU (65,507 bytes on loopback), so the costliest
+alone is 8,448 or 66,403 bytes, and an established connection's 31 probes take 262 KB to 2 MB of
+the 319 KB. A peer's socket held less than one first window 5,798 times in the run against 17
+before. Both are open (`docs/STATUS.md`).
+
+Tests: `charge::tests::handshakes_and_acknowledgements_are_charged_as_small_datagrams` (the macOS
+shared socket's own numbers), `a_small_datagram_fits_the_smallest_a_path_carries`, and
+`exchange::a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection` (a dial,
+a handshake waiting in its place, and both connected, read over a 10 ms round trip).
 
 ## 5. Consumers
 

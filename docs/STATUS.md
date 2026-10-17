@@ -107,6 +107,24 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-transport: on Linux's default receive buffer a measured shared socket refuses every new
+  connection (found 2026-10-17, older than §4o–§4q).** Docker's VM grants 425,984 bytes
+  (`rmem_max` 212,992), 319,488 past the release lag. The shared socket reserves for every place
+  admission lets a handshake wait in, taken or not: focal's 32 places of 30 probes, at the 896
+  bytes Linux charges a small datagram, take 860 KB. So once the socket has measured a datagram of
+  stream data its room is nothing, and `Room::first` refuses each first window. focal-node fails 13
+  of 414 tests there on focal's `main` (2,285 first windows refused) and 12 with §4r (2,206).
+  focal's Linux CI passes on `main`; what its runners grant is not known. Open: what a place
+  reserves while no handshake holds it.
+- **hyper-transport, hyper-quic: an established connection's probes are reserved at up to the
+  path's MTU, which a small buffer cannot hold once MTU discovery reaches the path (found
+  2026-10-17).** With §4q a datagram on loopback carries up to 65,507 bytes. On the 319,488 usable
+  bytes above, the costliest datagram alone on a peer's own socket is charged 8,448 or 66,403
+  bytes, and a connection's 31 probes then take 262 KB to 2 MB. In focal-node's run a peer's socket
+  held less than one first window 5,798 times, against 17 before §4q. A larger buffer holds them:
+  8 MiB holds the 2 MB. Open: what bounds the bytes a peer sends unprompted at a large MTU (a
+  probe's size, or the payload this side says it takes), before focal takes §4q.
+
 - **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once, Linux 6.x in
   Docker (`rust:1.98.1`, 4 CPUs) on a loaded host, `cargo test -p hyper-tokio` on the tree of the
   socket room (above): `a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` failed at
@@ -143,6 +161,20 @@ is worked around.
   committed): the links configured 169–382 s after the slowdown against 257–618 s, but a peer dead
   in its links' first heartbeats was noticed later, at the most 1.36 s on macOS against 0.75 s and
   5.8 s on Windows' timer against 2.5 s, the interval standing up to twice its floor.
+
+### Closed (2026-10-17)
+
+- **hyper-transport: once MTU discovery reached the path, every unprompted datagram was charged as
+  an MTU probe, and every handshake waiting in a place was charged twice.** focal's shared socket on
+  macOS then reserved 9,451,456 bytes of 8 MiB for 1,020 probes and 2 acknowledgements, each charged
+  as a 9,216-byte probe: the room was nothing and every dial was refused (9 of focal-node's 414
+  tests failed). A sample now carries its payload, and acknowledgements and handshakes' probes,
+  each of which fits the smallest datagram, are charged as the costliest datagram alone of that
+  size. A handshake is counted in its place and not again as a connection. One MTU probe is counted
+  for each peer that is or may be established. focal-node passes on macOS, 414 of 414
+  (`docs/transport.md` §4r). Tests: `charge::tests::handshakes_and_acknowledgements_are_charged_as_small_datagrams`,
+  `a_small_datagram_fits_the_smallest_a_path_carries`,
+  `exchange::a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection`.
 
 ### Closed (2026-10-16)
 

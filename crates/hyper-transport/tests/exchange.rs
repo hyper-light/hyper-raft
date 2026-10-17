@@ -23,7 +23,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use hyper_transport::{Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal};
+use hyper_transport::{
+    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, Unprompted, probes_within,
+};
 
 const PERIOD: Duration = Duration::from_secs(2);
 const TURNS: usize = 10_000;
@@ -2767,6 +2769,77 @@ fn the_windows_granted_never_pass_what_the_socket_holds() {
     net.a.disconnect(now, 2);
     net.until(TURNS, |net| net.b.stats().connections == 0);
     assert_eq!(net.b.stats().receive_granted, 0, "what it held came back");
+}
+
+/// What a socket's peers may send it unprompted, read through a handshake. Each place admission
+/// lets a handshake wait in is reserved whether taken or not: a handshake's probes, and one MTU
+/// probe from a client established before its server. A handshake in a place is not counted again
+/// as a connection. A dial's probes are a handshake's, and its server, established only after it,
+/// sends no MTU probe. An established peer's probes are of up to the path's MTU, with one MTU probe
+/// beside them. Do: node 1 dials node 2 over a 10 ms round trip (the test limits: 8 places, a
+/// 10-second idle timeout); read both nodes' shared sockets before, as node 1 dials, while node 2's
+/// handshake waits in its place, and once both are connected, and node 2's reading for node 1
+/// alone. Expect: those counts at each step.
+#[test]
+fn a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection() {
+    let pair = Pair::new();
+    let limits = limits();
+    let probes = probes_within(limits.idle_timeout);
+    let places = limits.admission.pending as u64;
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let book = || pair.book(Role::Node, Role::Node);
+    let a = pair.node::<Mantle>(1, Role::Node, book(), limits, 256 << 20, now);
+    let b = pair.node::<Mantle>(2, Role::Node, book(), limits, 256 << 20, now);
+    // A round trip of 10 ms, so the handshake is seen waiting between deliveries.
+    let mut net = Net::shaped(now, a, b, 1_000_000_000, 1 << 20, Duration::from_millis(5));
+    assert_eq!(
+        net.b.unprompted_shared(),
+        Unprompted {
+            acknowledgements: 0,
+            probes: places,
+            handshake_probes: places * probes,
+        },
+        "every place, none taken"
+    );
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let dialing = net.a.unprompted_shared();
+    assert_eq!(
+        (dialing.probes, dialing.handshake_probes),
+        (places, places * probes + probes),
+        "a dial's probes are a handshake's, and no MTU probe comes"
+    );
+    // Node 2's handshake waits in its place, its flight sent: node 1's Finished is a round trip
+    // away.
+    net.until(TURNS, |net| {
+        net.b.stats().admission.pending == 1 && net.b.unprompted_shared().acknowledgements > 0
+    });
+    let waiting = net.b.unprompted_shared();
+    assert_eq!(
+        (waiting.probes, waiting.handshake_probes),
+        (places, places * probes),
+        "the handshake is counted in its place, and not again"
+    );
+    let (mut one, mut two) = (false, false);
+    net.until(TURNS, |net| {
+        for event in events(&mut net.a) {
+            one |= matches!(event, Event::Connected { peer: 2, .. });
+        }
+        for event in events(&mut net.b) {
+            two |= matches!(event, Event::Connected { peer: 1, .. });
+        }
+        one && two
+    });
+    for (side, node) in [("node 1", &net.a), ("node 2", &net.b)] {
+        let shared = node.unprompted_shared();
+        assert_eq!(
+            (shared.probes, shared.handshake_probes),
+            (places + probes + 1, places * probes),
+            "{side}: an established peer's probes and its MTU probe beside every place"
+        );
+    }
+    let alone = net.b.unprompted(1).unwrap();
+    assert_eq!((alone.probes, alone.handshake_probes), (probes + 1, 0));
 }
 
 /// Node 1 and node 2 connected, node 1 with `sender` bytes of budget and node 2 with `receiver`.

@@ -572,6 +572,30 @@ fn length(bytes: usize) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
+/// What `quic`'s peer may send unprompted by any window while this side does not read: an
+/// acknowledgement for each of this side's ack-eliciting packets in flight to it, and `probes`
+/// loss probes, those of the idle timeout ([`crate::probes_within`]). While the connection
+/// handshakes, its probes are a handshake's, and its peer sends no MTU probe: an inbound handshake
+/// waits in an admission place ([`Endpoint::unprompted_shared`]), so this is a connection this
+/// side dialed, whose server is established only after it. Once established, its probes are of
+/// up to the path's MTU, and one MTU probe comes beside them.
+fn unprompted_by(quic: &Connection, probes: u64) -> Unprompted {
+    let acknowledgements = quic.ack_eliciting_in_flight();
+    if quic.is_handshaking() {
+        Unprompted {
+            acknowledgements,
+            probes: 0,
+            handshake_probes: probes,
+        }
+    } else {
+        Unprompted {
+            acknowledgements,
+            probes: probes.saturating_add(1),
+            handshake_probes: 0,
+        }
+    }
+}
+
 /// The code range of a TLS alert carried as a QUIC CRYPTO_ERROR (RFC 9000 §20.1: `0x0100` to
 /// `0x01ff`, the alert in the low byte).
 const CRYPTO_ERRORS: std::ops::RangeInclusive<u64> = 0x0100..=0x01ff;
@@ -1599,40 +1623,46 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             })
     }
 
-    /// What `peer` may send its socket unprompted by any window while this side does not read: an
-    /// acknowledgement for each of this side's ack-eliciting packets in flight to it, and the loss
-    /// probes it may send within the idle timeout ([`crate::probes_within`]). `None` for a peer with
-    /// no connection.
+    /// What `peer` may send its socket unprompted by any window while this side does not read
+    /// ([`unprompted_by`]). `None` for a peer with no connection.
     pub fn unprompted(&self, peer: PeerId) -> Option<Unprompted> {
         let key = self.core.connection_of(peer)?;
         let conn = self.conns.get(key).and_then(Option::as_ref)?;
-        Some(Unprompted {
-            acknowledgements: conn.quic.ack_eliciting_in_flight(),
-            probes: probes_within(self.core.limits.idle_timeout),
-        })
+        Some(unprompted_by(
+            &conn.quic,
+            probes_within(self.core.limits.idle_timeout),
+        ))
     }
 
     /// What the shared socket's peers may send it unprompted: each connection without a socket of
-    /// its own, as [`Endpoint::unprompted`], and the probes of each handshake admission lets wait.
+    /// its own, as [`Endpoint::unprompted`], and each place admission lets a handshake wait in,
+    /// taken or not. A place holds a handshake's loss probes and one MTU probe: a client's
+    /// handshake is done once it sends its Finished, its server's only once that is read (RFC 9001
+    /// §4.1.1), so the client may be established and probing while its server waits. A handshake
+    /// in a place is counted in it, and only its acknowledgements beside: counted again as a
+    /// connection, each handshake admission let wait was charged twice.
     pub fn unprompted_shared(&self) -> Unprompted {
         let probes = probes_within(self.core.limits.idle_timeout);
-        let pending = u64::try_from(self.core.limits.admission.pending).unwrap_or(u64::MAX);
+        let places = u64::try_from(self.core.limits.admission.pending).unwrap_or(u64::MAX);
+        let waiting = Unprompted {
+            acknowledgements: 0,
+            probes: places,
+            handshake_probes: places.saturating_mul(probes),
+        };
         self.conns
             .iter()
             .flatten()
             .filter(|conn| conn.room.is_none())
-            .fold(
-                Unprompted {
-                    acknowledgements: 0,
-                    probes: pending.saturating_mul(probes),
-                },
-                |sum, conn| Unprompted {
-                    acknowledgements: sum
-                        .acknowledgements
-                        .saturating_add(conn.quic.ack_eliciting_in_flight()),
-                    probes: sum.probes.saturating_add(probes),
-                },
-            )
+            .fold(waiting, |sum, conn| {
+                sum.plus(if conn.pending {
+                    Unprompted {
+                        acknowledgements: conn.quic.ack_eliciting_in_flight(),
+                        ..Unprompted::default()
+                    }
+                } else {
+                    unprompted_by(&conn.quic, probes)
+                })
+            })
     }
 
     /// The room the shared socket must hold before anything is measured: the first window of every

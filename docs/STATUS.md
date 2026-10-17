@@ -833,8 +833,11 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      network's losses and repeats narrowed to 25 in 100 reach 22–35 % more abstract states, and more
      a CPU-second, than the swarm's ranges as drawn, and widened to all, the fewest; calm stretches
      alternating with the drawn mix reach 13–24 % more, their length from 125 to 1,000 steps moving
-     little. The ranges stay until each planted defect's runs to catch under the narrower one are
-     measured beside them (item 1's measure), the gate's floors and catches having been set on them.
+     little. The narrower network catches every planted defect within the random walk's count (the
+     fast track's second rule at run 450, which the ranges as drawn miss in 8,868) and each at least as
+     often over the same 1,000 seeds (the read before the first commit 166 times against 72), so it is
+     to replace the drawn ranges, in a step that derives the gate's floors, the liveness bound, the
+     directed seeds and the swarm's recorded catches again on it (`docs/sim.md` §11 item 4).
    - Tails, `docs/tails.md` §7: T-0 (the grid) is built, its sources read and its conditions' values
      derived (§2.4); T-1 (the measurement kit: its open-loop schedule and quantile intervals built in
      hyper-measure, the per-process accounts of §1a open), T-2 (the impairment relay), then each crate

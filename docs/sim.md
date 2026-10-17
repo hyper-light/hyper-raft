@@ -722,10 +722,41 @@ allocations in release are measured at S-6 with the same schedules. The table an
    repeat. Calm stretches reach 13–24 % more states than the drawn mix alone, at up to 6 % fewer a
    CPU-second (Group, Fast) or 8–12 % more (Pipelined), their length from 125 to 1,000 steps moving
    little. The counts of states are exact for the seeds (a seed's run is its schedule); the CPU, the
-   host's under its load, moves the rate a few percent from run to run. The swarm keeps its ranges for
-   now: the gate's floors and the planted defects' catches (§15.8) were set on them, and a defect a
-   hostile network finds may need the wider rates, so a narrower range is taken only with each planted
-   defect's runs to catch under it (item 1's measure) beside these counts.
+   host's under its load, moves the rate a few percent from run to run. Each planted defect's runs to
+   its first catch (§15.8's measure, each campaign within the random walk's count, every catch's run
+   without its defect keeping every oracle, `each_catch_by_seed_is_its_defects`), for the swarm as
+   drawn, with every seed's losses and repeats to 25 in 100, and with each seed's network gentle (to
+   25 in 100) or as drawn by a coin of its own:
+
+   | Defect (§4.6) | Random walk | Swarm as drawn | to 25 in 100 | gentle or as drawn |
+   |---|---|---|---|---|
+   | a commit counted from an older term's replicas | not in 2,096 | 533 | 750 | 903 |
+   | a read served before the term's first commit | 4 | 18 | 1 | 1 |
+   | a vote sent before it is durable | 1 | 1 | 1 | 1 |
+   | the fast track without its first rule | 102,775 | 2,693 | 4,535 | 3,313 |
+   | the fast track without its second rule | 8,868 | not in 8,868 | **450** | **450** |
+
+   A first catch is one draw of a run count, so each defect's catches over the same 1,000 seeds were
+   counted too (`swarm_catch_rates`; the gentle-or-drawn seed's run is one of the other two):
+
+   | Defect (§4.6) | as drawn | to 25 in 100 | gentle or as drawn |
+   |---|---|---|---|
+   | a commit counted from an older term's replicas | 2 | 2 | 2 |
+   | a read served before the term's first commit | 72 | 166 | 114 |
+   | a vote sent before it is durable | 913 | 936 | 920 |
+   | the fast track without its first rule | 0 | 0 | 0 |
+   | the fast track without its second rule | 0 | 1 | 1 |
+
+   The narrower network is the first swarm to catch every planted defect within the random walk's
+   count, the second fast-track rule's, which the ranges as drawn miss in 8,868 runs, at 450, and it
+   catches each defect at least as often as the ranges as drawn, the read before the first commit 2.3
+   times as often; the first catches of the older-term commit and the first rule, later by 1.4 and 1.7
+   times, are single draws where the rates are equal. So the swarm's network is to be the narrower one:
+   it is taken with the gate's floors (§18), the liveness phase's bound (four times the most a no-defect
+   seed of the swarm took, `support::swarm`'s `LIVENESS`), the swarm's directed seeds and its recorded
+   catches derived again on it, a step of its own; until then the swarm keeps its ranges as drawn. The
+   hostile networks stay in the gate either way (`tests/check.rs`'s schedules at 25, 50 and 75 in a
+   hundred lost and repeated).
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.
 6. **hyper-log under the world.** Whether its owner can be driven as a step function with its device
    as world completions without a second code path in production, or whether its simulation keeps a

@@ -146,6 +146,15 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-rt: an idle turn asked the driver twice.** A step that found the shard idle with
+  readiness waits registered asked its driver at once, a zero-timeout wait, and the park that
+  followed asked again in its own wait: two system calls for one answer at every idle moment, one
+  of each a message for a bus node at 10,000 one-datagram messages a second. An idle turn now
+  leaves the ask to the park, whose wait returns at once with what is ready (`harvest_owed`). The
+  spin and `run_until_idle`, which may not park, ask first, and a caller's own `step` loop finds the
+  driver asked once a quantum, as a busy turn does. Test: `idle_spin::an_idle_shard_parks_without_asking_its_driver_first`
+  (41 parks, 41 asks before; none now).
+
 - **hyper-transport: a held lane's frame was counted as waiting for memory.** A lossless frame the
   budget could not hold stayed in `Stats::frames_reserving` after its owner held its lane, though no
   memory could move it. Focal's bus node gives such frames the room of its window, so at

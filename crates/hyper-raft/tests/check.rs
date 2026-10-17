@@ -132,24 +132,25 @@ fn the_group_schedules_keep_every_oracle_and_their_histories_are_linearizable() 
 }
 
 /// The floors of the group schedules under their swarm configurations, each set from its count over
-/// the default 96 seeds (2026-10-13, this test at its commit, `docs/sim.md` §18): more than one a seed
-/// where the count was, at least one a campaign where it was rarer.
+/// the default 96 seeds (2026-10-17, this test at its commit, on the swarm's network of
+/// `NETWORK_CEILING`, `docs/sim.md` §11 item 4, §18): more than one a seed where the count was, at
+/// least one a campaign where it was rarer.
 fn group_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 582, 96),
-        seed_floor("entries committed", 35762, 96),
-        seed_floor("log entries held", 28192, 96),
-        seed_floor("leaderships held to the committed entries", 582, 96),
-        seed_floor("messages held to their senders' devices", 176397, 96),
-        seed_floor("reads asked", 14989, 96),
-        seed_floor("reads recorded", 1140, 96),
-        seed_floor("read indexes answered", 3836, 96),
-        seed_floor("reads served", 568, 96),
-        seed_floor("writes published", 1063, 96),
-        seed_floor("writes answered committed", 1063, 96),
-        seed_floor("writes failed, another entry at their index", 249, 96),
-        campaign_floor("writes failed, their term ended past the commit", 38, 96),
-        seed_floor("operations left unknown by a restart", 1212, 96),
+        seed_floor("terms led", 893, 96),
+        seed_floor("entries committed", 60354, 96),
+        seed_floor("log entries held", 37247, 96),
+        seed_floor("leaderships held to the committed entries", 893, 96),
+        seed_floor("messages held to their senders' devices", 219674, 96),
+        seed_floor("reads asked", 15095, 96),
+        seed_floor("reads recorded", 2245, 96),
+        seed_floor("read indexes answered", 5316, 96),
+        seed_floor("reads served", 1253, 96),
+        seed_floor("writes published", 2533, 96),
+        seed_floor("writes answered committed", 2533, 96),
+        seed_floor("writes failed, another entry at their index", 370, 96),
+        campaign_floor("writes failed, their term ended past the commit", 46, 96),
+        seed_floor("operations left unknown by a restart", 2095, 96),
     ]
 }
 
@@ -207,25 +208,25 @@ fn the_fast_schedules_keep_every_oracle_and_their_histories_are_linearizable() {
 }
 
 /// The floors of the fast schedules under their swarm configurations, from their counts over the
-/// default 96 seeds (2026-10-13, this test at its commit, `docs/sim.md` §18).
+/// default 96 seeds (2026-10-17, this test at its commit, on the swarm's network, `docs/sim.md` §18).
 fn fast_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 427, 96),
-        seed_floor("entries committed", 26071, 96),
-        seed_floor("log entries held", 23096, 96),
-        seed_floor("leaderships held to the committed entries", 427, 96),
-        seed_floor("messages held to their senders' devices", 199122, 96),
-        seed_floor("reads asked", 15105, 96),
-        seed_floor("reads recorded", 599, 96),
-        seed_floor("read indexes answered", 3276, 96),
-        seed_floor("reads served", 270, 96),
-        seed_floor("writes published", 536, 96),
-        seed_floor("writes answered committed", 535, 96),
-        seed_floor("writes failed, another entry at their index", 467, 96),
-        campaign_floor("writes failed, their term ended past the commit", 7, 96),
-        seed_floor("operations left unknown by a restart", 745, 96),
-        seed_floor("fast votes cast", 28331, 96),
-        seed_floor("indexes a fast quorum chose", 229, 96),
+        seed_floor("terms led", 662, 96),
+        seed_floor("entries committed", 41010, 96),
+        seed_floor("log entries held", 34549, 96),
+        seed_floor("leaderships held to the committed entries", 662, 96),
+        seed_floor("messages held to their senders' devices", 270444, 96),
+        seed_floor("reads asked", 15139, 96),
+        seed_floor("reads recorded", 876, 96),
+        seed_floor("read indexes answered", 4243, 96),
+        seed_floor("reads served", 441, 96),
+        seed_floor("writes published", 868, 96),
+        seed_floor("writes answered committed", 868, 96),
+        seed_floor("writes failed, another entry at their index", 603, 96),
+        campaign_floor("writes failed, their term ended past the commit", 5, 96),
+        seed_floor("operations left unknown by a restart", 995, 96),
+        seed_floor("fast votes cast", 49200, 96),
+        seed_floor("indexes a fast quorum chose", 467, 96),
     ]
 }
 
@@ -239,25 +240,26 @@ fn the_pipelined_schedules_keep_every_oracle_and_their_histories_are_linearizabl
 }
 
 /// The floors of the pipelined schedules under their swarm configurations, from their counts over
-/// the default 48 seeds (2026-10-13, this test at its commit, `docs/sim.md` §18).
+/// the default 48 seeds (2026-10-17, this test at its commit, on the swarm's network, `docs/sim.md`
+/// §18): the reads served, a campaign's floor on the hostile network (46), are one a seed on it.
 fn pipelined_floors() -> Vec<Floor> {
     vec![
-        seed_floor("terms led", 96, 48),
-        seed_floor("entries committed", 2178, 48),
-        seed_floor("log entries held", 2219, 48),
-        seed_floor("leaderships held to the committed entries", 96, 48),
-        seed_floor("messages held to their senders' devices", 14629, 48),
-        seed_floor("leaders' commits held to their voters' devices", 328, 48),
-        seed_floor("entries applied held to their members' devices", 2178, 48),
-        seed_floor("reads asked", 2447, 48),
-        seed_floor("reads recorded", 100, 48),
-        seed_floor("read indexes answered", 216, 48),
-        campaign_floor("reads served", 46, 48),
-        seed_floor("writes published", 180, 48),
-        seed_floor("writes answered committed", 180, 48),
-        campaign_floor("writes failed, another entry at their index", 35, 48),
-        campaign_floor("writes failed, their term ended past the commit", 10, 48),
-        seed_floor("operations left unknown by a restart", 141, 48),
+        seed_floor("terms led", 113, 48),
+        seed_floor("entries committed", 3338, 48),
+        seed_floor("log entries held", 3325, 48),
+        seed_floor("leaderships held to the committed entries", 113, 48),
+        seed_floor("messages held to their senders' devices", 19588, 48),
+        seed_floor("leaders' commits held to their voters' devices", 443, 48),
+        seed_floor("entries applied held to their members' devices", 3338, 48),
+        seed_floor("reads asked", 2576, 48),
+        seed_floor("reads recorded", 194, 48),
+        seed_floor("read indexes answered", 401, 48),
+        seed_floor("reads served", 115, 48),
+        seed_floor("writes published", 285, 48),
+        seed_floor("writes answered committed", 285, 48),
+        campaign_floor("writes failed, another entry at their index", 28, 48),
+        campaign_floor("writes failed, their term ended past the commit", 13, 48),
+        seed_floor("operations left unknown by a restart", 180, 48),
     ]
 }
 

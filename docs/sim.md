@@ -751,12 +751,16 @@ allocations in release are measured at S-6 with the same schedules. The table an
    count, the second fast-track rule's, which the ranges as drawn miss in 8,868 runs, at 450, and it
    catches each defect at least as often as the ranges as drawn, the read before the first commit 2.3
    times as often; the first catches of the older-term commit and the first rule, later by 1.4 and 1.7
-   times, are single draws where the rates are equal. So the swarm's network is to be the narrower one:
-   it is taken with the gate's floors (§18), the liveness phase's bound (four times the most a no-defect
-   seed of the swarm took, `support::swarm`'s `LIVENESS`), the swarm's directed seeds and its recorded
-   catches derived again on it, a step of its own; until then the swarm keeps its ranges as drawn. The
-   hostile networks stay in the gate either way (`tests/check.rs`'s schedules at 25, 50 and 75 in a
-   hundred lost and repeated).
+   times, are single draws where the rates are equal. So the swarm's network is the narrower one since
+   2026-10-17 (`support::swarm`'s `NETWORK_CEILING`, the losses and repeats drawn over `[0, 75]` and
+   scaled to it, so every other draw of a seed is as it was): the gate's floors were derived again on
+   it (§18; every floor held, and the pipelined reads served, a campaign's on the hostile network, are
+   one a seed on it), the swarm's catches are the narrower network's above (each again clean without
+   its defect), the swarm's seeds with no defect are those of its rarest catch, 4,535 (13,585, by the
+   same rule), and the liveness phase's bound is four times the most any of them took (LIVENESSNOTE).
+   The directed seeds found on the hostile network keep it (`Configuration::swarm_within(…, 75)`), and
+   the hostile networks stay in the gate (`tests/check.rs`'s schedules at 25, 50 and 75 in a hundred
+   lost and repeated).
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.
 6. **hyper-log under the world.** Whether its owner can be driven as a step function with its device
    as world completions without a second code path in production, or whether its simulation keeps a
@@ -1371,8 +1375,9 @@ tests' own: the rules (pre-vote, check-quorum, refusing what arrives ahead of a 
 bare answers, and for pipelined members applying before durability; precedence by length is drawn
 and not run, as no consumer can set it, `docs/raft.md` §3.3), the
 windows and message sizes the tests use, every kind of step on or off (changes, a leader leaving,
-restarts, compaction, partitions, priorities, windows, bursts of reads), losses and repeats up to
-three in four (`tests/check.rs`' hostile networks), the fast track's share up to all, persistence
+restarts, compaction, partitions, priorities, windows, bursts of reads), losses and repeats up to a
+quarter (`NETWORK_CEILING`, §11 item 4; up to three in four before 2026-10-17, which `tests/check.rs`'s
+hostile networks keep), the fast track's share up to all, persistence
 steps up to three in four, and three or five members. The group's kind (fast, pipelined) is the
 harness's: the fast track's defects need the fast track.
 
@@ -1496,13 +1501,15 @@ sessions' work, load 9–72 (`docs/benchmarks.md`, "hyper-check's strategies and
 
 | Defect (§4.6) | Random walk (§14.6) | Swarm | PCT, depth 1 | PCT, depth 2 | Coverage-guided | Exhaustive rounds (rounds played) |
 |---|---|---|---|---|---|---|
-| a commit counted from an older term's replicas | not in 2,096 | **533** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
-| a read served before the term's first commit | 4 | 18 | 8 | 8 | 20 | **13,917** (two rounds, §15.14) |
+| a commit counted from an older term's replicas | not in 2,096 | **750** | not in 2,096 | not in 2,096 | not in 2,096 | **33,621** (four rounds) |
+| a read served before the term's first commit | 4 | **1** | 8 | 8 | 20 | **13,917** (two rounds, §15.14) |
 | a vote sent before it is durable | 1 | 1 | 1 | 1 | 1 | **11** (one lagged round, §15.14) |
-| the fast track without its first rule | 102,775 | **2,693** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
-| the fast track without its second rule | **8,868** | not in 8,868 | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
+| the fast track without its first rule | 102,775 | **4,535** | 22,066 | 38,861 | not in 102,775 | outside its scope (no fast track) |
+| the fast track without its second rule | 8,868 | **450** | not in 8,868 | not in 8,868 | not in 8,868 | outside its scope |
 
-On the core that takes an append behind its member's commit past it (2026-10-12: what the append
+The swarm's column is the swarm's on its network since 2026-10-17, losses and repeats to a quarter
+(§11 item 4), each catch recorded at its seed and clean without its defect; on the hostile network it
+drew before, the column was 533, 18, 1, 2,693 and not in 8,868. On the core that takes an append behind its member's commit past it (2026-10-12: what the append
 carries after the committed entry is appended, where the core answered with the commit and dropped
 it), the swarm's campaign on the older term's commit caught it at run 533 (seed 532), where it had
 at 172; every other catch recorded at its seed still catches there, its run without the defect
@@ -1525,9 +1532,11 @@ defect of depth one, 1 − (4/5)^R, above 0.9999 at every count here but the fir
 (the group's) and 0.185 (the second rule's); for depth three, at most 1.4·10⁻³ (the campaigns' own
 report, 2026-10-05). **What the counts say.** On the first fast-track rule the swarm beats the
 random walk by 38 times and PCT by 8.2 (depth 1) and 14 (depth 2), and coverage guidance does not catch it within the
-random walk's count; on the second, under the
-release (§15.13), only the random walk catches it within its count: a member holds a vote now
-until a classic commit covers it, so fewer schedules leave a fast quorum counted across a change. The swarm alone catches the older-term
+random walk's count (on the swarm's network since 2026-10-17, by 23, 4.9 and 8.6 times); on the
+second, under the release (§15.13), only the random walk caught it within its count on the hostile
+network: a member holds a vote now until a classic commit covers it, so fewer schedules leave a fast
+quorum counted across a change; the swarm on its quarter network catches it at run 450, 20 times
+sooner than the random walk (§11 item 4). The swarm alone catches the older-term
 commit, which needs an order of elections and partitions rather than of deliveries. The exhaustive round
 search is the only strategy that guarantees its result within its scope: it plays every four-round
 scenario, and the older-term commit is among them.
@@ -1945,7 +1954,11 @@ network the world's.
   checks, so the gate runs both: each seed fixed, and each seed its own. The floors were set again from
   the swarm's counts over the same seed counts (96, 96 and 48), by §4.4's rule; every path the fixed
   mixes floored is floored, the rarer at once a campaign (a group's write failed by its term ending
-  38 times in 96 seeds, the lagging members' reads served 46 in 48).
+  38 times in 96 seeds, the lagging members' reads served 46 in 48). Derived again on the swarm's
+  quarter network (2026-10-17, §11 item 4): every count rose but the fast writes failed by their
+  term's end (7 to 5, a campaign's floor either way) and the pipelined writes failed for another
+  entry (35 to 28, likewise); the group's entries committed went from 35,762 to 60,354, and the
+  lagging members' reads served, 115 in 48 seeds, are one a seed now.
 - **The oracle** is hyper-check's for these schedules since S-4 (`support::judge`); the harness's
   own checks stay for the fixed mixes and for the differential against raft-rs, which compares the
   two cores' words.

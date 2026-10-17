@@ -124,12 +124,20 @@ impl Configuration {
 
     /// A swarm's configuration for `seed` within the harness's ranges (Groce et al.; `docs/sim.md`
     /// §3.8): each rule and each kind of step on or off with even odds, each rate uniform over the
-    /// range the schedule tests run (losses and repeats to three in four, `tests/check.rs`'s
-    /// hostile networks; the fast track's share of proposals to all; persistence steps to the
-    /// pipelined schedules' bound), the windows and message sizes from the values the schedule
-    /// tests use, and the group from the sizes they run. The group kind (fast, pipelined) is the
-    /// harness's: a defect of the fast track is not caught by a group without it.
+    /// range the schedule tests run (losses and repeats to [`NETWORK_CEILING`] in a hundred; the fast
+    /// track's share of proposals to all; persistence steps to the pipelined schedules' bound), the
+    /// windows and message sizes from the values the schedule tests use, and the group from the sizes
+    /// they run. The group kind (fast, pipelined) is the harness's: a defect of the fast track is not
+    /// caught by a group without it.
     pub fn swarm(harness: Harness, seed: u64) -> Self {
+        Self::swarm_within(harness, seed, NETWORK_CEILING)
+    }
+
+    /// [`Configuration::swarm`] with the network's losses and repeats drawn over `[0, 75]` and scaled
+    /// into `[0, ceiling]`, so every other draw of the seed is the same at any ceiling: the swarm's at
+    /// [`NETWORK_CEILING`], and at 75 the hostile ranges the swarm drew until 2026-10-17, which the
+    /// directed seeds found then are run at.
+    pub fn swarm_within(harness: Harness, seed: u64, ceiling: u64) -> Self {
         let mut swarm = Swarm::of(seed);
         let base = harness.settings();
         let pre_vote = swarm.feature();
@@ -164,8 +172,8 @@ impl Configuration {
             priorities: swarm.feature(),
             windows: swarm.feature(),
             bursts: swarm.feature(),
-            lose: swarm.within(0, 75),
-            repeat: swarm.within(0, 75),
+            lose: swarm.within(0, 75) * ceiling / 75,
+            repeat: swarm.within(0, 75) * ceiling / 75,
             fast: if harness.fast() {
                 swarm.within(0, 100)
             } else {
@@ -201,6 +209,13 @@ impl Configuration {
         group
     }
 }
+
+/// The most losses and repeats in a hundred deliveries the swarm draws: measured to reach the most
+/// abstract states of a count of seeds and the most a CPU-second, and to catch every planted defect
+/// within the random walk's count, each at least as often over the same 1,000 seeds as the hostile
+/// `[0, 75]` it drew before (`docs/sim.md` §11 item 4). The hostile rates stay in the gate as
+/// `tests/check.rs`'s networks at 25, 50 and 75.
+pub const NETWORK_CEILING: u64 = 25;
 
 /// The most operations a run's liveness phase may act: four times the most any of the swarm's
 /// 15,000 seeds with no defect took (9,039, a group harness's,

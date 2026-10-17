@@ -51,7 +51,7 @@ use hyper_measure::usage;
 use hyper_raft::Mutant;
 use hyper_raft::proto::{Entry, Message, MessageType};
 use support::judge::{Core, Driver, Judge, Judged, Seed, drive, route};
-use support::swarm::{Configuration, Harness, run};
+use support::swarm::{Configuration, Harness, NETWORK_CEILING, run};
 use support::{Cluster, Draws, Lagged, Mix, New, Op, Replica, Seeded, Settings, Step};
 
 #[global_allocator]
@@ -393,7 +393,7 @@ fn every_step_of_the_default_schedules_is_a_step_of_the_model() {
 fn swarm_group_seed_9657_elects_by_the_logs_precedence() {
     const SEED: u64 = 9_657;
     let harness = Harness::Group;
-    let configuration = Configuration::swarm(harness, SEED);
+    let configuration = Configuration::swarm_within(harness, SEED, 75);
     assert!(!configuration.settings.by_length);
     let judged = run(harness, &configuration, SEED, None, &mut Seed(Seeded(SEED)));
     assert_eq!(judged.violation, None);
@@ -433,56 +433,9 @@ fn catch(judged: &Judged) -> Option<Violation> {
     judged.violation.clone()
 }
 
-/// A swarm configuration with its losses and repeats, drawn over `[0, 75]`, scaled into
-/// `[0, ceiling]`: the same seed's choice over a narrower or a wider range.
-fn scaled(mut configuration: Configuration, ceiling: u64) -> Configuration {
-    configuration.mix.lose = configuration.mix.lose * ceiling / 75;
-    configuration.mix.repeat = configuration.mix.repeat * ceiling / 75;
-    configuration
-}
-
-/// The swarm's campaign, each seed's network faults scaled into `[0, ceiling]` where one is given.
-fn swarm_campaign(case: Case, budget: u64, ceiling: Option<u64>) -> Campaign {
+fn swarm_campaign(case: Case, budget: u64) -> Campaign {
     for seed in 0..budget {
-        let drawn = Configuration::swarm(case.harness, seed);
-        let configuration = match ceiling {
-            Some(ceiling) => scaled(drawn, ceiling),
-            None => drawn,
-        };
-        let judged = run(
-            case.harness,
-            &configuration,
-            seed,
-            Some(case.mutant),
-            &mut Seed(Seeded(seed)),
-        );
-        if let Some(violation) = catch(&judged) {
-            return Ok(Catch {
-                runs: seed + 1,
-                seed,
-                violation,
-                tape: None,
-            });
-        }
-    }
-    Err(budget)
-}
-
-/// Whether `seed`'s network is gentle in the either-swarm: a coin from a stream of its own, so no draw
-/// of the configuration moves.
-fn gentle(seed: u64) -> bool {
-    Seeded(seed ^ 0x6a09_e667_f3bc_c908).next() & 1 == 0
-}
-
-/// The swarm's campaign, each seed's network gentle (to 25 in 100) or as drawn by `gentle`.
-fn either_campaign(case: Case, budget: u64) -> Campaign {
-    for seed in 0..budget {
-        let drawn = Configuration::swarm(case.harness, seed);
-        let configuration = if gentle(seed) {
-            scaled(drawn, 25)
-        } else {
-            drawn
-        };
+        let configuration = Configuration::swarm(case.harness, seed);
         let judged = run(
             case.harness,
             &configuration,
@@ -609,11 +562,6 @@ fn report(case: Case, strategy: &str, campaign: &Campaign) {
 #[derive(Clone, Copy, Debug)]
 enum Strategy {
     Swarm,
-    /// The swarm with its network's losses and repeats to 25 in 100 (`docs/sim.md` §11 item 4).
-    SwarmQuarter,
-    /// The swarm with each seed's network gentle (losses and repeats to 25 in 100) or as drawn, by a
-    /// coin of its own (`docs/sim.md` §11 item 4).
-    SwarmEither,
     Pct(u32),
     Guided,
 }
@@ -622,17 +570,7 @@ enum Strategy {
 fn campaign(strategy: Strategy, case: usize) {
     let case = CASES[case];
     match strategy {
-        Strategy::Swarm => report(case, "swarm", &swarm_campaign(case, budget(case), None)),
-        Strategy::SwarmQuarter => report(
-            case,
-            "swarm, losses and repeats to 25 in 100",
-            &swarm_campaign(case, budget(case), Some(25)),
-        ),
-        Strategy::SwarmEither => report(
-            case,
-            "swarm, each seed's network gentle or as drawn",
-            &either_campaign(case, budget(case)),
-        ),
+        Strategy::Swarm => report(case, "swarm", &swarm_campaign(case, budget(case))),
         Strategy::Pct(depth) => {
             let campaign = pct_campaign(case, depth, budget(case));
             report(case, &format!("PCT at depth {depth}"), &campaign);
@@ -676,16 +614,6 @@ campaigns! {
     swarm_vote_before_durable: Strategy::Swarm, 2;
     swarm_fast_beside_any_term: Strategy::Swarm, 3;
     swarm_fast_any_configuration: Strategy::Swarm, 4;
-    swarm_quarter_older_term_commit: Strategy::SwarmQuarter, 0;
-    swarm_quarter_read_before_first_commit: Strategy::SwarmQuarter, 1;
-    swarm_quarter_vote_before_durable: Strategy::SwarmQuarter, 2;
-    swarm_quarter_fast_beside_any_term: Strategy::SwarmQuarter, 3;
-    swarm_quarter_fast_any_configuration: Strategy::SwarmQuarter, 4;
-    swarm_either_older_term_commit: Strategy::SwarmEither, 0;
-    swarm_either_read_before_first_commit: Strategy::SwarmEither, 1;
-    swarm_either_vote_before_durable: Strategy::SwarmEither, 2;
-    swarm_either_fast_beside_any_term: Strategy::SwarmEither, 3;
-    swarm_either_fast_any_configuration: Strategy::SwarmEither, 4;
     pct1_older_term_commit: Strategy::Pct(1), 0;
     pct1_read_before_first_commit: Strategy::Pct(1), 1;
     pct1_vote_before_durable: Strategy::Pct(1), 2;
@@ -726,15 +654,10 @@ fn check_catches(guided: bool) {
         let case = CASES[*case];
         let configuration = match strategy {
             Strategy::Swarm => Configuration::swarm(case.harness, *seed),
-            Strategy::SwarmQuarter => scaled(Configuration::swarm(case.harness, *seed), 25),
-            Strategy::SwarmEither if gentle(*seed) => {
-                scaled(Configuration::swarm(case.harness, *seed), 25)
-            }
-            Strategy::SwarmEither => Configuration::swarm(case.harness, *seed),
             _ => Configuration::of(case.harness),
         };
         let (caught, clean) = match strategy {
-            Strategy::Swarm | Strategy::SwarmQuarter | Strategy::SwarmEither => (
+            Strategy::Swarm => (
                 run(
                     case.harness,
                     &configuration,
@@ -796,10 +719,11 @@ fn check_catches(guided: bool) {
 /// 8,868 runs without a catch; and the coverage-guided campaign ran `FastBesideAnyTerm`'s 102,775
 /// without one.
 const CATCHES: &[(Strategy, usize, u64)] = &[
-    (Strategy::Swarm, 0, 532),
-    (Strategy::Swarm, 1, 17),
+    (Strategy::Swarm, 0, 749),
+    (Strategy::Swarm, 1, 0),
     (Strategy::Swarm, 2, 0),
-    (Strategy::Swarm, 3, 2_692),
+    (Strategy::Swarm, 3, 4_534),
+    (Strategy::Swarm, 4, 449),
     (Strategy::Pct(1), 1, 7),
     (Strategy::Pct(1), 2, 0),
     (Strategy::Pct(1), 3, 22_065),
@@ -808,16 +732,6 @@ const CATCHES: &[(Strategy, usize, u64)] = &[
     (Strategy::Pct(2), 3, 38_860),
     (Strategy::Guided, 1, 20),
     (Strategy::Guided, 2, 1),
-    (Strategy::SwarmQuarter, 0, 749),
-    (Strategy::SwarmQuarter, 1, 0),
-    (Strategy::SwarmQuarter, 2, 0),
-    (Strategy::SwarmQuarter, 3, 4_534),
-    (Strategy::SwarmQuarter, 4, 449),
-    (Strategy::SwarmEither, 0, 902),
-    (Strategy::SwarmEither, 1, 0),
-    (Strategy::SwarmEither, 2, 0),
-    (Strategy::SwarmEither, 3, 3_312),
-    (Strategy::SwarmEither, 4, 449),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -1607,12 +1521,12 @@ fn strategy_costs() {
 // The swarm and the model over the core with no defect planted.
 
 /// The seeds the swarm runs each harness with no defect planted: enough to see, with probability
-/// 0.95, a defect that one seed in 2,693 reaches, ⌈ln 0.05 / ln(1 − 1/2,693)⌉: the rarest a planted
-/// defect the swarm catches was for it, the first fast-track rule's catch at run 2,693 (`CATCHES`).
-/// Run 2026-10-05 at 9,924 seeds (the count for the catch at 3,313 before raft-rs's precedence left
-/// the swarm): no failure on any harness, at most 9,039, 8,472 and 3,396 operations a liveness
-/// phase (group, fast, pipelined).
-const NO_DEFECT_SEEDS: u64 = 8_067;
+/// 0.95, a defect that one seed in 4,535 reaches, ⌈ln 0.05 / ln(1 − 1/4,535)⌉: the rarest a planted
+/// defect the swarm catches was for it, the first fast-track rule's catch at run 4,535 on its network
+/// of [`NETWORK_CEILING`] (`CATCHES`). Run 2026-10-05 at 9,924 seeds on the network before it: no
+/// failure on any harness, at most 9,039, 8,472 and 3,396 operations a liveness phase (group, fast,
+/// pipelined). NODEFECTRUN
+const NO_DEFECT_SEEDS: u64 = 13_585;
 
 /// The swarm's configurations of each harness with no defect planted, every step held to the
 /// model: every oracle keeps, every step is a model step, every group settles and every read it
@@ -1718,7 +1632,7 @@ fn the_swarm_seeds_that_found_the_judges_wanting_keep_every_oracle_and_the_model
         .into_iter()
         .chain([(Harness::Fast, 34_957)]);
     for (harness, seed) in seeds {
-        let configuration = Configuration::swarm(harness, seed);
+        let configuration = Configuration::swarm_within(harness, seed, 75);
         let mut driver = Conformed::new(Seed(Seeded(seed)), None);
         let judged = run(harness, &configuration, seed, None, &mut driver);
         assert_eq!(judged.violation, None, "{harness:?}, seed {seed}");
@@ -1735,7 +1649,7 @@ fn the_swarm_seeds_that_found_the_judges_wanting_keep_every_oracle_and_the_model
 #[test]
 fn the_swarm_seeds_whose_groups_never_converged_settle() {
     for seed in [2_396, 3_112] {
-        let configuration = Configuration::swarm(Harness::Fast, seed);
+        let configuration = Configuration::swarm_within(Harness::Fast, seed, 75);
         let mut driver = Conformed::new(Seed(Seeded(seed)), None);
         let judged = run(Harness::Fast, &configuration, seed, None, &mut driver);
         assert_eq!(judged.violation, None, "seed {seed}");
@@ -1757,7 +1671,7 @@ fn the_swarm_seeds_whose_groups_never_converged_settle() {
 #[test]
 fn a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost() {
     let seed = 41_345;
-    let configuration = Configuration::swarm(Harness::Fast, seed);
+    let configuration = Configuration::swarm_within(Harness::Fast, seed, 75);
     let judged = run(
         Harness::Fast,
         &configuration,
@@ -1771,17 +1685,17 @@ fn a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost() {
 // ---------------------------------------------------------------------------------------------
 // What each swarm setting reaches for its CPU (`docs/sim.md` §11 item 4).
 
-/// The swarm's settings measured: each harness's own ranges as drawn; the network's losses and
-/// repeats scaled from the drawn `[0, 75]` into `[0, 25]` and `[0, 100]` (the same seed's choice,
-/// a narrower and a wider range); and calm and adversarial stretches alternating (`docs/sim.md`
-/// §3.8; slates' explorer runs 250).
-const SETTINGS: [(&str, Option<u64>, Option<u64>); 6] = [
-    ("as drawn", None, None),
-    ("faults to 25 in 100", Some(25), None),
-    ("faults to 100 in 100", Some(100), None),
-    ("stretches of 125", None, Some(125)),
-    ("stretches of 250", None, Some(250)),
-    ("stretches of 1,000", None, Some(1_000)),
+/// The swarm's settings measured: the network's losses and repeats drawn over `[0, 75]` and scaled
+/// into `[0, 75]`, `[0, 25]` and `[0, 100]` (the same seed's choice over the swarm's ranges before
+/// 2026-10-17, a narrower and a wider range); and calm and adversarial stretches alternating at the
+/// first (`docs/sim.md` §3.8; slates' explorer runs 250).
+const SETTINGS: [(&str, u64, Option<u64>); 6] = [
+    ("faults to 75 in 100", 75, None),
+    ("faults to 25 in 100", 25, None),
+    ("faults to 100 in 100", 100, None),
+    ("stretches of 125", 75, Some(125)),
+    ("stretches of 250", 75, Some(250)),
+    ("stretches of 1,000", 75, Some(1_000)),
 ];
 
 /// `docs/sim.md` §11 item 4: what each swarm setting reaches for the CPU it costs. For each
@@ -1798,11 +1712,7 @@ fn swarm_ranges_and_stretches() {
             let before = usage::this().unwrap();
             let (mut committed, mut settled) = (0u64, 0u64);
             for seed in 0..SEEDS {
-                let drawn = Configuration::swarm(harness, seed);
-                let mut configuration = match ceiling {
-                    Some(ceiling) => scaled(drawn, ceiling),
-                    None => drawn,
-                };
+                let mut configuration = Configuration::swarm_within(harness, seed, ceiling);
                 configuration.mix.stretch = stretch;
                 let judged = {
                     let mut driver = Conformed::new(Seed(Seeded(seed)), Some(&mut points));
@@ -1825,36 +1735,32 @@ fn swarm_ranges_and_stretches() {
     }
 }
 
-/// `docs/sim.md` §11 item 4: each planted defect's catches over the same `SEEDS` seeds under the swarm
-/// as drawn, with every seed's network gentle (losses and repeats to 25 in 100), and with each seed's
-/// gentle or as drawn by its coin (`gentle`, whose run is one of the other two): a rate over a fixed
-/// count, where a first catch is one draw.
+/// `docs/sim.md` §11 item 4: each planted defect's catches over the same `SEEDS` seeds, the network's
+/// losses and repeats to 75 in a hundred (the swarm's ranges before 2026-10-17) and to the swarm's
+/// [`NETWORK_CEILING`]: a rate over a fixed count, where a first catch is one draw.
 #[test]
 #[ignore = "a measurement, in release"]
 fn swarm_catch_rates() {
     const SEEDS: u64 = 1_000;
     for (at, case) in CASES.iter().enumerate() {
-        let (mut drawn_caught, mut narrow_caught, mut either_caught) = (0u64, 0u64, 0u64);
+        let (mut hostile, mut gentle) = (0u64, 0u64);
         for seed in 0..SEEDS {
-            let drawn = Configuration::swarm(case.harness, seed);
-            let narrow = scaled(drawn.clone(), 25);
-            let caught = |configuration: &Configuration| {
+            let caught = |ceiling: u64| {
+                let configuration = Configuration::swarm_within(case.harness, seed, ceiling);
                 let judged = run(
                     case.harness,
-                    configuration,
+                    &configuration,
                     seed,
                     Some(case.mutant),
                     &mut Seed(Seeded(seed)),
                 );
                 u64::from(catch(&judged).is_some())
             };
-            let (by_drawn, by_narrow) = (caught(&drawn), caught(&narrow));
-            drawn_caught += by_drawn;
-            narrow_caught += by_narrow;
-            either_caught += if gentle(seed) { by_narrow } else { by_drawn };
+            hostile += caught(75);
+            gentle += caught(NETWORK_CEILING);
         }
         println!(
-            "case {at} {:?}: of {SEEDS} seeds caught as drawn {drawn_caught}, to 25 in 100 {narrow_caught}, gentle or as drawn {either_caught}",
+            "case {at} {:?}: of {SEEDS} seeds caught to 75 in 100 {hostile}, to {NETWORK_CEILING} in 100 {gentle}",
             case.mutant
         );
     }

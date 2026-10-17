@@ -223,6 +223,31 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-24)
+
+- **hyper-quic: right after its handshake a connection on a Windows loopback went silent for a probe
+  timeout (found by mantle; main's patch Q25, `326ddd7`, taken to this line).** mantle's cell tests
+  failed on Windows only, on silences of 0.87 to 1.48 s in which a lone node read nothing, each when a
+  client of the same identity came after one that had closed its socket. Reproduced at `2b13b15` with
+  a server and a client after client, each on a thread and runtime of its own
+  (`hyper-rt-transport/tests/reset_e2e_diag.rs` on branch `hunt/udp-reset-windows`): 26 of 1,536
+  exchanges stalled on the hosted Windows runners, 0.44 to 1.07 s on windows-11-arm and 0.5 to 1.56 s
+  on windows-2025, and none of 360 on Linux 6.19 and Darwin 25.4. Right after its handshake the
+  client sent its MTU search's first probe, as it did whenever it was idle, past its congestion
+  window and its pacer: 33,353 bytes (the midpoint of 1,200 and a Windows loopback's 65,507-byte
+  payload) against a first window of 12,000 (RFC 9002 §7.2's rule for 1,200-byte datagrams). It then
+  sent nothing at all, its request nor an acknowledgement, until
+  about a probe timeout later (the server sent its unacknowledged flight again a second after it),
+  and counted the probe lost. With the probe held to the window and the pacer (RFC 8899 §3, item 7;
+  `crates/hyper-quic/VENDORED.md` §36) the same runs stalled 0 of 576 against 91 of 576 without it
+  (runs 40088388382 against 40087563225, each exchange's datagrams logged, which made stalls more
+  frequent), and main's line 0 of 288 (run 40088250956); main's pacer repair alone (Q31, `c8c3cb6`)
+  left 61 of 576 (run 40088804422). The ICMP reports mantle suspected came from the same closed
+  sockets and caused none of it: the stalls came as often with Windows' reports switched off
+  (`SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` FALSE), and hyper-rt reads past a report (the next
+  entry). Test: `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` (12 probes at `2b13b15`,
+  none with Q25).
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

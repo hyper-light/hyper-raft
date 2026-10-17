@@ -1266,6 +1266,15 @@ on loopback, each search ending at the kernel's payload with no probe lost); `mt
 `pacing::an_mtu_rise_leaves_a_datagram_of_the_new_size_free_to_go`; the exchange tests' network now
 drops a datagram past Ethernet's payload and tells each node so (`common::LINK_PAYLOAD`).
 
+**A probe waits for the window and the pacer** (2026-10-17). A search to the path's MTU made each
+probe as large as the path allows, and a probe went whenever the connection was idle, past the
+congestion window and the pacer, as upstream's did for probes of at most 1,452 bytes. Behind a relay
+of 128 kbit/s in front of a loopback (MTU 65,536), the first step, about 33 KB, held the link two
+seconds: focal's three nodes behind such relays never heard each other's pre-votes. A probe is now
+sent only when it fits the window and the pacer lets it go (RFC 8899 §3, item 7; hyper-quic patch
+Q25): a window of one round trip of the path never affords a probe that would hold the path longer,
+so a slow path keeps its MTU and a fast one probes as before (`crates/hyper-quic/VENDORED.md` §36).
+
 ## 4r. A small datagram's charge, and each handshake counted once (2026-10-17)
 
 Once MTU discovery reached each path's MTU (§4q), focal's cluster tests on macOS refused new

@@ -513,3 +513,40 @@ fn a_set_back_peer_that_stays_quiet_is_closed_for_the_room() {
     let granted = mesh.node(RECEIVER).stats().receive_granted;
     assert!(granted <= capacity, "{granted} granted past {capacity}");
 }
+
+/// A peer set back that moves again, sending less than it owes, is set back afresh when it is idle
+/// again and another wants the room: its quiet period runs from then, not from the first set back.
+/// Only once it has moved nothing for a quiet period since is it closed.
+#[test]
+fn a_set_back_peer_that_moves_again_is_given_a_quiet_period_afresh() {
+    let first = first_window();
+    let kept = 8 * first;
+    let capacity = 2 * first + kept + 4 * first;
+    let mut mesh = Mesh::new(
+        &Credentials::new(3),
+        256 << 20,
+        hyper_sim::Source::Seed(0),
+        |receiver| receiver.set_receive_capacity(capacity),
+    );
+    connect(&mut mesh, QUIETED);
+    connect(&mut mesh, ACTIVE);
+    mesh.send(QUIETED, 2_000, 1_000);
+    mesh.wait(limits().serve_period * 2);
+    mesh.send(ACTIVE, 2_000, 1_000);
+    assert_eq!(mesh.node(RECEIVER).stats().windows_set_back, 1);
+
+    // It sends a little, a fifth of what it owes, and is idle again for a quiet period.
+    mesh.send_slowly(QUIETED, 5, 1_000, 5, std::time::Duration::from_millis(10));
+    mesh.wait(limits().serve_period);
+    mesh.send(ACTIVE, 2_000, 1_000);
+    assert_eq!(
+        mesh.node(RECEIVER).stats().windows_closed,
+        0,
+        "it moved since it was set back: its quiet period starts again"
+    );
+
+    // A quiet period more with nothing moved, and the next want closes it.
+    mesh.wait(limits().serve_period);
+    mesh.send(ACTIVE, 2_000, 1_000);
+    assert_eq!(mesh.node(RECEIVER).stats().windows_closed, 1);
+}

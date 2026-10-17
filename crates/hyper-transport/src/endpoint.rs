@@ -941,7 +941,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                     let holds = wanted.budget || (wanted.room && conn.room.is_none());
                     match (conn.set_back, since) {
                         _ if !(idle && holds) || conn.lost => false,
-                        (Some(at), Some(since)) if since <= at => {
+                        // Moved strictly before it was set back: a move at the instant of the
+                        // set back may have come after it, and earns a quiet period afresh.
+                        (Some(at), Some(since)) if since < at => {
                             now.saturating_duration_since(at) >= quiet
                         }
                         _ => {

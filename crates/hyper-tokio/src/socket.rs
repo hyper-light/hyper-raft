@@ -138,6 +138,8 @@ struct Linux {
     send: linux::Headers,
     receive: linux::Headers,
     received: Vec<linux::Received>,
+    /// The kernel's stamps carried to the monotonic clock.
+    carry: crate::clock::Carry,
 }
 
 impl Socket {
@@ -170,6 +172,7 @@ impl Socket {
                 send: linux::Headers::new(io.batch),
                 receive: linux::Headers::new(io.batch),
                 received: Vec::with_capacity(io.batch),
+                carry: crate::clock::Carry::new(linux::realtime_ns()?, linux::monotonic_ns()?),
             };
             (linux, vec![vec![0; RECEIVE_BYTES]; io.batch], stats)
         };
@@ -471,22 +474,28 @@ impl Socket {
             ..
         } = self;
         linux.received.clear();
+        let asked = buffers.len();
         let mut take = || linux::receive(fd, buffers, &mut linux.receive, &mut linux.received);
-        match through {
+        let filled = match through {
             Through::Reactor => udp.try_io(tokio::io::Interest::READABLE, take),
             Through::Kernel => take(),
         }?;
         stats.receive_calls = stats.receive_calls.saturating_add(1);
-        // Both clocks once a batch, after the receive: a stamp is carried over by its age. The
-        // realtime clock first: a thread preempted between the two reads then makes the age's end
-        // later, so a stamp comes out late, never early (the order mattered: read the other way, a
-        // throttled container's preemption put a stamp before its datagram was sent).
+        // Both clocks once a batch, after the receive, the realtime one first: a stamp is carried
+        // by the offset between them (`crate::clock::Carry`).
         let realtime_ns = if stats.kernel_stamps {
             linux::realtime_ns()?
         } else {
             0
         };
         let read_ns = linux::monotonic_ns()?;
+        linux.carry.read(realtime_ns, read_ns);
+        let carry = linux.carry;
+        // A batch that took less than it asked for emptied the socket, once its own stamps are
+        // carried.
+        if filled < asked {
+            linux.carry.emptied();
+        }
         let mut delivered = 0usize;
         let mut buffers = std::mem::take(&mut self.buffers);
         let received = std::mem::take(&mut self.linux.received);
@@ -494,9 +503,7 @@ impl Socket {
             let Some(bytes) = buffer.get_mut(..taken.length) else {
                 continue;
             };
-            let stamp = taken
-                .stamp
-                .map(|stamp| read_ns.saturating_sub(realtime_ns.saturating_sub(stamp)));
+            let stamp = taken.stamp.and_then(|stamp| carry.carry(stamp));
             let arrival = self.arrival(taken.from, stamp, read_ns);
             match taken.segment {
                 Some(size) => {

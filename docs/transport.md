@@ -481,12 +481,18 @@ its own). A heartbeat is judged by when the kernel received it, not when its own
 owner that wakes late does not blame its peer (`docs/timing.md` §2.4).
 - Linux: `SO_TIMESTAMPNS`, its `SCM_TIMESTAMPNS` read from each `recvmmsg` message's control
   buffer beside `UDP_GRO`'s (seven words, `CMSG_SPACE(4) + CMSG_SPACE(16)`). The stamp is
-  `CLOCK_REALTIME`; it is carried to `CLOCK_MONOTONIC` by its age, both clocks read once a batch
-  after the receive, the realtime one first so that a preemption between the reads makes a stamp
-  late and never early (read the other way, a container throttled to two CPUs put a stamp before
-  its datagram was sent, one run in fifty), and held within the read and no earlier than the stamp before it (a socket's
-  queue is first in, first out), so a step of the realtime clock moves one stamp within those
-  limits. Linux turns stamping on through a static key flipped from a work queue
+  `CLOCK_REALTIME`; it is carried to `CLOCK_MONOTONIC` by the offset between the two, both clocks
+  read once a batch after the receive, the realtime one first so that a preemption between the
+  reads makes a stamp late and never early (read the other way, a container throttled to two CPUs
+  put a stamp before its datagram was sent, one run in fifty). A slew moves both clocks alike; a
+  step of the realtime clock between a datagram's arrival and its read moves the read's offset and
+  not the stamp's, so a stamp is carried by the least offset read since the read before the last
+  one that found the socket empty, and to no earlier than that read (`clock::Carry`): late by a
+  step at most, never early. Carried by the read's offset alone, every forward step of Docker
+  Desktop's VM clock (0.28–0.85 ms, every 30 s) put the stamps it fell behind before their sends
+  (`docs/benchmarks.md`, "hyper-tokio: kernel stamps across a realtime step"). A stamp is held
+  within the read and no earlier than the stamp before it (a socket's queue is first in, first
+  out). Linux turns stamping on through a static key flipped from a work queue
   (`net_enable_timestamp`), so the first datagrams after the option is set may be stamped when read,
   late and never early.
 - macOS: `SO_TIMESTAMP_MONOTONIC`, `mach_absolute_time` taken as UDP input queues the datagram,

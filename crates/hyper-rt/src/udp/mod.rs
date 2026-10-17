@@ -31,6 +31,8 @@ mod linux;
 mod macos;
 
 mod batched;
+#[cfg(any(target_os = "linux", test))]
+mod carry;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

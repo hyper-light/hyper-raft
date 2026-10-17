@@ -125,12 +125,11 @@ fn until_queued(socket: &UdpSocket) {
     socket.set_nonblocking(true).unwrap();
 }
 
-/// What a held datagram's read found: its arrival, and the clock before the send, once it was
-/// queued and when the read began.
+/// What a held datagram's read found: its arrival, and the clock before the send and when the
+/// read began.
 struct Held {
     arrival: Arrival,
     before: u64,
-    in_socket: u64,
     read_from: u64,
 }
 
@@ -140,7 +139,6 @@ fn held_then_read(stamped: &mut Stamped, socket: &UdpSocket, out: &UdpSocket, bo
     let before = stamped.clock().now_ns();
     out.send_to(&[body], socket.local_addr().unwrap()).unwrap();
     until_queued(socket);
-    let in_socket = stamped.clock().now_ns();
     #[allow(
         clippy::disallowed_methods,
         reason = "the reader stopped while the datagram waits in its socket"
@@ -155,7 +153,6 @@ fn held_then_read(stamped: &mut Stamped, socket: &UdpSocket, out: &UdpSocket, bo
     Held {
         arrival,
         before,
-        in_socket,
         read_from,
     }
 }
@@ -164,7 +161,10 @@ fn held_then_read(stamped: &mut Stamped, socket: &UdpSocket, out: &UdpSocket, bo
 /// datagram held in the socket while its reader is stopped is stamped when it arrived where the
 /// kernel stamps, so an echo of it states a hold that covers the stop; elsewhere when it was read.
 /// The stop here is the reader asleep for `HELD_NS` once the datagram is queued, which a blocking
-/// peek says.
+/// peek says. A kernel stamp is carried to the monotonic clock late by a preemption between the
+/// clock reads after the receive, never early (`Clock`'s note), so it is bounded by the send and
+/// the read's start, as the plane socket's are; it held to when the peek returned until a
+/// preemption there put a stamp 6.5 µs past it (Linux in Docker under four busy loops, 2026-10-16).
 #[test]
 fn a_standard_sockets_datagram_is_stamped_when_it_arrived_not_when_it_was_read() {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -182,7 +182,7 @@ fn a_standard_sockets_datagram_is_stamped_when_it_arrived_not_when_it_was_read()
         assert_eq!(held.arrival.kernel, kernel);
         assert!(at >= previous, "stamps go back");
         let (low, high) = if kernel {
-            (held.before, held.in_socket)
+            (held.before, held.read_from)
         } else {
             (held.read_from, u64::MAX)
         };

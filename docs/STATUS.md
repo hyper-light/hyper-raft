@@ -107,14 +107,6 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
-- **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once, Linux 6.x in
-  Docker (`rust:1.98.1`, 4 CPUs) on a loaded host, `cargo test -p hyper-tokio` on the tree of the
-  socket room (above): `a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` failed at
-  `tests/stamps.rs:103` ("stamped before it was sent") and its standard-socket twin at line 189; the
-  same tests passed on `main` and on that tree three times after, alone and with the whole suite.
-  `SO_TIMESTAMPNS` stamps on `CLOCK_REALTIME`, which the adapter carries to the monotonic clock by
-  an offset: a realtime clock slewed between the offset's reading and the stamp would put a stamp
-  before the send. Not yet traced to that or ruled out.
 - **hyper-liveness: a link whose sender's floor keeps moving measures its evidence minutes late, and
   a node with only such links suspects no one meanwhile (found 2026-10-16).** A scratch fault in
   hyper-durable-e2e's `member-stopped` (branch `diag/slow-flush-repro`, never landed) holds every
@@ -143,6 +135,22 @@ is worked around.
   committed): the links configured 169–382 s after the slowdown against 257–618 s, but a peer dead
   in its links' first heartbeats was noticed later, at the most 1.36 s on macOS against 0.75 s and
   5.8 s on Windows' timer against 2.5 s, the interval standing up to twice its floor.
+
+### Closed (2026-10-17)
+
+- **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once in Docker on a loaded
+  host (`a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` at `tests/stamps.rs:103`, its
+  standard-socket twin at 189). Reproduced: Docker Desktop's VM steps `CLOCK_REALTIME` every 30 s
+  (0.01–4.5 ms, forward and back), and the adapter carried a Linux stamp (`SO_TIMESTAMPNS`, realtime)
+  to the monotonic clock by the offset read after the receive, so a forward step between a datagram's
+  arrival and its read put its stamp the step early. Before: 16 of 1,095 runs failed, 15 of them at a
+  step, one at each step but the run's last. A stamp is now carried by the least offset read since
+  the read before the last one that emptied the socket, and to no earlier than that read
+  (hyper-tokio `clock::Carry`, hyper-rt `udp/carry.rs`, whose shard clock had the same carry): late
+  by a step at most, never early. After: 0 of 1,554 runs across 20 steps. The other failure seen, a
+  stamp 6.5 µs past the standard-socket test's peek, was the test bounding the carry's stated
+  lateness (a preemption between its clock reads) by the peek; it is bounded by the read, as the
+  plane socket's test is (`docs/benchmarks.md`, "hyper-tokio: kernel stamps across a realtime step").
 
 ### Closed (2026-10-16)
 

@@ -1680,3 +1680,60 @@ fn a_fast_committed_entry_outlives_a_vote_its_log_covered_and_then_lost() {
     );
     assert_eq!(judged.violation, None);
 }
+
+// ---------------------------------------------------------------------------------------------
+// What each swarm setting reaches for its CPU (`docs/sim.md` §11 item 4).
+
+/// The swarm's settings measured: each harness's own ranges as drawn; the network's losses and
+/// repeats scaled from the drawn `[0, 75]` into `[0, 25]` and `[0, 100]` (the same seed's choice,
+/// a narrower and a wider range); and calm and adversarial stretches alternating (`docs/sim.md`
+/// §3.8; slates' explorer runs 250).
+const SETTINGS: [(&str, Option<u64>, Option<u64>); 6] = [
+    ("as drawn", None, None),
+    ("faults to 25 in 100", Some(25), None),
+    ("faults to 100 in 100", Some(100), None),
+    ("stretches of 125", None, Some(125)),
+    ("stretches of 250", None, Some(250)),
+    ("stretches of 1,000", None, Some(1_000)),
+];
+
+/// `docs/sim.md` §11 item 4: what each swarm setting reaches for the CPU it costs. For each
+/// harness and setting, the same seeds' swarm configurations run under the model's abstraction,
+/// every step held to it: the distinct abstract states reached (§15.4's points, over all the
+/// setting's runs), the process's CPU, the entries the runs committed and how many settled.
+#[test]
+#[ignore = "a measurement, in release"]
+fn swarm_ranges_and_stretches() {
+    const SEEDS: u64 = 200;
+    for harness in [Harness::Group, Harness::Fast, Harness::Pipelined] {
+        for (name, ceiling, stretch) in SETTINGS {
+            let mut points = Guided::new(Budget::default(), 1, 0).unwrap();
+            let before = usage::this().unwrap();
+            let (mut committed, mut settled) = (0u64, 0u64);
+            for seed in 0..SEEDS {
+                let mut configuration = Configuration::swarm(harness, seed);
+                if let Some(ceiling) = ceiling {
+                    configuration.mix.lose = configuration.mix.lose * ceiling / 75;
+                    configuration.mix.repeat = configuration.mix.repeat * ceiling / 75;
+                }
+                configuration.mix.stretch = stretch;
+                let judged = {
+                    let mut driver = Conformed::new(Seed(Seeded(seed)), Some(&mut points));
+                    run(harness, &configuration, seed, None, &mut driver)
+                };
+                assert_eq!(judged.violation, None, "{harness:?} {name} seed {seed}");
+                assert_eq!(judged.departure, None, "{harness:?} {name} seed {seed}");
+                committed += judged.counters.count("entries committed");
+                settled += u64::from(judged.settled);
+            }
+            let cpu_ns = usage::this().unwrap().since(&before).cpu_ns();
+            println!(
+                "{harness:?}, {name}: {} states, {:.0} a CPU-second ({:.1} s), {:.1} entries committed a run, {settled} of {SEEDS} settled",
+                points.points(),
+                points.points() as f64 / (cpu_ns as f64 / 1e9),
+                cpu_ns as f64 / 1e9,
+                committed as f64 / SEEDS as f64
+            );
+        }
+    }
+}

@@ -829,7 +829,12 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      messages take their arrivals with them (2026-10-17, §17): `World::cancel`, the event bound §7's,
      and hyper-durable's `C` the rule's 21 where it was 4,096. S-7 is built (§19): every end-to-end
      scenario's clients' history held linearizable by hyper-check's search, a planted stale read
-     refused.
+     refused. §11 item 4 is measured (2026-10-17): over the same 200 seeds of each harness, the
+     network's losses and repeats narrowed to 25 in 100 reach 22–35 % more abstract states, and more
+     a CPU-second, than the swarm's ranges as drawn, and widened to all, the fewest; calm stretches
+     alternating with the drawn mix reach 13–24 % more, their length from 125 to 1,000 steps moving
+     little. The ranges stay until each planted defect's runs to catch under the narrower one are
+     measured beside them (item 1's measure), the gate's floors and catches having been set on them.
    - Tails, `docs/tails.md` §7: T-0 (the grid) is built, its sources read and its conditions' values
      derived (§2.4); T-1 (the measurement kit: its open-loop schedule and quantile intervals built in
      hyper-measure, the per-process accounts of §1a open), T-2 (the impairment relay), then each crate

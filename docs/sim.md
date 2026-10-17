@@ -697,7 +697,35 @@ allocations in release are measured at S-6 with the same schedules. The table an
 3. **The abstraction's cost** (measured at S-5, §15.10) per step for coverage and conformance,
    against the step itself.
 4. **Swarm ranges and stretch lengths.** Distinct abstract states per CPU-second under each setting,
-   the measure FDB's "carefully tuned" rates leave unstated.
+   the measure FDB's "carefully tuned" rates leave unstated. Measured 2026-10-17
+   (`tests/strategies.rs`, `swarm_ranges_and_stretches`, in release on the M5 Max under its own
+   load): each harness's swarm configurations of the same 200 seeds, every step held to the model and
+   every run to every oracle, under six settings: the ranges as drawn; the network's losses and repeats,
+   drawn over `[0, 75]`, scaled into `[0, 25]` and `[0, 100]` (the same seed's choice, a narrower and a
+   wider range); and calm stretches, in which nothing is lost, repeated, partitioned, restarted or
+   corrupted (`Mix::calm`), alternating with the drawn mix (§3.8). Distinct abstract states over the
+   200 runs (§15.4's points), those a CPU-second of the process, and entries committed a run; all 200
+   runs settled in every cell:
+
+   | Setting | Group: states, a CPU-second, entries | Fast | Pipelined |
+   |---|---|---|---|
+   | as drawn | 20,809, 2,406, 419.5 | 26,257, 3,186, 293.4 | 6,000, 3,969, 48.9 |
+   | losses and repeats to 25 in 100 | 27,991, 2,620, 752.2 | 32,103, 3,253, 462.4 | 7,653, 4,672, 59.8 |
+   | losses and repeats to 100 in 100 | 16,875, 2,308, 284.1 | 20,727, 3,087, 202.9 | 5,412, 4,076, 38.9 |
+   | stretches of 125 | 25,862, 2,337, 564.7 | 30,095, 3,013, 388.5 | 7,137, 4,279, 58.1 |
+   | stretches of 250 | 25,375, 2,403, 528.9 | 29,936, 3,036, 381.9 | 7,312, 4,318, 61.2 |
+   | stretches of 1,000 | 24,631, 2,314, 523.1 | 29,687, 3,009, 360.1 | 7,170, 4,435, 59.0 |
+
+   The narrower network faults reach the most states of the seeds in every harness (35, 22 and 28 %
+   more than as drawn) and the most a CPU-second, and commit the most; the wider, the fewest: past a
+   quarter of messages lost or repeated, the group spends its steps failing to commit and its states
+   repeat. Calm stretches reach 13–24 % more states than the drawn mix alone, at up to 6 % fewer a
+   CPU-second (Group, Fast) or 8–12 % more (Pipelined), their length from 125 to 1,000 steps moving
+   little. The counts of states are exact for the seeds (a seed's run is its schedule); the CPU, the
+   host's under its load, moves the rate a few percent from run to run. The swarm keeps its ranges for
+   now: the gate's floors and the planted defects' catches (§15.8) were set on them, and a defect a
+   hostile network finds may need the wider rates, so a narrower range is taken only with each planted
+   defect's runs to catch under it (item 1's measure) beside these counts.
 5. **Competition parallel** in the search checker, on mantle's and the E2E histories.
 6. **hyper-log under the world.** Whether its owner can be driven as a step function with its device
    as world completions without a second code path in production, or whether its simulation keeps a

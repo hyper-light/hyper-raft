@@ -822,7 +822,11 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      files on Linux (ext4 and XFS on NVMe). The log is sealed by default since §11's group commit was
      measured (`docs/benchmarks.md`, "Group commit in an open loop, sealed against plain"); each
      consumer opens its log sealed with its own key source (`docs/seal.md` §3.2).
-   - hyper-rt §15's open items. Item 8 is now measured against slates' runtime and tokio: a client that
+   - hyper-rt §15's open items. Items 1, 2 and 5 are closed (2026-10-17, `docs/research/runtime-sources.md`):
+     AFD reports accept, receive and send readiness on Windows `AF_UNIX` sockets, measured on both
+     Windows runners; `TCP_NOTSENT_LOWAT` read at XNU and Linux, where Linux holds a write to the mark
+     and XNU only the wake; `sbitmap` read at `v6.12`, which keeps no summary level, so the wake
+     bitmap's summary is hyper-rt's own and its citation is corrected. Item 8 is now measured against slates' runtime and tokio: a client that
      pauses 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the spin before a
      park paid in full every time (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates'
      runtime and tokio").

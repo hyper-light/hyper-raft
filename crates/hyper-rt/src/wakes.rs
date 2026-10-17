@@ -1,9 +1,10 @@
-//! The wakes another thread sends a shard (docs/runtime.md §3.2): one bit per task slot, in 64-bit words,
-//! with a summary bit per word and one pending flag above them, the two-level shape of the Linux block
-//! layer's scalable bitmap of tags (`lib/sbitmap.c`).
+//! The wakes another thread sends a shard (docs/runtime.md §3.2): one bit per task slot, in 64-bit words, as
+//! the Linux block layer keeps its tags (`lib/sbitmap.c`, read at `v6.12`), with a summary bit per word and
+//! one pending flag above them, which are this crate's own: `sbitmap` keeps no summary, and spreads its words
+//! one to a cache line where these are packed (`docs/research/runtime-sources.md` §2).
 //!
 //! A wake is a `fetch_or` on the slot's bit, then a `fetch_or` on its word's summary bit when that word went
-//! from empty to non-empty (as `sbitmap` does) or the summary bit reads clear, then a swap of the pending flag;
+//! from empty to non-empty or the summary bit reads clear, then a swap of the pending flag;
 //! so most wakes write one cache line, not the summary word every waker of 4,096 slots shares (slates-dc's
 //! review, 2026-10-06), and no wake waits on another waker to mark the summary for it. The shard
 //! drains by swapping the flag, then each marked summary word, then each marked word, to zero: summary

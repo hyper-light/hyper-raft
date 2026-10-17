@@ -137,10 +137,12 @@ fn pattern(at: usize) -> u8 {
 const STREAMED: usize = 16 << 20;
 
 /// Do: await an accept before any client connects, then stream 16 MiB from the client while the
-/// server reads it. Expect: the accept, the server's reads and the client's writes each waited on
-/// the driver's readiness at least once, and every byte arrived in order. On Windows this is AFD's
-/// `IOCTL_AFD_POLL` on `AF_UNIX` sockets (docs/runtime.md §15 item 1): accept, receive and send
-/// readiness each reported, or the shard would park forever.
+/// server reads it. Expect: the accept and the server's reads each waited on the driver's readiness
+/// at least once, and every byte arrived in order; on Linux and macOS the client's writes waited too,
+/// their kernels holding a local stream's unread bytes to its buffers. On Windows this is AFD's
+/// `IOCTL_AFD_POLL` on `AF_UNIX` sockets (docs/runtime.md §15 item 1): accept and receive readiness
+/// reported, or the shard would park forever. Windows took the 16 MiB a write at a time without a
+/// write ever refused (both runners, CI run 39015895080), so no send readiness was asked there.
 #[test]
 fn a_local_streams_accept_reads_and_writes_each_wait_on_readiness() {
     let path = path("waits");
@@ -182,9 +184,11 @@ fn a_local_streams_accept_reads_and_writes_each_wait_on_readiness() {
     let writes = writes.try_recv().expect("the client finished");
     assert!(accepts >= 1, "the accept waited for the connect");
     assert!(reads >= 1, "the server's reads waited for bytes");
-    assert!(
-        writes >= 1,
-        "the client's writes waited for the server to read"
-    );
+    if cfg!(not(windows)) {
+        assert!(
+            writes >= 1,
+            "the client's writes waited for the server to read"
+        );
+    }
     let _ = std::fs::remove_file(&path);
 }

@@ -748,12 +748,18 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      measured (`docs/benchmarks.md`, "Group commit in an open loop, sealed against plain"); each
      consumer opens its log sealed with its own key source (`docs/seal.md` §3.2).
    - hyper-rt §15's open items. Items 1, 2, 5 and 6 are closed (2026-10-17, `docs/research/runtime-sources.md`):
-     AFD reports accept, receive and send readiness on Windows `AF_UNIX` sockets, measured on both
-     Windows runners; `TCP_NOTSENT_LOWAT` read at XNU and Linux, where Linux holds a write to the mark
+     AFD reports accept and receive readiness on Windows `AF_UNIX` sockets, measured on both Windows
+     runners, which took 16 MiB of sends unread without refusing a write (a writer held back by no kernel
+     buffer there); `TCP_NOTSENT_LOWAT` read at XNU and Linux, where Linux holds a write to the mark
      and XNU only the wake; `sbitmap` read at `v6.12`, which keeps no summary level, so the wake
      bitmap's summary is hyper-rt's own and its citation is corrected; the wake flag's loom failure
      reduced to a false alarm of loom 0.7.2's fence modelling (a plain store is correct, and passes the
-     current models). Item 8 is now measured against slates' runtime and tokio: a client that
+     current models). Item 10 is measured: a calibration costs a command 67 ms, and its error against the
+     machine now is the host's load, not the record's age (two rounds 1 to 29 minutes apart differed alike),
+     so a record is reused while its key matches; the control ring's depth it derives ranged 32 to 512
+     entries across the rounds, one draw of a p99 deciding it. Item 8's rules are measured on a prototype
+     (branch `proto-spin-rule`): Karlin-or-park takes 24–28 % less CPU a request from paused clients and
+     moves nothing else measured; it lands once mantle's run at 100M confirms it. Item 8 was first measured against slates' runtime and tokio: a client that
      pauses 200 µs costs hyper-rt 18.7 µs of CPU a request against their 12.0–13.7, the spin before a
      park paid in full every time (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates'
      runtime and tokio").

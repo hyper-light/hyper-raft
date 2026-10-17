@@ -410,6 +410,18 @@ async fn segmented_round_trip(
     let mut ring = Ring::new(Io { batch: 8 })?;
     let to = receiver.local_addr()?;
     let bytes = datagrams(count, segment, last);
+    // Every datagram crosses before the receiver reads one, so its buffer holds the whole burst:
+    // room for each at the most a datagram may take (`RECEIVE_BYTES`), whatever the platform
+    // charges a datagram beside its bytes. A default buffer is the OS's, and one that holds less
+    // drops what it cannot hold: the receive below then waits for datagrams that will never come.
+    let granted = receiver
+        .socket()
+        .set_recv_buffer_bytes(count.saturating_mul(RECEIVE_BYTES))?;
+    assert!(
+        granted >= bytes.len(),
+        "a receive buffer of {granted} bytes for a burst of {} bytes",
+        bytes.len()
+    );
     let mut done = Vec::new();
     let mut sent = 0;
     while sent < count {

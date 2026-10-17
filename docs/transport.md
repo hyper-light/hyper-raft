@@ -1195,6 +1195,61 @@ Busy core, bare-metal box, three interleaved pairs, medians:
 Tests: `send_buffer`'s `reads_find_their_piece_among_many` (400 uneven writes, acknowledgements
 trimming the front, every read against the bytes written) and
 `in_order_acknowledgements_leave_the_set_alone`.
+## 4q. MTU discovery searches up to the path's MTU as the kernel holds it (2026-10-16)
+
+quinn's defaults bounded the search at 1,452 bytes and told every peer it took 1,472 (Ethernet's
+MTU less the headers), whatever the path carried. A bus node then sent one 1,452-byte datagram for
+each 1,150-byte message it took and one for each it delivered, every datagram encrypted and
+processed alone: on a jumbo-frame bridge (MTU 9,000) it delivered no more than on Ethernet's.
+
+**The ceiling.** Each connection's search is bounded by what the peer takes and what its path
+carries (RFC 8899 §5.1.2's MAX_PLPMTU), the path read from the kernel when the driver sees the
+connection established, before its first probe (`Driver::tell_ceilings`): a socket of the peer's
+family is connected to it, asked and closed (`UdpSocket::path_payload_to`; connecting a datagram
+socket sends nothing). Linux and Windows hold the path's MTU (`IP_MTU`/`IPV6_MTU`, the route's or
+less where an ICMP "packet too big" taught it less); XNU holds none, so macOS reads the MTU of the
+interface holding the socket's source address (`getifaddrs`, `if_data.ifi_mtu`) under the host's UDP
+cap (`net.inet.udp.maxdgram`, 9,216 bytes by default). The payload is the MTU less the IP and UDP
+headers, never past what the length fields can say (65,507 for IPv4, 65,527 for IPv6). The endpoint
+tells peers it takes any datagram its receive chunks hold (`RECEIVE_CHUNK`, 65,527 bytes). A
+driver that knows its links before any path (a simulation, the tests' network) sets a ceiling every
+new connection starts under (`Endpoint::set_default_path_ceiling`).
+
+**What the search does with it.** A ceiling learned mid-search bounds the rest. A probe in flight
+past a lowered ceiling stays the search's, so its loss is a probe's and not congestion, but its fate
+no longer moves the search. A ceiling raised past a finished search starts the next one now.
+
+**What a larger MTU asked of the rest.** Congestion control and the pacer budgeted every datagram at
+a whole segment. At an MTU of 65,527 (the most a loopback path carries) RFC 9002 §7.2's minimum
+window is two datagrams: with one in flight a packet of a few hundred bytes waited for an
+acknowledgement, and with nothing more to send the peer's acknowledgement waited for its delay. A
+window or bucket that cannot take a whole segment but can take a datagram every QUIC path carries
+(RFC 9000 §14, 1,200 bytes) now takes one cut to what it can, as TCP sends what its window allows,
+and the batch ends with it (`Connection::congestion_room`). The pacer, which releases nothing until
+it holds a whole datagram, is credited one datagram of a larger MTU when the MTU rises, as a
+controller's window is raised to its minimum on the same news. And the driver matches its sockets to
+connections established in a turn before that turn's transmissions, so no first probe leaves before
+its ceiling: one of 33,363 bytes on a 1,500-byte path, refused at its send, counted in flight until
+found lost, held a new connection's data behind its window for a round trip.
+
+Busy core (the node's CPU shared with a busy loop), bare-metal box, 1,000,000 messages a second
+offered, every system on a bridge of MTU 9,000, three interleaved rounds, medians:
+
+| Node | Path MTU found | Delivered / s | p50 | p99 | p99.9 | Lost | CPU a message |
+|---|---|---|---|---|---|---|---|
+| bus, search to 1,452 | 1,452 | 419,117 | 11.72 ms | 18.38 ms | 19.58 ms | 0 | 1,173 ns |
+| bus, search to the path | 8,972 | 878,956 | 3.75 ms | 6.78 ms | 8.34 ms | 0 | 541 ns |
+| NATS 2.12 | - | 905,957 | 8.18 ms | 64.13 ms | 99.94 ms | 15,555 | - |
+
+On the default bridge (MTU 1,500) the search finds 1,472 and nothing else moves: busy-core 100,000 a
+second, 3,979 ns a message against 3,975 before.
+
+Tests: `udp`'s `a_connected_socket_reads_its_paths_payload_from_the_kernel` (Linux; macOS and Windows
+have their own) and `a_listener_reads_the_path_to_a_peer_as_a_connected_socket_would`;
+`peer_sockets::a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it` (two drivers
+on loopback, each search ending at the kernel's payload with no probe lost); `mtud`'s four;
+`pacing::an_mtu_rise_leaves_a_datagram_of_the_new_size_free_to_go`; the exchange tests' network now
+drops a datagram past Ethernet's payload and tells each node so (`common::LINK_PAYLOAD`).
 
 ## 5. Consumers
 

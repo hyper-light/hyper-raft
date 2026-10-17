@@ -154,6 +154,16 @@ is worked around.
   (`docs/transport.md` §4p). Tests: `send_buffer::reads_find_their_piece_among_many`,
   `send_buffer::in_order_acknowledgements_leave_the_set_alone`.
 
+- **hyper-transport: MTU discovery stopped at Ethernet's 1,452 bytes on every path.** quinn's
+  defaults bounded the search there and told peers 1,472, so a jumbo-frame path carried a datagram a
+  message as Ethernet did. Each connection's search is now bounded by the path's MTU as its kernel
+  holds it, read before its first probe (`Driver::tell_ceilings`, `UdpSocket::path_payload_to`:
+  `IP_MTU` on Linux and Windows, the interface's MTU under the UDP cap on macOS), peers are told the
+  receive chunks' 65,527 bytes, and a window or pacer short of a whole segment sends a datagram cut
+  to what it takes (`Connection::congestion_room`). On a 9,000-byte bridge a busy-core bus node found
+  8,972 and took 2.2 times less time a message: 878,956 delivered a second against 419,117
+  (`docs/transport.md` §4q). Tests: `udp`'s, `peer_sockets`'s, `mtud`'s and `pacing`'s.
+
 - **hyper-transport: every lane frame was copied twice before QUIC.** `send_frame` copied a frame into
   a buffer of its own and the lane's flush copied it into the stream (1.43 % and 1.36 % of a
   saturated bus node). A frame on a lane that holds none is now written straight from the sender's

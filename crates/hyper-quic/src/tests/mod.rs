@@ -894,12 +894,13 @@ fn a_window_used_up_grows_by_all_the_round_trip_after_acknowledges() {
         pair.drive_server();
         pair.time += Duration::from_millis(1);
     }
-    // The run is exact: from the 14,520-byte initial window (1,452-byte datagrams), the round trip
-    // after the window filled acknowledges 13,102 bytes; judged by the last transmission, the window
-    // grew by 4,002 of them, to 18,522.
+    // The run is exact: from the 14,520-byte initial window (1,452-byte datagrams), filled to
+    // within a datagram every path carries (1,200 bytes; a whole segment short, before datagrams
+    // were cut to what the window takes), the round trip after the window filled acknowledges 13,466
+    // bytes; judged by the last transmission, the window grew by 4,002 of 13,102, to 18,522.
     let cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
     assert_eq!(initial, 14_520);
-    assert_eq!(cwnd, 27_622);
+    assert_eq!(cwnd, 27_986);
 }
 
 /// A warm-up measures a path to four initial windows a round trip. Over a path that carries far

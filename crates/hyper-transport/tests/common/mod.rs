@@ -398,6 +398,8 @@ pub struct Net<A: Drive, B: Drive> {
     pub b_dead: bool,
     /// The datagrams each side has sent, `a`'s then `b`'s.
     pub datagrams: [u64; 2],
+    /// The datagrams of each side's that were past [`LINK_PAYLOAD`] and dropped on the wire.
+    pub oversized: [u64; 2],
     /// The caller's instant at the world's time zero.
     start: Instant,
     world: hyper_sim::World<Arrival>,
@@ -405,6 +407,13 @@ pub struct Net<A: Drive, B: Drive> {
     spare: Vec<Vec<u8>>,
     out: Vec<u8>,
 }
+
+/// Format: the most a datagram carries on the links these tests model: Ethernet's MTU (1,500,
+/// IEEE 802.3) less IPv4's 20-byte header (RFC 791) and UDP's 8 (RFC 768). A datagram past it is
+/// dropped on the wire, as a router drops a packet past its next hop's MTU that may not be
+/// fragmented (RFC 8899 §3), and a connected node is told it as its driver reads it from the
+/// kernel (`Endpoint::set_path_ceiling`).
+pub const LINK_PAYLOAD: usize = 1_472;
 
 /// `a` and `b` as nodes of the world.
 const A: hyper_sim::NodeId = hyper_sim::NodeId(0);
@@ -501,6 +510,7 @@ impl<A: Drive, B: Drive> Net<A, B> {
             b_address: "127.0.0.1:4434".parse().unwrap(),
             b_dead: false,
             datagrams: [0; 2],
+            oversized: [0; 2],
             start: now,
             world,
             wire,
@@ -521,11 +531,16 @@ impl<A: Drive, B: Drive> Net<A, B> {
             let Some(transmit) = transmit else {
                 return any;
             };
+            self.datagrams[usize::from(!from_a)] += 1;
+            if transmit.size > LINK_PAYLOAD {
+                self.oversized[usize::from(!from_a)] += 1;
+                any = true;
+                continue;
+            }
             let mut bytes = self.spare.pop().unwrap_or_default();
             bytes.clear();
             bytes.extend_from_slice(&self.out[..transmit.size]);
             let pair = if from_a { (A, B) } else { (B, A) };
-            self.datagrams[usize::from(!from_a)] += 1;
             self.wire
                 .send(
                     &mut self.world,
@@ -732,7 +747,9 @@ impl Pair {
             limits,
             congestion: Default::default(),
         };
-        Endpoint::new(config, Fixed::new(budget, 64), book, now).unwrap()
+        let mut node = Endpoint::new(config, Fixed::new(budget, 64), book, now).unwrap();
+        node.set_default_path_ceiling(u16::try_from(LINK_PAYLOAD).unwrap());
+        node
     }
 }
 

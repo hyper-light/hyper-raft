@@ -182,14 +182,20 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
                     "the peer's datagrams came by its own socket"
                 );
             }
-            // The client's bulk leaves its peer's socket as the endpoint made it, several datagrams
-            // a call where the kernel segments.
+            // The client's bulk leaves its peer's socket as the endpoint made it, as many datagrams a
+            // call as one segmented send carries at the path's MTU where the kernel segments: two or
+            // more at Ethernet's, one at loopback's 65,507 bytes on Linux, which fill a send alone.
             let peer = client.peer_stats();
             if cfg!(target_os = "linux") {
                 assert!(peer.gso, "{peer:?}");
+                let mtu = client
+                    .endpoint()
+                    .connection_stats(SERVER)
+                    .map_or(0, |stats| stats.path.current_mtu);
+                let most = u64::try_from(hyper_rt::udp::segments_per_send(usize::from(mtu)).min(2)).unwrap();
                 assert!(
-                    peer.send_calls * 2 < peer.sent,
-                    "segmented sends carried two datagrams or fewer a call: {peer:?}"
+                    peer.send_calls * most <= peer.sent,
+                    "segmented sends carried fewer than {most} datagrams a call at an MTU of {mtu}: {peer:?}"
                 );
             }
 
@@ -206,6 +212,68 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
                  its socket let go with it",
                 peer.sent, peer.send_calls
             )
+        })
+        .unwrap();
+    eprintln!("{report}");
+}
+
+/// RFC 8899 §5.1.2: a connection's MTU search ends at its path's MTU as the kernel holds it, the
+/// driver telling the connection before its first probe (`Driver::tell_ceilings`): on loopback,
+/// 65,507 bytes on Linux (its 65,536-byte MTU past what IPv4's length field says), macOS's UDP cap
+/// below its 16,384 (9,216 by default), and nothing past it probed. Each side's search is waited for
+/// as a fact; the guard only fails a search that never ends.
+#[test]
+fn a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it() {
+    let pki = Pki::new();
+    let one = pki.issue(&name(1));
+    let two = pki.issue(&name(2));
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let report = rt
+        .block_on(async move {
+            let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let mut server: Drv =
+                Driver::bind(endpoint(&pki, &two, &one.0, CLIENT, true), loopback, IO).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let mut client: Drv =
+                Driver::bind(endpoint(&pki, &one, &two.0, SERVER, false), loopback, IO).unwrap();
+            let client_addr = client.local_addr().unwrap();
+            let asked = hyper_rt::udp::UdpSocket::bind(loopback).unwrap();
+            let to_server = asked.path_payload_to(server_addr).unwrap();
+            let to_client = asked.path_payload_to(client_addr).unwrap();
+            let now = client.clock().unwrap();
+            client.endpoint().connect(now, SERVER, server_addr).unwrap();
+            let mut seen = Seen::default();
+            let began = Instant::now();
+            while seen.connected < 2 {
+                step(&mut server, &mut client, &mut seen).await;
+                assert!(began.elapsed() < GUARD, "the two never connected");
+            }
+            let mtu = |driver: &mut Drv, peer| {
+                driver
+                    .endpoint()
+                    .connection_stats(peer)
+                    .map(|stats| stats.path.current_mtu)
+            };
+            let (Some(to_server), Some(to_client)) = (to_server, to_client) else {
+                return "the kernel does not say: the search is the peer's limit's".to_owned();
+            };
+            while mtu(&mut client, SERVER) != Some(to_server)
+                || mtu(&mut server, CLIENT) != Some(to_client)
+            {
+                step(&mut server, &mut client, &mut seen).await;
+                assert!(
+                    began.elapsed() < GUARD,
+                    "the searches ended at {:?} and {:?}, the paths carry {to_server} and {to_client}",
+                    mtu(&mut client, SERVER),
+                    mtu(&mut server, CLIENT)
+                );
+            }
+            for (driver, peer) in [(&mut client, SERVER), (&mut server, CLIENT)] {
+                let path = driver.endpoint().connection_stats(peer).unwrap().path;
+                assert_eq!(path.lost_plpmtud_probes, 0, "no probe past the path: {path:?}");
+                assert_eq!(path.black_holes_detected, 0, "{path:?}");
+            }
+            format!("both searches ended at the kernel's payload: {to_server} and {to_client}")
         })
         .unwrap();
     eprintln!("{report}");

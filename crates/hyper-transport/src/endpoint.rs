@@ -34,8 +34,8 @@ use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
     ClientConfigHandle, Connection, ConnectionError, DatagramEvent, Dir, EcnCodepoint,
-    EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt, StreamEvent, StreamId,
-    Transmit, TransportConfig, TransportErrorCode, VarInt,
+    EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt, MtuDiscoveryConfig,
+    StreamEvent, StreamId, Transmit, TransportConfig, TransportErrorCode, VarInt,
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
@@ -194,6 +194,13 @@ impl Limits {
             .keep_alive_interval(self.keep_alive)
             .congestion(congestion.clone())
             .decimate_acks();
+        // MTU discovery searches up to what the peer takes and the path carries, as the path's
+        // socket tells it (`Endpoint::set_path_ceiling`), not to quinn's 1,452-byte default: a
+        // jumbo-frame path carried 8,954-byte datagrams, and a bus node at a million messages a
+        // second on a busy core used 2.24 times less time a message for it (docs/transport.md).
+        let mut search = MtuDiscoveryConfig::default();
+        search.upper_bound(u16::try_from(crate::RECEIVE_CHUNK).unwrap_or(u16::MAX));
+        transport.mtu_discovery_config(Some(search));
         Ok(transport)
     }
 }
@@ -463,6 +470,8 @@ pub struct Endpoint<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role
     core: Core<C, B, D>,
     receive: Receive,
     scratch: Vec<u8>,
+    /// The ceiling every connection's MTU search starts under (`set_default_path_ceiling`)
+    path_ceiling: Option<u16>,
     responses: VecDeque<(Transmit, Vec<u8>)>,
     spare: Vec<Vec<u8>>,
     /// By connection key: whether it waits in `touched`, in `rearm` or in `sending`.
@@ -629,6 +638,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
         let mut endpoint = EndpointConfig::default();
+        // Peers may send any datagram the receive chunks hold, where quinn's default told them
+        // Ethernet's 1,472 bytes whatever the path carried.
+        endpoint
+            .max_udp_payload_size(u16::try_from(crate::RECEIVE_CHUNK).unwrap_or(u16::MAX))
+            .map_err(|_| Refusal::Configuration)?;
         endpoint.config_slots(config_slots(&config.limits.admission)?);
         let mut quic =
             hyper_quic::Endpoint::new(endpoint, server, true, None).map_err(|_| Refusal::Quic)?;
@@ -674,6 +688,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
+            path_ceiling: None,
             responses: VecDeque::with_capacity(limits.max_responses),
             spare: Vec::with_capacity(limits.max_responses),
             marks: Vec::with_capacity(peers),
@@ -1639,6 +1654,33 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         Core::<C, B, D>::first_window()
     }
 
+    /// The largest UDP payload the local stack carries on any path, where the driver knows it before
+    /// it can read a path's own (a simulation's links, a host's interfaces): every connection made
+    /// from now on begins its MTU search under it, its first probe never past it, and a path's own
+    /// ceiling (`set_path_ceiling`) replaces it once read. A probe past a path's MTU is lost, and in
+    /// flight until it is found lost: a first probe of 33,363 bytes on a 1,500-byte path held a
+    /// new connection's data behind its window for a round trip.
+    pub fn set_default_path_ceiling(&mut self, payload: u16) {
+        self.path_ceiling = Some(payload);
+    }
+
+    /// The largest UDP payload the local stack carries on the path to `peer`, as its kernel knows
+    /// the path's MTU (its driver read it from the socket it connected to the peer, hyper-rt's
+    /// `UdpSocket::path_payload`): the connection's MTU discovery searches no further, and none of
+    /// its datagrams is larger. Refused `NotConnected` for a peer with no connection.
+    pub fn set_path_ceiling(&mut self, peer: PeerId, payload: u16) -> Result<(), Refusal> {
+        let key = self.core.connection_of(peer).ok_or(Refusal::NotConnected)?;
+        let now = self.core.now;
+        let conn = self
+            .conns
+            .get_mut(key)
+            .and_then(Option::as_mut)
+            .ok_or(Refusal::NotConnected)?;
+        conn.quic.set_path_ceiling(now, payload);
+        self.touch(key);
+        Ok(())
+    }
+
     /// `peer`'s connection receives on a socket of its own from now, whose queue holds `bytes` of
     /// datagram payload (its driver connected a socket to the peer): its windows leave the shared
     /// socket's room for a room of their own, in which they grow alone, so each connection a node
@@ -1762,7 +1804,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         done
     }
 
-    fn store(&mut self, key: usize, quic: Connection, dialed: Option<PeerId>, grant: Reservation) {
+    fn store(
+        &mut self,
+        key: usize,
+        mut quic: Connection,
+        dialed: Option<PeerId>,
+        grant: Reservation,
+    ) {
+        if let Some(ceiling) = self.path_ceiling {
+            quic.set_path_ceiling(self.core.now, ceiling);
+        }
         let limits = self.core.limits;
         let initial = initial_window(MIN_DATAGRAM);
         let grants = vec![grant];

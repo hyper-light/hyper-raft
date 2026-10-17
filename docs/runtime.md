@@ -36,13 +36,13 @@ before the part that rests on them is built.
 | MOM | G. Lugosi, S. Mendelson. "Mean Estimation and Regression Under Heavy-Tailed Distributions: A Survey." Foundations of Computational Mathematics 19, 2019 (arXiv:1906.04280, read there), §2.1 and Theorem 2; the median of means after Nemirovsky and Yudin 1983, Jerrum, Valiant and Vazirani 1986, Alon, Matias and Szegedy 1996 (through MOM) | peer-reviewed |
 | LEMON | J. Lemon. "Kqueue: A generic and scalable event notification facility." USENIX ATC '01, FREENIX track | peer-reviewed |
 | URING | J. Axboe, "Efficient IO with io_uring", 2019 (through NOTE26 §2.2) | NON-PEER-REVIEWED |
-| SBITMAP | Linux `lib/sbitmap.c`, `include/linux/sbitmap.h` (blk-mq's scalable bitmap of tags) | primary (source), UNVERIFIED revision |
+| SBITMAP | Linux `lib/sbitmap.c`, `include/linux/sbitmap.h` (blk-mq's scalable bitmap of tags), read at `v6.12` (`docs/research/runtime-sources.md` §2) | primary (source) |
 | AFD | the `IOCTL_AFD_POLL` technique of wepoll and mio (`mio/src/sys/windows/afd.rs`); SLATES-RT `afd.rs` | NON-PEER-REVIEWED |
-| AFUNIX | Microsoft, "AF_UNIX comes to Windows" (Windows 10 1803), and `SIO_AF_UNIX_GETPEERPID` in `afunix.h` | vendor, UNVERIFIED |
+| AFUNIX | Microsoft, "AF_UNIX comes to Windows" (Windows Command Line blog, 2017-12-19: Insider build 17063, first released in Windows 10 1803), and `SIO_AF_UNIX_GETPEERPID` in `afunix.h`, `_WSAIOR(IOC_VENDOR, 256)`, read at windows-sys 0.61.2 (`docs/research/runtime-sources.md` §3) | vendor |
 | SELFPIPE | D. J. Bernstein, "The self-pipe trick"; POSIX `sigaction`, async-signal-safe functions (XSH 2.4.3) | NON-PEER-REVIEWED; primary |
 | RFC5482 | TCP User Timeout Option | primary |
 | RFC896 | Congestion Control in IP/TCP Internetworks (Nagle) | primary |
-| NOTSENT | Linux `tcp(7)` `TCP_NOTSENT_LOWAT`; Apple `TCP_NOTSENT_LOWAT` in `netinet/tcp.h` | primary, UNVERIFIED for macOS semantics |
+| NOTSENT | `TCP_NOTSENT_LOWAT`, read at Linux `v6.12` (`tcp_stream_memory_free`, `tcp_sendmsg_locked`, `tcp_poll`) and XNU `xnu-12377.121.6` (`tcp_notsent_lowat_check`, `sowriteable`, `sosendcheck`) (`docs/research/runtime-sources.md` §1) | primary (source) |
 | GAI | POSIX `getaddrinfo`; Microsoft `GetAddrInfoExW` | primary |
 | FDB | J. Zhou et al. "FoundationDB: A Distributed Unbundled Transactional Key Value Store." SIGMOD '21, §4 (simulation) | peer-reviewed |
 | WAKER | Rust `core::task::{Waker, RawWakerVTable}` documentation, 1.98 | primary |
@@ -150,11 +150,11 @@ counted bound (`registry.rs` `send_foreign`). And the pair-ring path kicks uncon
 its own "a message to a spinning shard costs no syscall" (NOTE08 §3.1).
 
 hyper-rt keeps the local push and replaces both rings with a **wake bitmap** per shard: one bit per task
-slot, in 64-bit words with a summary word above every 64 (a two-level scalable bitmap, the structure
-blk-mq uses for its tags [SBITMAP]). A wake from another thread is one `fetch_or` on the slot's bit, one
-on its summary bit **only when the word went from empty to non-empty** (as sbitmap does: most wakes then
-touch one cache line, not the summary word all wakers of 4,096 slots share), and a kick only if the shard
-is parked (the loom-checked protocol, §3.5). The shard drains by swapping each marked summary word to zero
+slot, in 64-bit words, as blk-mq keeps its tags [SBITMAP], with a summary word above every 64 words of
+hyper-rt's own (`sbitmap` keeps none, read at `v6.12`: it walks its words from a per-CPU hint). A wake
+from another thread is one `fetch_or` on the slot's bit, one on its summary bit **only when the word went
+from empty to non-empty** (so most wakes touch one cache line, not the summary word all wakers of 4,096
+slots share), and a kick only if the shard is parked (the loom-checked protocol, §3.5). The shard drains by swapping each marked summary word to zero
 and then each marked word: **summary before word**, so a wake landing between them is either in the word
 the drain takes or marks the summary again for the next drain. A drain **starts where the last one
 stopped** and wraps, so under a step's batch bound high slots do not always queue behind low ones (a p99
@@ -876,7 +876,14 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
 - **`TCP_NOTSENT_LOWAT`** where the OS offers it (Linux, macOS) [NOTSENT], so writability means "the
   unsent queue is low", which keeps a slow peer's backlog in the application's hands, where a
   connection budget can see it. The value is the consumer's (one write's worth is the stated default:
-  DERIVED from the rule that the next write should find room).
+  DERIVED from the rule that the next write should find room). The two kernels differ in kind (read at
+  Linux `v6.12` and `xnu-12377.121.6`, `docs/research/runtime-sources.md` §1): Linux refuses a write
+  once the unsent bytes reach the mark (`tcp_sendmsg_locked`), and reports writability once they are
+  under half of it; XNU takes writes until the send buffer is full whatever the mark, and reports
+  writability once the unsent bytes are at or under it (or under one segment with Nagle on). hyper-rt
+  writes until the kernel refuses, so on Linux the kernel holds about the mark of unsent bytes and on
+  macOS up to the send buffer; on both the wake that follows a refusal comes only once the unsent queue
+  is low.
 - **`TCP_USER_TIMEOUT`** where offered (Linux) [RFC5482]: the consumer states how long unacknowledged
   data may wait before the connection is declared dead.
 - **A connection budget.** The listener takes the maximum it will hold open, process-wide (above); an
@@ -903,7 +910,8 @@ On all three OSes, IPv4 and IPv6: `TcpListener::bind(addr, backlog)`, `accept`, 
 
 `LocalListener` and `LocalStream`: `AF_UNIX` stream sockets on all three OSes. Windows has had `AF_UNIX`
 stream sockets since Windows 10 1803 [AFUNIX], so one mechanism serves all three, and AFD polls them as
-it polls TCP (**UNVERIFIED** that `IOCTL_AFD_POLL` reports readiness on `AF_UNIX` sockets; §15).
+it polls TCP: measured on the Windows runners (§15 item 1), where `tests/local.rs` awaits an accept, a
+read and a write each on the driver's readiness.
 
 The peer's identity is read from the kernel, never from the bytes: `SO_PEERCRED` on Linux,
 `LOCAL_PEERCRED` (or `getpeereid`) on macOS, and on Windows `SIO_AF_UNIX_GETPEERPID` then the process
@@ -1330,9 +1338,15 @@ thread. §12's row runs both drivers the same way.
 
 ## 15. Open items, to settle before the part that rests on them
 
-1. Whether `IOCTL_AFD_POLL` reports readiness on Windows `AF_UNIX` sockets (§5.3). Measured on the Windows
-   runners first; the named-pipe fallback is designed if not.
-2. macOS `TCP_NOTSENT_LOWAT` semantics against Linux's (§5.2), read against `xnu` source.
+1. Closed 2026-10-17: `IOCTL_AFD_POLL` reports accept, receive and send readiness on Windows `AF_UNIX`
+   sockets (§5.3). `tests/local.rs`, `a_local_streams_accept_reads_and_writes_each_wait_on_readiness`,
+   awaits an accept before any client connects and streams 16 MiB through the sockets' buffers, each of
+   the three waiting on the driver at least once (counted), on windows-2025 and windows-11-arm in CI
+   as on Linux and macOS; a readiness AFD did not report would park the shard forever. No named-pipe
+   fallback is needed.
+2. Closed 2026-10-17: macOS `TCP_NOTSENT_LOWAT` against Linux's, read at `xnu-12377.121.6` and Linux
+   `v6.12` (§5.2, `docs/research/runtime-sources.md` §1): both count the bytes not yet sent; Linux holds a
+   write to the mark and wakes under half of it, XNU holds only the wake, at or under it.
 3. Measured 2026-10-13 (`docs/benchmarks.md`, "hyper-rt: the loop under load, against slates' runtime
    and tokio"): the wake bitmap against slates' rings on the cross-shard and foreign-wake rows (§3.2),
    both runtimes carrying values on tokio's `mpsc`: a request and reply between two shards 909 k round
@@ -1340,7 +1354,10 @@ thread. §12's row runs both drivers the same way.
    requests a second against 305 k, the one-way p99 29.2 µs against 36.9.
 4. Measured: std's `sync_channel` against tokio's `mpsc` and a ring of hyper-rt's own (§8), with plain
    threads (mantle's note 42 §8) and under the shard's loop (`hyper-rt-compare`'s `hyper-mpsc` arm).
-5. `SBITMAP` and `AFUNIX` read at a named revision.
+5. Closed 2026-10-17: `SBITMAP` read at Linux `v6.12` and `AFUNIX` at the announcement and windows-sys
+   0.61.2 (`docs/research/runtime-sources.md` §2, §3). `sbitmap` keeps no summary level, so §3.2 and
+   `wakes.rs` no longer call the wake bitmap's summary its shape; it spreads its words one to a cache line,
+   which hyper-rt does not (item 7 measures the difference).
 6. A plain `Release` store of the wake bitmap's pending flag failed loom 0.7.2's parking model: the sender's
    own later load read the flag's earlier value, which coherence forbids. The flag is published with a swap
    (the model passes); the execution is to be reduced to a loom report or to an error of this model's.

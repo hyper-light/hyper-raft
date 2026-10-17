@@ -1196,3 +1196,166 @@ pub fn unhex(text: &str) -> Vec<u8> {
         .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
         .collect()
 }
+
+/// A certificate for each of nodes `1..=n` from one authority: made once for every run of a
+/// scenario.
+pub struct Issued {
+    pub pki: Pki,
+    pub issued: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Issued {
+    pub fn new(count: PeerId) -> Self {
+        let pki = Pki::new();
+        let issued = (1..=count).map(|peer| pki.issue(&name(peer))).collect();
+        Self { pki, issued }
+    }
+
+    /// The book every node of these credentials knows the others by, each a node.
+    pub fn book(&self) -> Book {
+        let mut book = Book::default();
+        for (at, (certificate, _)) in self.issued.iter().enumerate() {
+            book.add(certificate, at as PeerId + 1, Role::Node);
+        }
+        book
+    }
+}
+
+/// The address of node `peer` of a [`Mesh`].
+pub fn mesh_address(peer: PeerId) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 4432 + peer as u16))
+}
+
+fn mesh_peer(address: SocketAddr) -> PeerId {
+    PeerId::from(address.port() - 4432)
+}
+
+/// Nodes `1..=n` on hyper-sim's network, node `i` at world node `i - 1`, every path the zero one: a
+/// datagram arrives the instant it is sent, in the order sent; [`Net`] for more than two.
+pub struct Mesh<N: Drive> {
+    pub now: Instant,
+    start: Instant,
+    pub nodes: Vec<N>,
+    world: hyper_sim::World<Arrival>,
+    wire: hyper_sim::net::Net<Vec<u8>>,
+    out: Vec<u8>,
+}
+
+impl<N: Drive> Mesh<N> {
+    /// `nodes`, made at `now`, on a world drawing from `source`.
+    pub fn new(nodes: Vec<N>, now: Instant, source: hyper_sim::Source) -> Self {
+        let count = nodes.len();
+        let limits = hyper_sim::Limits {
+            events: 1 << 12,
+            nodes: count,
+            streams: 8,
+            steps: u64::MAX,
+            trace_words: 0,
+        };
+        let mut world =
+            hyper_sim::World::new(source, hyper_sim::Discipline::Ordered, limits).unwrap();
+        for _ in 0..count {
+            world.node(hyper_sim::Clock::default()).unwrap();
+        }
+        let wire = hyper_sim::net::Net::new(hyper_sim::net::NetLimits {
+            flows: count * count,
+            links: 0,
+            nats: 0,
+            link_messages: 0,
+            messages: 1 << 12,
+            bytes: 1 << 26,
+        });
+        Self {
+            now,
+            start: now,
+            nodes,
+            world,
+            wire,
+            out: Vec::with_capacity(1500),
+        }
+    }
+
+    /// The run's record: the digest of every arrival the world ordered.
+    pub fn finish(self) -> hyper_sim::Record {
+        self.world.finish()
+    }
+
+    pub fn node(&mut self, peer: PeerId) -> &mut N {
+        &mut self.nodes[(peer - 1) as usize]
+    }
+
+    /// Moves every datagram until no node has any.
+    pub fn exchange(&mut self) {
+        for _ in 0..1_000_000 {
+            let mut moved = false;
+            for at in 0..self.nodes.len() {
+                while let Some(transmit) = self.nodes[at].transmit(self.now, &mut self.out) {
+                    let to = mesh_peer(transmit.destination) - 1;
+                    let bytes = self.out[..transmit.size].to_vec();
+                    self.wire
+                        .send(
+                            &mut self.world,
+                            (hyper_sim::NodeId(at as u32), hyper_sim::NodeId(to as u32)),
+                            bytes,
+                            transmit.size,
+                            Arrival::Datagram,
+                        )
+                        .unwrap();
+                    moved = true;
+                }
+            }
+            while self
+                .world
+                .earliest()
+                .is_some_and(|due| due <= self.world.now())
+            {
+                let hyper_sim::Step::Event {
+                    event: Arrival::Datagram(ticket),
+                    ..
+                } = self.world.next(&mut hyper_sim::Fifo).unwrap()
+                else {
+                    panic!("only datagrams are scheduled");
+                };
+                let delivery = self
+                    .wire
+                    .deliver(&mut self.world, ticket, Arrival::Datagram)
+                    .unwrap()
+                    .unwrap();
+                let from = mesh_address(delivery.from.0 as PeerId + 1);
+                self.nodes[delivery.to.0 as usize].datagram(self.now, from, &delivery.payload);
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+        panic!("the network never went quiet");
+    }
+
+    /// Moves the clock to the earliest timer of any node, or to `limit` if that comes first, and
+    /// fires every node's timers due.
+    pub fn advance_until(&mut self, limit: Option<Instant>) {
+        let timer = self
+            .nodes
+            .iter_mut()
+            .filter_map(|node| node.timeout())
+            .min();
+        let next = match (timer, limit) {
+            (Some(timer), Some(limit)) => timer.min(limit),
+            (Some(timer), None) => timer,
+            (None, Some(limit)) => limit,
+            (None, None) => panic!("a node keeps a timer: its keep-alive"),
+        };
+        let at = u64::try_from(next.saturating_duration_since(self.start).as_nanos()).unwrap();
+        self.world.advance(at.max(self.world.now())).unwrap();
+        self.now = self.now.max(next);
+        for node in &mut self.nodes {
+            node.fire(self.now);
+        }
+    }
+
+    /// Moves the clock to the earliest timer of any node and fires every node's timers.
+    pub fn advance(&mut self) {
+        self.advance_until(None);
+    }
+}

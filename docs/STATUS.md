@@ -130,11 +130,23 @@ is worked around.
   kill. The worst time without evidence the design measured is 13–35 s (`docs/timing.md` §2.8,
   "Judged before its own evidence"), and none of its worlds moves a sender's floor for good. Open:
   what keeps a link's evidence across its sender's moves, or bounds a node's time without evidence.
-  One candidate, the interval followed up by doublings as it is followed down (a link's restarts
-  bounded by the logarithm of its floor's range), measured in the simulation as a prototype (not
-  committed): the links configured 169–382 s after the slowdown against 257–618 s, but a peer dead
-  in its links' first heartbeats was noticed later, at the most 1.36 s on macOS against 0.75 s and
-  5.8 s on Windows' timer against 2.5 s, the interval standing up to twice its floor.
+  Two candidates are built as prototypes on the unmerged branch `proto-liveness-floor`
+  (`HYPER_LIVENESS_FLOOR_RULE`), each a rule for where an interval goes when its sender's floor rises
+  past it, and measured on 2026-10-17 by the two simulations that state the trade (release, their
+  default seeds): **doubling**, the interval doubled until it holds the floor (a link's restarts bounded
+  by the logarithm of its floor's range; Lindley 1952 still holds, the interval above the floor), and
+  **latest**, the larger of the floor and the latest flush plus `G` (one move for a change of the
+  device's speed, where the mean of every flush creeps). The owner decides; neither is merged.
+
+  | Rule | configured after every device slows, median (range), macOS / Linux | the victim suspected after its kill | a peer dead in its links' first heartbeats noticed, median / p90 / most: macOS, busy, Linux, Windows |
+  |---|---|---|---|
+  | as built | 370 s (257–618) / 430 s (280–493) | 4–19 s | 71/560/746, 119/1102/1933, 48/156/276, 313/1754/2494 ms |
+  | doubling | 226 s (167–347) / 208 s (168–348) | 6–14 s | 91/607/1626, 129/984/2268, 58/278/608, 369/2703/5998 ms |
+  | latest | 218 s (153–378) / 192 s (120–285) | 8–16 s | 77/589/1078, 117/894/1692, 90/788/2184, 622/2472/5725 ms |
+
+  Each roughly halves the time to a link's own evidence, and each notices an early death later at the
+  tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
+  flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
 ### Closed (2026-10-17)
 

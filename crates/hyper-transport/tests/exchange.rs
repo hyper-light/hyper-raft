@@ -2703,7 +2703,7 @@ fn a_socket_that_holds_no_first_window_refuses_the_connection() {
     let a = pair.node::<Mantle>(1, Role::Node, book(), limits(), 256 << 20, now);
     let mut b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 256 << 20, now);
     assert_eq!(b.stats().receive_capacity, u64::MAX, "unbounded until told");
-    b.set_receive_capacity(first_window() - 1);
+    b.set_receive_capacity(first_window() - 1, 0);
     let mut net = Net::of(now, a, b, hyper_sim::Source::Seed(0));
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
@@ -2738,7 +2738,7 @@ fn the_windows_granted_never_pass_what_the_socket_holds() {
         limits(),
         256 << 20,
         hyper_sim::Source::Seed(0),
-        |b| b.set_receive_capacity(capacity),
+        |b| b.set_receive_capacity(capacity, 0),
     );
     let mut most = 0;
     let frame = [7u8; 1_000];
@@ -2771,21 +2771,21 @@ fn the_windows_granted_never_pass_what_the_socket_holds() {
     assert_eq!(net.b.stats().receive_granted, 0, "what it held came back");
 }
 
-/// What a socket's peers may send it unprompted, read through a handshake. Each place admission
-/// lets a handshake wait in is reserved whether taken or not: a handshake's probes, and one MTU
-/// probe from a client established before its server. A handshake in a place is not counted again
-/// as a connection. A dial's probes are a handshake's, and its server, established only after it,
-/// sends no MTU probe. An established peer's probes are of up to the path's MTU, with one MTU probe
-/// beside them. Do: node 1 dials node 2 over a 10 ms round trip (the test limits: 8 places, a
-/// 10-second idle timeout); read both nodes' shared sockets before, as node 1 dials, while node 2's
-/// handshake waits in its place, and once both are connected, and node 2's reading for node 1
-/// alone. Expect: those counts at each step.
+/// What a socket's peers may send it unprompted, read through a handshake. Only the admission
+/// places a handshake holds count: a handshake waiting in one may send its probes and one MTU probe
+/// (a client is established before its server), and is not counted again as a connection. A dial's
+/// server, established only after it, sends nothing larger than its probes. An established peer
+/// sends two datagrams of up to the path's MTU beside its probes: the rest of the packet its first
+/// probe timeout repeats, and an MTU probe. Do: node 1 dials node 2 over a 10 ms round trip (the
+/// test limits: 8 places, a 10-second idle timeout); read both nodes' shared sockets before, as
+/// node 1 dials, while node 2's handshake waits in its place, and once both are connected, and
+/// node 2's reading for node 1 alone. Expect: those counts at each step, and nothing for a place
+/// no handshake holds.
 #[test]
 fn a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection() {
     let pair = Pair::new();
     let limits = limits();
     let probes = probes_within(limits.idle_timeout);
-    let places = limits.admission.pending as u64;
     let now = hyper_sim::Anchor::new().instant(0).unwrap();
     let book = || pair.book(Role::Node, Role::Node);
     let a = pair.node::<Mantle>(1, Role::Node, book(), limits, 256 << 20, now);
@@ -2794,20 +2794,24 @@ fn a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection(
     let mut net = Net::shaped(now, a, b, 1_000_000_000, 1 << 20, Duration::from_millis(5));
     assert_eq!(
         net.b.unprompted_shared(),
+        Unprompted::default(),
+        "no place taken, nothing to send"
+    );
+    assert_eq!(
+        net.b.unprompted_handshake(),
         Unprompted {
             acknowledgements: 0,
-            probes: places,
-            handshake_probes: places * probes,
-        },
-        "every place, none taken"
+            probes,
+            large: 1,
+        }
     );
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
     let dialing = net.a.unprompted_shared();
     assert_eq!(
-        (dialing.probes, dialing.handshake_probes),
-        (places, places * probes + probes),
-        "a dial's probes are a handshake's, and no MTU probe comes"
+        (dialing.probes, dialing.large),
+        (probes, 0),
+        "a dial's server sends nothing larger than its probes"
     );
     // Node 2's handshake waits in its place, its flight sent: node 1's Finished is a round trip
     // away.
@@ -2816,9 +2820,9 @@ fn a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection(
     });
     let waiting = net.b.unprompted_shared();
     assert_eq!(
-        (waiting.probes, waiting.handshake_probes),
-        (places, places * probes),
-        "the handshake is counted in its place, and not again"
+        (waiting.probes, waiting.large),
+        (probes, 1),
+        "the handshake in its place, and nothing again as a connection"
     );
     let (mut one, mut two) = (false, false);
     net.until(TURNS, |net| {
@@ -2833,13 +2837,52 @@ fn a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection(
     for (side, node) in [("node 1", &net.a), ("node 2", &net.b)] {
         let shared = node.unprompted_shared();
         assert_eq!(
-            (shared.probes, shared.handshake_probes),
-            (places + probes + 1, places * probes),
-            "{side}: an established peer's probes and its MTU probe beside every place"
+            (shared.probes, shared.large),
+            (probes, 2),
+            "{side}: an established peer's probes and two larger datagrams"
         );
     }
     let alone = net.b.unprompted(1).unwrap();
-    assert_eq!((alone.probes, alone.handshake_probes), (probes + 1, 0));
+    assert_eq!((alone.probes, alone.large), (probes, 2));
+}
+
+/// A connection is taken only with room for its first window and for what its peer may send
+/// unprompted, as its driver last said that takes. Do: node 1 dials node 2, whose socket's room is
+/// a first window and 6,000 bytes less one, then one exactly; each said with 6,000 the room a
+/// handshake's peer takes. Expect: refused, typed, with nothing granted; then connected.
+#[test]
+fn a_connection_is_taken_only_with_room_for_its_peers_unprompted_messages() {
+    let pair = Pair::new();
+    let handshake = 6_000;
+    for (room, connects) in [
+        (first_window() + handshake - 1, false),
+        (first_window() + handshake, true),
+    ] {
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let book = || pair.book(Role::Node, Role::Node);
+        let a = pair.node::<Mantle>(1, Role::Node, book(), limits(), 256 << 20, now);
+        let mut b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 256 << 20, now);
+        b.set_receive_capacity(room, handshake);
+        let mut net = Net::of(now, a, b, hyper_sim::Source::Seed(0));
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        if connects {
+            let mut connected = false;
+            net.until(TURNS, |net| {
+                connected |= events(&mut net.b)
+                    .iter()
+                    .any(|event| matches!(event, Event::Connected { peer: 1, .. }));
+                connected
+            });
+            assert_eq!(net.b.stats().receive_refused, 0);
+            assert_eq!(net.b.stats().receive_granted, first_window());
+        } else {
+            net.until(TURNS, |net| net.b.stats().receive_refused > 0);
+            net.exchange();
+            assert_eq!(net.b.stats().receive_granted, 0, "nothing granted");
+            assert_eq!(net.b.stats().connections, 0);
+        }
+    }
 }
 
 /// Node 1 and node 2 connected, node 1 with `sender` bytes of budget and node 2 with `receiver`.

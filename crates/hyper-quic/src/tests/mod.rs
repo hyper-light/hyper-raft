@@ -3376,6 +3376,64 @@ fn loss_probe_requests_immediate_ack() {
     );
 }
 
+/// A probe timeout that follows an unanswered one repeats no stream data. Do: the client writes
+/// 20,000 bytes on a stream with every datagram it sends dropped, through its first probe timeout
+/// and the two after. Expect: the first timeout's two probes repeat stream data (one asking an
+/// immediate acknowledgement); the later ones carry none, each only its IMMEDIATE_ACK; every probe
+/// fits the smallest datagram.
+#[test]
+fn a_probe_timeout_after_an_unanswered_one_repeats_no_stream_data() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+
+    let default_mtu = mem::replace(&mut pair.mtu, 0);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&[0xab; 20_000])
+        .unwrap();
+    pair.drive_client();
+    let sent = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(pair.client_conn_mut(client_ch).pto_state().0, 0);
+
+    let mut rounds = Vec::new();
+    for timeout in 1..=3 {
+        let before = pair.client_conn_mut(client_ch).stats();
+        // Through the client's timers until this timeout has fired and its probes have gone.
+        for _ in 0..64 {
+            if pair.client_conn_mut(client_ch).pto_state().0 >= timeout {
+                break;
+            }
+            let wakeup = pair.client.next_wakeup().unwrap();
+            pair.time = pair.time.max(wakeup);
+            pair.drive_client();
+        }
+        assert_eq!(pair.client_conn_mut(client_ch).pto_state().0, timeout);
+        let after = pair.client_conn_mut(client_ch).stats();
+        rounds.push((
+            after.frame_tx.stream - before.frame_tx.stream,
+            after.frame_tx.immediate_ack - before.frame_tx.immediate_ack,
+            after.udp_tx.datagrams - before.udp_tx.datagrams,
+            after.udp_tx.bytes - before.udp_tx.bytes,
+        ));
+    }
+    pair.mtu = default_mtu;
+
+    let (streams, immediate, datagrams, bytes) = rounds[0];
+    assert!(
+        streams > 0,
+        "the first timeout repeats stream data: {rounds:?}"
+    );
+    assert_eq!((immediate, datagrams), (1, 2), "{rounds:?}");
+    assert!(bytes <= 2 * 1_200, "{rounds:?}");
+    for &(streams, immediate, datagrams, bytes) in &rounds[1..] {
+        assert_eq!((streams, immediate, datagrams), (0, 2, 2), "{rounds:?}");
+        assert!(bytes <= 2 * 1_200, "{rounds:?}");
+    }
+    assert!(sent.frame_tx.stream > 0);
+}
+
 #[test]
 /// This is mostly a sanity check to ensure our testing code is correctly dropping packets above the
 /// pmtu

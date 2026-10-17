@@ -107,24 +107,23 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
-- **hyper-transport: on Linux's default receive buffer a measured shared socket refuses every new
-  connection (found 2026-10-17, older than §4o–§4q).** Docker's VM grants 425,984 bytes
-  (`rmem_max` 212,992), 319,488 past the release lag. The shared socket reserves for every place
-  admission lets a handshake wait in, taken or not: focal's 32 places of 30 probes, at the 896
-  bytes Linux charges a small datagram, take 860 KB. So once the socket has measured a datagram of
-  stream data its room is nothing, and `Room::first` refuses each first window. focal-node fails 13
-  of 414 tests there on focal's `main` (2,285 first windows refused) and 12 with §4r (2,206).
-  focal's Linux CI passes on `main`; what its runners grant is not known. Open: what a place
-  reserves while no handshake holds it.
-- **hyper-transport, hyper-quic: an established connection's probes are reserved at up to the
-  path's MTU, which a small buffer cannot hold once MTU discovery reaches the path (found
-  2026-10-17).** With §4q a datagram on loopback carries up to 65,507 bytes. On the 319,488 usable
-  bytes above, the costliest datagram alone on a peer's own socket is charged 8,448 or 66,403
-  bytes, and a connection's 31 probes then take 262 KB to 2 MB. In focal-node's run a peer's socket
-  held less than one first window 5,798 times, against 17 before §4q. A larger buffer holds them:
-  8 MiB holds the 2 MB. Open: what bounds the bytes a peer sends unprompted at a large MTU (a
-  probe's size, or the payload this side says it takes), before focal takes §4q.
-
+- **hyper-transport: on Linux's default receive buffer the shared socket holds two first windows
+  (found 2026-10-17).** Docker's VM grants 425,984 bytes (`rmem_max` 212,992), 319,488 past the
+  release lag. Charged at its costliest stream byte (896 bytes for a datagram carrying 120), the
+  shared socket's room is about 31 KB once measured: two first windows and the room their peers'
+  unprompted messages take (`docs/transport.md` §4s). focal-node fails 8 of 414 tests there (117
+  first windows refused), against 13 on focal's `main` (2,285); focal's enrollment client gives up at
+  its first refusal (`Transport(Unavailable)`). focal's Linux CI passes on `main`; what its runners
+  grant is not known (their image sets no `rmem_max`). Open: whether a refused handshake's client
+  should try again (TCP's client does when a listener's backlog is full), and what a socket of that
+  buffer should admit at once.
+- **hyper-rt-transport: a socket is asked for its windows' demand at a byte charged a byte (found
+  2026-10-17, older than §4o).** A peer's socket asks `peer_demand` and a listener `receive_demand`,
+  neither with the charge measured nor the room unprompted messages take. A socket whose windows'
+  demand is 18,652 bytes (a 16 KiB ceiling and the reserve) is granted that much, and the 32 small
+  datagrams its one connection's peer may send unprompted (73 KB) leave its room nothing; its window
+  stays at the first. Seen 15 to 18 times in each Docker run above, on `main` as since. Open: an ask that adds
+  what the listener has measured.
 - **hyper-tokio `stamps`: a kernel stamp converted before the send.** Seen once, Linux 6.x in
   Docker (`rust:1.98.1`, 4 CPUs) on a loaded host, `cargo test -p hyper-tokio` on the tree of the
   socket room (above): `a_datagram_is_stamped_when_it_arrived_not_when_it_was_read` failed at
@@ -164,6 +163,23 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-transport, hyper-quic: on Linux's default buffer a measured shared socket refused every
+  new connection, and once MTU discovery reached the path a peer's own socket held less than one
+  first window.** The shared socket reserved for every admission place, taken or not: focal's 32
+  places of 30 probes took 860 KB of 319 KB. Now only the places taken count, and a first window is
+  taken only with room for what its peer may send unprompted, held until the driver's next capacity
+  counts it (`Room::first`, `Endpoint::set_receive_capacity(bytes, handshake)`). Each established
+  connection's 31 probes were charged at up to the path's MTU, 262 KB to 2 MB on loopback. But
+  every probe datagram is clamped to the smallest datagram, and now a probe timeout that follows an
+  unanswered one repeats no stream data (hyper-quic patch Q23). So a peer that has stopped reading
+  is sent at most one packet again, and the charge counts the probes as small datagrams and two of
+  up to the path's MTU. focal-node on Docker's default buffer: 8 of 414 fail against 13 on focal's
+  `main`, 117 first windows refused against 2,285, and no peer's socket below one first window
+  against 17. On macOS: 414 of 414 (`docs/transport.md` §4s). Tests:
+  `tests::a_probe_timeout_after_an_unanswered_one_repeats_no_stream_data`,
+  `credit::tests::a_first_window_is_taken_with_its_peers_unprompted_room`,
+  `exchange::a_connection_is_taken_only_with_room_for_its_peers_unprompted_messages`.
+
 - **hyper-transport: once MTU discovery reached the path, every unprompted datagram was charged as
   an MTU probe, and every handshake waiting in a place was charged twice.** focal's shared socket on
   macOS then reserved 9,451,456 bytes of 8 MiB for 1,020 probes and 2 acknowledgements, each charged
@@ -172,7 +188,7 @@ is worked around.
   each of which fits the smallest datagram, are charged as the costliest datagram alone of that
   size. A handshake is counted in its place and not again as a connection. One MTU probe is counted
   for each peer that is or may be established. focal-node passes on macOS, 414 of 414
-  (`docs/transport.md` §4r). Tests: `charge::tests::handshakes_and_acknowledgements_are_charged_as_small_datagrams`,
+  (`docs/transport.md` §4r). Tests: `charge::tests::acknowledgements_and_probes_are_charged_as_small_datagrams`,
   `a_small_datagram_fits_the_smallest_a_path_carries`,
   `exchange::a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection`.
 

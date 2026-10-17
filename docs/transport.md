@@ -985,9 +985,10 @@ Linux 6.6), and nothing in it is assumed.
   acknowledgement for each of this side's ack-eliciting packets in flight (RFC 9000 §13.2: a
   receiver may acknowledge every one) and the loss probes of the idle timeout: two at each probe
   timeout (RFC 9002 §6.2.4), the timeouts doubling (§6.2.1) from `kGranularity`, 32 for a 30-second
-  timeout. Each is one datagram that comes alone. A probe is charged as the costliest datagram that
-  came alone, an acknowledgement and a handshake's probe as the costliest alone of the smallest
-  datagram's size (§4r); retransmissions take no new window, so they count here. A GRO train is one message of many datagrams and gives only
+  timeout. Each is one datagram that comes alone. An acknowledgement and a probe are charged as the
+  costliest datagram alone of the smallest datagram's size, and the few datagrams of up to the
+  path's MTU a peer sends unprompted as the costliest alone (§4r, §4s); retransmissions take no new
+  window, so they count here. A GRO train is one message of many datagrams and gives only
   its charge per stream byte. Its share a datagram stands in until a datagram has come alone. The
   first build charged probes as the costliest message: one train sampled made 32 probes cost 32
   trains, past the whole queue, and the room fell to nothing. In the busy A/B the publisher was
@@ -1290,22 +1291,74 @@ can have:
 
 On the same tree, focal-node's library passes on macOS: 414 of 414, against 405 and 9 failed.
 
-**Measured on Linux, not yet fixed.** Docker's VM grants the default buffer (`rmem_max` 212,992, so
-425,984 with Linux's doubling, 319,488 usable past the release lag). There, focal-node fails 12
-tests with this change and 13 on focal's `main` before any of §4o–§4q, the same tests. Both runs
-refuse first windows on the shared socket (2,206 and 2,285 times), because the reservation for
-every place and connection passes the queue in both: 960 handshake probes at 896 bytes each already
-take 860 KB. That refusal is older than this change. focal's Linux CI passes on `main`; what its
-runners grant is not known (their image sets no `rmem_max`). What MTU discovery added on that buffer is a smaller room on each peer's own socket.
-A datagram there now carries up to the path's MTU (65,507 bytes on loopback), so the costliest
-alone is 8,448 or 66,403 bytes, and an established connection's 31 probes take 262 KB to 2 MB of
-the 319 KB. A peer's socket held less than one first window 5,798 times in the run against 17
-before. Both are open (`docs/STATUS.md`).
+**Measured on Linux.** Docker's VM grants the default buffer (`rmem_max` 212,992, so 425,984 with
+Linux's doubling, 319,488 usable past the release lag). There, focal-node failed 12 tests with this
+change alone and 13 on focal's `main` before any of §4o–§4q, the same tests. Both runs refused
+first windows on the shared socket (2,206 and 2,285 times): the reservation for every place passed
+the queue in both, 960 handshake probes at 896 bytes each already taking 860 KB. And what MTU
+discovery added on that buffer was a smaller room on each peer's own socket: a datagram there
+carries up to the path's MTU (65,507 bytes on loopback), the costliest alone was 8,448 or 66,403
+bytes, and an established connection's 31 probes, each charged as one, took 262 KB to 2 MB of the
+319 KB. A peer's socket held less than one first window 5,798 times in the run, against 17 before.
+§4s takes both.
 
-Tests: `charge::tests::handshakes_and_acknowledgements_are_charged_as_small_datagrams` (the macOS
+Tests: `charge::tests::acknowledgements_and_probes_are_charged_as_small_datagrams` (the macOS
 shared socket's own numbers), `a_small_datagram_fits_the_smallest_a_path_carries`, and
 `exchange::a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection` (a dial,
 a handshake waiting in its place, and both connected, read over a 10 ms round trip).
+
+## 4s. What a peer sends unprompted at any MTU, and a place charged while held (2026-10-17)
+
+§4r left two defects on Linux's default buffer (above). Both came from reserving what a peer could
+not send.
+
+**Probes.** §4i charged each of an established connection's 31 probes as the costliest datagram
+alone. hyper-quic clamps every probe to the smallest datagram already (upstream's rule in
+`Connection::allocate_datagram`, so a probe gets through a path whose MTU has shrunk). But a probe
+moves its oldest packet's frames into the queue to send, and what its two datagrams cannot hold
+goes beside them as the congestion window allows. So each probe timeout could still send up to a
+packet of the path's MTU again, and a peer this side has stopped reading may time out fifteen times
+before its idle timeout. The fix is at the sender (hyper-quic patch Q23). The first probe timeout
+after an acknowledgement still repeats its oldest packet whole, so a lost reply goes again with its
+probe (Chromium's rule, `crates/hyper-quic/VENDORED.md` §11). A timeout that follows an unanswered one says the peer is not
+acknowledging: it has stopped reading, and what it was sent waits in its socket's queue, or the
+path drops it, and the probe's acknowledgement will declare it lost. Its probes repeat no stream
+data in the application space, only control frames, as upstream's did (RFC 9002 §6.2.4: previously
+sent data "MAY" be sent). So a peer that has stopped reading is sent at most one packet of stream
+data again, whatever the path's MTU and however many timeouts pass. The receive charge now counts
+an established peer's probes as small datagrams and two of up to the path's MTU beside them: the
+rest of the packet its first timeout repeats, and its MTU probe (`Unprompted::large`).
+
+**Places.** The shared socket reserved for every place admission lets a handshake wait in, taken or
+not. A place no handshake holds has no peer to send. Now only the places taken count
+(`Endpoint::unprompted_shared`). The reservation for places not yet taken guarded a promise: a
+window granted is never taken back, so a handshake admitted later must not pass the queue. That
+promise is kept where the handshake is admitted. A first window is taken only with room for what
+its peer may send unprompted (`Room::first`; `Endpoint::unprompted_handshake`, a handshake's probes
+and one MTU probe), and that room is held until the driver says a capacity that counts the
+handshake (`Endpoint::set_receive_capacity` takes both, from `SocketCharge::rooms`). A window still
+grows only while what is left holds both for every place not taken (`kept_for_handshakes`), so a
+peer that grew first never shuts out one that comes next.
+
+**Measured, focal-node on Docker's default buffer:**
+
+| Tree | Failed of 414 | First windows refused | A peer's socket under one first window |
+|---|---|---|---|
+| focal `main` | 13 | 2,285 | 17 |
+| §4r alone | 12 | 2,206 | 5,798 |
+| §4r and §4s | 8 | 117 | 0 |
+
+On macOS focal-node passes, 414 of 414. The 8 that still fail on that buffer are open
+(`docs/STATUS.md`). The shared socket's room there is about 31 KB: the queue charged at its costliest
+stream byte, 896 bytes for a datagram carrying 120, holds two first windows. focal's enrollment
+client then gives up at the first refusal (`Transport(Unavailable)`) where it could try again.
+
+Tests: `tests::a_probe_timeout_after_an_unanswered_one_repeats_no_stream_data` (hyper-quic: the
+first timeout's probes repeat stream data, the next two's none, every probe within the smallest
+datagram); `credit::tests::a_first_window_is_taken_with_its_peers_unprompted_room`;
+`exchange::a_connection_is_taken_only_with_room_for_its_peers_unprompted_messages`;
+`exchange::a_handshake_is_reserved_in_its_place_and_an_established_peer_as_a_connection`, now with
+nothing for a place no handshake holds; `charge::tests::acknowledgements_and_probes_are_charged_as_small_datagrams`.
 
 ## 5. Consumers
 

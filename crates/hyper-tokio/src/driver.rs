@@ -69,7 +69,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         let ask = hyper_transport::socket_buffer_ask(endpoint.receive_demand());
         crate::sys::set_recv_buffer(&socket, usize::try_from(ask).unwrap_or(usize::MAX))?;
         let unmeasured = endpoint.unmeasured_room();
-        endpoint.set_receive_capacity(unmeasured);
+        endpoint.set_receive_capacity(unmeasured, 0);
         // Stamped where the kernel stamps, so a drain knows what was queued when it began.
         let socket = Socket::new(socket, io, true)?;
         // The fold reads std's `Instant`, which is the clock `Clock` reads: `CLOCK_MONOTONIC`,
@@ -271,11 +271,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             u64::try_from(read).unwrap_or(u64::MAX),
         );
         self.measure.after(before, after, consumed, taken, emptied);
-        let room = self
+        let (room, handshake) = self
             .measure
-            .room(self.endpoint.unprompted_shared())
-            .unwrap_or_else(|| self.endpoint.unmeasured_room());
-        self.endpoint.set_receive_capacity(room);
+            .rooms(
+                self.endpoint.unprompted_shared(),
+                self.endpoint.unprompted_handshake(),
+            )
+            .unwrap_or_else(|| (self.endpoint.unmeasured_room(), 0));
+        self.endpoint.set_receive_capacity(room, handshake);
         self.measure.set_room(room);
         Ok(())
     }

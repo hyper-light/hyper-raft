@@ -559,13 +559,24 @@ impl Connection {
             return Some(challenge);
         }
 
-        // If we need to send a probe, make sure we have something to send.
+        // If we need to send a probe, make sure we have something to send. The first timeout
+        // after an acknowledgement repeats the oldest packet whole, so a lost reply goes again
+        // with its probe. One that follows an unanswered timeout says the peer is not
+        // acknowledging: it has stopped reading, and what it was sent waits in its socket's
+        // queue, or the path drops it, and the probe's acknowledgement will declare it lost. Its
+        // probes repeat no stream data in the Data space, only control frames, as upstream's did,
+        // so a peer that has stopped reading is sent at most one packet's stream data again
+        // whatever its MTU, however many timeouts pass (hyper-transport's receive charge counts
+        // on it). A handshake space's packets fit the smallest datagram and repeat whole.
         for space in SpaceId::iter() {
             let request_immediate_ack =
                 space == SpaceId::Data && self.peer_supports_ack_frequency();
-            self.spaces
-                .get_mut(space)
-                .maybe_queue_probe(request_immediate_ack, &mut self.streams);
+            let streams_too = space != SpaceId::Data || self.pto_count <= 1;
+            self.spaces.get_mut(space).maybe_queue_probe(
+                request_immediate_ack,
+                streams_too,
+                &mut self.streams,
+            );
         }
         self.queue_copies(now);
 

@@ -17,10 +17,11 @@
 //!   packet this side has in flight, at most (RFC 9000 §13.2: a receiver may acknowledge every
 //!   one), and its loss probes, at most two at each probe timeout (RFC 9002 §6.2.4), the timeouts
 //!   doubling (§6.2.1) from at least `kGranularity` until the idle timeout ends the connection.
-//!   Retransmissions take no new window, so they are counted here. An established peer adds one
+//!   Retransmissions take no new window, so they are counted here. Every probe is clamped to the
+//!   smallest datagram; a peer also sends the rest of the packet its first probe repeats, and one
 //!   MTU probe. The kernel charges a datagram by its size, so each is charged as the costliest
-//!   datagram seen of the size it can have: an established connection's probe up to the path's
-//!   MTU; an acknowledgement and a handshake's probe no larger than [`MIN_DATAGRAM`].
+//!   datagram seen of the size it can have: an acknowledgement and a probe no larger than
+//!   [`MIN_DATAGRAM`], the rest and the MTU probe up to the path's MTU.
 //!
 //! A sample is one message the driver read as the only one queued, so the charge the kernel
 //! reported before the read was that message's exactly (the driver's singleton rule). The worst of
@@ -66,16 +67,20 @@ pub struct Unprompted {
     /// frame of at most 1,065 bytes (RFC 9000 §19.3, each integer at most 8 bytes, ECN counts
     /// included), 1,106 with a short header's 25 and the AEAD's tag.
     pub acknowledgements: u64,
-    /// Datagrams of up to the path's MTU: established connections' loss probes, [`probes_within`]
-    /// their idle timeouts, and one MTU probe for each peer that is or may be established. A
-    /// search has one probe in flight at a time, and a probe is lost only once a later packet is
-    /// acknowledged (RFC 9002 §6.1), so a peer this side has stopped acknowledging sends no
-    /// second.
+    /// Loss probes, [`probes_within`] their idle timeouts. Each fits the smallest datagram:
+    /// hyper-quic clamps every probe to it (`Connection::allocate_datagram`, upstream's rule, so a
+    /// probe gets through a path whose MTU has shrunk), and until its handshake is done it sends
+    /// nothing larger (its initial MTU; it probes for more only once established,
+    /// `Connection::send_when_idle`).
     pub probes: u64,
-    /// Handshakes' loss probes, [`probes_within`] their idle timeouts each. hyper-quic sends
-    /// nothing larger than its initial MTU, [`MIN_DATAGRAM`], until its handshake is done: it
-    /// probes for more only once established (`Connection::send_when_idle`).
-    pub handshake_probes: u64,
+    /// Datagrams of up to the path's MTU. Each peer that is or may be established sends one MTU
+    /// probe: a search has one in flight, and a probe is lost only once a later packet is
+    /// acknowledged (RFC 9002 §6.1). An established peer's first probe timeout repeats its oldest
+    /// packet whole, and what its two probes cannot hold goes beside them as its congestion window
+    /// allows: one packet more. A timeout that follows an unanswered one repeats no stream data
+    /// (`Connection::poll_transmit`), so a peer this side has stopped acknowledging sends nothing
+    /// larger after.
+    pub large: u64,
 }
 
 impl Unprompted {
@@ -84,7 +89,7 @@ impl Unprompted {
         Self {
             acknowledgements: self.acknowledgements.saturating_add(other.acknowledgements),
             probes: self.probes.saturating_add(other.probes),
-            handshake_probes: self.handshake_probes.saturating_add(other.handshake_probes),
+            large: self.large.saturating_add(other.large),
         }
     }
 }
@@ -156,10 +161,11 @@ pub struct ReceiveCharge {
     /// The greatest charge a stream byte of a message carrying stream data, as `(charged, stream)`:
     /// a datagram's or a coalesced train's.
     data: Worst<(u64, u64)>,
-    /// The greatest charge of a datagram that came alone: what a probe, one datagram, may cost.
+    /// The greatest charge of a datagram that came alone: what a datagram of up to the path's MTU
+    /// may cost.
     lone: Worst<u64>,
     /// The greatest charge of a datagram that came alone no larger than [`MIN_DATAGRAM`]: what an
-    /// acknowledgement and a handshake's probe cost, each of which fits the smallest datagram
+    /// acknowledgement and a probe cost, each of which fits the smallest datagram
     /// ([`Unprompted`]).
     small: Worst<u64>,
     /// The greatest charge a datagram of a coalesced train, its charge over its datagrams: what a
@@ -247,11 +253,11 @@ impl ReceiveCharge {
 
     /// The stream bytes the queue holds for the peers' windows, `unprompted` messages on top:
     /// `None` until a message carrying stream data has been sampled. Each unprompted message is a
-    /// datagram that comes alone: a probe is charged as the costliest datagram that came alone, an
-    /// acknowledgement and a handshake's probe as the costliest no larger than [`MIN_DATAGRAM`] (as
-    /// a probe before one has been sampled). Before any datagram has come alone, a coalesced
-    /// train's share a datagram stands in; a train is never a probe's charge, whose datagrams it
-    /// holds many of.
+    /// datagram that comes alone: an acknowledgement and a probe are charged as the costliest
+    /// datagram alone no larger than [`MIN_DATAGRAM`], a datagram of up to the path's MTU as the
+    /// costliest alone of any size (which stands in for the first before one has been sampled).
+    /// Before any datagram has come alone, a coalesced train's share a datagram stands in; a train
+    /// is never one datagram's charge, whose datagrams it holds many of.
     pub fn room(&self, queue: Queue, unprompted: Unprompted) -> Option<u64> {
         let (charged, stream) = self.data.get(costlier)?;
         let lone = self
@@ -262,9 +268,9 @@ impl ReceiveCharge {
         let small = self.small.get(greater).unwrap_or(lone);
         let reserved = unprompted
             .acknowledgements
-            .saturating_add(unprompted.handshake_probes)
+            .saturating_add(unprompted.probes)
             .saturating_mul(small)
-            .saturating_add(unprompted.probes.saturating_mul(lone));
+            .saturating_add(unprompted.large.saturating_mul(lone));
         let usable = queue
             .buffer
             .saturating_sub(queue.release_lag)
@@ -437,6 +443,15 @@ impl SocketCharge {
         self.charge.room(self.queue?, unprompted)
     }
 
+    /// The room as [`SocketCharge::room`], and what of it a peer more sending `more` unprompted
+    /// would take: what a driver says of a shared socket (hyper-transport's
+    /// `Endpoint::set_receive_capacity`).
+    pub fn rooms(&self, unprompted: Unprompted, more: Unprompted) -> Option<(u64, u64)> {
+        let room = self.room(unprompted)?;
+        let after = self.room(unprompted.plus(more))?;
+        Some((room, room.saturating_sub(after)))
+    }
+
     /// The room now in force.
     pub fn set_room(&mut self, room: u64) {
         self.room = room;
@@ -467,10 +482,10 @@ mod tests {
         assert!(!charge.measured());
     }
 
-    /// A coalesced train is never a probe's charge: probes are charged at its share a datagram
-    /// until a datagram comes alone, then at that datagram's.
+    /// A coalesced train is never one datagram's charge: datagrams of up to the path's MTU are
+    /// charged at its share a datagram until a datagram comes alone, then at that datagram's.
     #[test]
-    fn a_train_is_no_probes_charge() {
+    fn a_train_is_no_datagrams_charge() {
         let mut charge = ReceiveCharge::new();
         charge.sample(Charged {
             charged: 70_000,
@@ -480,15 +495,15 @@ mod tests {
         });
         let unprompted = Unprompted {
             acknowledgements: 0,
-            probes: 32,
-            handshake_probes: 0,
+            probes: 0,
+            large: 32,
         };
         let share = 70_000u64.div_ceil(45);
         let usable = QUEUE.buffer - QUEUE.release_lag - 32 * share;
         assert_eq!(
             charge.room(QUEUE, unprompted),
             Some(usable * 64_000 / 70_000),
-            "probes at the train's share a datagram until a datagram comes alone"
+            "at the train's share a datagram until a datagram comes alone"
         );
         charge.sample(Charged {
             charged: 2_304,
@@ -532,8 +547,9 @@ mod tests {
         );
     }
 
-    /// Unprompted messages are taken off the queue first: acknowledgements at the costliest
-    /// datagram no larger than the smallest a path carries, probes at the costliest of any.
+    /// Unprompted messages are taken off the queue first: acknowledgements and probes at the
+    /// costliest datagram no larger than the smallest a path carries, datagrams of up to the
+    /// path's MTU at the costliest of any.
     #[test]
     fn unprompted_messages_are_reserved_first() {
         let mut charge = ReceiveCharge::new();
@@ -551,25 +567,26 @@ mod tests {
         });
         let unprompted = Unprompted {
             acknowledgements: 10,
-            probes: 4,
-            handshake_probes: 0,
+            probes: 6,
+            large: 4,
         };
-        let usable = QUEUE.buffer - QUEUE.release_lag - 10 * 768 - 4 * 2_290;
+        let usable = QUEUE.buffer - QUEUE.release_lag - (10 + 6) * 768 - 4 * 2_290;
         assert_eq!(charge.room(QUEUE, unprompted), Some(usable * 1_400 / 2_290));
     }
 
-    /// A handshake's probes and acknowledgements are charged as the costliest datagram no larger
-    /// than the smallest a path carries, not as an MTU probe. Do: the shared socket of focal's
-    /// cluster tests on macOS, an 8 MiB queue: 32 places a handshake may wait in (128
-    /// connections), 30 probes each (a 10-second idle timeout) and an MTU probe each, two
-    /// connections without sockets of their own, and two acknowledgements; samples of a
-    /// 1,452-byte datagram of stream data, a 1,200-byte handshake datagram charged 2,304 (an mbuf
-    /// cluster) and a 9,216-byte MTU probe charged 9,248 (a jumbo cluster). Expect: the room is the
-    /// queue less 962 small datagrams and 94 of the MTU probe's size. Charged as the MTU probe, as
-    /// they were, the 1,020 probes and 2 acknowledgements reserved 9,451,456 bytes, past the whole
-    /// queue: the room was nothing, and every new connection was refused.
+    /// Acknowledgements and probes are charged as the costliest datagram no larger than the
+    /// smallest a path carries, not as an MTU probe. Do: the shared socket of focal's cluster tests
+    /// on macOS, an 8 MiB queue: 32 places a handshake may wait in (128 connections), 30 probes
+    /// each (a 10-second idle timeout) and an MTU probe each; two established connections without
+    /// sockets of their own, 30 probes each and two datagrams of up to the path's MTU; two
+    /// acknowledgements; samples of a 1,452-byte datagram of stream data, a 1,200-byte handshake
+    /// datagram charged 2,304 (an mbuf cluster) and a 9,216-byte MTU probe charged 9,248 (a jumbo
+    /// cluster). Expect: the room is the queue less 1,022 small datagrams and 36 of the MTU probe's
+    /// size. Charged as the MTU probe, as they were, the 1,020 probes and 2 acknowledgements
+    /// reserved 9,451,456 bytes, past the whole queue: the room was nothing, and every new
+    /// connection was refused.
     #[test]
-    fn handshakes_and_acknowledgements_are_charged_as_small_datagrams() {
+    fn acknowledgements_and_probes_are_charged_as_small_datagrams() {
         let queue = Queue {
             buffer: 8 << 20,
             release_lag: 0,
@@ -580,8 +597,8 @@ mod tests {
         assert_eq!(probes, 30);
         let unprompted = Unprompted {
             acknowledgements: 2,
-            probes: places + connections * (probes + 1),
-            handshake_probes: places * probes,
+            probes: (places + connections) * probes,
+            large: places + connections * 2,
         };
         let mut charge = ReceiveCharge::new();
         charge.sample(Charged {
@@ -602,12 +619,11 @@ mod tests {
             datagrams: 1,
             bytes: 9_216,
         });
-        let small = 2 + places * probes;
-        let large = places + connections * (probes + 1);
-        assert_eq!((small, large), (962, 94));
-        let usable = queue.buffer - small * 2_304 - large * 9_248;
+        let small = 2 + (places + connections) * probes;
+        assert_eq!((small, unprompted.large), (1_022, 36));
+        let usable = queue.buffer - small * 2_304 - unprompted.large * 9_248;
         assert_eq!(charge.room(queue, unprompted), Some(usable * 1_400 / 2_290));
-        let before = (2 + places * probes + connections * probes) * 9_248;
+        let before = small * 9_248;
         assert_eq!(before, 9_451_456);
         assert!(before > queue.buffer, "as before, past the whole queue");
     }
@@ -622,7 +638,7 @@ mod tests {
         let acknowledgement = Unprompted {
             acknowledgements: 1,
             probes: 0,
-            handshake_probes: 0,
+            large: 0,
         };
         charge.sample(Charged {
             charged: 4_000,

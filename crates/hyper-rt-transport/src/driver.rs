@@ -204,7 +204,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             .socket()
             .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
         let unmeasured = endpoint.unmeasured_room();
-        endpoint.set_receive_capacity(unmeasured);
+        endpoint.set_receive_capacity(unmeasured, 0);
         let anchor = (shard_now()?, Instant::now());
         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
         Ok(Self {
@@ -573,12 +573,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 |endpoint| Some(endpoint.stream_bytes_received_shared()),
             )?;
             self.listener_ready = ended == Queued::More;
-            let unprompted = self.endpoint.unprompted_shared();
-            let room = self
+            let (room, handshake) = self
                 .measure
-                .room(unprompted)
-                .unwrap_or_else(|| self.endpoint.unmeasured_room());
-            self.endpoint.set_receive_capacity(room);
+                .rooms(
+                    self.endpoint.unprompted_shared(),
+                    self.endpoint.unprompted_handshake(),
+                )
+                .unwrap_or_else(|| (self.endpoint.unmeasured_room(), 0));
+            self.endpoint.set_receive_capacity(room, handshake);
             self.measure.set_room(room);
         }
         for peer in &mut self.peers {

@@ -547,6 +547,9 @@ struct Core<C: Classes, B, D> {
     pool: Pool,
     /// What the socket's receive queue holds of the windows granted ([`Room`]).
     room: Room,
+    /// The room a handshake's peer's unprompted messages take, as last said
+    /// ([`Endpoint::set_receive_capacity`]): what a first window is taken with.
+    handshake_room: u64,
     /// Moves whenever a connection is identified or goes ([`Endpoint::connection_generation`]).
     generation: u64,
     /// Lanes whose next frame waits for the budget ([`Reading::Reserving`]) and that their owner
@@ -575,24 +578,16 @@ fn length(bytes: usize) -> u64 {
 /// What `quic`'s peer may send unprompted by any window while this side does not read: an
 /// acknowledgement for each of this side's ack-eliciting packets in flight to it, and `probes`
 /// loss probes, those of the idle timeout ([`crate::probes_within`]). While the connection
-/// handshakes, its probes are a handshake's, and its peer sends no MTU probe: an inbound handshake
-/// waits in an admission place ([`Endpoint::unprompted_shared`]), so this is a connection this
-/// side dialed, whose server is established only after it. Once established, its probes are of
-/// up to the path's MTU, and one MTU probe comes beside them.
+/// handshakes its peer sends nothing larger: an inbound handshake waits in an admission place
+/// ([`Endpoint::unprompted_shared`]), so this is a connection this side dialed, whose server is
+/// established only after it. Once established, the peer sends two datagrams of up to the path's
+/// MTU beside them: the rest of the packet its first probe timeout repeats, and an MTU probe
+/// ([`Unprompted::large`]).
 fn unprompted_by(quic: &Connection, probes: u64) -> Unprompted {
-    let acknowledgements = quic.ack_eliciting_in_flight();
-    if quic.is_handshaking() {
-        Unprompted {
-            acknowledgements,
-            probes: 0,
-            handshake_probes: probes,
-        }
-    } else {
-        Unprompted {
-            acknowledgements,
-            probes: probes.saturating_add(1),
-            handshake_probes: 0,
-        }
+    Unprompted {
+        acknowledgements: quic.ack_eliciting_in_flight(),
+        probes,
+        large: if quic.is_handshaking() { 0 } else { 2 },
     }
 }
 
@@ -706,6 +701,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 stats: Stats::default(),
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
                 room: Room::unbounded(),
+                handshake_room: 0,
                 generation: 0,
                 reserving: 0,
                 reserving_at: Vec::new(),
@@ -1498,15 +1494,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .saturating_add(reserve)
     }
 
-    /// The socket's receive queue holds `bytes` of its peers' stream data: what its driver's
+    /// The socket's receive queue holds `bytes` of its peers' stream data, the unprompted messages
+    /// of every connection on it counted ([`Endpoint::unprompted_shared`]): what its driver's
     /// [`crate::ReceiveCharge`] tells of the buffer the socket reports, or before anything is
-    /// measured [`Endpoint::unmeasured_room`]. From now the windows granted, summed, never pass
-    /// it, a window grows only while what is left holds the first windows of the
-    /// handshakes that may come, and a connection whose first window it cannot hold is refused
-    /// [`Refusal::ReceiveBuffer`] (`credit`'s socket room). Windows granted already stand until they
-    /// are given back.
-    pub fn set_receive_capacity(&mut self, bytes: u64) {
+    /// measured [`Endpoint::unmeasured_room`]. `handshake` is the room one handshake more would
+    /// take for its peer's ([`Endpoint::unprompted_handshake`]; nothing before a measurement). From
+    /// now the windows granted, summed, never pass it: a connection is taken only with room for its
+    /// first window and its peer's unprompted messages, else refused [`Refusal::ReceiveBuffer`],
+    /// and a window grows only while what is left holds both for each handshake admission may
+    /// still let wait (`credit`'s socket room). Windows granted already stand until they are given
+    /// back.
+    pub fn set_receive_capacity(&mut self, bytes: u64, handshake: u64) {
         self.core.room.set_capacity(bytes);
+        self.core.handshake_room = handshake;
     }
 
     /// The owner holds `peer`'s lane `lane`: nothing more of it is read until the owner lets it go
@@ -1635,34 +1635,40 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// What the shared socket's peers may send it unprompted: each connection without a socket of
-    /// its own, as [`Endpoint::unprompted`], and each place admission lets a handshake wait in,
-    /// taken or not. A place holds a handshake's loss probes and one MTU probe: a client's
-    /// handshake is done once it sends its Finished, its server's only once that is read (RFC 9001
-    /// §4.1.1), so the client may be established and probing while its server waits. A handshake
-    /// in a place is counted in it, and only its acknowledgements beside: counted again as a
-    /// connection, each handshake admission let wait was charged twice.
+    /// its own, as [`Endpoint::unprompted`], a handshake waiting in an admission place as
+    /// [`Endpoint::unprompted_handshake`] with its acknowledgements. Only the places taken count:
+    /// a place no handshake holds has no peer to send, and a handshake taken later is taken with
+    /// room for its own ([`Endpoint::set_receive_capacity`]). Every place was reserved, taken or
+    /// not, and a handshake in one counted again as a connection: on Linux's default buffer
+    /// focal's 32 places took 860 KB of a 319 KB queue, and every first window was refused.
     pub fn unprompted_shared(&self) -> Unprompted {
         let probes = probes_within(self.core.limits.idle_timeout);
-        let places = u64::try_from(self.core.limits.admission.pending).unwrap_or(u64::MAX);
-        let waiting = Unprompted {
-            acknowledgements: 0,
-            probes: places,
-            handshake_probes: places.saturating_mul(probes),
-        };
         self.conns
             .iter()
             .flatten()
             .filter(|conn| conn.room.is_none())
-            .fold(waiting, |sum, conn| {
+            .fold(Unprompted::default(), |sum, conn| {
                 sum.plus(if conn.pending {
                     Unprompted {
                         acknowledgements: conn.quic.ack_eliciting_in_flight(),
-                        ..Unprompted::default()
+                        ..self.unprompted_handshake()
                     }
                 } else {
                     unprompted_by(&conn.quic, probes)
                 })
             })
+    }
+
+    /// What a handshake waiting in an admission place may send unprompted besides its
+    /// acknowledgements: its loss probes, and one MTU probe. A client's handshake is done once it
+    /// sends its Finished, its server's only once that is read (RFC 9001 §4.1.1), so the client
+    /// may be established and probing while its server waits.
+    pub fn unprompted_handshake(&self) -> Unprompted {
+        Unprompted {
+            acknowledgements: 0,
+            probes: probes_within(self.core.limits.idle_timeout),
+            large: 1,
+        }
     }
 
     /// The room the shared socket must hold before anything is measured: the first window of every
@@ -1998,7 +2004,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// first, then the budget's bytes.
     fn window_grant(&mut self) -> Result<Reservation, Refusal> {
         let bytes = Self::first_window();
-        self.room.first(bytes)?;
+        self.room.first(bytes, self.handshake_room)?;
         match self.budget.reserve(bytes, Lane::Window) {
             Ok(grant) => Ok(grant),
             Err(refusal) => {
@@ -2014,13 +2020,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         initial_window(MIN_DATAGRAM).saturating_add(reserve)
     }
 
-    /// The room a window's growth leaves: the first windows of the handshakes admission may still
-    /// let wait at once.
+    /// The room a window's growth leaves: for each handshake admission may still let wait at once,
+    /// its first window and the room its peer's unprompted messages take.
     fn kept_for_handshakes(&self) -> u64 {
         let limit = self.limits.admission.pending;
         let waiting = self.admission.stats().pending;
         let more = u64::try_from(limit.saturating_sub(waiting)).unwrap_or(u64::MAX);
-        more.saturating_mul(Self::first_window())
+        more.saturating_mul(Self::first_window().saturating_add(self.handshake_room))
     }
 
     /// A window grant given back: its room in the socket's queue and its bytes.

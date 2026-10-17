@@ -773,9 +773,13 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   on Windows and in simulation, as hyper-tokio does, handed over on the **shard's clock**, the one its
   timers run on. The kernel stamps on a clock of its own (`CLOCK_REALTIME`; `mach_absolute_time`, which
   stops while the host sleeps where the shard's `CLOCK_MONOTONIC` does not), so a stamp is carried over by
-  its age: the stamps' clock read after the receive and the shard's after it, so a preemption between the
-  two makes a stamp late, never early; held within the read's time and no earlier than the arrival before
-  it (`udp/batched.rs`).
+  the offset between the clocks: the stamps' clock read after the receive and the shard's after it, so a
+  preemption between the two makes a stamp late, never early; held within the read's time and no earlier
+  than the arrival before it (`udp/batched.rs`). On Linux a step of the realtime clock between a datagram's
+  arrival and its read moves the read's offset and not the stamp's, so a stamp is carried by the least
+  offset read since the read before the last batch that emptied the socket, and to no earlier than that
+  read: late by a step at most, never early (`udp/carry.rs`, as hyper-tokio's `clock::Carry`). macOS's
+  offset only grows, by the time the host slept, so the latest one carries a stamp late, never early.
 - **Drops told by the traffic.** On Linux a socket asks for `SO_RXQ_OVFL`: each datagram queued once the
   socket has dropped any for want of room carries the count since the socket was made, and the socket
   keeps the latest (`IoStats::drops`, `Some(0)` until a datagram says more, `None` where the kernel does

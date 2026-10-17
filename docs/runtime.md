@@ -267,9 +267,14 @@ one poll a spin with a wait held and a quantum longer than the window, where eve
 **Every way of running the loop takes the driver's completions.** The harvest is part of the step
 (`harvest_turn`), not of the threaded `run` alone, so `block_on`, `run_until_idle` and a caller's own
 `step` and `park` deliver readiness as `run` does. A busy native turn asks the driver once a quantum, the
-same quantum the spin uses, measured from the driver's last actual retrieval; an idle turn asks at once;
-the simulation asks every turn, since its virtual clock does not advance while a task runs and a quantum
-would never pass. Only a wait in the driver renews the retrieval's age: a park skipped for ready local
+same quantum the spin uses, measured from the driver's last actual retrieval. An idle turn leaves the ask
+to the park that follows, whose wait returns at once with what is ready (`harvest_owed`); the spin and
+`run_until_idle`, which may not park, ask first, and a caller's own `step` loop finds the driver asked
+once a quantum, as a busy turn does. An idle turn used to ask at once, a zero-timeout wait before the
+park's: two system calls for one answer, which at 10,000 one-datagram messages a second made a bus node
+ask its driver twice a message (2026-10-16; `tests/idle_spin.rs`: an idle shard with a wait held parks
+at its timers' pace and asks its driver in no idle turn). The simulation asks every turn, since its
+virtual clock does not advance while a task runs and a quantum would never pass. Only a wait in the driver renews the retrieval's age: a park skipped for ready local
 work, or a spin answered by an inbox, does not postpone it. Before, a task that yielded continuously
 kept `block_on`, a manual `step` loop and a skipped `park` from ever asking, so a datagram already in the
 socket waited until the yielding task stopped (`tests/busy_readiness.rs`, `manual_step_readiness.rs`,
@@ -771,6 +776,11 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   its age: the stamps' clock read after the receive and the shard's after it, so a preemption between the
   two makes a stamp late, never early; held within the read's time and no earlier than the arrival before
   it (`udp/batched.rs`).
+- **Drops told by the traffic.** On Linux a socket asks for `SO_RXQ_OVFL`: each datagram queued once the
+  socket has dropped any for want of room carries the count since the socket was made, and the socket
+  keeps the latest (`IoStats::drops`, `Some(0)` until a datagram says more, `None` where the kernel does
+  not tell). A drop is so known without reading the socket's account, a system call; one after the last
+  datagram received is told by the next (docs/transport.md §4l).
 - **Astray reports.** A UDP socket reports an earlier datagram's ICMP refusal or unreachable (and, on
   Windows, a send to a closed port as `WSAECONNRESET`) on a later call that moves no data. The seam returns
   it as its own outcome, counted and read past, never an error of the socket; a batched receive reads past

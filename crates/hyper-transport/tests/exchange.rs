@@ -2891,6 +2891,81 @@ fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
     assert_eq!(stats.frames_reserving, 0);
 }
 
+/// A held lane's frame waits for its owner, not for the budget: holding the lane takes its waiting
+/// frame out of `frames_reserving`, so an owner that gives memory to the frames waiting for it (a
+/// bus node gives its window's) is not asked to for a frame no memory moves, and a retry does not
+/// read it. Let go, the frame waits for the budget again, is read once the budget holds it, and
+/// every frame arrives, in order.
+#[test]
+fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
+    const FRAMES: u32 = 60;
+    const FRAME: usize = 1_000;
+    // Room for the connection's first window and its streams' heads, and a dozen frames.
+    let budget = first_window() * 2 + 12 * FRAME as u64;
+    let pair = Pair::new();
+    let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
+    let frame = |sequence: u32| {
+        let mut body = [9u8; FRAME];
+        body[..4].copy_from_slice(&sequence.to_be_bytes());
+        body
+    };
+    let mut sent = 0u32;
+    // The receiver polls nothing until its budget is full and the next frame waits for it.
+    let mut held = 0;
+    while held < 8 {
+        match net.a.send_frame(2, 0, Kind::Append, &frame(sent)) {
+            Ok(()) => {
+                sent += 1;
+                held = 0;
+            }
+            Err(Refusal::LaneFull) => {
+                held += 1;
+                net.exchange();
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(sent < FRAMES, "the sender was never held");
+    }
+    assert_eq!(net.b.frames_reserving(), 1, "the next frame waits for the budget");
+    // Held, it waits for its owner: the budget given back moves nothing of it.
+    net.b.hold_lane(1, 0).unwrap();
+    assert_eq!(net.b.frames_reserving(), 0, "a held lane waits for its owner");
+    assert_eq!(net.b.stats().frames_reserving, 0);
+    let mut order = Vec::new();
+    let take = |net: &mut Net<Node<Kept>, Node<Kept>>, order: &mut Vec<u32>| {
+        while let Some(event) = net.b.poll_event() {
+            if let Event::Frame { frame, .. } = event {
+                order.push(u32::from_be_bytes(frame.bytes()[..4].try_into().unwrap()));
+                net.b.release(frame);
+            }
+        }
+    };
+    take(&mut net, &mut order);
+    let before = order.len();
+    assert!(before > 0, "the frames the budget held were read");
+    net.b.retry_reserving();
+    net.exchange();
+    take(&mut net, &mut order);
+    assert_eq!(order.len(), before, "nothing more read of a held lane");
+    assert_eq!(net.b.frames_reserving(), 0);
+    // Let go: its frame is reserved now that the budget holds it, and the sender sends the rest.
+    net.b.release_lane(1, 0).unwrap();
+    for _ in 0..10_000 {
+        take(&mut net, &mut order);
+        while sent < FRAMES && net.a.send_frame(2, 0, Kind::Append, &frame(sent)).is_ok() {
+            sent += 1;
+        }
+        if order.len() == FRAMES as usize {
+            break;
+        }
+        net.exchange();
+    }
+    assert_eq!(order, (0..FRAMES).collect::<Vec<_>>(), "every frame, in order");
+    let stats = net.b.stats();
+    assert_eq!(stats.frames_dropped, 0, "none dropped");
+    assert_eq!(stats.frames_reserving, 0);
+}
+
 /// The same receiver, its frames' class lossy, skips what its budget cannot hold, and counts it.
 #[test]
 fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {

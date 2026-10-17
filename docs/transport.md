@@ -308,7 +308,9 @@ rule, Dumazet 2012) it held as much as CUBIC's window, which on loopback, where 
 grew to 1.55 GB: a publisher the node held queued 470 ms in its own lane. And an owner that cannot take more holds the
 peer's lane (`Endpoint::hold_lane`, `release_lane`): read no further past its opening, the peer is
 held at QUIC's flow control and its own lane fills, where it would otherwise queue in the owner
-without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median). Admission
+without bound (a bus node took a stalled subscriber's every publish, 2.5 s at the median); a held
+lane's frame that waited for the budget waits for its owner instead, and leaves the count of frames
+waiting for memory until it is let go (§4m). Admission
 bounds pending handshakes (Retry under load), identities, connections per identity (the idle one
 used longest ago replaced, below) and connections in all; every exchange and lane has a table bound.
 Every refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
@@ -1069,6 +1071,71 @@ the default's 25 ms delay held it past 25 ms; a tail loss is probed sooner. The 
 bounds hold: the delay asked stays under the smoothed round trip wherever the peer's granularity
 allows (draft-ietf-quic-ack-frequency-14 §8.1), and the pacer, not the acknowledgements, spaces a
 sender's bursts (§8.2).
+
+## 4l. A socket's account read at an epoch's doublings (2026-10-16)
+
+The measured room (§4i) read each socket's account, `SO_MEMINFO` (a `getsockopt`), before every
+drain, and again after a drain that took one message alone: two system calls a drain wherever the
+traffic comes a datagram at a time. On the bare-metal bench a bus node at 10,000 messages a second
+made 8.3 system calls a message, 2.4 of them these reads (1.7 of 5.3 at 100,000).
+
+The samples were worth taking only as the room needs them. The room is the worst charge a stream
+byte over the current window epoch and the one before (§4i), and an epoch that brings no sample
+keeps the worst it had, so it is enough that each epoch bring one where it can, and that a change
+of traffic within an epoch be read soon. A socket now reads its account at every drain until a
+message carrying stream data is measured, and then at an epoch's drains 0, 2, 6, 14, …, each read at
+twice the drains before it (`SocketCharge::wants_before`): an epoch of `n` drains reads about
+log₂ `n` times, and an epoch's end starts the count again. A read that finds a singleton is a sample
+as before.
+
+The reads also said when the kernel had dropped what the queue could not hold, which forgets the
+samples (§4i). A drop is now told by the traffic itself: each socket asks the kernel for
+`SO_RXQ_OVFL`, the count of datagrams it dropped for want of room, attached to each datagram queued
+once the count is past zero (socket(7)), and the driver gives the socket's latest count to its
+measure after each drain (`SocketCharge::drops`). A drop after the last datagram received is told by
+the next, which is when the room is next used. Linux only; the account on macOS tells no drops, as
+before. hyper-tokio keeps its reads before every drain: its sockets do not parse the count.
+
+Measured on the bare-metal bench, interleaved A/B pairs against the same tree reading before
+every drain:
+
+| Rate, condition | Pairs | CPU a message (median) | p99 | p99.9 |
+|---|---|---|---|---|
+| 100,000/s | 3 | 6,082 ns (6,207 before) | 0.56 ms (0.62) | 1.80 ms (1.91) |
+| 10,000/s | 3 | 7,135 ns (7,434) | 0.04 ms (0.04) | 0.14 ms (0.22) |
+| 10,000/s, busy core | 3 + 6 | 7,767 and 8,057 ns (7,920 and 8,609) | 0.04 ms (0.04) | 0.30 and 0.61 ms (0.11 and 0.85) |
+
+The busy rows are two passes, the second with other work loading the machine. No socket dropped a
+datagram (`RcvbufErrors` 0). The largest room measured rose by about a fifth (1.46 MB to 1.69–1.82
+MB): fewer samples see fewer of an epoch's worst charges.
+
+Tests: `charge::tests::the_account_is_read_at_doublings_of_an_epochs_drains` (the reads' drains,
+through two epochs), `a_drop_the_traffic_tells_forgets_the_samples`, and on Linux
+`udp_batched::a_drop_is_told_by_the_next_datagram` (an overflowed socket's next datagram counts
+every datagram it could not hold).
+
+## 4m. A held lane's frame waits for its owner (2026-10-16)
+
+A lossless frame the budget cannot hold waits in `Reading::Reserving`, counted in
+`Stats::frames_reserving`, and an owner that can give memory back reads that count: focal's bus
+node gives such a frame the room of its window's oldest batches. A lane its owner holds (§4a) is
+not read, so its waiting frame is not asked again whatever the budget holds, but it stayed
+counted. On the bare-metal bench a node held a publisher whose frame had been refused while its
+memory was short (1,000,000 messages a second on a busy core). From then on it saw a frame
+waiting at every turn and gave it the window: every batch went, the node holding 16 MB of its
+1.5 GiB, and the subscriber the publisher was held for was told a gap of 1,817 offsets.
+
+A held lane's waiting frame now waits for its owner: holding the lane takes the frame out of the
+count, and letting it go puts the frame back and reads it on (`mark_lanes`). The count is also
+kept for each connection, and a retry visits only the connections with a frame waiting
+(`Endpoint::retry_reserving`). It used to take every connection out and put it back, which had
+each one given its turn to transmit and placed again by its deadline at the next poll
+(`read_touched`). `Endpoint::frames_reserving` reads the count without visiting every
+connection, as `stats` does.
+
+Test: `exchange::a_held_lanes_frame_waits_for_its_owner_not_the_budget`. Holding the waiting lane
+takes it out of the count, and a retry and the budget given back read nothing of it. Let go, it
+is reserved and read on, and every frame arrives in order.
 
 ## 5. Consumers
 

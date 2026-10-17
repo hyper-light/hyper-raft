@@ -146,6 +146,37 @@ is worked around.
 
 ### Closed (2026-10-16)
 
+- **hyper-rt: an idle turn asked the driver twice.** A step that found the shard idle with
+  readiness waits registered asked its driver at once, a zero-timeout wait, and the park that
+  followed asked again in its own wait: two system calls for one answer at every idle moment, one
+  of each a message for a bus node at 10,000 one-datagram messages a second. An idle turn now
+  leaves the ask to the park, whose wait returns at once with what is ready (`harvest_owed`). The
+  spin and `run_until_idle`, which may not park, ask first, and a caller's own `step` loop finds the
+  driver asked once a quantum, as a busy turn does. Test: `idle_spin::an_idle_shard_parks_without_asking_its_driver_first`
+  (41 parks, 41 asks before; none now).
+
+- **hyper-transport: a held lane's frame was counted as waiting for memory.** A lossless frame the
+  budget could not hold stayed in `Stats::frames_reserving` after its owner held its lane, though no
+  memory could move it. Focal's bus node gives such frames the room of its window, so at
+  1,000,000 messages a second on a busy core (the bare-metal bench) it gave the window away at
+  every turn until none was left. It held 16 MB of its 1.5 GiB at the time, and told a subscriber
+  a gap of 1,817 offsets (`docs/transport.md` §4m). Holding a lane now takes its waiting frame out
+  of the count, and letting the lane go puts the frame back and reads it on. A retry visits only
+  the connections with a frame waiting, where it took every connection out and back.
+  `Endpoint::frames_reserving` reads the count without the visit `stats` makes. Test:
+  `exchange::a_held_lanes_frame_waits_for_its_owner_not_the_budget`.
+
+- **hyper-rt, hyper-transport, hyper-rt-transport: a socket's account was read twice a drain.** The
+  measured room read each socket's account (`SO_MEMINFO`, a `getsockopt`) before every drain, and
+  again after a drain that took one message alone. On the bare-metal bench a bus node at 10,000
+  messages a second made 8.3 system calls a message, 2.4 of them these reads. A socket now reads
+  its account at an epoch's drains 0, 2, 6, 14, … (`SocketCharge::wants_before`). A drop is told
+  by the traffic, not by the reads: `SO_RXQ_OVFL`, attached to each datagram once the kernel has
+  dropped one. Measured (interleaved A/B, `docs/transport.md` §4l): CPU a message 2–6 % less at
+  10,000 and 100,000 a second and on a busy core, with p99 and p99.9 no worse. Tests:
+  `charge::tests::the_account_is_read_at_doublings_of_an_epochs_drains`,
+  `a_drop_the_traffic_tells_forgets_the_samples`, `udp_batched::a_drop_is_told_by_the_next_datagram`.
+
 - **hyper-quic, hyper-transport: a third of a bus node's datagrams were acknowledgements.** Every
   connection acknowledged every other ack-eliciting packet (RFC 9000 §13.2.2's default), so at
   100,000 one-packet messages a second a node handled 3.4 datagrams a message, 1.0 of them

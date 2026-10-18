@@ -921,6 +921,85 @@ fn a_peers_time_to_answer_begins_when_it_has_the_request() {
     assert!(took >= Duration::from_secs(4), "{took:?}");
 }
 
+/// A request smaller than a datagram is given a whole period once the peer has it, as a larger one
+/// is: the peer that answers it within its period of having it is never refused, though the answer
+/// arrives more than a period after the send. Do: over a path of 60 ms each way, ask a head-only
+/// request of a server that answers nine tenths of a period after it has it. Expect: answered, a
+/// period and more after the send. Charged a datagram at the end of the period it was sent in, it
+/// was refused `Stalled` there, 20 ms before its answer came (focal's seal of 93 bytes, its peer's
+/// "not yet" sent as the peer's period ended and 24 ms late on a loaded host).
+#[test]
+fn a_request_smaller_than_a_datagram_is_given_its_period_once_the_peer_has_it() {
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let a = pair.node::<Mantle>(
+        1,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        256 << 20,
+        now,
+    );
+    let b = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        256 << 20,
+        now,
+    );
+    let one_way = Duration::from_millis(60);
+    let mut net = Net::shaped(now, a, b, 100_000_000, 64 * 1_200, one_way);
+    net.shape_back(100_000_000, 64 * 1_200, one_way);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    net.until(TURNS, |net| {
+        let a = events(&mut net.a)
+            .iter()
+            .any(|event| matches!(event, Event::Connected { .. }));
+        let _ = events(&mut net.b);
+        a
+    });
+    // Settled, as a connection that has served before is: what the handshake left to send and the
+    // search for the path's MTU are done, so the request is all the period carries.
+    for _ in 0..TURNS {
+        net.exchange();
+        let _ = events(&mut net.a);
+        let _ = events(&mut net.b);
+        net.advance_within(Duration::from_millis(10));
+    }
+    let period = Duration::from_secs(1);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.think = period * 9 / 10;
+    let began = net.now;
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Get, Class::Request),
+            1,
+            None,
+            period,
+        )
+        .unwrap();
+    for _ in 0..TURNS {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.now = Some(net.now);
+        server.serve(&mut net.b);
+        if asker.finished() {
+            break;
+        }
+        net.exchange();
+        net.advance_within(Duration::from_millis(10));
+    }
+    assert!(asker.finished());
+    assert_eq!(asker.asked[0].refused, None, "{:?}", asker.asked[0]);
+    let took = net.now - began;
+    assert!(took > period, "{took:?}");
+}
+
 /// A stream its peer never reads ends by its own bytes (focal's audit F38), and the exchanges of its
 /// class beside it on the connection go on. Do: ask 2 MiB the server never reads, then small requests
 /// of the same class one after another, which it answers. Expect: the large one refused `Stalled`

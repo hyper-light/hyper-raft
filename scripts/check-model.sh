@@ -40,7 +40,8 @@ workers="${TLC_WORKERS:-1}"
 # one that passes; the part of CI's model job it runs in (.github/workflows/ci.yml, where the parts
 # run side by side); the module checked, FastTrack unless named (a scenario, FastTrackScenario, is
 # FastTrack held to an order of leaders and proposals; Reconfig, the configuration a member counts
-# by across two changes, docs/research/reconfiguration.md §5).
+# by across two changes, docs/research/reconfiguration.md §5; Held, core step R-8's commits on
+# entries held in memory, docs/raft.md §3.7).
 configurations="
 one          FastTrack.cfg                -                       fast
 round        FastTrackRound.cfg           -                       fast
@@ -81,6 +82,13 @@ designb      FastTrackScenarioB.cfg       -                       scenario FastT
 designblog   FastTrackScenarioBLog.cfg    -                       scenario FastTrackScenario
 roundballot  FastTrackRoundBallot.cfg     -                       fast
 oneb         FastTrackB.cfg               -                       fast
+held         Held.cfg                     -                       held     Held
+heldreach    HeldReached.cfg              NoHeldCommit            held     Held
+heldmemory   HeldLeaderMemory.cfg         LeaderHolds             held     Held
+heldpast     HeldPastPromise.cfg          LeaderHolds             held     Held
+heldcover    HeldCoverOnly.cfg            LeaderHolds             held     Held
+heldlower    HeldLowerPromise.cfg         LeaderHolds             held     Held
+heldownlog   HeldOwnLog.cfg               LeaderHolds             held     Held
 "
 
 if [ "${1:-}" = "--parts" ]; then

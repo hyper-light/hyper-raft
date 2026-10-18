@@ -289,6 +289,61 @@ liveness property (`docs/raft.md` §3.3). CI's TLC counted both (run 37387647725
 mirror's 667,123, `rlength` refused at 848). The mirror finds the same
 (`by_the_logs_precedence_a_group_with_every_member_up_can_always_elect`).
 
+**Commits on entries held in memory (`Held.tla`, core step R-8, 2026-10-18).** A third module, of
+the classic core of three voters, each its own fate, whose followers answer for memory under a
+durable promise and whose leader commits on the first of the classic quorum and a held quorum
+(`docs/raft.md` §3.7). It is hyper-check's model of the step (`tests/models/held.rs`) written as a
+specification, state for state: the same variables, steps and guards. TLC's distinct states under
+the members' symmetry are that search's classes, as the FastTrack mirror's are TLC's, so `held`
+states the Rust search's count before TLC has run it, and TLC's count checks the transcription.
+The refused configurations are each at the smallest scope at which the Rust search's shortest
+history finds the defect (8, 8, 14, 15 and 13 steps, 2,813, 4,929, 902,347, 1,627,973 and 548,792
+classes searched); their counts are TLC's own and await the branch's first CI run, which they state
+a ceiling for until then.
+
+| Name | Configuration | Bounds | Distinct states | Result |
+|---|---|---|---|---|
+| `held` | `Held.cfg` | 3 voters, each its own fate, 2 terms, 2 indexes, a write out at a time | 13,383,629 (hyper-check's) | passes |
+| `heldreach` | `HeldReached.cfg` | `held` and the claim `NoHeldCommit` | first CI run | refused: `NoHeldCommit` |
+| `heldmemory` | `HeldLeaderMemory.cfg` | a leader counting its memory, 2 terms, 1 index | first CI run | refused: `LeaderHolds` |
+| `heldpast` | `HeldPastPromise.cfg` | an answer for memory with no promise, 2 terms, 1 index | first CI run | refused: `LeaderHolds` |
+| `heldcover` | `HeldCoverOnly.cfg` | an answer under the durable promise alone, past a lower one out | first CI run | refused: `LeaderHolds` |
+| `heldlower` | `HeldLowerPromise.cfg` | a write stating a promise below what the member answered for | first CI run | refused: `LeaderHolds` |
+| `heldownlog` | `HeldOwnLog.cfg` | a mark narrowed to the member's own durable log | first CI run | refused: `LeaderHolds` |
+
+What each shows:
+- `held`: Leader Completeness and agreement in every run of the scope. A held quorum spans the
+  leader's fate whether or not the leader holds the entry, and the leader counts itself by its disk
+  alone, so with three members a held quorum without a disk among it spans all three: `Spanning` of
+  three is the same search (the Rust search's classes and every path count are the same at both).
+- `heldreach` shows `held` commits an entry fewer than a majority of disks hold; a classic commit
+  never does, for a majority's disks held it when it was counted and no later append takes a
+  committed entry from a log.
+- The five refused by `LeaderHolds` are the rules the argument of §3.7 rests on, each taken out.
+  Ending a promise's mark by index alone (`Mutant = "index"`) has no configuration: the Rust search
+  does not refuse it at three terms (58,184,381 classes), for the stale tails a member can reach
+  are a later leader's entries over what it answered for, which no committed entry was, and at two
+  terms none is reachable; the core keeps the log's order, which the argument states.
+
+| Action | What it is in `crates/hyper-raft` |
+|---|---|
+| `Elect(c, t, G)` | `Raft::campaign` and `Raft::step_vote`: a voter judges by `Raft::claim` (its mark while marked, R-5), a marked candidate's own vote is not counted (R-7); `Raft::become_leader` ends the mark and writes the first entry. |
+| `Take(l)` | The leader's proposal appended to its log. |
+| `Replicate(l, f, k)` | `Raft::handle_append_entries` (`Log::maybe_append`); `through` is `HeldCommit::through`, how far the member's log is known to match its leader's. |
+| `HeldAnswer(f)` | `Raft::answer_held` for what `Raft::held_cover` covers: the durable promise and every promise out, while the member answers its leader (`Raft::answers_held`) and is not marked. |
+| `DurableAnswer(f)` | `Raft::handle_append_response` at the leader: the member's persisted index (`Progress::matched`). |
+| `Issue(s, p)` | A ready's `HardState::held_index`/`held_term` (`Raft::refresh_held_promise`, `Raft::held_taken`): any index of the member's term while it follows a matched leader, which covers every reach the probe states; never below what it owes unless its log reaches it; none where its log reaches it. |
+| `Complete(s)` | `Raft::held_durable` at `RawNode::persist_through` and `advance_through`; a mark its log reaches ends (`Lost::reached_by`). |
+| `Crash(s)` | A restart on hyper-log's `HardState` and its promise: `Raft::open_held` marks through a promise the durable log does not reach. |
+| `Commit(l, i)` | `Raft::maybe_commit` with `Raft::held_quorum_index` (`Progress::held_quorum_index`, `held_half`): the leader by its persisted index, a holder's disk waiving the span. |
+| `Narrow(l, m)` | `Raft::hear_asking` (the leader's heartbeat with `Message::incarnation` and `end`) and `Raft::narrow_held` at the member. |
+
+What it leaves out, and why it is sound to: the probe's reach and the idle withdrawal only choose
+among the promises `Issue` may state; suspicion (`Raft::suspect_held`) and a member of one fate
+only refuse held answers the model counts; a write out deeper than one is the pipeline schedules'
+(`tests/pipeline.rs`); an incarnation names the member the leader's word is for, and the model's
+`Narrow` acts on the member as it is, with no stale word to refuse.
+
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a
 `StateBudget` it cannot exceed without being stopped, and its count recorded here with the run.

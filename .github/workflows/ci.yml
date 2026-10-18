@@ -99,11 +99,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [fast, change, small, reconfig, scenario]
+        part: [fast, change, small, reconfig, scenario, held]
     runs-on: ubuntu-24.04
     # The state bound is what bounds the work; this catches a checker that stopped making
     # progress: twice the whole suite's measured time at one worker (docs/models/README.md),
-    # which every part is within.
+    # which every part is within. The held part (Held.tla, core step R-8, 2026-10-18) is not yet
+    # measured: its passing configuration has 13,383,629 states, 1.4 times grow's 9,551,710, which
+    # the change part runs within this; its first run's time is the measurement to state here.
     timeout-minutes: 131
     env:
       TLA_TOOLS: ${{ github.workspace }}/target/tla
@@ -129,7 +131,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - run: diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast reconfig scenario small)
+      - run: diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast held reconfig scenario small)
   explore:
     # hyper-check's exhaustive searches at full scope (docs/sim.md §15.1): slates' models at the
     # class counts slates recorded, every rejected variant refused by its shortest history, and

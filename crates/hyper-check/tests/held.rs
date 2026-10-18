@@ -38,6 +38,12 @@ fn scope(max_term: u8, max_len: usize, spanning: usize, mutant: Mutant) -> Scope
     }
 }
 
+/// The distinct states `docs/models/Held.cfg` states, at two terms and two indexes: the TLA+
+/// specification (`docs/models/Held.tla`) is this model state for state, so TLC's count under the
+/// members' symmetry is this search's class count. Spanning three is the same search with three
+/// members each its own fate (`Held.tla` says why), so both spans count it.
+const HELD_CFG_STATES: u64 = 13_383_629;
+
 /// The core's rules at two terms and two indexes, and at three terms and two: every run holds
 /// Leader Completeness and agreement, and each mechanism the argument rests on is reached.
 #[test]
@@ -74,22 +80,27 @@ fn the_cores_rules_hold_every_committed_entry() {
         ] {
             assert!(report.taken(&model, path) > 0, "{path} never reached");
         }
+        if (max_term, max_len) == (2, 2) {
+            assert_eq!(report.classes, HELD_CFG_STATES, "spanning {spanning}");
+        }
     }
 }
 
-/// Each rule taken out: the search finds the defect it is for.
+/// Each rule taken out: the search finds the defect it is for, a leader lacking a committed entry,
+/// at the scope of the TLA+ configuration that takes the rule out (`docs/models/Held*.cfg`): the
+/// smallest at which it is found.
 #[test]
 #[ignore = "serial searches to each rule's defect, in release; CI's explore job runs them"]
 fn each_rule_taken_out_is_caught() {
-    for mutant in [
-        Mutant::LeaderMemory,
-        Mutant::AnswerPastPromise,
-        Mutant::DurableCoverOnly,
-        Mutant::LowerPromise,
-        Mutant::NarrowToOwnLog,
+    for (mutant, max_len) in [
+        (Mutant::LeaderMemory, 1usize),
+        (Mutant::AnswerPastPromise, 1),
+        (Mutant::DurableCoverOnly, 2),
+        (Mutant::LowerPromise, 2),
+        (Mutant::NarrowToOwnLog, 2),
     ] {
         let model = Held {
-            scope: scope(2, 2, 2, mutant),
+            scope: scope(2, max_len, 2, mutant),
         };
         let start = model.initial();
         let found = shortest(
@@ -102,10 +113,19 @@ fn each_rule_taken_out_is_caught() {
         )
         .unwrap();
         match found {
-            Outcome::Fault { history, fault, .. } => println!(
-                "{mutant:?}: {fault:?} after {} steps: {history:?}",
-                history.len()
-            ),
+            Outcome::Fault {
+                history,
+                fault,
+                report,
+                ..
+            } => {
+                println!(
+                    "{mutant:?}: {fault:?} after {} steps, {} classes: {history:?}",
+                    history.len(),
+                    report.classes
+                );
+                assert_eq!(fault, Fault::LeaderHolds, "{mutant:?}");
+            }
             other => panic!("{mutant:?} not caught: {other:?}"),
         }
     }

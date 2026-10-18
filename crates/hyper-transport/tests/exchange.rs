@@ -975,6 +975,62 @@ fn a_stream_its_peer_never_reads_ends_by_its_own_bytes_and_the_others_go_on() {
     assert!(net.now - began <= PERIOD * 8, "{:?}", net.now - began);
 }
 
+/// A stream its peer reads at its own pace is never refused for it (focal's audit F38 judges a stream
+/// unread when its peer gives no credit back): held to the peer's pace, it is out of credit at nearly
+/// every judgement, everything it sent acknowledged, while its bytes are taken as they go. Do: ask
+/// 8 MiB of a server that reads 512 KiB at the start of every 400 ms, over a link of a millisecond
+/// each way, so the request moves in the server's steps for more than two windows and waits, out of
+/// credit and acknowledged, between them. Expect: answered whole, never refused. Judged on the state
+/// alone, two judgements a window apart that each found it so refused it, whatever it moved between.
+#[test]
+fn a_stream_its_peer_reads_at_its_own_pace_is_never_refused() {
+    const BODY: u64 = 8 << 20;
+    const STEP: u64 = 512 << 10;
+    const EVERY: Duration = Duration::from_millis(400);
+    let pair = Pair::new();
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let book = || pair.book(Role::Node, Role::Node);
+    let a = pair.node::<Mantle>(1, Role::Node, book(), limits(), 256 << 20, now);
+    let b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 256 << 20, now);
+    let mut net = Net::shaped(now, a, b, 1_000_000_000, 1 << 20, Duration::from_millis(1));
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.pace = Some((STEP, EVERY));
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        !asker.connected.is_empty() && !server.connected.is_empty()
+    });
+    let began = net.now;
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Snapshot, Class::Bulk),
+            3,
+            Some(BODY),
+            PERIOD,
+        )
+        .unwrap();
+    net.until(TURNS * 100, |net| {
+        server.now = Some(net.now);
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.asked.iter().all(|asked| asked.done)
+    });
+    let asked = &asker.asked[0];
+    assert_eq!(asked.refused, None, "{asked:?}");
+    assert_eq!((asked.reply, asked.read), (Some(BODY), BODY), "{asked:?}");
+    // Two judgements a window apart, each finding the stream out of credit and acknowledged.
+    assert!(
+        net.now - began > PERIOD * 2,
+        "held to the server's pace past two windows: {:?}",
+        net.now - began
+    );
+}
+
 /// Replication frames on lanes arrive in order, each lane on its own stream; a lane is as wide as
 /// the core's window, and the lanes to a peer are bounded.
 #[test]

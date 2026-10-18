@@ -190,6 +190,16 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-transport: a stream its peer read in steps was refused as unread while it moved.** F38's
+  unread rule judged a stream by its state at each judgement, once a period: out of credit with
+  everything it sent acknowledged at two judgements a window apart, it was refused `Stalled`, whatever
+  it wrote between them. A stream held to its peer's pace is in that state at nearly every instant:
+  hyper-rt-transport's `exchanges` test refused its 8 MiB request in 12 runs of 14 under two dozen busy
+  loops (and on the macOS gate twice in three runs), the server reading every byte as it came. The wait
+  now starts again whenever the stream has written more than when it was found unread (`docs/transport.md`
+  §4a). Test: `exchange::a_stream_its_peer_reads_at_its_own_pace_is_never_refused` (refused at 4.6 MB
+  under the old rule); 0 of 14 under the same load.
+
 - **hyper-quic: a probe of the path's MTU took a slow path whole.** Sent whenever the connection was
   idle, past the congestion window and the pacer, the search's first step on a loopback's MTU (about
   33 KB) held a relay of 128 kbit/s two seconds, and focal's three nodes behind such relays elected

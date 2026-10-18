@@ -283,8 +283,11 @@ the peer drains the bottleneck); sent whole, it is in the network until the peer
 acknowledgement of a datagram's worth; the peer's period to answer begins when QUIC reports the
 exchange's stream acknowledged whole, never when it was sent (focal's audit F38: a request in a
 bottleneck's queue was refused before the peer had it); a stream its peer does not read — out of
-credit, a datagram of it and more sent and all of that acknowledged — ends a window after it is found
-so, and the exchanges waiting only for the credit it holds are not judged until it comes back (F38's
+credit, a datagram of it and more sent and all of that acknowledged, and nothing written since — ends a
+window after it is found so, the wait starting again whenever it has written more (2026-10-17: judged
+on its state alone at two judgements a window apart, a stream its peer read in steps was refused while
+it moved, 8 MiB on a loaded host in 12 runs of 14), and the exchanges waiting only for the credit it
+holds are not judged until it comes back (F38's
 other half: one unread stream had starved every exchange of its class on the connection, hyper-quic
 patch Q8); a period's sent bytes count only if the
 peer was heard in it, so probes sent to a dead peer do not keep its exchanges alive; an answer is

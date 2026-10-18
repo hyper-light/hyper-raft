@@ -736,8 +736,11 @@ pub struct Raft<S> {
     pub(crate) durable_commit: u64,
     /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
     lost: Option<Lost>,
-    /// Commits on entries held in memory (core step R-8): what a member keeps for them.
-    pub(crate) held_commit: HeldCommit,
+    /// Commits on entries held in memory (core step R-8): what a member keeps for them, behind a
+    /// pointer: a group that states no fates never reads it, and inline it would be a fifth of a
+    /// kilobyte in every member a host holds (focal's session, whose inline size its debug stacks on
+    /// Windows bound).
+    pub(crate) held_commit: Box<HeldCommit>,
     /// The configuration the member counts by is the newest its log states, applied or not
     /// (`docs/raft.md` §3.4): the tracker's. `conf_newest_at` is the index of the entry that made
     /// it, and `conf_before` the configuration before that entry, made at `conf_before_at`. Of the
@@ -779,7 +782,10 @@ pub struct Raft<S> {
     /// What a member keeps that elects by suspicion ([`Elections::Suspicion`]);
     /// none on ticks, where it would be eight bytes and a branch.
     pub(crate) watch: Option<Box<Watch>>,
-    pub(crate) config: Config,
+    /// The settings, behind a pointer: read where they are used and never written after the
+    /// member opens, a quarter kilobyte inline in every member a host holds (focal's session,
+    /// whose inline size its debug stacks on Windows bound).
+    pub(crate) config: Box<Config>,
 }
 
 /// The messages that wait to be taken, and what they hold, by capacity,
@@ -1384,7 +1390,7 @@ impl<S: Storage> Raft<S> {
             priority_in_force: 0,
             durable_commit: 0,
             lost: config.lost,
-            held_commit: HeldCommit::default(),
+            held_commit: Box::default(),
             conf_before: Configuration::default(),
             conf_before_at: 0,
             conf_newest_at: 0,
@@ -1407,7 +1413,7 @@ impl<S: Storage> Raft<S> {
                 // It knows no leader yet (`become_follower` below arms it).
                 Elections::Suspicion => Some(Box::default()),
             },
-            config: config.clone(),
+            config: Box::new(config.clone()),
         };
         raft.conf_before = conf_before;
         raft.applied_conf = applied_conf;

@@ -209,6 +209,22 @@ is worked around.
   §5.3). The TLA+ model is `docs/models/Held.tla`, the exhaustive model state for state: TLC counted
   `held` at exactly the Rust search's 13,383,629 states and refused each rule taken out (CI run
   39147385800, `docs/models/README.md`). Open: a leader's window freed by held answers.
+- **hyper-durable: a write made again held entries no `Ready` had issued.** `make_again` wrote every
+  entry the core held not yet durable under the last refused `Ready`'s notice, which covers only the
+  refused writes' entries, so the core issued the rest again; a leader applying ahead of its write
+  applied them from its followers' word, compacted while that second write stalled (the store held
+  them, and a compaction is bounded by what the store holds), and its write made again fell below
+  the store's start: the shell's simulation refused it at seed 9785 of its fourth shape, the explore
+  job's failure on R-8 (traced: the refused `Ready` held 7..8, the write made again 7..14, the next
+  `Ready` 9..14, the compaction started the log at 11). The write made again now holds the entries a
+  `Ready` issued (`Unstable::issued_entries`) and states no commit past them (I7). It is in `main`'s
+  shell: `a_write_made_again_holds_only_what_the_refused_writes_held` fails there (the write made
+  again held through 4 where the refused one held 2). The shell's schedules pass at 10,000 seeds a
+  shape (`docs/durable.md` §2.4).
+- **hyper-rt-transport: the shared-port driver test unwrapped Winsock's refusal.** Since 0802a05
+  Windows refuses a shared bind before any socket is bound (`netsys::port_sharing`), and
+  `a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own` unwrapped it on both
+  Windows gates; it now expects the refusal there and drives the plain socket's row.
 
 ### Closed (2026-10-17)
 

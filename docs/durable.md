@@ -189,9 +189,16 @@ A write refused for room another write frees (`Backlog`, `Full`, `TooManyGroups`
 whole, with the writes after it untaken (hyper-log refuses each one sent behind it, `Behind`), and
 the replica refuses calls `Stalled` until room may have been freed: its own compaction durable, or
 its owner's word (`Replica::resume`); made again before, the writes would only be refused again, a
-refusal a drive. They are made again as one write of everything the core holds not yet durable,
-the fast track's proposals among it (`RawNode::issued_proposals`: the core keeps those of every
-write issued until its notice), whose notice is the last refused `Ready`'s: a member that cannot persist takes no part (mantle, audit S04). A
+refusal a drive. They are made again as one write of everything the refused writes held, the
+entries a `Ready` issued that are not yet durable (`Unstable::issued_entries`) and the fast track's
+proposals among them (`RawNode::issued_proposals`: the core keeps those of every write issued until
+its notice), whose notice is the last refused `Ready`'s: a member that cannot persist takes no part
+(mantle, audit S04). An entry no write was issued for is not in it, nor a commit past the entries it
+holds (I7): written there, under a notice that does not cover it, the entry would be issued again in
+its own `Ready`, and the store, already holding it, would let a compaction pass it before that
+write, which it then refuses below its start (the shell's simulation, seed 9785 of its fourth shape: a
+leader applying ahead of its write applied what its followers took from that `Ready`, and compacted
+while the `Ready`'s write stalled). A
 snapshot the core took meanwhile, which no `Ready` gave, is not in it, nor the entries after it: the
 state machine has not installed it, and the log would start past the state machine (I8); its own
 `Ready` installs it and writes it, and the write made again states no commit past what earlier
@@ -1363,7 +1370,14 @@ Tests (`crates/hyper-durable/tests`):
   `make_again`, test `a_write_made_again_never_starts_the_log_past_the_state_machine`. It is in
   `main`'s shell; R-3's out-of-order acknowledgement (R17) changed the schedules that reach it.
   With the compaction rule's count checked at every step (R22), soaked again at 1,000 seeds a
-  shape and the crash after every event at 64 seeds.
+  shape and the crash after every event at 64 seeds. At 10,000 seeds a shape on R-8's core, one
+  more (seed 9785 of the leader applying ahead): a refused write made again held the entries no
+  `Ready` had issued as well as the refused ones, under a notice that covers only the refused
+  ones, so the core issued those entries again; the store, already holding them, let a
+  compaction made while that second write stalled pass them, and refused the write made again
+  below its start. It is in `main`'s shell (the test fails there); R-8 changed the schedules that
+  reach it. Fixed in `make_again`, test `a_write_made_again_holds_only_what_the_refused_writes_held`;
+  soaked at 10,000 seeds a shape.
 - `directed.rs`: mantle's four cases and focal's two, on hyper-log over simulated devices with the
   power cut at each write and flush in turn, both ways of taking readies. The founder campaigns on
   its owner's word; the members are given their timing once it leads, as no span is chosen before

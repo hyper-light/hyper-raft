@@ -236,7 +236,7 @@ fn each_connection_receives_on_a_socket_of_its_own_and_lets_it_go_with_the_conne
 /// the socket over loses no peer's queue of its own. Do: a client connects to a server driven on a
 /// socket bound with its port shared (`UdpSocket::bind_shared`), then to one driven on a plain
 /// socket. Expect: the first gives the client a socket of its own where the platform shares ports,
-/// the second never.
+/// and Winsock, which shares none so, refuses its bind (`netsys::port_sharing`); the second never.
 #[test]
 fn a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own() {
     let pki = Pki::new();
@@ -245,12 +245,20 @@ fn a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own() 
     let mut rt = LocalRuntime::new(&config()).unwrap();
     rt.block_on(async move {
         let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let shares = usize::from(cfg!(unix));
         for (socket, apart) in [
-            (hyper_rt::udp::UdpSocket::bind_shared(loopback), shares),
+            (hyper_rt::udp::UdpSocket::bind_shared(loopback), 1),
             (hyper_rt::udp::UdpSocket::bind(loopback), 0),
         ] {
-            let socket = socket.unwrap();
+            let socket = match socket {
+                Err(refused) if cfg!(windows) && apart == 1 => {
+                    assert!(
+                        matches!(refused, hyper_rt::RtError::BadConfig { .. }),
+                        "{refused:?}"
+                    );
+                    continue;
+                }
+                socket => socket.unwrap(),
+            };
             assert_eq!(socket.shares_port().unwrap(), apart == 1);
             let batched = hyper_rt::udp::Batched::new(socket, IO, false).unwrap();
             let mut server: Drv =

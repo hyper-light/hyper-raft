@@ -1817,6 +1817,77 @@ fn a_write_made_again_never_starts_the_log_past_the_state_machine() {
     assert_eq!(r.machine().durable.applied.index, 8);
 }
 
+/// A write made again holds what the refused writes held and nothing past it: an entry no write
+/// was issued for waits for the `Ready` that issues it. Written with them, the core issued it
+/// again, its followers took it from that `Ready` and committed it, the leader applied it ahead of
+/// its write, and a compaction bounded by what the store held passed it while the leader stalled
+/// a second time: the store refused it, made again, below its start (the shell's simulation, seed
+/// 9785 of its fourth shape: "refused write: first 9 ... disk start 11").
+#[test]
+fn a_write_made_again_holds_only_what_the_refused_writes_held() {
+    let room = Fault::Room("the group's retained bound");
+    let mut r = led(3, true);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    pump(&mut r);
+    // One entry in a write the log refuses, and two proposed before the refusal is taken, which
+    // no write was issued for.
+    r.propose(Vec::new(), b"a".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    let a = r.core().raft.log().last_index().unwrap();
+    r.log_mut().refuse = Some(room.clone());
+    assert!(r.log_mut().make_durable(), "refused");
+    r.propose(Vec::new(), b"b".to_vec()).unwrap();
+    r.propose(Vec::new(), b"c".to_vec()).unwrap();
+    let c = r.core().raft.log().last_index().unwrap();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    // Made again: the refused write, then the `Ready` of the two, whose appends leave with it.
+    r.resume();
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(!r.is_stalled());
+    assert_eq!(r.log_mut().pending(), 2);
+    acknowledge(&mut r, 2);
+    acknowledge(&mut r, 3);
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(r.applied().index, c, "applied ahead of its write");
+    assert!(r.log_mut().make_durable());
+    assert_eq!(
+        r.log_mut().disk.last(),
+        a,
+        "the write made again held more than the refused write"
+    );
+    // The write of the two is refused too, and the leader compacts while stalled.
+    r.log_mut().refuse = Some(room);
+    assert!(r.log_mut().make_durable(), "refused");
+    out.clear();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert!(r.compact(0, now(), waker()).unwrap());
+    assert!(r.log_mut().make_durable());
+    let started = r.log_mut().disk.start.index;
+    assert!(
+        started <= a,
+        "compacted past what the store held, to {started}"
+    );
+    pump(&mut r);
+    assert!(!r.is_stalled());
+    assert_eq!(r.log_mut().disk.last(), c);
+    let applied: Vec<&[u8]> = r
+        .machine()
+        .now
+        .entries
+        .iter()
+        .map(|(_, _, data)| data.as_slice())
+        .filter(|data| !data.is_empty())
+        .collect();
+    assert_eq!(applied, [&b"a"[..], b"b", b"c"]);
+}
+
 /// The window a leader keeps in flight to a member is twice what the transport says the path to it
 /// carries in a round trip (mantle note 32 R16, `hyper_timing::inflight_window`): set as the owner
 /// says it, for a member of the group only.

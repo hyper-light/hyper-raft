@@ -187,6 +187,7 @@ fn update(rng: &mut Rng, h: Held, round: u64) -> Update {
             term: term.max(h.term),
             vote: rng.below(3),
             commit: last.min(h.last),
+            held: None,
         });
     }
     if rng.chance(10) {
@@ -280,6 +281,7 @@ fn round(log: &Log<common::Held>, stepped: &Holder, rng: &mut Rng, n: u64, out: 
             term: n,
             vote: 0,
             commit: 0,
+            held: None,
         }),
         ..Update::default()
     };

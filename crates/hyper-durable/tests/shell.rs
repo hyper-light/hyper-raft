@@ -713,6 +713,8 @@ fn store_with(entries: &[Entry], commit: u64) -> RamStore {
                 term: 2,
                 vote: 1,
                 commit,
+                held_index: 0,
+                held_term: 0,
             }),
             ..Write::default()
         })
@@ -823,6 +825,8 @@ fn marked_store() -> SimStore {
                 term: 1,
                 vote: 1,
                 commit: 1,
+                held_index: 0,
+                held_term: 0,
             }),
             ..Write::default()
         })

@@ -78,6 +78,8 @@ fn what_is_written_reads_back_and_a_later_entry_replaces_an_earlier() {
         term: 2,
         vote: 1,
         commit: 1,
+        held_index: 0,
+        held_term: 0,
     };
     wal.persist(vec![entry(1, 1), entry(2, 1), entry(3, 1)], Some(&hard))
         .unwrap();

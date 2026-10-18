@@ -643,6 +643,34 @@ every record and payload, R-2's CRC-32C), crash and corruption never conflated, 
 used before a member is given up, and no protocol path (election, catch-up) that spreads a local
 loss.
 
+### 5.3 Commits on entries held in memory (core step R-8)
+
+The core's rule is `docs/raft.md` §3.7; the shell's part is small:
+
+- **The promise is a hard state's.** hyper-log writes it with the term, vote and commit, under a
+  record kind of its own (`HARD_STATE_HELD`, the promise's index and term after the commit), so a
+  log of a group with no fates is the one it always was. The persist row has no room for it, only a
+  flag that one was stated: a frame confirmed and then damaged restores the last index there is, of
+  the row's term, and the core marks the member through it until its leader narrows the mark. A torn
+  frame's promise was never durable, so none was answered for under it: the restore keeps the
+  promise of the frames before. `Replica`'s write decision counts a moved promise as it counts a
+  moved term or vote (`hard_of`).
+- **The incarnation.** `Config::incarnation` must differ between a member's openings, so that a
+  leader's end stated to one opening is never taken by the next. Where the owner gives none, the
+  shell draws one at each `Replica::open` from std's hasher keys, which the operating system seeds
+  once a thread and which advance at every draw: two openings in one process differ, and two
+  processes' are independent.
+- **Suspicion.** The owner's node-level detector says whom it suspects (`Replica::suspect`, `trust`,
+  `restarted`); the shell passes each to the core's held count (`suspect_held`, `trust_held`) beside
+  its elections, one stream per node pair for every group.
+- **A planned stop.** `Replica::quiet_held` stops the member's held answers; once
+  `Replica::held_settled`, no promise is stated, durable or out, and a member stopped then opens
+  unmarked. A group whose members all stop so needs no narrowing to resume.
+- **What leaves without a write.** Every drive takes `RawNode::light_now` after its `Ready`
+  (`Replica::take_light`): the held answers, a leader's appends, and what the core commits, given
+  to apply in place, whatever the writes out. A `Ready` waits for a place in the depth, and so,
+  before, did all of these: a held commit came no sooner than the leader's next flush.
+
 ## 6. Bounds
 
 Every hold has a bound derived from a quantity the system already has:

@@ -58,6 +58,7 @@ fn small(term: u64) -> Update {
             term,
             vote: 1,
             commit: 0,
+            held: None,
         }),
         ..Update::default()
     }

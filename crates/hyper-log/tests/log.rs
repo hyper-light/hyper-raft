@@ -263,6 +263,7 @@ fn hard(term: u64, commit: u64) -> HardState {
         term,
         vote: 1,
         commit,
+        held: None,
     }
 }
 
@@ -1010,6 +1011,7 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
                     term: 1,
                     vote: 2,
                     commit: i - 1,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -1020,6 +1022,7 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
         term: 2,
         vote: 3,
         commit: 3,
+        held: None,
     };
     log.write(
         1,
@@ -1069,6 +1072,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
                         term: 1,
                         vote: 2,
                         commit: i - 1,
+                        held: None,
                     }),
                     ..Update::default()
                 },
@@ -1080,6 +1084,7 @@ fn damage_to_the_last_acknowledged_frame_is_restored_from_its_persist_record() {
             term: 2,
             vote: 3,
             commit: 3,
+            held: None,
         };
         log.write(
             1,
@@ -1176,6 +1181,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
                     term: 2,
                     vote: 1,
                     commit: 0,
+                    held: None,
                 }),
                 proposals: vec![Proposal {
                     index: 5,
@@ -1190,6 +1196,7 @@ fn a_lost_frame_with_proposals_leaves_its_group_damaged_until_removed() {
         term: 3,
         vote: 2,
         commit: 1,
+        held: None,
     };
     let other = log
         .submit(
@@ -1286,6 +1293,7 @@ fn damaged_group_one(seed: u64, cfg: Config) -> SimFile {
                 term: 2,
                 vote: 1,
                 commit: 0,
+                held: None,
             }),
             proposals: vec![Proposal {
                 index: 2,
@@ -1393,6 +1401,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
                 term: 2,
                 vote: 1,
                 commit: 2,
+                held: None,
             }),
             ..Update::default()
         },
@@ -1455,6 +1464,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
                 term: 1,
                 vote: 1,
                 commit: 1,
+                held: None,
             }),
             ..Update::default()
         },
@@ -1468,6 +1478,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
         term: 4,
         vote: 3,
         commit: 2,
+        held: None,
     };
     assert!(matches!(
         log.write(
@@ -1507,6 +1518,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
             term: 4,
             vote: 3,
             commit: 1,
+            held: None,
         })
     );
 }
@@ -1531,6 +1543,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
                     term: 1,
                     vote: 1,
                     commit: 1,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -1540,6 +1553,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
             term: 2,
             vote: 2,
             commit: 1,
+            held: None,
         };
         let second = Update {
             entries: Some(entries(2, &[2])),
@@ -2015,6 +2029,7 @@ fn a_groups_updates_keep_their_order_when_one_waits_for_room() {
         term,
         vote,
         commit: 0,
+        held: None,
     };
     gated.hold();
     let shut = gated.released();
@@ -2605,6 +2620,7 @@ fn a_full_log_takes_any_frame_once_its_groups_compact() {
                         term: 1,
                         vote: 1,
                         commit: 0,
+                        held: None,
                     }),
                     ..Update::default()
                 },
@@ -3273,6 +3289,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                     term: 1,
                     vote: 1,
                     commit: 1,
+                    held: None,
                 }),
                 ..Update::default()
             },
@@ -3299,6 +3316,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                             term: 1,
                             vote: 0,
                             commit: 0,
+                            held: None,
                         }),
                         ..Update::default()
                     },
@@ -3351,6 +3369,7 @@ fn a_confirmation_outlives_a_torn_record_of_the_next_frame() {
                     term: 1,
                     vote: 1,
                     commit: 1,
+                    held: None,
                 })
             ),
             "{at}"
@@ -3380,6 +3399,7 @@ fn a_commit_that_fails_before_its_frame_answers_every_update() {
             term,
             vote: 1,
             commit: 0,
+            held: None,
         }),
         ..Update::default()
     };
@@ -3444,6 +3464,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                     term: 1,
                     vote: 0,
                     commit: 0,
+                    held: None,
                 };
                 log.write(
                     g,
@@ -3485,6 +3506,7 @@ fn power_lost_while_restoring_a_lost_frame_loses_nothing_acknowledged() {
                             term: 2,
                             vote: 2,
                             commit: 0,
+                            held: None,
                         }),
                         proposals,
                         ..Update::default()

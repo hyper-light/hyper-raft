@@ -109,6 +109,7 @@ pub fn update(group: u128, index: u64) -> Update {
             term: 1,
             vote: 0,
             commit: index,
+            held: None,
         }),
         ..Update::default()
     }

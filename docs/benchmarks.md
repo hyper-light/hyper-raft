@@ -9430,3 +9430,50 @@ saved and not the whole gain.
 cd crates/hyper-rt-compare && cargo build --release   # on the branch proto-always-kick
 HYPER_RT_KICK_MODE=1 HYPER_RT_KICK_SPIN_NS=300 target/release/hyper-rt-compare hyper pingpong n=20000 warm=2000
 ```
+
+## Commits on entries held in memory, against the classic commit (R-8, 2026-10-18)
+
+`benches/pipeline.rs` (hyper-raft), in release: three voters on a simulated network and devices,
+time simulated in microseconds, closed-loop clients proposing 64-byte entries at the leader and
+again once theirs is applied there, 20,000 entries a row. A flush is 4,330 µs (mantle's p50 for an
+append waiting one `F_FULLFSYNC` on APFS) and a one-way trip 198 µs (half QUIC's 395 µs loopback
+round trip). **classic** commits on a quorum's durable answers; **held** states each voter its own
+fate, a held commit spanning all three (core step R-8, `docs/raft.md` §3.7). Both take what leaves
+without a write at every step (`RawNode::light_now`). The `flush` device answers a write at its
+flush; the `confirmed` device is hyper-log's, a frame answered once a later flush confirms it. The
+latencies are the protocol's and the devices', the same every run; depth is the writes a member
+keeps out.
+
+| device | commit | clients | depth | p50 µs | p99 µs | entries/s | flushes/entry |
+|---|---|---|---|---|---|---|---|
+| flush | classic | 1 | 1 | 4,726 | 4,726 | 212 | 3.000 |
+| flush | held | 1 | 1 | 396 | 1,110 | 2,396 | 0.289 |
+| flush | classic | 4 | 1 | 8,660 | 8,660 | 462 | 1.500 |
+| flush | held | 4 | 1 | 396 | 766 | 9,432 | 0.073 |
+| flush | classic | 16 | 3 | 8,660 | 8,660 | 1,846 | 0.375 |
+| flush | held | 16 | 3 | 396 | 3,142 | 17,004 | 0.041 |
+| flush | classic | 64 | 3 | 8,660 | 8,660 | 7,352 | 0.094 |
+| flush | held | 64 | 3 | 792 | 7,076 | 25,468 | 0.027 |
+| confirmed | classic | 1 | 1 | 9,056 | 9,056 | 110 | 6.001 |
+| confirmed | held | 1 | 1 | 396 | 980 | 2,442 | 0.283 |
+| confirmed | classic | 16 | 3 | 12,990 | 12,990 | 1,230 | 0.563 |
+| confirmed | held | 16 | 3 | 396 | 8,264 | 11,637 | 0.059 |
+| confirmed | classic | 64 | 3 | 12,990 | 12,990 | 4,886 | 0.141 |
+| confirmed | held | 64 | 3 | 3,934 | 8,264 | 20,670 | 0.033 |
+
+What it shows:
+- **A held commit is the round trip.** Its p50 is 396 µs, the 395 µs round trip, from one client
+  to sixteen: a follower answers an entry its durable promise covers when it takes it, and the
+  leader commits on both followers' answers before any write of the entry is durable. The classic
+  commit waits for a leader's and a follower's flushes, 12 to 33 times as long at p50.
+- **What it took.** Three causes held the first measurement at one flush, each found here: a
+  `Ready` refused while the writes out fill the depth held a leader's appends, a follower's held
+  answers and the leader's apply for a write of the member's own (`RawNode::light_now`, which
+  also took the classic commit from 12,990 to 8,660 µs at sixty-four clients); a promise reaching
+  only as far as measured arrivals settled at one entry a write, since the arrivals it measured
+  were those it let come (the doubling probe, `HeldCommit::ahead`); and a promise of the whole
+  term reached the round trip but left a voter marked past every log once the term's leader was
+  gone (`docs/raft.md` §3.7).
+- **The tail.** p99 is the round trip with no write out to wait on, and one or two flushes where
+  the probe has yet to reach far enough (its doubling starts from what came), and at sixty-four
+  clients, where a leader frees its window to a follower only on durable answers.

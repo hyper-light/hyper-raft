@@ -35,6 +35,12 @@
 //! On both, a write that asks for no flush (`Ready::must_sync`, a commit
 //! alone) is answered with the writes before it and costs none.
 //!
+//! Two commits: **classic**, a quorum's durable answers; and **held**, the
+//! voters each its own fate, a held commit's holders and its leader spanning
+//! all three (core step R-8, `docs/raft.md` §3.7): a follower's held answer
+//! leaves at once under its durable promise, and the leader commits on the
+//! first of the classic quorum and a held quorum.
+//!
 //! The times are this machine's, measured: a flush is 4,330 µs, mantle's
 //! p50 for an append that waits one `F_FULLFSYNC` on APFS
 //! (`docs/measurements/2026-09-29-log-confirmation.md` in mantle), and a
@@ -107,7 +113,7 @@ struct Group {
 }
 
 impl Group {
-    fn new(depth: usize, confirmed: bool) -> Self {
+    fn new(depth: usize, confirmed: bool, held: bool) -> Self {
         let mut members = Vec::new();
         for id in 1..=VOTERS {
             let store = Store::new(ConfState {
@@ -119,6 +125,10 @@ impl Group {
                 heartbeat_tick: 2,
                 max_size_per_msg: 4 * 1024 * 1024 + 1024,
                 max_inflight_msgs: 128,
+                fates: held.then(|| hyper_raft::Fates {
+                    of: (1..=VOTERS).map(|id| (id, id)).collect(),
+                    spanning: VOTERS as usize,
+                }),
                 ..Config::new(id, support::limits(VOTERS as usize, depth))
             };
             members.push(Member {
@@ -167,9 +177,16 @@ impl Group {
         }
     }
     /// Takes what the member may, submits it, and starts a flush if the
-    /// device is idle.
+    /// device is idle. What may be applied and sent without a write is first,
+    /// whatever the writes out (`RawNode::light_now`).
     fn drive(&mut self, member: usize, now: u64) {
         loop {
+            let mut light = self.members[member].raw.light_now(false).unwrap();
+            let committed = light.take_committed_entries();
+            self.applied(member, now, &committed);
+            let node = &mut self.members[member];
+            node.raw.advance_apply_to(node.applied).unwrap();
+            self.send(now, light.take_messages());
             let node = &mut self.members[member];
             if !node.raw.has_ready() || node.raw.in_flight() >= node.depth {
                 break;
@@ -182,7 +199,9 @@ impl Group {
                 hard: ready.hard_state().copied(),
                 messages: ready.take_persisted_messages(),
             };
-            let messages = ready.take_messages();
+            // Held answers leave at once, whatever the write (R-8).
+            let mut messages = ready.take_held_messages();
+            messages.extend(ready.take_messages());
             let committed = ready.take_committed_entries();
             node.raw.advance_issued(ready).unwrap();
             let idle = !node.busy && node.queued.is_empty() && node.unconfirmed.is_empty();
@@ -320,7 +339,9 @@ fn percentile(sorted: &[u64], part: f64) -> u64 {
 
 fn main() {
     for confirmed in [false, true] {
-        table(confirmed);
+        for held in [false, true] {
+            table(confirmed, held);
+        }
     }
 }
 
@@ -328,10 +349,11 @@ fn main() {
     clippy::disallowed_methods,
     reason = "a benchmark measures real time on the host"
 )]
-fn table(confirmed: bool) {
+fn table(confirmed: bool, held: bool) {
     println!(
-        "{:<10} {:<8} {:>7} {:>10} {:>10} {:>14} {:>16} {:>12}",
+        "{:<10} {:<8} {:<8} {:>7} {:>10} {:>10} {:>14} {:>16} {:>12}",
         "device",
+        "commit",
         "clients",
         "depth",
         "p50 µs",
@@ -341,6 +363,7 @@ fn table(confirmed: bool) {
         "wall ns/entry"
     );
     let device = if confirmed { "confirmed" } else { "flush" };
+    let commit = if held { "held" } else { "classic" };
     let entries = 20_000;
     for clients in [1u64, 4, 16, 64] {
         for depth in [1usize, 2, 3] {
@@ -349,7 +372,7 @@ fn table(confirmed: bool) {
             let mut wall = f64::INFINITY;
             let mut outcome = (0, 0, 0.0, 0.0);
             for _ in 0..3 {
-                let mut group = Group::new(depth, confirmed);
+                let mut group = Group::new(depth, confirmed, held);
                 let started = Instant::now();
                 let simulated = group.run(clients, entries);
                 let elapsed = started.elapsed().as_nanos() as f64;
@@ -364,8 +387,8 @@ fn table(confirmed: bool) {
                 );
             }
             println!(
-                "{:<10} {:<8} {:>7} {:>10} {:>10} {:>14.0} {:>16.3} {:>12.0}",
-                device, clients, depth, outcome.0, outcome.1, outcome.2, outcome.3, wall
+                "{:<10} {:<8} {:<8} {:>7} {:>10} {:>10} {:>14.0} {:>16.3} {:>12.0}",
+                device, commit, clients, depth, outcome.0, outcome.1, outcome.2, outcome.3, wall
             );
         }
     }

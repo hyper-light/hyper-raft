@@ -188,6 +188,26 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-18)
+
+- **hyper-raft: commits on entries held in memory, across fates (core step R-8, building).** A
+  follower answers an append at once for the entries its durable promise covers, and a leader that
+  counts its own disk commits on the first of the classic quorum and a held quorum, a majority of
+  each half whose fates with its own span what the owner asks (`Config::fates`; a holder's disk
+  waives the span). A member that opens with a promise its log does not reach is marked through it
+  (R-5), and its leader narrows the mark to where its log ends, stated to the member's incarnation;
+  R-7 judges its elections. `RawNode::light_now` gives what may leave or be applied without a write,
+  whatever the writes out. Its design replaced a first build after SAUCR (fast quorum ⌈M/2⌉+1,
+  peers' maps, a restarted member asking a bare minority), whose schedules left every voter
+  recovering and none able to vouch, nothing lost (seed 7). Shown: the schedules at the four
+  settings on ticks and by suspicion and the crash at every persistence step, every committed entry
+  kept; hyper-check's exhaustive model at two and three terms (13.4 and 58.2 million classes), each
+  rule taken out refused; a held commit's p50 the 395 µs round trip in the simulated pipeline, 12 to
+  33 times below the classic commit's (`docs/raft.md` §3.7, `docs/benchmarks.md`, "Commits on
+  entries held in memory"). hyper-log stores the promise in a hard state record of its own kind;
+  hyper-durable draws each opening's incarnation and takes `light_now` at every drive (`docs/durable.md`
+  §5.3). Open: the TLA+ model's part, counted by CI; a leader's window freed by held answers.
+
 ### Closed (2026-10-17)
 
 - **hyper-transport: a request smaller than a datagram was refused at the end of the period it was

@@ -148,6 +148,7 @@ The durable shell needs four more core steps, R-4 to R-7. Their design and gates
 | **R-6** (done, 2026-10-02) | An apply pause (etcd's `applyingEntsPaused`): `RawNode::pause_apply`, `resume_apply`; a leader's own-term entries given to apply before its own write is durable (`Config::apply_unpersisted`, off by default as raft-rs's limit is zero); and the durable commit carried in answers: `MsgAppendResponse` and `MsgHeartbeatResponse` state no commit beyond the durable commit (`C_d`, `docs/durable.md` §4.1) when they leave, not `log.committed()`. The core knows `C_d` from each durable `Ready`'s hard state and from `RawNode::commit_durable`, by which the shell states every other commit it writes (`docs/durable.md` §4.4). The case found in mantle (`1c179e8`, its F17 commit fence): a member commits alone as leader in `advance_append`, then steps down in the same term (check-quorum), and holds a commit no write states; a shell's `configuration_known` must not count it. R-4 did not carry it: the core was told which writes are durable, not which commit a write stated. | Run: the directed tests `an_answer_states_no_commit_that_no_durable_write_stated` (mantle's case), `an_answer_a_notice_releases_states_the_durable_commit` (fails on R-4), `an_owner_that_pauses_apply_is_given_nothing_more`, `a_leader_applies_its_own_committed_entries_before_its_write_is_durable`; `tests/pipeline.rs` with the oracle holding every answer's commit to the sender's disk and the harness keeping the commit fence with the pause, at four settings (the fourth a leader applying before its write, its disk the slowest) and the crash at every persistence step with and without it; the raft-rs differential unchanged with no translation (`docs/durable.md` §4.4, "Against raft-rs"); allocations identical on every workload; `benches/pipeline.rs` (`docs/benchmarks.md`, "The durable commit and the apply pause (R-6)"). |
 | **L-2** (timing, done, 2026-10-02) | Elections by suspicion: `Config::elections` (`Elections::Ticks`, raft-rs's, the default and the differential's; `Elections::Suspicion`), `RawNode::suspect`, `trust`, `restarted`, `set_timing`, `hold_campaigns`, `wake`, `deadline` (`src/watch.rs`; `docs/timing.md` §2.9 has the rules and their sources). On ticks nothing changes: every tick-path suite passes unchanged. | Run: the raft-rs differential, `tests/group.rs`, `tests/fast.rs` and `tests/pipeline.rs` on ticks, unchanged; `tests/suspicion.rs` (directed tests in time: the delay as the law's draw, a fresh draw at every arming, and each crash's first round split exactly when the law's event holds on the members' delays); `tests/pipeline.rs` by suspicion: the durability oracle at the four settings (10,000 schedules of 4,000 steps from seed 1,000, and 1,000 from 0), the fast track (2,000 schedules), the crash at every persistence step (20 seeds); counts in `crates/hyper-raft/ORIGIN.md`. |
 | **R-7** (done, 2026-10-02) | CTRL's leader-side recovery with the suffix marks hyper-log keeps (`docs/durable.md` §5.2): a marked member campaigns on its log and its own vote is not counted (`Raft::campaign`), where the others can be a quorum of each half and not in a fast group (`Raft::may_campaign`); voters judge by their claims (R-5); elected, its mark ends (`Raft::become_leader`). The vote is CTRL's question for the whole lost range: a grant is `dontHave`, a refusal `have` or `haveFaulty`; `have`'s fix is the have-er's own election. The safety argument, the configurations and the marks it covers are §5.2's. | Run: `tests/repair.rs` (Figure 4(b) in suffix form: the only current logs marked, mantle's rule electing no one, which fails on R-5, and R-7 electing the one the others vouch for; a marked log that may lack a committed entry never elected, which fails with the candidate's own vote counted or the voters judging by their logs; a marked member of one or two voters asking no one); `tests/pipeline.rs` with faults at rest by suspicion as well as on ticks, and with two of three voters marked at once, the harness's `Cluster::electable` holding the rule; the schedules' waits before and after R-7; the TLA+ model's `Lose`, `Claim`, `Own` and eight configurations, three that pass and five refused, at the states CI counted; hyper-durable's suites with the shell's marked member campaigning; `docs/benchmarks.md`, "A marked member's election (R-7)". |
+| **R-8** (designing, 2026-10-17) | Commits on entries held in memory, SAUCR's fast quorum (Alagappan et al., OSDI 2018) with a fate condition (focal's doc 33): a follower answers an append it takes with a held acknowledgement at once (`Message::held`), beside its durable answer after the write; a leader keeps each member's `Progress::held`, and commits an index ⌈n/2⌉+1 voters hold, none suspected, whose holders span the fates its owner's rule asks (`Config::fates`); otherwise the classic durable quorum, as now. A member's hard state records the term it gave held acknowledgements in, with the term write it makes anyway; restarted in such a term, it is marked (R-5's `Lost`) at its last logged entry, recovered as the maximum a bare minority of members names (SAUCR §3.5, the leader's appends carrying each member's held index), and repaired and judged by R-5 and R-7 as any marked member. Off unless an owner states fates; the classic path unchanged. §3.7. | To run: `tests/pipeline.rs`'s durability oracle with held commits at the four settings, a crash at every persistence step, simultaneous crashes of every holder unflushed (unavailable, never a committed entry lost), staggered crashes inside and outside the flush, and shared-fate members refused the held commit; the raft-rs differential unchanged with no fates; the TLA+ model's `Hold`, `CrashUnflushed` and `Recover` actions; allocations a commit counted; `benches/pipeline.rs`, a commit's latency held against durable. |
 
 A campaign supersedes its own vote requests still waiting to be taken (2026-10-03, found by mantle's
 D-1): a member whose writes stay out through many election timeouts, ticked meanwhile, sends at most
@@ -903,6 +904,48 @@ within the patience keep the term, and a window none answers in deposes; a follo
 a long window counts at its end; past the patience the leader steps down; a transfer is given up at
 the election timeout whatever the patience; a patient leader commits nothing alone and yields to a
 newer term; an overflowing patience is refused; under suspicion it changes nothing.
+
+### 3.7 Commits on entries held in memory, across fates (R-8, designing)
+
+Why. A classic commit waits for a quorum's durable writes: on focal's measured box a 4 KiB durable
+write is 2.6 ms and a commit's log wait 19–25 ms, where the network's round trip is tenths of a
+millisecond. SAUCR (OSDI 2018) commits on a quorum's memory while enough members are up and on their
+disks once failures arise, within 0–9% of memory-only ZooKeeper; it counts members, and a group whose
+members share a host or a power feed fails as one whatever the count. focal's doc 33 adds the fate
+condition; this section is the core's part.
+
+The rule.
+- **A held acknowledgement.** A follower that takes an append's entries into its log answers at once
+  with `Message::held` set: it holds them in memory, as it will on disk once its write is done. It
+  promises nothing durable, so it leaves without waiting for the write (a `Ready`'s held messages are
+  apart from those it releases after persisting); the durable answer leaves after the write as now.
+- **What a leader counts.** `Progress::held` is the highest index a member said it holds, never below
+  `matched`. The leader's own is its last index. A member heard from in neither of the last two
+  heartbeat intervals is suspected and its held index not counted (SAUCR: a switch on the first
+  missing answer).
+- **The commit.** The greatest index of this term that a classic quorum's `matched` reaches, or that
+  ⌈n/2⌉+1 voters hold (each half of a joint configuration on its own) whose fates, as the owner states
+  them (`Config::fates`: each member's fate, and how many distinct fates a held commit's holders must
+  span), the holders reach. SAUCR's ⌈n/2⌉+1, not a majority: its recovery (below) asks a bare minority,
+  and only a holder set of ⌈n/2⌉+1 meets every bare minority (focal's doc 33 §4.4a has the
+  counterexample with a majority).
+- **The marker.** A member's hard state records `held_term`, the term it gives held acknowledgements
+  in, with the term and vote write it makes on taking a term, so no write is added.
+- **Recovery.** A member that opens with `held_term` equal to its term may have acknowledged entries
+  its disk lacks. It starts marked (`Lost { index: last possible, term: held_term }`, R-5), so it
+  votes for no candidate whose log does not resolve the mark and does not campaign; it asks the other
+  members for the last entry they know it held (the leader's appends and heartbeats carry each
+  member's held index, SAUCR's LLE map) and, once a bare minority not marked themselves has answered,
+  narrows the mark to the greatest (SAUCR's max-among-minority). R-5 repairs it by entries and R-7
+  judges its election; a mark no live member can repair leaves the group unavailable, never with a
+  committed entry missing.
+- **Off by default.** Without fates nothing changes: no held message, no marker, the classic commit.
+
+What it must show. The pipeline oracle holding every committed entry across: held commits at the
+four settings; a crash at every persistence step; every holder of a held commit crashed unflushed at
+once (the group unavailable, nothing committed lost); holders crashed one at a time inside and outside
+their writes' completion; members of one fate never committing on held answers. The TLA+ model gains
+the held answer, an unflushed crash and the recovery, and checks Leader Completeness over them.
 
 ## 4. The crates that follow
 

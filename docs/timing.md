@@ -251,6 +251,33 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
   the stamp removes was measured: between the kernel's stamp and the process's read, macOS
   p99.9 3.8–4.7 ms and up to 101 ms (100 µs heartbeats, load 17–32), p99.9 73 ms and up to
   125 ms at load 41; Linux p99.9 0.09–0.15 ms, up to 22 ms.
+- **Local health against the flush proof.** A node whose own log stalls must not blame its peers
+  for lateness its disk may share (Lifeguard's local health, carried from the node's wakes to its
+  durability). A peer's next heartbeat leaves only once the peer's log made a write durable after
+  the latest was due (§2.1), so a stall of a disk two nodes share holds both nodes' heartbeats
+  alike. A freshness point is judged only once this node has made a write durable since it took
+  the heartbeat the point follows; from that write the peer is given the time the point gave it
+  from the heartbeat, which is what a heartbeat proved as the disk came back takes to arrive
+  (`pair::Deferred`, `PairReport::deferred`). A node whose disk runs judges as before: it makes a
+  write durable at least once an interval, its own heartbeats' proofs, well inside a freshness
+  window wherever `α` exceeds its mean flush, and an ordinary run defers nothing (the simulation's
+  busy world, eight seeds, configured and doubled: no deferral on any pair, the configuration times
+  the same to the nanosecond as without the rule). A node whose own disk stalls holds its judgments
+  for as long, which costs it nothing it could use: a vote, a campaign and a held commit each need
+  its own write durable, and reads are confirmed by a quorum, never by a lease (`docs/raft.md`
+  §1, ReadIndex), so a leader that holds its judgment serves nothing stale. A peer that died in the stall is
+  suspected after it, at the point its last heartbeat set, noticed no later than that point gave
+  from the heartbeat, counted from the node's first write durable after; the peers whose disks run
+  suspect it within their stated bound meanwhile. Found by focal's event bus on one machine's disk
+  (2026-10-18): one stall of 584–587 ms in every node's log flush in the same second left no
+  heartbeat proved, each node suspected both others, and the leader, left no trusted quorum,
+  stepped down and was elected again, the step-down costing about a second and a redirect storm
+  its clients' lanes could not hold. Tests: `sim::a_stall_every_nodes_disk_shares_suspects_no_one`
+  (fails without the rule: "node 1 suspected 2 across a stall every disk shared"),
+  `sim::a_peer_killed_while_this_nodes_disk_stalls_is_suspected_once_it_is_back`, and
+  `processes::a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is`, whose stalled
+  member now holds the killed one trusted until its disk is resumed and suspects it after; every
+  record traces the deferrals step for step (`record::Tracer::excused`).
 
 ### 2.5 What a test does
 

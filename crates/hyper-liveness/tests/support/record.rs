@@ -89,6 +89,9 @@ pub(crate) enum Entry {
     Holds { peer: PeerId, trust: Option<Trust> },
     /// A heartbeat the node sent `peer`: its run and number.
     Sent { peer: PeerId, run: u64, seq: u64 },
+    /// The node's own log made a write durable at `at`, as fed to the stream: what its judgment of
+    /// each peer is deferred against (`docs/timing.md` §2.4, local health).
+    Durable { at: u64 },
 }
 
 /// What a record counts of a peer, as the node's report states it.
@@ -141,7 +144,8 @@ impl Record {
                     counted.skipped += seq.saturating_sub(previous).saturating_sub(1);
                 }
             }
-            Entry::Polled { .. } | Entry::Told(_) | Entry::Holds { .. } => {}
+            Entry::Polled { .. } | Entry::Told(_) | Entry::Holds { .. } | Entry::Durable { .. } => {
+            }
         }
         self.entries.push(entry);
     }
@@ -205,6 +209,11 @@ impl Record {
     /// A heartbeat sent to `peer`.
     pub(crate) fn sent(&mut self, peer: PeerId, run: u64, seq: u64) {
         self.push(Entry::Sent { peer, run, seq });
+    }
+
+    /// The node's own log made a write durable at `at`, fed to the stream.
+    pub(crate) fn durable(&mut self, at: u64) {
+        self.push(Entry::Durable { at });
     }
 
     /// What `report` states of `peer` that the record does not count: `None` where every count is
@@ -309,12 +318,25 @@ impl std::ops::AddAssign for Traced {
 }
 
 /// What a node held of a peer as its record went: the peer's latest run begun, the latest
-/// heartbeat taken in it, and the trust the stream last stated.
+/// heartbeat taken in it, the trust the stream last stated, and where the point it was held trusted
+/// to stands against the node's own durability.
 #[derive(Clone, Copy, Debug, Default)]
 struct Held {
     run: Option<u64>,
     last: Option<Last>,
     holds: Option<Trust>,
+    deferred: Deferred,
+}
+
+/// The stream's local health, as the record shows it (`docs/timing.md` §2.4): a point that passed
+/// while the node made nothing durable since it took the heartbeat the point follows is judged once
+/// it has, the peer given from that write the time the point gave it from the heartbeat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Deferred {
+    #[default]
+    No,
+    Stalled,
+    Until(u64),
 }
 
 /// The call the told changes after it came from, and where it is in the record.
@@ -348,6 +370,8 @@ fn judged(refused: Option<Refusal>) -> bool {
 struct Tracer<'a> {
     node: PeerId,
     entries: &'a [Entry],
+    /// The latest write the node's own log made durable, as fed.
+    durable: Option<u64>,
     /// Every heartbeat any node sent: sender, receiver, run, number.
     sent: &'a BTreeSet<(PeerId, PeerId, u64, u64)>,
     held: BTreeMap<PeerId, Held>,
@@ -385,13 +409,18 @@ impl Tracer<'_> {
                 }
                 if refused.is_none() {
                     held.last = Some(beat.last());
+                    // The heartbeat ends the gap a deferred point held.
+                    held.deferred = Deferred::No;
                 }
                 held.holds = holds;
             }
-            Some(Call::Polled { place, .. }) => {
+            Some(Call::Polled { place, now }) => {
                 for (peer, until) in std::mem::take(&mut self.due) {
                     let gone = self.held.get(&peer).is_none_or(|held| held.holds.is_none());
-                    if !gone && !self.told.contains(&(peer, until)) {
+                    if !gone
+                        && !self.told.contains(&(peer, until))
+                        && !self.excused(peer, until, now)
+                    {
                         self.fail(
                             place,
                             format!(
@@ -407,12 +436,52 @@ impl Tracer<'_> {
         self.told.clear();
     }
 
+    /// Whether the node's own durability excuses its call at `time`, at or past the point `until`
+    /// it held `peer` trusted to, from telling the suspicion: the stream's rule (`pair::Deferred`),
+    /// taken step for step over the record.
+    fn excused(&mut self, peer: PeerId, until: u64, time: u64) -> bool {
+        let durable = self.durable;
+        let Some(held) = self.held.get_mut(&peer) else {
+            return false;
+        };
+        let Some(last) = held.last else {
+            return false;
+        };
+        let taken = last.arrival_ns;
+        match held.deferred {
+            Deferred::Until(at) if time < at => return true,
+            Deferred::Until(_) => {}
+            _ if durable.is_none_or(|durable| durable <= taken) => {
+                held.deferred = Deferred::Stalled;
+                return true;
+            }
+            Deferred::Stalled => {
+                let at = durable
+                    .unwrap_or(time)
+                    .saturating_add(until.saturating_sub(taken));
+                if time < at {
+                    held.deferred = Deferred::Until(at);
+                    return true;
+                }
+            }
+            Deferred::No => {}
+        }
+        held.deferred = Deferred::No;
+        false
+    }
+
     fn walk(&mut self) {
         for (place, entry) in self.entries.iter().enumerate() {
             match *entry {
                 Entry::Began => {
                     self.settle();
                     self.held.clear();
+                    self.durable = None;
+                }
+                Entry::Durable { at } => {
+                    // The call before is judged on the durability it saw.
+                    self.settle();
+                    self.durable = Some(self.durable.map_or(at, |durable| durable.max(at)));
                 }
                 Entry::Fed {
                     peer,
@@ -425,6 +494,7 @@ impl Tracer<'_> {
                     if judged(refused)
                         && let Some(Trust::Trusted { until_ns }) = before.holds
                         && beat.stamp >= until_ns
+                        && !self.excused(peer, until_ns, beat.stamp)
                     {
                         // Judged at its arrival: the point passed, so the call tells it.
                         self.traced.passed += 1;
@@ -649,6 +719,7 @@ pub(crate) fn trace(records: &[(PeerId, &[Entry])]) -> (Traced, Vec<String>) {
         Tracer {
             node,
             entries,
+            durable: None,
             sent: &sent,
             held: BTreeMap::new(),
             call: None,

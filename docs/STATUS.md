@@ -221,6 +221,22 @@ is worked around.
   shell: `a_write_made_again_holds_only_what_the_refused_writes_held` fails there (the write made
   again held through 4 where the refused one held 2). The shell's schedules pass at 10,000 seeds a
   shape (`docs/durable.md` §2.4).
+- **hyper-liveness: a stall of a disk every node shares elected.** A peer's heartbeat is proved by a
+  flush, so one stall of a disk two nodes share holds both nodes' heartbeats alike, and each
+  suspected the other for lateness its own disk had too: focal's event bus on one machine's disk
+  had one stall of 584–587 ms in every node's log flush in the same second leave each node
+  suspecting both others, and its leader, left no trusted quorum, stepped down and was elected
+  again, at a cost of about a second and a redirect storm (traced on the bare-metal machine,
+  2026-10-18). Lifeguard's local health, carried from the node's wakes to its durability: a
+  freshness point is judged only once this node has made a write durable since it took the
+  heartbeat the point follows, the peer given from that write the time the point gave it from the
+  heartbeat (`pair::Deferred`, `PairReport::deferred`). An ordinary run defers nothing (the busy
+  world, eight seeds: no deferral, configuration times identical to the nanosecond); a node whose
+  disk stalls holds its judgments for as long, needing its own disk for any act they lead to. Tests:
+  `sim::a_stall_every_nodes_disk_shares_suspects_no_one` (fails without the rule),
+  `sim::a_peer_killed_while_this_nodes_disk_stalls_is_suspected_once_it_is_back`, and the processes
+  test's stalled member, now resumed; the records carry each node's durable writes and the tracer
+  checks every deferral (`docs/timing.md` §2.4).
 - **hyper-rt-transport: the shared-port driver test unwrapped Winsock's refusal.** Since 0802a05
   Windows refuses a shared bind before any socket is bound (`netsys::port_sharing`), and
   `a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own` unwrapped it on both

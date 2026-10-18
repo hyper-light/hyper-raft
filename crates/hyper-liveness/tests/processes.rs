@@ -107,12 +107,15 @@ fn secret_between(a: u64, b: u64) -> ExporterSecret {
     ExporterSecret::new(bytes)
 }
 
-/// What the device thread sends the owner's wake socket: a flush completed, or the disk stopped.
-/// The supervisor's commands are longer: [`STALL`] and [`HOLD`].
+/// What the device thread sends the owner's wake socket: a flush completed, the disk stopped, or it
+/// went on again. The supervisor's commands are longer: [`STALL`], [`RESUME`] and [`HOLD`].
 const COMPLETED: u8 = 0;
 const STOPPED: u8 = 1;
+const RESUMED: u8 = 2;
 /// The supervisor's command that the member's disk stop.
 const STALL: &[u8] = b"stall";
+/// The supervisor's command that a stopped disk go on: what it held, it then completes.
+const RESUME: &[u8] = b"resume";
 /// The supervisor's command that the member hold its thread, answering nothing, until a byte comes
 /// on its standard input: a member stopped on a platform with no signal that stops a process
 /// (Windows), as hyper-raft-e2e's members are held (`hyper_raft_e2e::parent`).
@@ -121,8 +124,10 @@ const HOLD: &[u8] = b"hold";
 /// The member's disk: one thread writing and flushing one file, a request at a time.
 enum Request {
     Flush,
-    /// The disk stops: nothing it is asked completes again.
+    /// The disk stops: nothing it is asked completes until it is resumed.
     Stall,
+    /// A stopped disk goes on, completing what it held.
+    Resume,
 }
 
 fn device(
@@ -144,26 +149,46 @@ fn device(
     // A liveness write is one block of the size the system reports for the file, so the device
     // takes it whole and the flush is of that block alone.
     let block = vec![0xa5u8; hyper_block::file::preferred_block(&file, &path).unwrap()];
+    let mut flush = || -> bool {
+        let started = clock.now_ns();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&block).unwrap();
+        file.sync_data().unwrap();
+        if done.send((started, clock.now_ns())).is_err() {
+            return false;
+        }
+        // A wake for the owner; lost only if the owner is gone.
+        let _ = wake.send(&[COMPLETED]);
+        true
+    };
     while let Ok(request) = requests.recv() {
         match request {
             Request::Flush => {
-                let started = clock.now_ns();
-                file.seek(SeekFrom::Start(0)).unwrap();
-                file.write_all(&block).unwrap();
-                file.sync_data().unwrap();
-                if done.send((started, clock.now_ns())).is_err() {
+                if !flush() {
                     return;
                 }
-                // A wake for the owner; lost only if the owner is gone.
-                let _ = wake.send(&[COMPLETED]);
             }
             Request::Stall => {
-                // A disk that stopped: the thread says so, then holds its last request for ever.
+                // A disk that stopped: the thread says so, then holds every request until it is
+                // resumed (for ever, unresumed); at most the one flush the owner keeps in flight.
                 let _ = wake.send(&[STOPPED]);
-                let (_keep, never) = sync_channel::<()>(0);
-                let _ = never.recv();
-                return;
+                let mut held = 0usize;
+                loop {
+                    match requests.recv() {
+                        Ok(Request::Resume) => break,
+                        Ok(Request::Flush) => held += 1,
+                        Ok(Request::Stall) => {}
+                        Err(_) => return,
+                    }
+                }
+                let _ = wake.send(&[RESUMED]);
+                for _ in 0..held {
+                    if !flush() {
+                        return;
+                    }
+                }
             }
+            Request::Resume => {}
         }
     }
 }
@@ -265,10 +290,10 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
     let wake = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let waker = UdpSocket::bind("127.0.0.1:0").unwrap();
     waker.connect(wake.local_addr().unwrap()).unwrap();
-    // Room for the most requests ever outstanding: the one flush the owner keeps in flight, and
-    // the stall. With room for one, a stall that came while a flush waited for the device thread
-    // was refused and lost, and the member's disk never stopped.
-    let (requests, requested) = sync_channel::<Request>(2);
+    // Room for the most requests ever outstanding: the one flush the owner keeps in flight, the
+    // stall and the resume. With room for one, a stall that came while a flush waited for the
+    // device thread was refused and lost, and the member's disk never stopped.
+    let (requests, requested) = sync_channel::<Request>(3);
     let (done, completions) = sync_channel::<(u64, u64)>(1);
     std::thread::spawn(move || device(file, requested, done, waker));
 
@@ -402,6 +427,13 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         if said == Some(&[STOPPED][..]) {
             disk = Disk::Stopped;
         }
+        if said == Some(&[RESUMED][..]) {
+            disk = Disk::Running;
+        }
+        if said == Some(RESUME) {
+            let _ = requests.try_send(Request::Resume);
+            continue;
+        }
         if said == Some(STALL) {
             disk = if requests.try_send(Request::Stall).is_ok() {
                 Disk::Asked
@@ -474,6 +506,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             flush_most = flush_most.max(durable.saturating_sub(started));
             blocked = blocked.saturating_add(durable.saturating_sub(started));
             liveness.on_durable(Write::Liveness, started, durable);
+            record.durable(durable);
         }
         let told = asked.changes.len();
         liveness.poll(now, &mut asked);
@@ -638,6 +671,7 @@ fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut Strin
                 writeln!(out, "r {me} h {peer} {}", trust_field(trust))
             }
             Entry::Sent { peer, run, seq } => writeln!(out, "r {me} o {peer} {run} {seq}"),
+            Entry::Durable { at } => writeln!(out, "r {me} d {at}"),
         };
     }
 }
@@ -729,6 +763,7 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
             },
             None,
         ),
+        "d" => (Entry::Durable { at: number(2)? }, None),
         _ => return None,
     };
     Some((member, entry, late))
@@ -1973,18 +2008,22 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
         assert!(found.sent >= found.due);
     }
 
-    // A node killed.
+    // A node killed: every live member suspects it, each within its stated bound. The stalled
+    // member's own log makes nothing durable since it took the killed member's last heartbeat, so
+    // it holds its judgment (local health, `docs/timing.md` §2.4): what it would judge, it could not
+    // act on, its vote unwritable.
     let mut victim = supervisor.members.0.remove(&KILLED).unwrap();
     let killed_at = clock.now_ns();
     victim.kill().unwrap();
     victim.wait().unwrap();
-    let survivors: Vec<u64> = (1..=NODES).filter(|m| *m != KILLED).collect();
-    supervisor.wait("every survivor suspects the killed member", |s| {
-        survivors
-            .iter()
+    let live: Vec<u64> = (1..=NODES)
+        .filter(|m| *m != STALLED && *m != KILLED)
+        .collect();
+    supervisor.wait("every live member suspects the killed member", |s| {
+        live.iter()
             .all(|m| s.holds_suspected(*m, KILLED, killed_at))
     });
-    for member in &survivors {
+    for member in &live {
         let found = supervisor.suspicion(*member, KILLED);
         assert!(
             found.at - found.due <= found.detection,
@@ -1994,16 +2033,57 @@ fn a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is() {
             found.detection
         );
     }
-    // Live members: the pairs between the members that neither stalled nor died, both ways, as
-    // each reports once it holds both of the others suspected.
-    let live: Vec<u64> = (1..=NODES)
-        .filter(|m| *m != STALLED && *m != KILLED)
-        .collect();
-    supervisor.wait("each live member states both suspected", |s| {
-        live.iter().all(|m| {
-            s.holds_suspected(*m, STALLED, killed_at) && s.holds_suspected(*m, KILLED, killed_at)
-        })
+    // The stalled member still holds the killed one trusted, its point passed and deferred.
+    let deferred = supervisor
+        .latest
+        .get(&STALLED)
+        .and_then(|stated| stated.peers.get(&KILLED))
+        .map(|seen| seen.trust);
+    assert_eq!(
+        deferred,
+        Some('T'),
+        "the stalled member judged the killed one while its own disk made nothing durable"
+    );
+
+    // Its disk resumed: it suspects the killed member, noticed only after, and the live members
+    // trust it again.
+    let resumed_at = clock.now_ns();
+    UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .send_to(RESUME, ("127.0.0.1", wakes[&STALLED] as u16))
+        .unwrap();
+    supervisor.wait("the resumed member suspects the killed member", |s| {
+        s.holds_suspected(STALLED, KILLED, resumed_at)
     });
+    let found = supervisor.suspicion(STALLED, KILLED);
+    assert!(
+        found.noticed >= resumed_at,
+        "the resumed member noticed the killed one at {}, before its disk was resumed at {resumed_at}",
+        found.noticed
+    );
+    assert!(
+        found.at - found.due <= found.detection,
+        "the resumed member's suspicion stands {} ns past the killed node's last schedule, past \
+         its stated bound of {} ns",
+        found.at - found.due,
+        found.detection
+    );
+    supervisor.wait(
+        "each live member trusts the resumed member and suspects the killed",
+        |s| {
+            live.iter().all(|m| {
+                s.holds_suspected(*m, KILLED, resumed_at)
+                    && s.latest.get(m).is_some_and(|stated| {
+                        stated.at >= resumed_at
+                            && stated
+                                .peers
+                                .get(&STALLED)
+                                .is_some_and(|seen| seen.trust == 'T')
+                    })
+            })
+        },
+    );
+    let survivors: Vec<u64> = (1..=NODES).filter(|m| *m != KILLED).collect();
     supervisor.members.stop();
     supervisor.finish();
     let traced = supervisor.traced();

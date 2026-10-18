@@ -298,6 +298,10 @@ struct Node {
     owner: Owner,
     alive: bool,
     disk_stalled: bool,
+    /// A stall that ends ([`Sim::stall_for_now`], [`Sim::resume`]): the writes submitted or in
+    /// flight while it holds, each with when it was submitted, completed when it ends; none while
+    /// the disk runs.
+    disk_held: Option<Vec<(Write, u64)>>,
     /// What every flush of the node's disk takes past its world's draw: a device slowed for good.
     disk_slowed: u64,
     /// The heartbeats taken when the node last charged its detectors an election.
@@ -387,6 +391,7 @@ impl Sim {
                     },
                     alive: true,
                     disk_stalled: false,
+                    disk_held: None,
                     disk_slowed: 0,
                     charged: 0,
                     disk_busy_until: 0,
@@ -491,6 +496,11 @@ impl Sim {
         if self.nodes[node].disk_stalled {
             return;
         }
+        let now = self.now;
+        if let Some(held) = self.nodes[node].disk_held.as_mut() {
+            held.push((write, now));
+            return;
+        }
         let start = self.now.max(self.nodes[node].disk_busy_until);
         let u = self.streams.unit(&mut self.sim, "disk", node as u64);
         let done = start + quantile(self.world.flush, u) + self.nodes[node].disk_slowed;
@@ -506,6 +516,36 @@ impl Sim {
                 started,
             },
         );
+    }
+
+    /// `node`'s disk stops completing writes until [`Sim::resume`]: what is in flight and what is
+    /// submitted meanwhile waits for it.
+    fn stall_for_now(&mut self, node: usize) {
+        self.nodes[node].disk_held.get_or_insert_with(Vec::new);
+    }
+
+    /// `node`'s disk goes on: every write it held completes, in order, each a flush after the one
+    /// before, its time from when it was submitted.
+    fn resume(&mut self, node: usize) {
+        let Some(held) = self.nodes[node].disk_held.take() else {
+            return;
+        };
+        for (write, started) in held {
+            let start = self.now.max(self.nodes[node].disk_busy_until);
+            let u = self.streams.unit(&mut self.sim, "disk", node as u64);
+            let done = start + quantile(self.world.flush, u) + self.nodes[node].disk_slowed;
+            self.nodes[node].disk_busy_until = done;
+            self.writing += 1;
+            self.schedule(
+                done,
+                node,
+                Ev::Durable {
+                    node,
+                    write,
+                    started,
+                },
+            );
+        }
     }
 
     /// Polls `node` and carries out what it asked; a frozen node polls at its thaw.
@@ -867,11 +907,16 @@ impl Sim {
                 if !self.nodes[node].alive || self.nodes[node].disk_stalled {
                     return;
                 }
+                if let Some(held) = self.nodes[node].disk_held.as_mut() {
+                    held.push((write, started));
+                    return;
+                }
                 self.woken(node);
                 let now = self.now;
                 let n = &mut self.nodes[node];
                 n.durable.push(now);
                 n.liveness.on_durable(write, started, now);
+                n.record.durable(now);
                 self.polled(node);
                 self.drain(node);
                 // The groups keep the log busy: their next write as this one completes.
@@ -937,10 +982,17 @@ impl Sim {
                     let _ = self.feed(node, from, &bytes, stamp);
                     None
                 }
+                Event::Durable { write, started, .. } if self.nodes[node].disk_held.is_some() => {
+                    if let Some(held) = self.nodes[node].disk_held.as_mut() {
+                        held.push((write, started));
+                    }
+                    None
+                }
                 Event::Durable { write, started, .. } if !self.nodes[node].disk_stalled => {
                     let n = &mut self.nodes[node];
                     n.durable.push(now);
                     n.liveness.on_durable(write, started, now);
+                    n.record.durable(now);
                     Some(write)
                 }
                 _ => None,
@@ -1281,6 +1333,167 @@ fn a_stalled_disk_is_suspected_as_a_crash_is() {
         // The stalled node still hears its peers: it took a heartbeat from each since every peer
         // suspected it (the wait above), and its suspicions of them, live throughout, are traced
         // with every other (`Sim::traced`).
+    }
+}
+
+/// Every live pair of `sim` trusted: a suspicion held from just before a stall or a kill would be
+/// held through it, and measure nothing of it.
+fn all_trusted(sim: &Sim) -> bool {
+    let nodes = sim.nodes.len() as u64;
+    sim.nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.alive)
+        .all(|(node, n)| {
+            (1..=nodes)
+                .filter(|peer| *peer != node as u64 + 1 && sim.nodes[*peer as usize - 1].alive)
+                .all(|peer| matches!(n.liveness.trust(peer), Some(Trust::Trusted { .. })))
+        })
+}
+
+/// A stall every node's disk shares (one machine's disk under every node, as a benchmark's, or a
+/// virtual machine's host's) holds every heartbeat, each proved by a flush: each node's own log has
+/// made nothing durable since it took each peer's latest heartbeat, so it defers each freshness
+/// point the stall passes and judges it once its own disk is back, the peer given the time the
+/// point gave it (local health, `docs/timing.md` §2.4). No node suspects another. The stall held
+/// the group's commits, which an election could not have shortened, every vote waiting on the same
+/// disk: the event bus on the bare-metal machine (2026-10-18) had one 0.6 s stall of its one disk
+/// leave every node suspecting both others, and its leader stepped down.
+#[test]
+fn a_stall_every_nodes_disk_shares_suspects_no_one() {
+    for seed in seeds(12, 8) {
+        let mut sim = Sim::new(3, BUSY, seed);
+        sim.run_until_configured();
+        sim.run_until_doubled();
+        sim.run_while(|sim| !all_trusted(sim), None);
+        let nodes = sim.nodes.len();
+        let pairs: Vec<(usize, u64)> = (0..nodes)
+            .flat_map(|node| {
+                (1..=nodes as u64)
+                    .filter(move |peer| *peer != node as u64 + 1)
+                    .map(move |peer| (node, peer))
+            })
+            .collect();
+        let report =
+            |sim: &Sim, (node, peer): (usize, u64)| sim.nodes[node].liveness.report(peer).unwrap();
+        let before: Vec<_> = pairs.iter().map(|pair| report(&sim, *pair)).collect();
+        for node in 0..nodes {
+            sim.stall_for_now(node);
+        }
+        // Until every pair's freshness passed in the stall: each node deferred a point of each
+        // peer, or suspected it.
+        sim.run_while(
+            |sim| {
+                pairs.iter().zip(&before).any(|(pair, was)| {
+                    let now = report(sim, *pair);
+                    now.deferred <= was.deferred && now.suspicions <= was.suspicions
+                })
+            },
+            None,
+        );
+        let held: Vec<u64> = pairs.iter().map(|pair| report(&sim, *pair).taken).collect();
+        for node in 0..nodes {
+            sim.resume(node);
+        }
+        // Until each node took a heartbeat of each peer since: every point the stall deferred was
+        // judged.
+        sim.run_while(
+            |sim| {
+                pairs
+                    .iter()
+                    .zip(&held)
+                    .any(|(pair, taken)| report(sim, *pair).taken <= *taken)
+            },
+            None,
+        );
+        for (pair, was) in pairs.iter().zip(&before) {
+            assert_eq!(
+                report(&sim, *pair).suspicions,
+                was.suspicions,
+                "seed {seed}: node {} suspected {} across a stall every disk shared",
+                pair.0 + 1,
+                pair.1
+            );
+        }
+    }
+}
+
+/// A node whose own disk stalls defers its judgment of its peers and judges once its disk is back:
+/// a peer killed in the stall is suspected after the disk resumes, never before, at the point the
+/// peer's last heartbeat set, noticed no later than that point gave from the heartbeat, counted
+/// from the latest write the node made durable before it noticed. Its peer whose disk runs suspects
+/// the killed one within the bound it states, as ever.
+#[test]
+fn a_peer_killed_while_this_nodes_disk_stalls_is_suspected_once_it_is_back() {
+    for seed in seeds(13, 8) {
+        let mut sim = Sim::new(3, BUSY, seed);
+        sim.run_until_configured();
+        sim.run_until_doubled();
+        sim.run_while(|sim| !all_trusted(sim), None);
+        let (stalled, running, victim) = (0usize, 1usize, 2usize);
+        let peer = victim as u64 + 1;
+        sim.stall_for_now(stalled);
+        // Killed once the stalled node took a heartbeat of it past its own last durable write: a
+        // peer killed before is judged by a disk that made a write durable since its last
+        // heartbeat, whose silence is evidence, and suspected as ever.
+        let taken = sim.nodes[stalled].liveness.report(peer).unwrap().taken;
+        sim.run_while(
+            |sim| sim.nodes[stalled].liveness.report(peer).unwrap().taken <= taken,
+            None,
+        );
+        sim.nodes[victim].alive = false;
+        sim.run_while(
+            |sim| sim.nodes[running].liveness.trust(peer) != Some(Trust::Suspected),
+            None,
+        );
+        let found = sim.nodes[running]
+            .suspicions
+            .iter()
+            .rfind(|s| s.peer == peer)
+            .copied()
+            .unwrap();
+        let last = found.last.unwrap();
+        assert!(found.at_ns - last.due_ns <= found.detection.unwrap().as_nanos() as u64);
+        // The stalled node holds its judgment while its own log makes nothing durable.
+        assert!(
+            matches!(
+                sim.nodes[stalled].liveness.trust(peer),
+                Some(Trust::Trusted { .. })
+            ),
+            "seed {seed}: the stalled node judged the killed one while its disk held"
+        );
+        let resumed_at = sim.now;
+        sim.resume(stalled);
+        sim.run_while(
+            |sim| sim.nodes[stalled].liveness.trust(peer) != Some(Trust::Suspected),
+            None,
+        );
+        let found = sim.nodes[stalled]
+            .suspicions
+            .iter()
+            .rfind(|s| s.peer == peer)
+            .copied()
+            .unwrap();
+        assert!(
+            found.noticed_ns >= resumed_at,
+            "seed {seed}: noticed at {} before the resume at {resumed_at}",
+            found.noticed_ns
+        );
+        let last = found.last.unwrap();
+        let durable = sim.nodes[stalled]
+            .durable
+            .iter()
+            .copied()
+            .filter(|at| *at <= found.noticed_ns)
+            .max()
+            .unwrap();
+        assert!(
+            found.noticed_ns - durable <= found.at_ns - last.arrival_ns,
+            "seed {seed}: noticed {} ns after its latest durable write, past the {} ns the point \
+             gave from the heartbeat",
+            found.noticed_ns - durable,
+            found.at_ns - last.arrival_ns
+        );
     }
 }
 

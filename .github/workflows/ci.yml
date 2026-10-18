@@ -103,9 +103,8 @@ jobs:
     runs-on: ubuntu-24.04
     # The state bound is what bounds the work; this catches a checker that stopped making
     # progress: twice the whole suite's measured time at one worker (docs/models/README.md),
-    # which every part is within. The held part (Held.tla, core step R-8, 2026-10-18) is not yet
-    # measured: its passing configuration has 13,383,629 states, 1.4 times grow's 9,551,710, which
-    # the change part runs within this; its first run's time is the measurement to state here.
+    # which every part is within. The held part (Held.tla, core step R-8) took 14 min 47 s in its
+    # first run (2026-10-18, run 39147385800), its passing configuration 10 min 50 s of it.
     timeout-minutes: 131
     env:
       TLA_TOOLS: ${{ github.workspace }}/target/tla

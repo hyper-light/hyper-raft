@@ -295,21 +295,22 @@ durable promise and whose leader commits on the first of the classic quorum and 
 (`docs/raft.md` §3.7). It is hyper-check's model of the step (`tests/models/held.rs`) written as a
 specification, state for state: the same variables, steps and guards. TLC's distinct states under
 the members' symmetry are that search's classes, as the FastTrack mirror's are TLC's, so `held`
-states the Rust search's count before TLC has run it, and TLC's count checks the transcription.
-The refused configurations are each at the smallest scope at which the Rust search's shortest
-history finds the defect (8, 8, 14, 15 and 13 steps, 2,813, 4,929, 902,347, 1,627,973 and 548,792
-classes searched); their counts are TLC's own and await the branch's first CI run, which they state
-a ceiling for until then.
+stated the Rust search's count before TLC had run it, and TLC counted exactly that (CI run
+39147385800, 10 min 50 s at four workers): the transcription checked against the search, state for
+state. The refused configurations are each at the smallest scope at which the Rust search's
+shortest history finds the defect (8, 8, 14, 15 and 13 steps, 2,813, 4,929, 902,347, 1,627,973 and
+548,792 classes searched); their counts are TLC's own, from the same run, each within 8 % of the
+Rust search's, whose breadth-first order is not TLC's. The part took 14 min 47 s.
 
 | Name | Configuration | Bounds | Distinct states | Result |
 |---|---|---|---|---|
-| `held` | `Held.cfg` | 3 voters, each its own fate, 2 terms, 2 indexes, a write out at a time | 13,383,629 (hyper-check's) | passes |
-| `heldreach` | `HeldReached.cfg` | `held` and the claim `NoHeldCommit` | first CI run | refused: `NoHeldCommit` |
-| `heldmemory` | `HeldLeaderMemory.cfg` | a leader counting its memory, 2 terms, 1 index | first CI run | refused: `LeaderHolds` |
-| `heldpast` | `HeldPastPromise.cfg` | an answer for memory with no promise, 2 terms, 1 index | first CI run | refused: `LeaderHolds` |
-| `heldcover` | `HeldCoverOnly.cfg` | an answer under the durable promise alone, past a lower one out | first CI run | refused: `LeaderHolds` |
-| `heldlower` | `HeldLowerPromise.cfg` | a write stating a promise below what the member answered for | first CI run | refused: `LeaderHolds` |
-| `heldownlog` | `HeldOwnLog.cfg` | a mark narrowed to the member's own durable log | first CI run | refused: `LeaderHolds` |
+| `held` | `Held.cfg` | 3 voters, each its own fate, 2 terms, 2 indexes, a write out at a time | 13,383,629 (hyper-check's, and TLC's) | passes |
+| `heldreach` | `HeldReached.cfg` | `held` and the claim `NoHeldCommit` | 83,153 | refused: `NoHeldCommit` |
+| `heldmemory` | `HeldLeaderMemory.cfg` | a leader counting its memory, 2 terms, 1 index | 2,841 | refused: `LeaderHolds` |
+| `heldpast` | `HeldPastPromise.cfg` | an answer for memory with no promise, 2 terms, 1 index | 4,562 | refused: `LeaderHolds` |
+| `heldcover` | `HeldCoverOnly.cfg` | an answer under the durable promise alone, past a lower one out | 878,569 | refused: `LeaderHolds` |
+| `heldlower` | `HeldLowerPromise.cfg` | a write stating a promise below what the member answered for | 1,592,828 | refused: `LeaderHolds` |
+| `heldownlog` | `HeldOwnLog.cfg` | a mark narrowed to the member's own durable log | 526,260 | refused: `LeaderHolds` |
 
 What each shows:
 - `held`: Leader Completeness and agreement in every run of the scope. A held quorum spans the

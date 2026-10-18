@@ -206,10 +206,9 @@ is worked around.
   33 times below the classic commit's (`docs/raft.md` §3.7, `docs/benchmarks.md`, "Commits on
   entries held in memory"). hyper-log stores the promise in a hard state record of its own kind;
   hyper-durable draws each opening's incarnation and takes `light_now` at every drive (`docs/durable.md`
-  §5.3). The TLA+ model is `docs/models/Held.tla`, the exhaustive model state for state, so `held`
-  states the Rust search's 13,383,629 states for TLC to match, and each rule taken out is a
-  configuration TLC must refuse (`docs/models/README.md`). Open: TLC's counts, from the branch's
-  first CI run; a leader's window freed by held answers.
+  §5.3). The TLA+ model is `docs/models/Held.tla`, the exhaustive model state for state: TLC counted
+  `held` at exactly the Rust search's 13,383,629 states and refused each rule taken out (CI run
+  39147385800, `docs/models/README.md`). Open: a leader's window freed by held answers.
 
 ### Closed (2026-10-17)
 

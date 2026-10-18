@@ -280,9 +280,13 @@ answers take to come). While a request is being sent a period is charged what wa
 acknowledged, whichever is more (a sender held by the peer's credit on a slow path sends nothing while
 the peer drains the bottleneck); sent whole, it is in the network until the peer acknowledges it
 (hyper-quic's `acked_bytes`, patch Q6), and is waited on while each period brings the peer's
-acknowledgement of a datagram's worth; the peer's period to answer begins when QUIC reports the
-exchange's stream acknowledged whole, never when it was sent (focal's audit F38: a request in a
-bottleneck's queue was refused before the peer had it); a stream its peer does not read — out of
+acknowledgement of a datagram's worth, or of the rest of the request where less is left (2026-10-17:
+charged a datagram, a request smaller than one, acknowledged whole, was refused at the end of the
+period it was sent in, so its peer's "not yet", sent as the peer's own period ended, lost the race
+whenever it was late: focal's 93-byte seal on a loaded host, the answer 24 ms late); the peer's
+period to answer begins when QUIC reports the exchange's stream acknowledged whole, never when it
+was sent (focal's audit F38: a request in a bottleneck's queue was refused before the peer had it);
+a stream its peer does not read — out of
 credit, a datagram of it and more sent and all of that acknowledged, and nothing written since — ends a
 window after it is found so, the wait starting again whenever it has written more (2026-10-17: judged
 on its state alone at two judgements a window apart, a stream its peer read in steps was refused while

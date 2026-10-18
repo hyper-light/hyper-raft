@@ -190,6 +190,19 @@ is worked around.
 
 ### Closed (2026-10-17)
 
+- **hyper-transport: a request smaller than a datagram was refused at the end of the period it was
+  sent in.** A request being asked must move a datagram's worth each period, and one smaller than a
+  datagram, acknowledged whole, moved less: it was refused `Stalled` at its first judgement, one
+  period from the send, where the peer's period to answer begins when it has the request. Its peer's
+  "not yet" goes as the peer's own period ends, less the round trip and its timer's lateness, so it
+  arrived by a fraction of a millisecond and lost whenever it was late: focal's 128 kbit/s seal test
+  (93 bytes owed, 475 sent and 310 acknowledged in the period) failed in 1 run of 5 under twelve busy
+  loops, its answer 24 ms late. A request acknowledged whole in a period has moved all it had
+  (`docs/transport.md` §4a). Tests: `progress::tests::a_request_smaller_than_a_datagram_is_given_a_window_once_the_peer_has_it`
+  and `exchange::a_request_smaller_than_a_datagram_is_given_its_period_once_the_peer_has_it` (a
+  head-only request answered nine tenths of a period after the peer has it, over 60 ms each way:
+  refused 20 ms before its answer under the old rule).
+
 - **hyper-transport: a stream its peer read in steps was refused as unread while it moved.** F38's
   unread rule judged a stream by its state at each judgement, once a period: out of credit with
   everything it sent acknowledged at two judgements a window apart, it was refused `Stalled`, whatever

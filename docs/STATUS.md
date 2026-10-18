@@ -225,6 +225,19 @@ is worked around.
 
 ### Closed (2026-10-24)
 
+- **hyper-transport: a stream its peer read in steps was refused as unread while it moved (main's
+  `1912194`, taken to this line: the cause of mantle's busy-job objects failures, where on 4 of 4 busy
+  runners a gateway judged its reader unread and refused the exchange `Stalled`, the reader having
+  taken bytes 7 to 22 ms before the verdict and consumed everything sent).** F38's unread rule judged a
+  stream by its state at each judgement, once a period: out of credit with everything it sent
+  acknowledged at two judgements a window apart, it was refused `Stalled`, whatever it wrote between
+  them. A stream held to its peer's pace is in that state at nearly every instant: hyper-rt-transport's
+  `exchanges` test refused its 8 MiB request in 12 runs of 14 under two dozen busy loops (and on the
+  macOS gate twice in three runs), the server reading every byte as it came. The wait now starts again
+  whenever the stream has written more than when it was found unread (`docs/transport.md` §4a). Test:
+  `exchange::a_stream_its_peer_reads_at_its_own_pace_is_never_refused` (refused at 4.6 MB under the old
+  rule); 0 of 14 under the same load.
+
 - **hyper-rt: on Windows a console close or a shutdown ended the process as the handler returned, before
   a subscriber's orderly stop (found by mantle).** The console handler returned TRUE as soon as it had
   woken the subscribers, and for a close or a shutdown the system then ends the process (HandlerRoutine:

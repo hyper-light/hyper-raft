@@ -322,6 +322,20 @@ bounds pending handshakes (Retry under load), identities, connections per identi
 used longest ago replaced, below) and connections in all; every exchange and lane has a table bound.
 Every refusal is typed, and one that ends an exchange crosses the wire as the stream reset's code.
 
+**Every dial past the places is answered in its turn** (2026-10-19). A retry under load, a
+refusal, a version negotiation and a stateless reset each answer one datagram the endpoint took,
+and wait for the owner's next transmit poll (`Limits::max_responses`); quinn sends each as its
+datagram is handled and drops it only for a full socket. An owner that polls its transmits after
+each receive states what one receive hands the endpoint, so a burst of dials is answered whole: a
+dial whose answer is dropped hears nothing until its probe timeout, and dials begun together probe
+again together. focal stated the handshake places as the bound, one for its enrollment sponsor, and
+of eight joiners dialing at once only the first heard its answer; the rest probed in step, one
+answered a round, and two failed their joins after 10 s (`tests/responses.rs`: two of eight heard
+before any probe timeout at a bound of one, all eight at the burst's datagrams). The queue grows as
+responses come, and keeps buffers for later ones only as many as the handshake places: laid out at
+its bound as before, a bound of 4,096 cost each endpoint 524 KB as it was made, a client's
+connector too.
+
 **Only an idle connection is replaced** (2026-10-10, focal's fix of 2026-10-09 ported). An identity
 at its bound used to replace whichever of its connections it had used least, busy or not: in focal,
 64 callers of one principal against a bound of 16 replaced 27,765 connections in 30 s and a third

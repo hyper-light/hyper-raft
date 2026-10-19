@@ -1290,7 +1290,8 @@ impl<N: Drive> Mesh<N> {
         let limits = hyper_sim::Limits {
             events: 1 << 12,
             nodes: count,
-            streams: 8,
+            // One for the schedule and one a node (`hyper_sim::Limits::streams`).
+            streams: count + 1,
             steps: u64::MAX,
             trace_words: 0,
         };

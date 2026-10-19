@@ -46,6 +46,15 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-19, in its document: in hyper-transport, an endpoint's own responses (a retry
+under load, a refusal, a version negotiation, a stateless reset) are queued as they come, never laid
+out at their bound (`Limits::max_responses`), and keep buffers for later ones only as many as the
+handshake places, so an owner may state what one receive hands the endpoint and a burst of dials is
+answered whole (`docs/transport.md`, "Every dial past the places is answered in its turn";
+`tests/responses.rs`: two of eight dialers heard before any probe timeout at a bound of one and
+all eight at the burst's, and a bound of 4,096 laid out 524 KB as an endpoint was made and now
+nothing). The test mesh asks hyper-sim for a stream a node and one for the schedule.
+
 Landed 2026-10-19, in its document: in hyper-durable, a compaction's start made durable takes the
 entries it let go of out of the compaction rule's count by the share each was counted at as it
 applied, kept beside it in four bytes, where it walked the log again from the new start and read

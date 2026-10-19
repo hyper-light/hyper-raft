@@ -90,7 +90,14 @@ pub struct Limits {
     pub keep_alive: Option<Duration>,
     /// The endpoint's own responses (version negotiation, retries, refusals, stateless resets)
     /// queued for sending; one past the bound is dropped and counted, as RFC 9000 lets an endpoint
-    /// leave any of them unsent.
+    /// leave any of them unsent. Each answers one datagram the endpoint took since its transmits
+    /// were last polled, so an owner that polls them after each of its receives states what one
+    /// receive hands the endpoint, and none of a burst's is dropped: quinn sends each as its
+    /// datagram is handled, dropping it only for a full socket. A dial whose answer is dropped
+    /// hears nothing until its probe timeout, and dials begun together probe again together:
+    /// eight joiners of an enrollment sponsor with one handshake place, answered one at a time
+    /// from a bound of one, failed their joins after 10 s of probes (focal, 2026-10-19). The
+    /// queue grows as responses come and is never laid out at the bound.
     pub max_responses: usize,
     /// The chunks of [`crate::RECEIVE_CHUNK`] bytes received datagrams are cut from, each reserved
     /// from the budget: the chunk memory a peer can pin is at most this many chunks, whatever it
@@ -763,8 +770,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
             path_ceiling: None,
-            responses: VecDeque::with_capacity(limits.max_responses),
-            spare: Vec::with_capacity(limits.max_responses),
+            responses: VecDeque::new(),
+            spare: Vec::new(),
             marks: Vec::with_capacity(peers),
             touched: Vec::with_capacity(peers),
             rearm: Vec::with_capacity(peers),
@@ -826,7 +833,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         out.clear();
         if let Some((transmit, bytes)) = self.responses.pop_front() {
             out.extend_from_slice(&bytes);
-            if self.spare.len() < self.core.limits.max_responses {
+            // A buffer for a later response, as many kept as the handshakes waiting at once:
+            // a burst past them takes its buffers as it comes and gives them up after.
+            if self.spare.len() < self.core.limits.admission.pending
+                && self.spare.try_reserve(1).is_ok()
+            {
                 self.spare.push(bytes);
             }
             return Some(transmit);
@@ -2048,13 +2059,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     fn respond(&mut self, transmit: Transmit, bytes: &[u8]) {
-        if self.responses.len() >= self.core.limits.max_responses {
+        let response = bytes.get(..transmit.size).unwrap_or(bytes);
+        if self.responses.len() >= self.core.limits.max_responses
+            || self.responses.try_reserve(1).is_err()
+        {
             self.core.stats.responses_dropped = self.core.stats.responses_dropped.saturating_add(1);
             return;
         }
         let mut copy = self.spare.pop().unwrap_or_default();
         copy.clear();
-        copy.extend_from_slice(bytes.get(..transmit.size).unwrap_or(bytes));
+        if copy.try_reserve(response.len()).is_err() {
+            self.core.stats.responses_dropped = self.core.stats.responses_dropped.saturating_add(1);
+            return;
+        }
+        copy.extend_from_slice(response);
         self.responses.push_back((transmit, copy));
     }
 

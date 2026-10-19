@@ -1045,7 +1045,14 @@ on macOS and Linux 6.12; `tests/blocking_waits.rs` on macOS (2026-10-10).
 
 Of slates' machine profile, the runtime reads: the cores the process may run on and their classes, the CPU
 budget a cgroup grants, the base page, the mean and p99 wake (park to running), the null system call's
-cost, and the clock read's cost. The codec, hash, memcpy, fault and lock probes serve slates' storage
+cost, and the clock read's cost. A consumer that sizes its memory to the machine reads the memory a new
+allocation may take now (`Facts::memory_available_now`): on Linux the machine's `MemAvailable` within
+the room of each cgroup over the process with a ceiling, the lower of `memory.max` and `memory.high`,
+as the kernel measures a cgroup's headroom (mm/memcontrol.c `mem_cgroup_wb_stats`), plus its clean file
+pages, which reclaim takes before a charge fails (mm/page-writeback.c `mdtc_calc_avail`); the facts'
+memory limit takes `memory.high` too. Under a 24 GiB scope on a 128 GB machine, `MemAvailable` alone
+read the machine's 82 GB, and mantle's engine, growing while the machine had memory free, was killed
+at its limit (mantle docs/research/64). The codec, hash, memcpy, fault and lock probes serve slates' storage
 and are not carried.
 
 ### 10.2 Calibration, measured once and kept

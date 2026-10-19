@@ -91,6 +91,13 @@ impl DeviceFile {
         };
         let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
         refuse_zones(path, &file, node)?;
+        // A file still empty is asked to be written in place where its file system would copy it
+        // on write (`sys::written_in_place`): btrfs takes the mark only now, before the file's
+        // first byte, and a log's file comes here empty whoever made it (a caller may make it
+        // first, and open it without `create`), and grows by writes, never preallocated.
+        if !node && file.metadata().map_err(wrap("stat"))?.len() == 0 {
+            sys::written_in_place(&file);
+        }
         let layout = match caching {
             Caching::Direct => align,
             Caching::Buffered => layout_of(&file, path, align)?,
@@ -355,6 +362,16 @@ impl DeviceFile {
             self.file.sync_data()
         };
         synced.map_err(|e| self.io_error("sync_data", e))
+    }
+
+    /// Whether the file system writes the file in place where it would copy it on write: `Some`
+    /// on btrfs, whether the file is marked (`FS_NOCOW_FL`, asked at [`DeviceFile::open`] of an
+    /// empty file), `None` on a file system that writes every file in place, or that cannot say.
+    pub fn written_in_place(&self) -> Option<bool> {
+        if self.node {
+            return None;
+        }
+        sys::written_in_place_marked(&self.file)
     }
 
     /// Reserves space so the file is `len` bytes long with its blocks allocated. Only for a
@@ -706,8 +723,6 @@ mod sys {
     }
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        written_in_place(file);
         // Linux: fallocate(2) mode 0 allocates and extends. macOS: rustix issues
         // F_PREALLOCATE from the physical end of file, then ftruncate(2) — correct only
         // for an empty file, which is the one use.
@@ -720,16 +735,18 @@ mod sys {
     const BTRFS_SUPER_MAGIC: i128 = 0x9123_683E;
 
     /// Asks btrfs to write a still-empty file in place (`FS_NOCOW_FL`, chattr(1)'s `C`), as a
-    /// log's file is written: btrfs copies a file on write by default, so every write of the
-    /// preallocated space took new extents from its free-space bitmaps and summed its own
-    /// checksums of the data, where the log sums and seals its own. An event-bus node on btrfs
-    /// spent 6 to 25% of its CPU in `_find_next_zero_bit` and `steal_from_bitmap` on its log's
-    /// I/O thread (focal on fedora under perf, 2026-10-19). btrfs takes the flag only on an empty
-    /// file (btrfs(5), "nodatacow"), so it is asked before the space is allocated; systemd's
-    /// journal asks the same of its files. A file system that is not btrfs is left as it is, and a
-    /// btrfs that refuses keeps the file as before: written by copying, and as durable.
+    /// log's file is written: btrfs copies a file on write by default, so every overwrite of the
+    /// log's written blocks took new extents from its free-space bitmaps and summed its own
+    /// checksums of the data (and, mounted with `compress`, compressed it), where the log sums and
+    /// seals its own. An event-bus node on btrfs spent 6 to 25% of its CPU in
+    /// `_find_next_zero_bit` and `steal_from_bitmap` on its log's I/O thread (focal on fedora
+    /// under perf, 2026-10-19). btrfs takes the flag only on an empty file and leaves a file with
+    /// a byte in it as it is, without an error (`btrfs_fileattr_set` sets `NODATACOW` only at an
+    /// `i_size` of zero), so it is asked as the file is opened empty; systemd's journal asks the
+    /// same of its files. A file system that is not btrfs is left as it is, and a btrfs that
+    /// refuses keeps the file as before: written by copying, and as durable.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn written_in_place(file: &File) {
+    pub(super) fn written_in_place(file: &File) {
         if !rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == BTRFS_SUPER_MAGIC) {
             return;
         }
@@ -738,8 +755,12 @@ mod sys {
         }
     }
 
-    /// Whether the file is marked to be written in place.
-    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    /// Elsewhere every file system focal ships on writes a file in place.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn written_in_place(_file: &File) {}
+
+    /// Whether the file is marked to be written in place: `None` off btrfs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) fn written_in_place_marked(file: &File) -> Option<bool> {
         let on_btrfs =
             rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == BTRFS_SUPER_MAGIC);
@@ -749,6 +770,11 @@ mod sys {
         rustix::fs::ioctl_getflags(file)
             .ok()
             .map(|flags| flags.contains(rustix::fs::IFlags::NOCOW))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn written_in_place_marked(_file: &File) -> Option<bool> {
+        None
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -840,6 +866,13 @@ mod sys {
         file.set_len(len)
     }
 
+    /// NTFS writes a file in place: nothing to ask.
+    pub(super) fn written_in_place(_file: &File) {}
+
+    pub(super) fn written_in_place_marked(_file: &File) -> Option<bool> {
+        None
+    }
+
     pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         let mut options = super::options(create);
         options.custom_flags(FILE_FLAG_NO_BUFFERING);
@@ -860,27 +893,41 @@ mod tests {
         Alignment::new(4096).unwrap()
     }
 
-    /// Do: preallocate a new file. Expect: on btrfs it is marked to be written in place
-    /// (`FS_NOCOW_FL`); elsewhere nothing is asked of the file system. Run with `TMPDIR` on a btrfs
-    /// to see the mark.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    /// Do: open an empty file made beforehand without `create`, as a log's owner opens the file
+    /// it made (focal's bus makes it with `File::create`), then write past its end as the log
+    /// grows. Expect: on btrfs it is marked to be written in place (`FS_NOCOW_FL`), and stays
+    /// so; a file opened with a byte in it is left as it was, copied on write, since btrfs takes
+    /// the mark only on an empty file. Elsewhere nothing is asked and nothing is said. Run with
+    /// `TMPDIR` on a btrfs to see the mark.
     #[test]
-    fn a_preallocated_file_on_btrfs_is_written_in_place() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test makes its files outside the device layer, as the log's owner may"
+    )]
+    fn a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was() {
         let dir = tempfile::tempdir().unwrap();
-        let file = DeviceFile::open(
-            &dir.path().join("log"),
-            true,
-            CachingRequest::PreferDirect,
-            align(),
-        )
-        .unwrap();
-        file.preallocate(1 << 20).unwrap();
-        if let Some(marked) = sys::written_in_place_marked(file.std_file()) {
-            assert!(
-                marked,
-                "a preallocated file on btrfs was left to be copied on write"
+        let path = dir.path().join("log");
+        std::fs::File::create(&path).unwrap();
+        let file = DeviceFile::open(&path, false, CachingRequest::PreferDirect, align()).unwrap();
+        let mut block = AlignedBuf::zeroed(4096, align()).unwrap();
+        block.extend_from_slice(&[7; 4096]).unwrap();
+        file.write_all_at(block.as_slice(), 1 << 20).unwrap();
+        file.sync_data().unwrap();
+        let other = dir.path().join("written");
+        std::fs::write(&other, [1u8]).unwrap();
+        let written = DeviceFile::open(&other, false, CachingRequest::Buffered, align()).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if file.written_in_place().is_some() {
+            assert_eq!(
+                file.written_in_place(),
+                Some(true),
+                "a file opened empty on btrfs was left to be copied on write"
             );
+            assert_eq!(written.written_in_place(), Some(false));
+            return;
         }
+        assert_eq!(file.written_in_place(), None);
+        assert_eq!(written.written_in_place(), None);
     }
 
     /// A transfer of no bytes from an empty buffer, whose address is the empty slice's, is no

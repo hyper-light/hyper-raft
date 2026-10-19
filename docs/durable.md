@@ -828,11 +828,16 @@ of the device's cache alone. A slot reused is written already and is not filled 
   a written block takes new extents from its free-space bitmaps and sums btrfs's own checksums of
   the data, so the argument above (an overwrite is a flush of the device's cache alone) held there
   only once the file is written in place. The file is marked so (`FS_NOCOW_FL`, chattr(1)'s `C`)
-  while it is still empty, before its space is allocated, the one time btrfs takes the mark
-  (`DeviceFile::preallocate`); the log sums and seals its own records, so nothing btrfs checked is
-  left unchecked. An event-bus node on btrfs had spent 6 to 25% of its CPU in the free-space search
-  on its log's I/O thread (focal on fedora under perf, 2026-10-19); systemd's journal marks its
-  files the same way. A file system that is not btrfs is not asked.
+  as it is opened while still empty (`DeviceFile::open`), before its first byte, the one time btrfs
+  takes the mark: btrfs leaves a file with a byte in it as it is, without an error. The open is the
+  place because a log's file grows by its writes and is never preallocated, and its owner may make
+  it first and open it without `create` (focal's bus does); the mark first went on
+  `DeviceFile::preallocate`, which the log never calls, and a bus node's file was found unmarked
+  (`lsattr`, 2026-10-19). `DeviceFile::written_in_place` says whether a file is marked. The log sums
+  and seals its own records, so nothing btrfs checked is left unchecked. An event-bus node on btrfs
+  had spent 6 to 25% of its CPU in the free-space search on its log's I/O thread (focal on fedora
+  under perf, 2026-10-19); systemd's journal marks its files the same way. A file system that is
+  not btrfs is not asked.
 - **Recovery is unchanged by the zeros.** A frame is read only where its block begins with the frame
   magic and a segment's header only where its block begins with the segment magic; neither magic
   has a zero byte, so a zeroed block is no header and reads as the end, as the file's end does

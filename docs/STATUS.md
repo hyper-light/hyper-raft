@@ -46,11 +46,14 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
-Landed 2026-10-19, in its document: in hyper-block, a preallocated file on btrfs is marked to be
-written in place (`FS_NOCOW_FL`) while still empty, where btrfs copied every overwrite of the log's
+Landed 2026-10-19, in its document: in hyper-block, a file on btrfs opened while still empty is
+marked to be written in place (`FS_NOCOW_FL`), where btrfs copied every overwrite of the log's
 blocks and summed its own checksums, 6 to 25% of an event-bus node's CPU on its log's I/O thread
-(`docs/durable.md` §6.3; `file::tests::a_preallocated_file_on_btrfs_is_written_in_place`, run with
-`TMPDIR` on a btrfs: fails without the mark).
+(`docs/durable.md` §6.3). The mark first went on `DeviceFile::preallocate`, which the log never
+calls: a bus node's log was found unmarked by `lsattr`. It now goes on `DeviceFile::open`, whoever
+made the empty file, and `DeviceFile::written_in_place` reports it
+(`file::tests::a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was`,
+run with `TMPDIR` on a btrfs: fails without the mark).
 
 Landed 2026-10-19: in hyper-log, whether a segment is live is a search of the live slots by their
 incarnations, which rise from the tail (`State::is_live`), where it scanned every live slot: the

@@ -33,9 +33,10 @@ use std::time::{Duration, Instant};
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
-    ClientConfigHandle, Connection, ConnectionError, DatagramEvent, Dir, EcnCodepoint,
-    EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt, MtuDiscoveryConfig,
-    StreamEvent, StreamId, Transmit, TransportConfig, TransportErrorCode, VarInt,
+    ClientConfigHandle, Connection, ConnectionError, ConnectionId, DatagramEvent, Dir,
+    EcnCodepoint, EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt,
+    MtuDiscoveryConfig, StreamEvent, StreamId, Transmit, TransportConfig, TransportErrorCode,
+    VarInt,
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
@@ -342,6 +343,10 @@ struct Conn<R> {
     dialed: Option<PeerId>,
     /// Whether an inbound handshake still holds its pending place.
     pending: bool,
+    /// An inbound handshake's origin: the connection ID its client first sent to, and whether the
+    /// client proved its address with a retry's token, which names that ID (RFC 9000 §8.1.2,
+    /// §7.3). What tells a handshake its client gave up for a retry from the one it went on with.
+    origin: Option<(ConnectionId, bool)>,
     peer: Option<(PeerId, R)>,
     epoch: Epoch,
     /// Its exchanges, oldest first.
@@ -591,6 +596,8 @@ struct Core<C: Classes, B, D> {
     /// By connection key, its lanes counted in `reserving`: what a retry visits, so a budget that
     /// holds more asks again of the connections with a frame waiting, never every connection.
     reserving_at: Vec<u32>,
+    /// The inbound handshakes that hold a pending place, by key: no more than the places.
+    pending_keys: Vec<usize>,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -766,6 +773,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 generation: 0,
                 reserving: 0,
                 reserving_at: Vec::new(),
+                pending_keys: Vec::with_capacity(limits.admission.pending),
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1205,7 +1213,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
         };
         self.core.dialing = self.core.dialing.saturating_add(1);
-        self.store(handle.0, quic, Some(peer), grant);
+        self.store(handle.0, quic, Some(peer), None, grant);
         Ok(())
     }
 
@@ -1967,6 +1975,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         key: usize,
         mut quic: Connection,
         dialed: Option<PeerId>,
+        origin: Option<(ConnectionId, bool)>,
         grant: Reservation,
     ) {
         if let Some(ceiling) = self.path_ceiling {
@@ -1983,6 +1992,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             serial,
             dialed,
             pending: dialed.is_none(),
+            origin,
             peer: None,
             epoch: 0,
             exchanges: Vec::with_capacity(
@@ -2013,6 +2023,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     fn attempt(&mut self, now: Instant, attempt: Attempt, buffer: &mut Vec<u8>) {
+        let remote = attempt.remote_address();
+        let origin = (*attempt.orig_dst_cid(), attempt.remote_address_validated());
+        // A client that took a retry may have sent its ClientHello again under the connection ID
+        // it first used before the retry reached it (a probe timeout on a slow path, a client
+        // held off its CPU), and one of the two copies may come while every place is taken and
+        // the other once one is free. Admitted, the copy its client gave up holds its place until
+        // its idle timeout, and the client's own attempt with the token is refused for that place:
+        // eight joiners of an enrollment sponsor with one place waited 10 s behind such a copy in
+        // 15 of 15 runs under CPU contention (focal, 2026-10-19). A token names the ID its client
+        // used before the retry, and binds its address (RFC 9000 §8.1.4), so the attempt it
+        // carries closes a handshake pending under that ID from that address without a token, and
+        // an attempt without one under the ID of a handshake pending with a token is that copy.
+        let superseded = self
+            .core
+            .pending_with(remote, origin.0, !origin.1, &self.conns);
+        if !origin.1 && superseded.is_some() {
+            // Answered nothing: its client goes on with the handshake its token began.
+            self.quic.ignore(attempt);
+            return;
+        }
+        if let Some(key) = superseded {
+            self.close(now, key, Refusal::Closed.code());
+        }
         let admission = self.core.admission.stats();
         let crowded = admission.pending.saturating_mul(2) >= self.core.admission.limits().pending;
         // A source that has not proven its address takes no place while half of them are taken
@@ -2045,7 +2078,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         buffer.clear();
         match self.quic.accept(attempt, now, buffer, None, None) {
             Ok((handle, quic)) => {
-                self.store(handle.0, quic, None, grant);
+                self.store(handle.0, quic, None, Some(origin), grant);
+                self.core.pending_keys.push(handle.0);
                 self.pump(now, handle.0);
             }
             Err(error) => {
@@ -2131,6 +2165,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D> {
+    /// The handshake pending from `remote` under `id`, admitted with a token if `validated`: one
+    /// at most, the client's one attempt under that ID. A look at the pending places alone.
+    fn pending_with(
+        &self,
+        remote: SocketAddr,
+        id: ConnectionId,
+        validated: bool,
+        conns: &[Option<Box<Conn<C::Role>>>],
+    ) -> Option<usize> {
+        self.pending_keys.iter().copied().find(|&key| {
+            conns.get(key).and_then(Option::as_ref).is_some_and(|conn| {
+                conn.origin == Some((id, validated)) && conn.quic.remote_address() == remote
+            })
+        })
+    }
+
     /// A connection's first window, with the reserve on top of it: room in the socket's queue
     /// first, then the budget's bytes.
     fn window_grant(&mut self) -> Result<Reservation, Refusal> {
@@ -2385,6 +2435,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.pending {
             conn.pending = false;
             self.admission.end_pending();
+            self.pending_keys.retain(|&held| held != key);
         }
         if conn.dialed.is_some() {
             self.dialing = self.dialing.saturating_sub(1);
@@ -2523,6 +2574,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.pending {
             conn.pending = false;
             self.admission.end_pending();
+            self.pending_keys.retain(|&held| held != key);
         }
     }
 

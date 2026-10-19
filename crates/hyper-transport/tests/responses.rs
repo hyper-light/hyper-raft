@@ -1,6 +1,7 @@
-//! The endpoint's own responses (version negotiation, retries, refusals, stateless resets): a burst
-//! of dials past a listener's handshake places is answered whole in the turn its datagrams arrive,
-//! and the room for the responses is taken as they come, never laid out at the bound.
+//! Dials past a listener's handshake places: a burst of them is answered whole in the turn its
+//! datagrams arrive, the room for the endpoint's own responses (version negotiation, retries,
+//! refusals, stateless resets) is taken as they come, never laid out at the bound, and a ClientHello
+//! its client sent again before a retry reached it holds no place.
 
 #![allow(
     clippy::unwrap_used,
@@ -19,7 +20,7 @@ mod common;
 use common::*;
 use hyper_measure::alloc;
 use hyper_transport::tls::Tls;
-use hyper_transport::{AdmissionLimits, Config, Endpoint, Event, Fixed, Limits, PeerId};
+use hyper_transport::{AdmissionLimits, Config, Endpoint, Event, Fixed, Limits, PeerId, Refusal};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -44,11 +45,10 @@ fn listener_limits(max_responses: usize) -> Limits {
     }
 }
 
-/// The listener and its dialers on hyper-sim's network, each knowing every other.
-fn burst(max_responses: usize) -> Mesh<Node<Mantle>> {
-    let issued = Issued::new(DIALERS + 1);
-    let now = hyper_sim::Anchor::new().instant(0).unwrap();
-    let nodes: Vec<Node<Mantle>> = issued
+/// The listener and `dialers` dialers, each knowing every other, made at `now`.
+fn nodes(dialers: PeerId, max_responses: usize, now: std::time::Instant) -> Vec<Node<Mantle>> {
+    let issued = Issued::new(dialers + 1);
+    issued
         .issued
         .iter()
         .enumerate()
@@ -77,8 +77,17 @@ fn burst(max_responses: usize) -> Mesh<Node<Mantle>> {
             )
             .unwrap()
         })
-        .collect();
-    Mesh::new(nodes, now, hyper_sim::Source::Seed(0))
+        .collect()
+}
+
+/// The listener and its dialers on hyper-sim's network.
+fn burst(max_responses: usize) -> Mesh<Node<Mantle>> {
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    Mesh::new(
+        nodes(DIALERS, max_responses, now),
+        now,
+        hyper_sim::Source::Seed(0),
+    )
 }
 
 /// The dialers that heard how their dial ended: up, or refused.
@@ -165,4 +174,130 @@ fn a_listener_lays_out_no_room_for_responses_it_has_not_made() {
     // The first makes what a process makes once (the TLS provider's tables among them).
     made(1);
     assert_eq!(made(1), made(1 << 12));
+}
+
+/// Datagrams between nodes `1..` at their mesh addresses, moved by hand, no time passing: each node's
+/// transmits are taken, and handed to their destination unless `hold` keeps them back.
+fn route(
+    nodes: &mut [Node<Mantle>],
+    now: std::time::Instant,
+    mut hold: impl FnMut(PeerId, PeerId, &[u8]) -> bool,
+) {
+    let mut out = Vec::new();
+    for _ in 0..10_000 {
+        let mut moved = false;
+        for at in 0..nodes.len() {
+            let from = at as PeerId + 1;
+            while let Some(transmit) = nodes[at].transmit(now, &mut out) {
+                let to = PeerId::from(transmit.destination.port() - 4432);
+                let bytes = out[..transmit.size].to_vec();
+                if !hold(from, to, &bytes) {
+                    nodes[(to - 1) as usize].datagram(now, mesh_address(from), &bytes);
+                }
+                moved = true;
+            }
+        }
+        if !moved {
+            return;
+        }
+    }
+    panic!("the nodes never went quiet");
+}
+
+/// Whether `node` heard its dial of `peer` end, and how: up, or refused with its reason.
+fn outcome(node: &mut Node<Mantle>, peer: PeerId) -> Option<Result<(), Option<Refusal>>> {
+    let mut heard = None;
+    while let Some(event) = node.poll_event() {
+        match event {
+            Event::Connected { peer: up, .. } if up == peer => heard = Some(Ok(())),
+            Event::Unreachable {
+                peer: down,
+                refusal,
+            }
+            | Event::Closed {
+                peer: down,
+                refusal,
+                ..
+            } if down == peer => heard = Some(Err(refusal)),
+            _ => {}
+        }
+    }
+    heard
+}
+
+/// Do: a listener with one handshake place, dialed by A and by B. A takes the place; B's
+/// ClientHello is answered with a retry, which is held back while A's handshake completes and the
+/// place comes free; then B's first datagram arrives again, as a client sends its ClientHello again
+/// before a retry reaches it, and only then the retry, so B comes back with its token. No time
+/// passes. Expect: B is up and the listener holds no handshake pending. Before the token named the
+/// ID B gave up, the second copy took the place free and B's token was refused for it, the copy
+/// holding the place until its idle timeout: eight joiners of focal's enrollment sponsor waited 10 s
+/// behind such a copy (2026-10-19).
+#[test]
+fn a_clienthello_sent_again_before_its_retry_holds_no_place() {
+    const A: PeerId = 2;
+    const B: PeerId = 3;
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let mut nodes = nodes(2, 16, now);
+    let mut to_a: Vec<Vec<u8>> = Vec::new();
+    let mut to_b: Vec<Vec<u8>> = Vec::new();
+    // A's ClientHello takes the place; the listener's answers to A wait.
+    nodes[(A - 1) as usize]
+        .connect(now, LISTENER, mesh_address(LISTENER))
+        .unwrap();
+    route(&mut nodes, now, |_, to, bytes| {
+        if to == A {
+            to_a.push(bytes.to_vec());
+            return true;
+        }
+        false
+    });
+    assert_eq!(nodes[0].stats().admission.pending, 1, "A holds the place");
+    // B's ClientHello, its first datagram kept to arrive again, is answered with a retry, which
+    // waits.
+    nodes[(B - 1) as usize]
+        .connect(now, LISTENER, mesh_address(LISTENER))
+        .unwrap();
+    let mut first_of_b: Option<Vec<u8>> = None;
+    route(&mut nodes, now, |from, to, bytes| {
+        if from == B && first_of_b.is_none() {
+            first_of_b = Some(bytes.to_vec());
+        }
+        match to {
+            A => to_a.push(bytes.to_vec()),
+            B => to_b.push(bytes.to_vec()),
+            _ => return false,
+        }
+        true
+    });
+    assert!(!to_b.is_empty(), "B was answered");
+    // A's handshake completes, B's answers still waiting: the place comes free.
+    for datagram in std::mem::take(&mut to_a) {
+        nodes[(A - 1) as usize].datagram(now, mesh_address(LISTENER), &datagram);
+    }
+    route(&mut nodes, now, |_, to, bytes| {
+        if to == B {
+            to_b.push(bytes.to_vec());
+            return true;
+        }
+        false
+    });
+    assert_eq!(
+        outcome(&mut nodes[(A - 1) as usize], LISTENER),
+        Some(Ok(())),
+        "A is up"
+    );
+    assert_eq!(nodes[0].stats().admission.pending, 0, "A's place is free");
+    // B's ClientHello again under the ID the retry answered, then the retry, and B's token.
+    nodes[0].datagram(now, mesh_address(B), &first_of_b.unwrap());
+    for datagram in to_b {
+        nodes[(B - 1) as usize].datagram(now, mesh_address(LISTENER), &datagram);
+    }
+    route(&mut nodes, now, |_, _, _| false);
+    assert_eq!(
+        outcome(&mut nodes[(B - 1) as usize], LISTENER),
+        Some(Ok(())),
+        "B was refused the place its own copy took"
+    );
+    assert_eq!(nodes[0].stats().admission.pending, 0);
 }

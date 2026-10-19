@@ -46,6 +46,15 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-19, in its document: in hyper-transport, a ClientHello its client sent again under
+the connection ID a retry answered holds no handshake place: an attempt with the retry's token
+closes a handshake pending under the ID the token names from the same address without a token, and
+an attempt without one under the ID of a handshake pending with a token is ignored. focal's
+enrollment sponsor, one place, held its place 10 s for such a copy in 15 of 15 runs under CPU
+contention (`docs/transport.md`, "A ClientHello its client gave up for a retry holds no place";
+`tests/responses.rs`, a_clienthello_sent_again_before_its_retry_holds_no_place: refused `Pending`
+before, up after).
+
 Landed 2026-10-19, in its document: in hyper-transport, an endpoint's own responses (a retry
 under load, a refusal, a version negotiation, a stateless reset) are queued as they come, never laid
 out at their bound (`Limits::max_responses`), and keep buffers for later ones only as many as the

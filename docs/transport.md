@@ -336,6 +336,20 @@ responses come, and keeps buffers for later ones only as many as the handshake p
 its bound as before, a bound of 4,096 cost each endpoint 524 KB as it was made, a client's
 connector too.
 
+**A ClientHello its client gave up for a retry holds no place** (2026-10-19). A client may send
+its ClientHello again under the connection ID it first used before the retry reaches it (a probe
+timeout on a slow path; a client held off its CPU, which sent its second copy 16 to 70 ms after
+the first in focal's joiners' runs), and the two copies may come one while every place is taken,
+answered with the retry, and one after a place came free, admitted. The copy its client gave up
+then held the place until its idle timeout, and the client's own attempt with the token was
+refused for that place: eight joiners of focal's enrollment sponsor, which has one place, waited
+10 s behind such a copy in 15 of 15 runs under CPU contention. A retry's token names the ID its
+client used before the retry and binds its address (RFC 9000 §8.1.4), so an attempt that carries
+one closes a handshake pending under that ID from that address without a token, and an attempt
+without one under the ID of a handshake pending with a token is that copy, ignored. Only the
+pending handshakes are looked at, as many as the places (`tests/responses.rs`, the copy delivered
+again after the place came free: refused `Pending` before, up after).
+
 **Only an idle connection is replaced** (2026-10-10, focal's fix of 2026-10-09 ported). An identity
 at its bound used to replace whichever of its connections it had used least, busy or not: in focal,
 64 callers of one principal against a bound of 16 replaced 27,765 connections in 30 s and a third

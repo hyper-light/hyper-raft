@@ -301,3 +301,90 @@ fn a_clienthello_sent_again_before_its_retry_holds_no_place() {
     );
     assert_eq!(nodes[0].stats().admission.pending, 0);
 }
+
+/// Do: a listener with one handshake place. A takes it; B, answered with a retry, comes back with
+/// its token and is refused for the place, its token's ClientHello kept to arrive again, as a
+/// client sends a copy a spacing behind its original (hyper-quic's handshake copies); A's handshake
+/// completes, the place comes free, and B's copy arrives, after B heard its refusal; then C dials.
+/// No time passes. Expect: the copy takes no place, and C is up. Admitted, the copy of the attempt
+/// B gave up held the place until its idle timeout, and C was refused for it: an enrollment
+/// joiner's copy held its sponsor's one place 10 s in one run of six under CPU contention
+/// (focal, 2026-10-19).
+#[test]
+fn a_copy_of_a_refused_attempt_holds_no_place() {
+    const A: PeerId = 2;
+    const B: PeerId = 3;
+    const C: PeerId = 4;
+    let now = hyper_sim::Anchor::new().instant(0).unwrap();
+    let mut nodes = nodes(3, 16, now);
+    let mut to_a: Vec<Vec<u8>> = Vec::new();
+    // A takes the place; the listener's answers to A wait.
+    nodes[(A - 1) as usize]
+        .connect(now, LISTENER, mesh_address(LISTENER))
+        .unwrap();
+    route(&mut nodes, now, |_, to, bytes| {
+        if to == A {
+            to_a.push(bytes.to_vec());
+            return true;
+        }
+        false
+    });
+    assert_eq!(nodes[0].stats().admission.pending, 1, "A holds the place");
+    // B is answered with a retry, comes back with its token and is refused; its first datagram
+    // with the token is kept.
+    nodes[(B - 1) as usize]
+        .connect(now, LISTENER, mesh_address(LISTENER))
+        .unwrap();
+    let mut sent_by_b = 0;
+    let mut token_of_b: Option<Vec<u8>> = None;
+    route(&mut nodes, now, |from, to, bytes| {
+        if from == B {
+            sent_by_b += 1;
+            // Its first flight is the ClientHello without a token; the one after the retry
+            // carries it.
+            if token_of_b.is_none() && sent_by_b > 2 {
+                token_of_b = Some(bytes.to_vec());
+            }
+        }
+        if to == A {
+            to_a.push(bytes.to_vec());
+            return true;
+        }
+        false
+    });
+    assert!(
+        matches!(
+            outcome(&mut nodes[(B - 1) as usize], LISTENER),
+            Some(Err(Some(Refusal::Pending)))
+        ),
+        "B was refused for the place A holds"
+    );
+    // A's handshake completes, and the place comes free.
+    for datagram in std::mem::take(&mut to_a) {
+        nodes[(A - 1) as usize].datagram(now, mesh_address(LISTENER), &datagram);
+    }
+    route(&mut nodes, now, |_, _, _| false);
+    assert_eq!(
+        outcome(&mut nodes[(A - 1) as usize], LISTENER),
+        Some(Ok(())),
+        "A is up"
+    );
+    assert_eq!(nodes[0].stats().admission.pending, 0, "A's place is free");
+    // B's copy of its token's ClientHello, after B gave the attempt up.
+    nodes[0].datagram(now, mesh_address(B), &token_of_b.unwrap());
+    route(&mut nodes, now, |_, _, _| false);
+    assert_eq!(
+        nodes[0].stats().admission.pending,
+        0,
+        "the copy of the attempt B gave up took the place"
+    );
+    nodes[(C - 1) as usize]
+        .connect(now, LISTENER, mesh_address(LISTENER))
+        .unwrap();
+    route(&mut nodes, now, |_, _, _| false);
+    assert_eq!(
+        outcome(&mut nodes[(C - 1) as usize], LISTENER),
+        Some(Ok(())),
+        "C was refused the place the copy took"
+    );
+}

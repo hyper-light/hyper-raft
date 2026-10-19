@@ -350,6 +350,19 @@ without one under the ID of a handshake pending with a token is that copy, ignor
 pending handshakes are looked at, as many as the places (`tests/responses.rs`, the copy delivered
 again after the place came free: refused `Pending` before, up after).
 
+The copies are hyper-quic's own, by design: a client sends a copy of each handshake flight a
+copy spacing behind its original (`TransportConfig::handshake_copies`), so a handshake survives the
+loss of either. A copy of an attempt the listener refused comes as well, and may come once a place
+is free, after its client heard the refusal and gave the attempt up; admitted, it held the place
+until its idle timeout (one run of six under CPU contention, after the rule above). The listener
+keeps each attempt it refused, by its client's address, the ID its client first sent to and whether
+it carried a token, and ignores a copy of one: exactly, a lookup in a set, for a false match would
+ignore a live client's attempt. A record is kept while a token is valid
+(`ServerConfig::retry_token_validity`), past which a copy that carries one is refused as expired,
+and as many as the endpoint answers in a turn (`Limits::max_responses`), the oldest let go first
+(`tests/responses.rs`, a_copy_of_a_refused_attempt_holds_no_place: the copy took the place before,
+none after, and the next dialer is up).
+
 **Only an idle connection is replaced** (2026-10-10, focal's fix of 2026-10-09 ported). An identity
 at its bound used to replace whichever of its connections it had used least, busy or not: in focal,
 64 callers of one principal against a bound of 16 replaced 27,765 connections in 30 s and a third

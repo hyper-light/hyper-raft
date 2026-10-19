@@ -24,7 +24,7 @@
 //! refuses a datagram, whose acknowledgements every connection's loss detection needs (RFC 9002
 //! §6).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -35,8 +35,8 @@ use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
     ClientConfigHandle, Connection, ConnectionError, ConnectionId, DatagramEvent, Dir,
     EcnCodepoint, EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt,
-    MtuDiscoveryConfig, StreamEvent, StreamId, Transmit, TransportConfig, TransportErrorCode,
-    VarInt,
+    MtuDiscoveryConfig, ServerConfig, StreamEvent, StreamId, Transmit, TransportConfig,
+    TransportErrorCode, VarInt,
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
@@ -598,6 +598,66 @@ struct Core<C: Classes, B, D> {
     reserving_at: Vec<u32>,
     /// The inbound handshakes that hold a pending place, by key: no more than the places.
     pending_keys: Vec<usize>,
+    /// The attempts the endpoint refused, whose copies are ignored.
+    refused: Refused,
+}
+
+/// The attempts an endpoint refused (its places taken, or a bound it holds), each by its client's
+/// address, the connection ID its client first sent to and whether it carried a retry's token,
+/// oldest first. A copy of one, which its client sent a copy spacing behind it (hyper-quic's
+/// handshake copies) and which may come once a place is free, is ignored: its client was told the
+/// attempt was refused and gave it up, and admitted the copy held its place until its idle timeout
+/// (an enrollment joiner's copy of its token's attempt, 10 s in one run of six under CPU
+/// contention, focal 2026-10-19). Its token's flag keeps a refused copy of a ClientHello sent before
+/// a retry from matching the attempt its client made with the token. Kept while a token is valid
+/// (`ServerConfig::retry_token_validity`), after which a copy that carries one is refused as
+/// expired, and as many as the endpoint answers in one turn (`Limits::max_responses`), the oldest
+/// let go first.
+#[derive(Debug, Default)]
+struct Refused {
+    order: VecDeque<(Instant, (SocketAddr, ConnectionId, bool))>,
+    keys: HashSet<(SocketAddr, ConnectionId, bool)>,
+    /// None for an endpoint that takes no connection.
+    lifetime: Option<Duration>,
+}
+
+impl Refused {
+    /// Lets go of the records past the lifetime.
+    fn expire(&mut self, now: Instant) {
+        let Some(lifetime) = self.lifetime else {
+            return;
+        };
+        while let Some(&(at, key)) = self.order.front() {
+            if now.saturating_duration_since(at) <= lifetime {
+                return;
+            }
+            self.order.pop_front();
+            self.keys.remove(&key);
+        }
+    }
+
+    fn holds(&self, key: &(SocketAddr, ConnectionId, bool)) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// Records a refusal, letting go of the oldest past `bound`: a record that finds no room is
+    /// not kept, and its copy is judged as any attempt is.
+    fn remember(&mut self, now: Instant, key: (SocketAddr, ConnectionId, bool), bound: usize) {
+        if self.lifetime.is_none() || self.keys.contains(&key) {
+            return;
+        }
+        while self.order.len() >= bound {
+            let Some((_, oldest)) = self.order.pop_front() else {
+                return;
+            };
+            self.keys.remove(&oldest);
+        }
+        if self.order.try_reserve(1).is_err() || self.keys.try_reserve(1).is_err() {
+            return;
+        }
+        self.order.push_back((now, key));
+        self.keys.insert(key);
+    }
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -722,6 +782,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
+        let retry_lifetime = server.as_ref().map(ServerConfig::retry_token_validity);
         let mut endpoint = EndpointConfig::default();
         // Peers may send any datagram the receive chunks hold, where quinn's default told them
         // Ethernet's 1,472 bytes whatever the path carried.
@@ -774,6 +835,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 reserving: 0,
                 reserving_at: Vec::new(),
                 pending_keys: Vec::with_capacity(limits.admission.pending),
+                refused: Refused {
+                    lifetime: retry_lifetime,
+                    ..Refused::default()
+                },
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1296,6 +1361,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .limits
             .transport(C::RANKS, &self.core.congestion)?;
         let (server, client) = tls.prepare(&transport)?;
+        let retry_lifetime = server.as_ref().map(ServerConfig::retry_token_validity);
         let client = self
             .quic
             .insert_client_config(client)
@@ -1304,6 +1370,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             self.quic.retire_client_config(client);
             return Err(Refusal::Quic);
         }
+        // Tokens the earlier configuration issued are still checked by its lifetime, and a record
+        // is kept for the longer of the two.
+        self.core.refused.lifetime = match (self.core.refused.lifetime, retry_lifetime) {
+            (Some(was), Some(now)) => Some(was.max(now)),
+            (was, now) => was.or(now),
+        };
         let replaced = std::mem::replace(&mut self.client, client);
         self.quic.retire_client_config(replaced);
         Ok(())
@@ -2046,6 +2118,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         if let Some(key) = superseded {
             self.close(now, key, Refusal::Closed.code());
         }
+        let record = (remote, origin.0, origin.1);
+        self.core.refused.expire(now);
+        if self.core.refused.holds(&record) {
+            // A copy of an attempt its client was told was refused, and gave up.
+            self.quic.ignore(attempt);
+            return;
+        }
         let admission = self.core.admission.stats();
         let crowded = admission.pending.saturating_mul(2) >= self.core.admission.limits().pending;
         // A source that has not proven its address takes no place while half of them are taken
@@ -2068,6 +2147,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 if refusal != Refusal::Pending {
                     self.core.admission.end_pending();
                 }
+                let bound = self.core.limits.max_responses;
+                self.core.refused.remember(now, record, bound);
                 buffer.clear();
                 if let Some(transmit) = self.quic.refuse(attempt, buffer) {
                     self.respond(transmit, buffer);

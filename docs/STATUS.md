@@ -53,7 +53,10 @@ an attempt without one under the ID of a handshake pending with a token is ignor
 enrollment sponsor, one place, held its place 10 s for such a copy in 15 of 15 runs under CPU
 contention (`docs/transport.md`, "A ClientHello its client gave up for a retry holds no place";
 `tests/responses.rs`, a_clienthello_sent_again_before_its_retry_holds_no_place: refused `Pending`
-before, up after).
+before, up after). A copy of an attempt the listener refused, which hyper-quic's handshake
+copies send a spacing behind the original, is ignored: the listener keeps what it refused, by
+address, first ID and token, while a token is valid and as many as it answers in a turn
+(a_copy_of_a_refused_attempt_holds_no_place: the copy took the place before, none after).
 
 Landed 2026-10-19, in its document: in hyper-transport, an endpoint's own responses (a retry
 under load, a refusal, a version negotiation, a stateless reset) are queued as they come, never laid

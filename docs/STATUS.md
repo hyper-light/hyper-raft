@@ -46,6 +46,16 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-19, in its document: in hyper-durable, a compaction's start made durable takes the
+entries it let go of out of the compaction rule's count by the share each was counted at as it
+applied, kept beside it in four bytes, where it walked the log again from the new start and read
+from the device each applied entry the store's cache had let go, on the owner's thread: focal's
+event bus, its start its window's floor, read 51 to 637 ms a page that way and its followers were
+suspected (`docs/durable.md` §6.1; `tests/hyperlog.rs`,
+`a_compactions_start_made_durable_reads_no_applied_entry_back`, which counts three reads through
+the log's owner before the change and none after; the simulation checks the count against a walk
+of the log at every step, R22).
+
 Landed 2026-10-16, each in its document: in the end-to-end harnesses' waits
 (`hyper_raft_e2e::quiet`, which all three keep), a member silent past its excuse ends at once only a
 wait on every member's own facts, a wait for what the group answers going on while the members heard

@@ -738,9 +738,17 @@ machine's images cost; zero makes a log due whenever it holds anything applied.
 
 What is counted is the applied entries past the log's start, in the bytes the core counts an entry
 (`EntryRef::encoded_bytes`, the wire's: what sending them to a member costs, against sending the
-image). The count is kept as entries apply, and walked again from the log at open and once a
-compaction's start is durable (`Replica::compactable_bytes`); an install starts it at the image's
-point as it is written. A compaction's start the log refuses changes nothing, and the log stays due
+image). The count is kept as entries apply, each entry's share kept beside it in four bytes, and
+walked from the log only at open (`Replica::compactable_bytes`); a compaction's start, once
+durable, takes out the shares of the entries it let go of, oldest first, and reads nothing; an
+install starts it at the image's point as it is written. Walked again from the log, the applied
+entries a store's cache has let go are read from its device: focal's event bus, whose start is
+its window's floor, hundreds of megabytes behind its apply point, read them back one page at a
+time through the log's owner, behind its writes, 51 to 637 ms a page on the thread that serves its
+heartbeats, and its followers were suspected (2026-10-19). The shares hold four bytes an applied
+entry the log holds, a tenth of what the log keeps of each (`hyper_log`'s slot), charged to the
+replica's budget, and give their room back by half once a quarter of it is used (a dynamic table's
+contraction, Cormen et al., *Introduction to Algorithms*, §17.4). A compaction's start the log refuses changes nothing, and the log stays due
 for the owner to ask again (§2.4). The image is the one the shell made at its last compaction (the
 snapshot it serves members behind the start), the one it installed, or at open, the image of what
 the member opened with: the one it prepares when the log was compacted before, else the machine's

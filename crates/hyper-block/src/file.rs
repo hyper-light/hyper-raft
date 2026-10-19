@@ -706,11 +706,49 @@ mod sys {
     }
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        written_in_place(file);
         // Linux: fallocate(2) mode 0 allocates and extends. macOS: rustix issues
         // F_PREALLOCATE from the physical end of file, then ftruncate(2) — correct only
         // for an empty file, which is the one use.
         rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len)
             .map_err(io::Error::from)
+    }
+
+    /// btrfs's statfs(2) `f_type` (include/uapi/linux/magic.h, `BTRFS_SUPER_MAGIC`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const BTRFS_SUPER_MAGIC: i128 = 0x9123_683E;
+
+    /// Asks btrfs to write a still-empty file in place (`FS_NOCOW_FL`, chattr(1)'s `C`), as a
+    /// log's file is written: btrfs copies a file on write by default, so every write of the
+    /// preallocated space took new extents from its free-space bitmaps and summed its own
+    /// checksums of the data, where the log sums and seals its own. An event-bus node on btrfs
+    /// spent 6 to 25% of its CPU in `_find_next_zero_bit` and `steal_from_bitmap` on its log's
+    /// I/O thread (focal on fedora under perf, 2026-10-19). btrfs takes the flag only on an empty
+    /// file (btrfs(5), "nodatacow"), so it is asked before the space is allocated; systemd's
+    /// journal asks the same of its files. A file system that is not btrfs is left as it is, and a
+    /// btrfs that refuses keeps the file as before: written by copying, and as durable.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn written_in_place(file: &File) {
+        if !rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == BTRFS_SUPER_MAGIC) {
+            return;
+        }
+        if let Ok(flags) = rustix::fs::ioctl_getflags(file) {
+            let _ = rustix::fs::ioctl_setflags(file, flags | rustix::fs::IFlags::NOCOW);
+        }
+    }
+
+    /// Whether the file is marked to be written in place.
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    pub(super) fn written_in_place_marked(file: &File) -> Option<bool> {
+        let on_btrfs =
+            rustix::fs::fstatfs(file).is_ok_and(|s| i128::from(s.f_type) == BTRFS_SUPER_MAGIC);
+        if !on_btrfs {
+            return None;
+        }
+        rustix::fs::ioctl_getflags(file)
+            .ok()
+            .map(|flags| flags.contains(rustix::fs::IFlags::NOCOW))
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -820,6 +858,29 @@ mod tests {
 
     fn align() -> Alignment {
         Alignment::new(4096).unwrap()
+    }
+
+    /// Do: preallocate a new file. Expect: on btrfs it is marked to be written in place
+    /// (`FS_NOCOW_FL`); elsewhere nothing is asked of the file system. Run with `TMPDIR` on a btrfs
+    /// to see the mark.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_preallocated_file_on_btrfs_is_written_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("log"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        file.preallocate(1 << 20).unwrap();
+        if let Some(marked) = sys::written_in_place_marked(file.std_file()) {
+            assert!(
+                marked,
+                "a preallocated file on btrfs was left to be copied on write"
+            );
+        }
     }
 
     /// A transfer of no bytes from an empty buffer, whose address is the empty slice's, is no

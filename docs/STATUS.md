@@ -46,6 +46,14 @@ out; eight more for the marked members, three that pass and five refused, at the
 as CI counted them (`docs/models/README.md`). CI's `model` job runs
 them on Linux.
 
+Landed 2026-10-19: in hyper-log, whether a segment is live is a search of the live slots by their
+incarnations, which rise from the tail (`State::is_live`), where it scanned every live slot: the
+sealer asks for each of its sessions after every frame, so a frame cost its sessions times its
+segments, and `Owner::done` was 16 to 17% of an event-bus node's CPU with its window's 1.5 GiB in
+the log (focal on fedora under perf, 2026-10-19). A property test drives segments opened at the
+head and freed from the tail in any order and checks the search against the scan for every
+incarnation.
+
 Landed 2026-10-19, in its document: in hyper-transport, a ClientHello its client sent again under
 the connection ID a retry answered holds no handshake place: an attempt with the retry's token
 closes a handshake pending under the ID the token names from the same address without a token, and

@@ -55,6 +55,16 @@ made the empty file, and `DeviceFile::written_in_place` reports it
 (`file::tests::a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was`,
 run with `TMPDIR` on a btrfs: fails without the mark).
 
+Landed 2026-10-19: in hyper-log, the sealer forgets the sessions of freed segments from the tail
+after each frame (`Sealer::retain_from_tail`), where it asked whether every session's segment was
+live: segments leave only from the tail and sessions begin only at the head, so the dead are the
+oldest keys, and a frame costs one look and one per session forgotten. The search below made each
+look cheap, and the looks were still a frame's sessions: with frames that cost nothing to flush
+(focal's bus on ext4 without barriers, as on CI's disk, 8,800 frames a second a node at 10,000
+records a second), `State::is_live` was 22% of a node's CPU (perf with LBR stacks). An open still
+asks of every session, recovery having found sessions of segments it may find dead
+(`Sealer::retain`). `seal::tests::the_walk_from_the_tail_forgets_the_freed_sessions_asking_only_about_them`.
+
 Landed 2026-10-19: in hyper-log, whether a segment is live is a search of the live slots by their
 incarnations, which rise from the tail (`State::is_live`), where it scanned every live slot: the
 sealer asks for each of its sessions after every frame, so a frame cost its sessions times its

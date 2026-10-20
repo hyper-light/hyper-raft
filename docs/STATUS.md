@@ -55,6 +55,14 @@ made the empty file, and `DeviceFile::written_in_place` reports it
 (`file::tests::a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was`,
 run with `TMPDIR` on a btrfs: fails without the mark).
 
+Landed 2026-10-19, in its document: in hyper-log, a frame's confirmation is made durable the
+cheaper of the two ways the device has measured on its file, a write durable on its own or a write
+and a flush (`Device::confirm`; `docs/durable.md` §6.2): a consumer NVMe drive's 4 KiB FUA write
+took 4.3 ms at the median against 2.9 ms for a write and `fdatasync`. Running means of every sample
+since open, no constant; `LogStats::flushed_confirmations` counts the choice. `tests/confirm.rs`: a
+drive whose durable write costs more confirms by flushing after the one durable write that measured
+it; one whose flush costs more confirms durable throughout.
+
 Landed 2026-10-19: in hyper-log, `LogStats` counts the sweeps a log laid and the bytes they
 relocated (`sweeps`, `swept_bytes`; `docs/durable.md` §13.1): what a full log wrote a second time.
 focal's event bus at its closed-loop ceiling on CI logged 195 bytes for each 128-byte record whose

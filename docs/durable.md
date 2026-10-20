@@ -798,7 +798,16 @@ the flushes an append costs"). Three ways out were weighed (2026-10-07):
   advertises FUA and the write is an overwrite, so the device's whole cache is not flushed for one
   record. `LogStats::durable_writes` counts them, `flushes` the rest; where the device has no FUA the
   kernel flushes in its place. macOS has no such write (`F_BARRIERFSYNC` orders and does not
-  persist), so a confirmation there stays a full flush. This is what hyper-log does.
+  persist), so a confirmation there stays a full flush. This is what hyper-log does, with one
+  measure: a FUA write is not cheaper than a flush on every drive. On a consumer NVMe drive (a
+  Samsung 9100 PRO, fio on a btrfs file written in place) a 4 KiB `O_DSYNC` write took 4.3 ms at the
+  median and a 4 KiB write and `fdatasync` 2.9 ms, so each confirmation made durable on its own cost
+  a frame 1.4 ms more than one written and flushed. The device makes each confirmation the cheaper
+  of the two ways it has measured on its file (`Device::confirm`): the durable write first, as it was
+  the only way; the write and flush judged by its own mean once taken, by the frames' record write
+  and flush before; each mean of every sample since the log opened, so no constant weighs them, and
+  a way not taken keeps its mean until the other's passes it. `LogStats::flushed_confirmations`
+  counts the confirmations written and flushed by that choice.
 
 A frame not confirmed is the torn tail when it does not read, and an unacknowledged suffix when it
 does; neither is restored or marked. A frame whose flush failed, but every sector of which reached the
@@ -1179,6 +1188,7 @@ and allocates no more on that project's workload.
 | `write` | A histogram of each frame's writes, the frame and its persist record. |
 | `commit_wait` | A histogram of each update's wait, from its submission to the end of the flush that let it be answered: the next frame's, whose record confirms its frame, or its frame's own confirmation's. |
 | `flushing_since` | When the frame or confirmation the device holds went to it, while one does. |
+| `flushed_confirmations` | Confirmations written and flushed where the file could have written them durable on their own, the device having measured the write and flush cheaper (§6.2); each also counts in `flushes`. |
 | `sweeps`, `swept_bytes` | Sweeps laid (frames that copied the tail segment's live entries ahead of their updates, the log having fewer than two segments free), and the bytes of the records they relocated: what the log wrote a second time, its write amplification's own part. |
 | `at` | When the owner answered. |
 

@@ -664,6 +664,7 @@ impl<F: BlockFile> Device<F> {
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
+        let mut zeroed = 0u64;
         let mut record_ns = None;
         // Every call into the file, its asking whether it fills new space included, is inside the
         // boundary: the file is the caller's code.
@@ -671,7 +672,8 @@ impl<F: BlockFile> Device<F> {
             if let Some((at, len)) = zero
                 && self.file.fills_new_space()
             {
-                bytes = self.zero_fill(at, len)?;
+                zeroed = self.zero_fill(at, len)?;
+                bytes = zeroed;
             }
             bytes = bytes.saturating_add(self.write(first.0, first.1)?);
             if let Some((buf, at)) = second {
@@ -694,6 +696,7 @@ impl<F: BlockFile> Device<F> {
             durable_write: false,
             durable_fallback: false,
             flushed_confirmation: false,
+            zeroed,
         };
         if wrote.is_err() {
             return (wrote, timing);
@@ -747,6 +750,7 @@ impl<F: BlockFile> Device<F> {
             durable_write: false,
             durable_fallback: false,
             flushed_confirmation: true,
+            zeroed: 0,
         };
         let wrote = guarded(|| self.write(buf, at));
         let written = stats::now();
@@ -782,6 +786,7 @@ impl<F: BlockFile> Device<F> {
             durable_write: false,
             durable_fallback: false,
             flushed_confirmation: false,
+            zeroed: 0,
         };
         let written = guarded(|| {
             let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;

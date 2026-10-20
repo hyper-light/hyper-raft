@@ -831,7 +831,10 @@ A slot the file grows by is therefore written whole with zeros before its first 
 frame's own flush (`device::Frame::zero`; the first slot at the log's creation), where the file says
 it pays (`BlockFile::fills_new_space`: a direct file on Linux, and the simulator, which stands for
 it). Every later frame in the slot is an overwrite of written blocks inside the file's size, a flush
-of the device's cache alone. A slot reused is written already and is not filled again.
+of the device's cache alone. A slot reused is written already and is not filled again. The zeros
+are counted (`LogStats::zeroed_bytes`, §13.1): on focal's event bus, a new log at its closed-loop
+ceiling on fedora's NVMe wrote 1.88 GB of zeros a node in a 40-second run, 32% of its log's bytes,
+as its file grew to the size its retention holds.
 
 - **btrfs writes the file in place.** btrfs copies a file on write by default: every overwrite of
   a written block takes new extents from its free-space bitmaps and sums btrfs's own checksums of
@@ -1190,6 +1193,7 @@ and allocates no more on that project's workload.
 | `flushing_since` | When the frame or confirmation the device holds went to it, while one does. |
 | `flushed_confirmations` | Confirmations written and flushed where the file could have written them durable on their own, the device having measured the write and flush cheaper (§6.2); each also counts in `flushes`. |
 | `sweeps`, `swept_bytes` | Sweeps laid (frames that copied the tail segment's live entries ahead of their updates, the log having fewer than two segments free), and the bytes of the records they relocated: what the log wrote a second time, its write amplification's own part. |
+| `zeroed_bytes` | Bytes of zeros written over the slots the file grew by, each once, before its first frame (§6.3); each also counts in `bytes`. What growing the log wrote that no record holds: a new log's whole file on its way to the size its retention holds, nothing once it is there. |
 | `at` | When the owner answered. |
 
 The thread that does a job's I/O times its writes and its flush apart and carries the times back

@@ -51,6 +51,10 @@ pub struct LogStats {
     /// own: the device measured a write and a flush of its cache cheaper than its durable write (a
     /// consumer NVMe drive's FUA write costs more than a flush). Each also counts in `flushes`.
     pub flushed_confirmations: u64,
+    /// Bytes of zeros written over the slots the file grew by, each before its first frame
+    /// (`docs/durable.md` §6.3), counted in `bytes` too: what growing the log wrote that no
+    /// record holds.
+    pub zeroed_bytes: u64,
     /// Asks for a slot past the file's end the owner refused (`crate::Growth`), each read as the
     /// file's bound reached: the frame that needed it answered `Full`. It counts asks, not
     /// episodes: the log asks again whenever it looks for room, so one bound reached counts as
@@ -77,6 +81,7 @@ impl LogStats {
             durable_writes: 0,
             durable_fallbacks: 0,
             flushed_confirmations: 0,
+            zeroed_bytes: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -118,6 +123,9 @@ pub(crate) struct Timing {
     /// A confirmation written and flushed, the device having measured that cheaper than a write
     /// made durable on its own (`device::Device::confirm`).
     pub(crate) flushed_confirmation: bool,
+    /// Bytes of zeros written over a slot the file grew by, before its first frame (`zero_fill`);
+    /// counted in `bytes` too.
+    pub(crate) zeroed: u64,
 }
 
 /// The nanoseconds from `from` to `to`, saturating.
@@ -136,6 +144,8 @@ pub(crate) struct Tally {
     pub(crate) durable_fallbacks: u64,
     /// Confirmations written and flushed by the device's choice (`Timing::flushed_confirmation`).
     pub(crate) flushed_confirmations: u64,
+    /// Bytes of zeros the frames that grew the file wrote.
+    pub(crate) zeroed_bytes: u64,
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
@@ -152,6 +162,7 @@ impl Tally {
             durable_writes: 0,
             durable_fallbacks: 0,
             flushed_confirmations: 0,
+            zeroed_bytes: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -177,6 +188,7 @@ impl Tally {
         if timing.durable_fallback {
             self.durable_fallbacks = self.durable_fallbacks.saturating_add(1);
         }
+        self.zeroed_bytes = self.zeroed_bytes.saturating_add(timing.zeroed);
         if timing.flushed_confirmation {
             self.flushed_confirmations = self.flushed_confirmations.saturating_add(1);
         }

@@ -63,6 +63,13 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-19: in hyper-log, `LogStats::zeroed_bytes` counts the zeros written over the slots
+a file grows by (`docs/durable.md` §6.3, §13.1). focal's event bus at its closed-loop ceiling on
+fedora (a new log a node, 40 seconds) wrote 1.88 GB of zeros a node, 32% of its log's bytes:
+the write amplification the sweeps (none) and the records did not account for.
+`growth::the_zeros_a_log_writes_are_the_slots_it_grew_by_once` checks the count is the slots grown
+past the first, once each, and that slots a compaction freed are written again with no zeros.
+
 Landed 2026-10-19: in hyper-log, `LogStats` counts the sweeps a log laid and the bytes they
 relocated (`sweeps`, `swept_bytes`; `docs/durable.md` §13.1): what a full log wrote a second time.
 focal's event bus at its closed-loop ceiling on CI logged 195 bytes for each 128-byte record whose

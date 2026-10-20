@@ -243,6 +243,28 @@ fn a_compaction_frees_slots_and_writes_resume_as_under_the_bound() {
     assert_eq!(admits_at(&ledger), admits, "the file grew again");
 }
 
+/// Each slot the file grows by is written with zeros once, by the frame that grows into it, and
+/// the zeros are counted (`docs/durable.md` §6.3, §13.1): a log filled to four slots reports the
+/// three it grew by past the first, which a new log zeroes before it counts anything, and the
+/// slots a compaction freed are written again with no zeros more.
+#[test]
+fn the_zeros_a_log_writes_are_the_slots_it_grew_by_once() {
+    let mut bounded = config();
+    bounded.max_segments = 4;
+    let log = Log::create(sim(5), bounded, ID).unwrap();
+    let mut next = 1;
+    assert!(matches!(fill(&log, &mut next), LogError::Full));
+    let len = log.with_file(|file| file.len()).unwrap().unwrap();
+    assert_eq!(len, SEGMENT + 4 * SEGMENT);
+    let zeroed = log.stats(None).unwrap().zeroed_bytes;
+    assert_eq!(zeroed, 3 * SEGMENT);
+    drop(log.close().unwrap());
+    let log = Log::create(sim(5), bounded, ID).unwrap();
+    assert!(resumed_after_compaction(&log) > 0);
+    assert_eq!(log.stats(None).unwrap().zeroed_bytes, zeroed);
+    drop(log.close().unwrap());
+}
+
 /// The write that grows the file into a new slot fails (another owner filled the volume): the log
 /// fences, as before, and what it admitted and never made durable goes back first.
 #[test]

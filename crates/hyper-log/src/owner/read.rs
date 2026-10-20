@@ -80,6 +80,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         out.durable_writes = tally.durable_writes;
         out.durable_fallbacks = tally.durable_fallbacks;
         out.flushed_confirmations = tally.flushed_confirmations;
+        out.zeroed_bytes = tally.zeroed_bytes;
         out.flush.clone_from(&tally.flush);
         out.write.clone_from(&tally.write);
         out.commit_wait.clone_from(&tally.commit_wait);

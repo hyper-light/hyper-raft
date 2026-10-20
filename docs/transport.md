@@ -373,10 +373,11 @@ lanes carried. Each event now waits in a seat of a bounded table, given back whe
 - a peer's lifecycle waits as one event, its latest state with its epoch (its newest connection up;
   that connection closed; a dial failed with no connection up since): a change while it waits
   replaces it and moves it to the back, after the refusals of the exchanges a closed connection
-  carried, and a state the owner was already told waits as nothing; a state that came and went
-  between its polls is not reported, and a `Connected` of a later epoch says the earlier are not the
-  ones exchanges use. The peer's entry is held while the event waits, and while a connection or a
-  dial of the peer needs it.
+  carried, and a state the owner was already told waits as nothing, but for a dial's end (§4u: a
+  dial that fails with no connection up is told even when the owner's last event said the same); a
+  state that came and went between its polls is not reported, and a `Connected` of a later epoch
+  says the earlier are not the ones exchanges use. The peer's entry is held while the event waits,
+  and while a connection or a dial of the peer needs it.
 
 A table at its bound refuses, typed, the stream (`Refusal::Exchanges`, as before), the connection or
 the dial (`Refusal::Events`) that would need one more seat. No event is dropped, and no datagram is
@@ -1441,6 +1442,41 @@ found 136 first windows refused and no window set back or closed (7 of 414 faile
 no window there grew and went idle while another wanted the room, so the take-back never acted in
 focal's suite, and what moved between the arms' runs is not its. The eight are the open defect's
 (`docs/STATUS.md`, the shared socket's room on that buffer).
+
+## 4u. Every dial ends in an event its owner is told (2026-10-20, found by mantle)
+
+`Endpoint::connect` promises that a dial holds the peer's entry for the lifecycle event it ends in,
+and an owner that dials again on what it is told (mantle's node redials on `Closed` and
+`Unreachable`) relies on hearing each dial's end. The rule that a state the owner was already told
+waits as nothing (§4a) broke that: a dial that failed in the state the owner had polled last was told
+nothing. On mantle's Windows runners a cut of about 18 s outlasted two failed dials: the node was told
+`Closed` as its connection idled out, `Unreachable` for its first redial, and nothing for its second,
+whose `Unreachable` was the state it had polled from the first. Its link stood at `dials 3, ended 2`
+with no dial in flight and none to come (the endpoint's entry: `peer 2 conn None dialing false
+unreachable Some(None) reported true`), and the peer stayed unreachable after the path healed. Any
+owner on any system meets it once a partition outlasts two failed dials. The same loss came another
+way: while a dial was in flight the peer connected in and went again, the owner polling neither
+event; the dial's failure took the state back to the one the owner was last told, so the waiting
+event was taken back and nothing told the dial's end.
+
+A dial that fails with no connection to its peer up now forgets what the owner was told
+(`Core::dial_failed`), so its `Unreachable` is told even when the last event the owner polled said
+the same. One `Unreachable` waiting unpolled stands for every dial that ends as it says, so an owner
+that dials again before polling still finds one event, and the events stay bounded by §4a's seats. A
+dial that fails while a connection the peer opened is up changes nothing the owner was told: that
+connection's `Connected` was told or waits, and is not told again. Nothing else forgets what was
+told, so no other path announces an unchanged state again. Forgetting at the dial's end needs no
+flag set at its start: `dial_failed` is the dial's own end, run once for it (its connection is marked
+lost as it runs, `Conn::lost`).
+
+Tests (`tests/exchange.rs`): `a_dial_failing_as_the_last_one_did_is_told_all_the_same` (mantle's
+sequence: connected, the path cut and the connection idled out, three failed dials each told
+`Unreachable`, two more with nothing polled between them told as one, and a dial after the path
+healed connected; before the fix the second dial was told nothing, `dial 2: []`) and
+`a_dial_ending_after_its_peer_came_and_went_unpolled_is_told` (before: nothing told) fail without
+the change; `a_dial_ending_while_its_peer_is_connected_tells_nothing_new` holds that a dial failing
+beside a connection the peer opened tells nothing, and fails if the dial's end forgets what was told
+with that connection up (`Connected` told again).
 
 ## 5. Consumers
 

@@ -188,6 +188,26 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-20)
+
+- **hyper-transport: a dial that failed as the last one did was told nothing (found by mantle).**
+  `Endpoint::connect` promises each dial the lifecycle event it ends in, but a state the owner was
+  already told waited as nothing, so a dial that failed in the state the owner had polled last was
+  not told. On mantle's Windows runners a cut of about 18 s outlasted two failed dials: the node was
+  told `Closed`, `Unreachable` for its first redial and nothing for its second, and since it redials
+  on those events it never dialed again; the peer stayed unreachable after the path healed (its link
+  at `dials 3, ended 2`, the endpoint's entry `conn None dialing false unreachable Some(None)
+  reported true`). A dial during which the peer connected in and went, the owner polling neither,
+  was lost the same way. A dial that fails with no connection up now forgets what the owner was told
+  (`Core::dial_failed`), so its `Unreachable` is told; one waiting unpolled stands for it, and a dial
+  failing beside a connection the peer opened tells nothing again (`docs/transport.md` §4u). Tests:
+  `a_dial_failing_as_the_last_one_did_is_told_all_the_same` (before: `dial 2: []`) and
+  `a_dial_ending_after_its_peer_came_and_went_unpolled_is_told` (before: `[]`), red before the fix;
+  `a_dial_ending_while_its_peer_is_connected_tells_nothing_new` holds the rest. In mantle's Windows
+  CI, the same change in its vendored copy, its relayed cut tests (3 and 5 voters, three rounds
+  each) passed 12 of 12 runs on windows-x86_64 and windows-aarch64; without it every round failed
+  on both.
+
 ### Closed (2026-10-19)
 
 - **hyper-durable: a page read from `GroupStore` ran past the core's bound on a message (found by

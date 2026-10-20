@@ -63,6 +63,14 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-20: in hyper-quic, a probe of the path's MTU that the window and the pacer can carry
+goes before new data (patch Q26, `crates/hyper-quic/VENDORED.md` §37): sent only in the room data
+left, a busy connection's probes starved and its search stayed at 1,200 bytes
+(`peer_sockets::a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it`, 7 runs of 40
+on arm64 Linux, two arm64 CI runs; 40 of 40 with Q26). `tests::an_mtu_search_runs_on_a_connection_that_keeps_sending`:
+16 MiB in 318 datagrams against 14,377 without. The peer_sockets test's failure now names both
+sides' path statistics.
+
 Landed 2026-10-20: in hyper-block, a direct file writes new space with zeros only where its file
 system allocates in place and journals the allocation (ext2, ext3, ext4, XFS, by statfs(2)'s
 `f_type`, asked once at open; `DeviceFile::fills_new_space`, `docs/durable.md` §6.3). On btrfs the

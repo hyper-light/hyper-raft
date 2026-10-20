@@ -86,43 +86,43 @@ fn len(log: &Log<SimFile>) -> u64 {
     log.with_file(|f| f.len()).unwrap().unwrap()
 }
 
-/// Waits until the log's statistics meet `met`, charged to the fill's own progress: the wait fails
-/// only once the fill's pieces and the fills ended stop moving for a thousand looks for each piece
-/// a slot holds. The log's threads write a fill while the test's yields; a fill that stops moves
-/// nothing, and fails the wait.
+/// Waits until the log's statistics meet `met`, charged to the fill's own steps: a look at the file
+/// is a job for the device, queued behind the one it has, so when a look returns the piece of a fill
+/// the device was writing is written, and the log, idle again, has given it the next. A fill of a
+/// slot therefore ends within as many looks as the slot has pieces, at most one a block, and the
+/// wait fails only once two such fills' looks passed without `met`: it is charged to the pieces a
+/// fill writes, never to the time a busy machine takes to write them.
 fn until(log: &Log<SimFile>, what: &str, met: impl Fn(&LogStats) -> bool) -> Box<LogStats> {
-    let pieces = usize::try_from(4 * SEGMENT).unwrap() / BLOCK;
-    let mut still = 0;
-    let mut seen = (u64::MAX, u64::MAX);
-    loop {
+    let looks = 2 * (4 * SEGMENT / BLOCK as u64) + 2;
+    for _ in 0..looks {
         let stats = log.stats(None).unwrap();
         if met(&stats) {
             return stats;
         }
-        let now = (stats.fill_pieces, stats.fills + stats.fill_failures);
-        if now == seen {
-            still += 1;
-            assert!(
-                still < pieces * 1_000,
-                "{what}: no fill moved in {still} looks"
-            );
-        } else {
-            (seen, still) = (now, 0);
-        }
-        std::thread::yield_now();
+        log.with_file(|_| ()).unwrap();
     }
+    let stats = log.stats(None).unwrap();
+    assert!(
+        met(&stats),
+        "{what}: not met in {looks} of the device's turns: {stats:?}"
+    );
+    stats
 }
 
 /// Writes small entries from `index` until a frame opens the slot filled ahead and the fill of the
-/// slot after it has begun: the index the next write takes.
+/// slot after it has begun: the index the next write takes. After each write the device is given a
+/// look, so the log, idle once the write is answered, has its turn to begin a fill that is due.
 fn open_the_filled_slot(log: &Log<SimFile>, mut index: u64) -> u64 {
     let pieces = log.stats(None).unwrap().fill_pieces;
-    while log.stats(None).unwrap().fill_pieces == pieces {
+    loop {
         log.write(1, entry(index, SMALL)).unwrap();
         index += 1;
+        log.with_file(|_| ()).unwrap();
+        if log.stats(None).unwrap().fill_pieces > pieces {
+            return index;
+        }
         assert!(index < 1_000, "no slot after the first was filled");
     }
-    index
 }
 
 /// The small entries before `upto` read back as written.
@@ -190,9 +190,10 @@ fn a_frame_that_opens_a_slot_writes_no_zeros() {
 
 /// An idle log writes the next slot whole with zeros ahead of its first frame, in pieces no larger
 /// than its last frame's writes, and flushes it once, with its last piece: with no frame yet a
-/// piece is a block, sixteen to a slot; with frames and records of a block each it is two, eight
-/// to a slot. The frames that fill a slot filled ahead are overwrites and grow the file by none of
-/// it; every entry reads back after a reopen.
+/// piece is a block, sixteen to a slot; after frames of a block and records of a block it is two,
+/// or three after the frame that opened a slot, its segment's header beside it, so six to eight
+/// pieces fill a slot. The frames that fill a slot filled ahead are overwrites and grow the file
+/// by none of it; every entry reads back after a reopen.
 #[test]
 fn an_idle_log_fills_the_next_slot_ahead_in_pieces_no_larger_than_its_frames() {
     let log = Log::create(sim(2), measured(), ID).unwrap();
@@ -202,10 +203,10 @@ fn an_idle_log_fills_the_next_slot_ahead_in_pieces_no_larger_than_its_frames() {
     assert_eq!(first.fill_pieces, SEGMENT / BLOCK as u64, "a block a piece");
     let index = open_the_filled_slot(&log, 1);
     let second = until(&log, "the second fill", |s| s.fills == 2);
-    assert_eq!(
-        second.fill_pieces - first.fill_pieces,
-        SEGMENT / (2 * BLOCK as u64),
-        "a frame's two blocks a piece"
+    let pieces = second.fill_pieces - first.fill_pieces;
+    assert!(
+        (SEGMENT.div_ceil(3 * BLOCK as u64)..=SEGMENT / (2 * BLOCK as u64)).contains(&pieces),
+        "{pieces} pieces: two or three blocks each, as the frames before them"
     );
     assert_eq!(second.zeroed_bytes, 2 * SEGMENT);
     assert_eq!(second.fill_failures, 0);

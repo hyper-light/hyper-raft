@@ -592,7 +592,8 @@ fn reclaiming_segments_keeps_every_live_record() {
 
 /// The statistics count every frame, flush, byte and wait the log made (`docs/durable.md`
 /// §13.1), against the file's own counts: writes one at a time, each a frame of one small update,
-/// its persist record and its confirmation, a block each, and two flushes.
+/// its persist record and its confirmation, a block each, and a flush, and one more for a
+/// confirmation the device flushed.
 #[test]
 fn the_statistics_count_each_frame_flush_byte_and_wait() {
     let log = Log::create(sim(46), config(16, 8), ID).unwrap();
@@ -621,21 +622,25 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
     assert_eq!(after.frames - before.frames, n);
     assert_eq!(after.updates - before.updates, n);
     assert_eq!(after.flushes - before.flushes, syncs_after - syncs);
-    // Each frame is flushed, and each, nothing following it, is confirmed by a write made durable
-    // on its own: one flush and one durable write a frame, no second flush.
-    assert_eq!(after.flushes - before.flushes, n);
-    assert_eq!(after.durable_writes - before.durable_writes, n);
+    // Each frame is flushed, and each, nothing following it, is confirmed one of the two ways the
+    // device measured (`Device::confirm`): by a write made durable on its own, no flush with it,
+    // or by a write and a flush of its own, whichever has cost the less on this file so far, which
+    // a busy machine's clock decides. Every confirmation is one or the other, and every flush is
+    // a frame's or a flushed confirmation's.
+    let durable = after.durable_writes - before.durable_writes;
+    let flushed = after.flushed_confirmations - before.flushed_confirmations;
+    assert_eq!(durable + flushed, n, "{durable} durable, {flushed} flushed");
+    assert_eq!(after.flushes - before.flushes, n + flushed);
     assert_eq!(after.durable_fallbacks - before.durable_fallbacks, 0);
     assert_eq!(
         after.bytes - before.bytes,
         (writes_after - writes) * BLOCK as u64
     );
-    assert_eq!(after.flush.count() - before.flush.count(), n);
+    assert_eq!(after.flush.count() - before.flush.count(), n + flushed);
     assert_eq!(after.write.count() - before.write.count(), n);
     assert_eq!(after.commit_wait.count() - before.commit_wait.count(), n);
     // Each wait runs from its submission past its frame's writes and flush and its
-    // confirmation's durable write, one write at a time, so the waits hold every write and flush
-    // timed.
+    // confirmation, one write at a time, so the waits hold every write and flush timed.
     let waited = after.commit_wait.sum_ns() - before.commit_wait.sum_ns();
     let worked = (after.write.sum_ns() - before.write.sum_ns())
         + (after.flush.sum_ns() - before.flush.sum_ns());
@@ -1033,10 +1038,19 @@ fn a_frame_confirmed_by_a_durable_write_is_restored_and_marked_after_a_power_cut
         },
     )
     .unwrap();
-    // Every frame here was alone: each confirmed by a durable write, none by a flush of its own.
+    // Every frame here was alone: each confirmed on its own, by a durable write or by a write and
+    // a flush of its own as the device measured the cheaper (`Device::confirm`), its persist
+    // record written either way.
     let stats = log.stats(None).unwrap();
-    assert!(stats.durable_writes >= 4, "{stats:?}");
-    assert_eq!(stats.flushes, stats.frames, "{stats:?}");
+    assert!(
+        stats.durable_writes + stats.flushed_confirmations >= 4,
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.flushes,
+        stats.frames + stats.flushed_confirmations,
+        "{stats:?}"
+    );
     log.with_file(|f| f.crash(Crash::LoseAll).unwrap()).unwrap();
     let file = closed(log);
     file.clear_faults().unwrap();

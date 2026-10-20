@@ -248,6 +248,14 @@ is worked around.
   entry). Test: `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` (12 probes at `2b13b15`,
   none with Q25).
 
+- **hyper-quic: with Q25, a busy connection's MTU search starved (main's patch Q26, `0427988`, taken
+  to this line with Q25).** Q25 holds a probe to the room data leaves, and a connection that kept
+  sending left it none: its search stayed at 1,200 bytes, which main's
+  `peer_sockets::a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it` found (7 runs
+  of 40 on arm64 Linux). A probe the window could carry with nothing in flight and the pacer's bucket
+  full goes before new 1-RTT data (`crates/hyper-quic/VENDORED.md` §37). Test:
+  `tests::an_mtu_search_runs_on_a_connection_that_keeps_sending`.
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

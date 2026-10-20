@@ -1274,6 +1274,8 @@ seconds: focal's three nodes behind such relays never heard each other's pre-vot
 sent only when it fits the window and the pacer lets it go (RFC 8899 §3, item 7; hyper-quic patch
 Q25): a window of one round trip of the path never affords a probe that would hold the path longer,
 so a slow path keeps its MTU and a fast one probes as before (`crates/hyper-quic/VENDORED.md` §36).
+A probe the window and the pacer can carry goes before new data (patch Q26, §37), so a connection
+that keeps sending still searches.
 
 ## 4r. A small datagram's charge, and each handshake counted once (2026-10-17)
 

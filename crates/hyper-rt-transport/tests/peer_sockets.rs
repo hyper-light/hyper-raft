@@ -276,9 +276,12 @@ fn a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it() {
                 step(&mut server, &mut client, &mut seen).await;
                 assert!(
                     began.elapsed() < GUARD,
-                    "the searches ended at {:?} and {:?}, the paths carry {to_server} and {to_client}",
+                    "the searches ended at {:?} and {:?}, the paths carry {to_server} and {to_client}; \
+                     the client's path {:?}; the server's {:?}",
                     mtu(&mut client, SERVER),
-                    mtu(&mut server, CLIENT)
+                    mtu(&mut server, CLIENT),
+                    client.endpoint().connection_stats(SERVER).map(|stats| stats.path),
+                    server.endpoint().connection_stats(CLIENT).map(|stats| stats.path)
                 );
             }
             for (driver, peer) in [(&mut client, SERVER), (&mut server, CLIENT)] {

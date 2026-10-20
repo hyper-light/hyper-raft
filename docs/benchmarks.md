@@ -7737,6 +7737,31 @@ and a frame that arrives during it waits for all of it: the cost moves to the ne
 a fill in pieces of the device's largest transfer is where to start if a workload measures growth
 latency.
 
+## hyper-log: zeros on btrfs, measured and dropped (2026-10-20)
+
+focal's event bus (three nodes, one CPU each, 128-byte records, each node's log on fedora's NVMe,
+btrfs, written in place: `FS_NOCOW_FL`), its tree at hyper-raft 9c21338 against the same tree with
+`DeviceFile::fills_new_space` false, interleaved, three rounds, each run a new log a node, 10 s of
+warm-up and 30 measured. The side without zeros wrote none (`LogStats::zeroed_bytes` 0 on every
+node). Records a second and client latency are the bench's; bytes and commit waits the log's own
+(`zeroed_bytes`, `bytes`, `commit_wait`), node 1's. The volume is shared with another tenant's
+database, which stalled both sides in some rounds (the p99s of a second and more).
+
+| rate | zeros | records/s | p50 | p99 | log bytes a record a node | commit wait p50 |
+|---|---|---|---|---|---|---|
+| ceiling | written | 684k, 581k, 672k | 44.7, 40.2, 45.2 ms | 89.6, 108, 88.0 ms | 207, 193, 211 | 27, 23, 27 ms |
+| ceiling | none | 700k, 780k, 398k | 44.6, 40.1, 77.1 ms | 84.1, 54.6, 152 ms | 132, 139, 135 | 27, 23, 27 ms |
+| 1,000/s | written | 999 | 28.8, 28.1, 32.1 ms | 40.8, 37.7, 69.9 ms | | 25, 23, 27 ms |
+| 1,000/s | none | 999 | 36.5, 25.4, 43.2 ms | 57.5, 34.9, 1,986 ms | | 29, 21, 38 ms |
+| 10,000/s | written | 9,960 to 9,989 | 134, 33.5, 27.6 ms | 235, 70.7, 34.2 ms | | 25, 27, 25 ms |
+| 10,000/s | none | 9,981 to 9,990 | 26.4, 32.7, 60.3 ms | 865, 61.9, 90.8 ms | | 21, 29, 23 ms |
+
+Without the zeros the log writes the records' batches and nothing beside them (132 bytes a
+128-byte record), and its commits wait as long; what btrfs's flush commits for a frame that extends
+the file against one that overwrites a zeroed block was not measured apart, only that the two cost
+the frames the same. Dropped on btrfs: zeros only where the file system journals its allocation in
+place (ext2, ext3, ext4, XFS by `f_type`; `docs/durable.md` §6.3).
+
 ## hyper-swim: a pair the pool does not fit, judged provisionally (2026-10-07)
 
 Branch `swim-pair-deadline`, the derivation in `docs/timing.md` §2.7 ("A pair the pool does not fit").

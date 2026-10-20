@@ -63,6 +63,15 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-20: in hyper-block, a direct file writes new space with zeros only where its file
+system allocates in place and journals the allocation (ext2, ext3, ext4, XFS, by statfs(2)'s
+`f_type`, asked once at open; `DeviceFile::fills_new_space`, `docs/durable.md` §6.3). On btrfs the
+zeros were a third of focal's event-bus log bytes and bought nothing: without them the log wrote
+132 to 139 bytes a node for each 128-byte record against 193 to 211 with them, and the commits'
+median wait was the same both ways (docs/benchmarks.md, "zeros on btrfs, measured and dropped").
+`file::tests::zeros_are_written_ahead_only_where_the_file_system_journals_its_allocation` checks
+the rule for each magic and a direct file's answer for its own file system (btrfs on fedora: none).
+
 Landed 2026-10-19: in hyper-log, `LogStats::zeroed_bytes` counts the zeros written over the slots
 a file grows by (`docs/durable.md` §6.3, §13.1). focal's event bus at its closed-loop ceiling on
 fedora (a new log a node, 40 seconds) wrote 1.88 GB of zeros a node, 32% of its log's bytes:

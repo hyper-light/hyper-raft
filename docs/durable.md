@@ -829,12 +829,22 @@ frame's confirmation could not be a lone FUA write.
 
 A slot the file grows by is therefore written whole with zeros before its first frame, under that
 frame's own flush (`device::Frame::zero`; the first slot at the log's creation), where the file says
-it pays (`BlockFile::fills_new_space`: a direct file on Linux, and the simulator, which stands for
-it). Every later frame in the slot is an overwrite of written blocks inside the file's size, a flush
-of the device's cache alone. A slot reused is written already and is not filled again. The zeros
-are counted (`LogStats::zeroed_bytes`, §13.1): on focal's event bus, a new log at its closed-loop
-ceiling on fedora's NVMe wrote 1.88 GB of zeros a node in a 40-second run, 32% of its log's bytes,
-as its file grew to the size its retention holds.
+it pays (`BlockFile::fills_new_space`: a direct file on a file system that allocates in place and
+journals the allocation, ext2, ext3, ext4 and XFS by statfs(2)'s `f_type`, asked once at open; and
+the simulator, which stands for it). Every later frame in the slot is an overwrite of written blocks
+inside the file's size, a flush of the device's cache alone. A slot reused is written already and is
+not filled again. The zeros are counted (`LogStats::zeroed_bytes`, §13.1).
+
+Nowhere else are they written. A file system that writes every block out of place by design
+(f2fs, bcachefs) writes a block written ahead again elsewhere, and one that keeps nothing (tmpfs)
+commits nothing; on macOS's APFS they bought nothing (docs/benchmarks.md, 2026-10-07). On btrfs,
+its log files written in place, they were measured and dropped: focal's event bus, each node's log written in place on fedora's NVMe, a new
+log a node, three interleaved rounds at its closed-loop ceiling, 1,000 and 10,000 records a second
+(docs/benchmarks.md, "zeros on btrfs, measured and dropped"). With the zeros, 1.88 GB of each node's
+5.7 GB at the ceiling were zeros and the log wrote 193 to 211 bytes a node for each record; without
+them 132 to 139, the batch's own 132; the commits' median wait (each node's
+`LogStats::commit_wait`) was 23 to 27 ms both ways at the ceiling and 21 to 38 ms both ways at
+the two rates, so nothing paid for a third of the drive's writes.
 
 - **btrfs writes the file in place.** btrfs copies a file on write by default: every overwrite of
   a written block takes new extents from its free-space bitmaps and sums btrfs's own checksums of

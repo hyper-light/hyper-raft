@@ -904,6 +904,12 @@ is worked around.
   rounds' median coefficient of variation, and a shard tracks the median of its last five blocks' means,
   so its own wakes outvote the boot's after 36. A probe short of the floor reports what it measured,
   `quick` (`docs/runtime.md` §10.4; `machine::wake`'s tests).
+- **hyper-seal: a sealed file's plaintext is wiped from its writer's and reader's buffer.** A
+  segment is sealed and opened in place in the one buffer each keeps, which was given back to the
+  allocator as it was, so a file's last opened (or not yet sealed) segment stayed in freed memory.
+  The buffer is now wiped when let go, with the volatile writes and fence a key's slot is wiped with
+  (`sealed_file::Wiped`; `a_readers_and_a_writers_buffers_are_wiped_when_let_go`). Found by focal,
+  sealing its enrollment's private keys through `sealed_file` (focal doc 29 §12).
 - **hyper-seal §11: the log sealed by default.** Group commit in an open loop, a plain, a second
   plain and a sealed log at once on the device, at 100 B to 16 KiB entries and 25–75% of their
   capacity, load 22–40: at the median sealing costs nothing a run resolves (0.964–1.043 of the plain

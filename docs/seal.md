@@ -237,7 +237,10 @@ the crate that writes.
   whole.
 - **Memory.** One aligned buffer per writer or reader, the segment and its tag, the footer and two
   alignments, made when the writer or reader is: no allocator call after setup (counted:
-  `cargo bench -p hyper-seal --bench files`).
+  `cargo bench -p hyper-seal --bench files`). A segment is sealed and opened in place in it, so it
+  holds plaintext while the writer or reader works: it is wiped when let go (§8's volatile writes
+  and fence), and no file's plaintext is left in memory it gives back
+  (`a_readers_and_a_writers_buffers_are_wiped_when_let_go`).
 - **Tests** (`sealed_file_tests.rs`) refuse a flipped byte at every offset, a cut at and between
   segment boundaries, an extension, a segment spliced from another file under the same key, two
   segments swapped, the wrong parent, a header re-pointed at another file's key record (with and
@@ -447,7 +450,8 @@ so the bound is never a refused read.
 
 A consumer that holds plaintext in RAM between writes (slates' "at rest is idle RAM") seals it with
 §4's construction under a volume key in a `Secret32`, and keeps only the sealed bytes; its plaintext
-buffers are the consumer's to wipe.
+buffers are the consumer's to wipe. The buffers `sealed_file` seals and opens in are its own, and
+wiped (§4.1).
 
 ## 9. FIPS mode
 

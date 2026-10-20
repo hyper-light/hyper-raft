@@ -1282,6 +1282,23 @@ Gilbert–Elliott loss, path and interface MTU, NAT expiry). hyper-rt keeps it a
   listener and focal's local clients need them.
 - **Completions from simulated devices** through the same `Waker` seam as §7.
 
+**A bounded run** (2026-10-20). `run_until_idle` returns only once no shard has work and no deadline
+remains, and a world of nodes always has one (a node's heartbeats and liveness, its transport's
+keep-alive and idle timers), so it never returns from one, and the loop's pump was private, so a caller
+could not build a bounded run from `step` and `advance`. `SimRuntime::run_until(deadline_ns) -> u64` is the
+same loop stopped at a deadline: every event due at or before it is taken (a shard's timer, a datagram's
+arrival, and the work each wakes, the work their tasks make at that instant among it), none due after it,
+and the clock is left at `deadline_ns`; a deadline at or before now takes what is due now and moves the
+clock nowhere. The next call goes on as if the run had not stopped, so a world run in slices sees what it
+sees run in one, each event at the same time, and its harness checks its invariants between slices and
+waits on the facts it needs a slice at a time. Its steps are bounded as `run_until_idle`'s are: it stops
+only once no shard has work at the time it reached, and returns the steps it took. `tests/sim_run_until.rs`:
+on two shards whose tasks run forever (periodic timers of 3 and 7 ms, a datagram sent each 3 ms on a path of
+5 ms), each slice of 2 ms takes exactly the closed form of what is due by its end, each event at the time it
+was due, the clock at the slice's end; on a jittered path the world in twenty slices sees what it sees in
+one, every event at the same time and in the same order with the same fabric counts, one seed gives one run
+and another another. Both fail with an event at a slice's end left to the next (`<` for `<=`).
+
 ## 12. Measurement and tests
 
 Benchmarks (`docs/benchmarks.md`, hardware, date and command each), each row against what each consumer
@@ -1347,6 +1364,15 @@ endpoints on one shard:
 
 Not yet a like-for-like comparison: hyper-tokio's scenario runs its ends in two processes, this one on one
 thread. §12's row runs both drivers the same way.
+
+**On the simulation runtime** (2026-10-20). The driver and the plane's socket run on `SimRuntime`'s shards
+as they are: `Driver::bind` finds no shared port on the fabric and binds one socket that takes every peer, as
+on Windows, and `PlaneSocket::bind` takes a fabric port. A node is a future `spawn_on` takes, its plane's
+receive among its awaits (hyper-datagram's `Fence` is `Sync`), and a world of nodes runs in slices of
+`run_until` (§11). `tests/simulation.rs` runs three nodes on three shards, mutual TLS and a seeded QUIC
+layer each, two clients each asking a request of 256 KiB, sending a lane frame and sealing a plane message
+keyed from its connection's exporter, the server answering and echoing; two runs from one seed give the same
+reports, virtual times and fabric counts (`docs/transport.md` §4v).
 
 ## 15. Open items, to settle before the part that rests on them
 

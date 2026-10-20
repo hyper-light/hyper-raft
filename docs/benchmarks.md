@@ -2155,6 +2155,34 @@ high-water mark and refuses any datagram that arrives out of order, where hyper-
 window accepts a verified late datagram once; and slates' keys are not yet tied to a session
 (mantle audit §11.8), where hyper-datagram's come from the QUIC connection's exporter.
 
+## The plane's peers in the order of their ids (2026-10-20)
+
+`Plane` kept its peers in a `HashMap` of the standard library's random hasher and `flush` walked it,
+so one flush's datagrams to several peers left in an order drawn per process, which set two runs of
+one seed of mantle's node simulation apart (`docs/transport.md` §4v). The peers are now a `Vec` sorted
+by id, each found by binary search, flushed in that order. A peer is found for every message queued
+and every datagram opened.
+
+`cargo bench -p hyper-datagram --bench round` (added with the change: the allocation bench's round,
+timed, 32,000 datagrams a cell after 100 rounds) on the M5 Max above, macOS 26.4.1, 2026-10-20 at
+04:18 PDT, load average 7 to 12 from the machine's other sessions. Before is `ba0c87b` with the bench
+copied in; the two binaries alternated in four ABBA blocks of fresh processes. Nanoseconds a message,
+median (least–most) of 8 runs each:
+
+| Peers | Message | Messages a datagram | Before, `HashMap` | After, sorted `Vec` |
+|---|---|---|---|---|
+| 1 | 16 B | 66 | 15.5 (15.2–22.5) | 11.4 (11.2–14.7) |
+| 1 | 128 B | 9 | 65.3 (63.2–68.6) | 59.5 (57.7–60.9) |
+| 1 | 1,024 B | 1 | 463.2 (450.8–483.0) | 456.4 (442.1–488.5) |
+| 16 | 16 B | 66 | 16.0 (15.6–16.6) | 13.5 (13.2–13.8) |
+| 16 | 128 B | 9 | 67.5 (65.7–70.2) | 63.6 (62.8–65.4) |
+| 16 | 1,024 B | 1 | 490.2 (471.9–501.0) | 474.1 (457.5–478.1) |
+
+At 16 B a message's peer lookup is a large part of its cost: a quarter less time with one peer, a
+sixth less with sixteen, whose search takes four comparisons where the hash took one probe; at
+1,024 B, one message a datagram, the seal is the cost and the two are even. Allocations,
+reallocations, bytes asked and minor faults (`--bench allocs`): 0 in every cell, before and after.
+
 ## Commands for the plane
 
 ```sh
@@ -2163,6 +2191,9 @@ cargo test -p hyper-datagram
 
 # Allocations per datagram.
 cargo bench -p hyper-datagram --bench allocs
+
+# Time a message of a round, one peer and sixteen.
+cargo bench -p hyper-datagram --bench round
 
 # The comparison, slates as it builds, then slates with its ARMv8 crypto.
 cd crates/hyper-datagram-compare && cargo build --release

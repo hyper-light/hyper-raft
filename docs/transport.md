@@ -424,7 +424,8 @@ never depends on it.
   - `endpoint()` lends the endpoint for the owner's calls between events; `flush()` sends what
     those calls queued without waiting; `stats()` counts datagrams, system calls and drops.
 - `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
-  sends; `receive(plane, fence, deliver).await` opens a batch; `receive_ready(plane, fence,
+  sends; `receive(plane, fence, deliver).await` opens a batch, its future `Send` (the owner's
+  `Fence` is `Sync`, §4v); `receive_ready(plane, fence,
   deliver)` opens what is queued without waiting, for an owner to feed its detectors before it
   judges a deadline: on a kernel-stamped socket it asks the kernel, not the reactor, whose
   readiness is as of its last turn (a datagram that came through a stop of the process was queued
@@ -1477,6 +1478,62 @@ healed connected; before the fix the second dial was told nothing, `dial 2: []`)
 the change; `a_dial_ending_while_its_peer_is_connected_tells_nothing_new` holds that a dial failing
 beside a connection the peer opened tells nothing, and fails if the dial's end forgets what was told
 with that connection up (`Connected` told again).
+
+## 4v. The transport on hyper-rt's simulation runtime (2026-10-20)
+
+hyper-rt-transport's `Driver` and `PlaneSocket` run on `SimRuntime`'s shards as they are, so a world of
+nodes, their transports, datagram planes and replicas, runs deterministically on one thread (mantle's
+node simulation; `docs/runtime.md` §11, §14):
+
+- `Driver::bind` finds no shared port on the fabric (`UdpSocket::bind_shared` refuses one there, its
+  ports being one socket's each) and binds one socket that takes every peer, as on Windows. The fabric
+  charges a socket's queue each datagram's payload (§4i) and tells no path's MTU, so the endpoint's
+  default ceiling stands.
+- `PlaneSocket::bind` takes a fabric port; a datagram arrives when it is read, on the virtual clock.
+- A node is the future `spawn_on` takes, which is `Send`. hyper-datagram's `Fence` is `Sync`, so the
+  `&dyn Fence` a receive holds across its await is `Send`, in both adapters. mantle's node simulation
+  found a node awaiting its plane was not `Send`; `a_planes_receive_is_a_send_future`
+  (hyper-rt-transport, hyper-tokio) and `a_fence_is_shared_with_the_futures_that_hold_it`
+  (hyper-datagram) do not compile without it. No implementor needed a change: hyper-raft's are unit
+  structs (`AdmitAll`, a test's own), slates passes `AdmitAll`, and focal and mantle implement none.
+- A plane's flush hands its datagrams out in the order of the peers' ids. `Plane` kept its peers in a
+  `HashMap` of the standard library's random hasher, which `flush` walked, so the datagrams of one
+  flush to several peers left in an order drawn per process, and a fabric path that draws (jitter,
+  loss) drew for each in that order: mantle's node simulation traced two runs of one seed apart at
+  the first such flush (a node's datagrams to ports 66 and 2 at one instant, in either order). The
+  peers are a `Vec` sorted by id, each found by binary search, as hyper-transport keeps its peers:
+  `a_flush_hands_out_each_peers_datagram_in_the_order_of_their_ids` (hyper-datagram) failed in every
+  process before, each time in another order. No allocation moved and a round is as fast or faster
+  (`docs/benchmarks.md`, "The plane's peers in the order of their ids"). slates, which vendors the
+  crate, calls it as before.
+- A world always has a next deadline, so it runs in slices of `SimRuntime::run_until`.
+
+`tests/simulation.rs` runs two clients and a server, each on a shard of its own, over a path of 1 ms ±
+0.25 ms one way. Each client's request of 256 KiB is answered and its reply read, every byte checked; a
+frame it sends on a lane is echoed; a message it seals under keys from its connection's TLS exporter is
+echoed on the plane. The server's listener holds both connections with no socket of their own, and the
+fabric drops nothing. Two runs from one seed give the same reports, the same clock at the end and the
+same fabric counts; another seed gives another run. On macOS the handshakes completed at 1.67 and 2.22 ms
+of virtual time and the clients were done at 30.7 and 31.9 ms, 1,009 datagrams delivered.
+
+**What a seed's run rests on.** The bytes differ from run to run and the flow does not, while:
+- each endpoint's QUIC layer is seeded (`Endpoint::new_seeded`): `Endpoint::new` seeds it from the
+  system, and the reserved transport parameter's random length moves the handshake's sizes;
+- TLS signs with a scheme of one length (Ed25519, as the tests' `Pki::issue`): ECDSA's DER signatures
+  are 70 to 72 bytes. AWS-LC's own randomness moves no size otherwise;
+- the certificates are the run's own, the same bytes from one seed: hyper-tls compresses a handshake's
+  certificate chain (RFC 8879, brotli and zlib by default), so a certificate's bytes, not only its
+  length, move the handshake's sizes. The test makes its authority once for both runs; a run replayed
+  in another process derives its authority from the seed (mantle's simulation does);
+- congestion is CUBIC, NewReno or Copa: hyper-quic's BBR seeds its probe cycle's generator from the
+  thread's (`Pcg32::from_rng(&mut rand::rng())`).
+
+Drawn per process and moving no size or time: connection IDs (`HashedConnectionIdGenerator`'s key and
+nonces, and a client's first destination ID), the stateless reset key and the token key
+(`EndpointConfig::default`, `ServerConfig::with_crypto`). A token's issue and expiry are judged on the
+host's wall clock (`StdSystemTime`, the server's `TimeSource`), not the world's: a token never expires in
+virtual time. A driver's timer granularity is never measured on the simulation (`docs/STATUS.md`, open
+defects), so every host runs a seed at RFC 9002's 1 ms.
 
 ## 5. Consumers
 

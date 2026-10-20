@@ -107,6 +107,22 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-rt-transport, hyper-tokio: a driver folds its timer's lateness into `G` only when it finds
+  its timer fired in the turn that armed it (found 2026-10-20, by the simulation).** Each turn of
+  `poll_event` hands a due timeout to the endpoint (`handle_timeout`) before it looks at its timer, and
+  the timer for the next deadline then replaces the one that fired, unread; `fired`, which folds the
+  wait (`Lateness::on_wait`) and tells the endpoint (`Endpoint::set_granularity`), runs only when a
+  deadline passes inside a turn, between the turn's reading of the clock and its timer's poll, which a
+  simulated clock never does. hyper-rt-transport's `tests/simulation.rs` world run for 5 s of virtual
+  time with scratch prints (never landed): every due timeout its three drivers handled, 82 over three
+  runs, keep-alives among them, had the driver's timer armed for it, and none was folded, so the
+  endpoints kept RFC 9002's 1 ms (`K_GRANULARITY`). hyper-tokio's `poll_event` takes the same order.
+  Open: fold a wait at the turn that finds its deadline passed (a wait that reached its deadline,
+  whatever ended it: hyper-liveness's rule, `docs/timing.md` §2.4), which moves the windows' tuning
+  (`Window::tune`) from 1 ms to the measured `G` on every host, so it lands measured with the
+  consumers' suites. A simulated driver then floors `G` at the virtual clock's step, a nanosecond, not
+  at the host clock's resolution `Driver::with_ring` reads (`hyper_rt::machine::clock::resolution_ns`:
+  1 µs on macOS, 100 ns on Windows), or one seed's run would differ from host to host.
 - **hyper-raft: on the swarm's quarter network one group's liveness phase does not converge (found
   2026-10-17).** With the swarm's losses and repeats narrowed to a quarter (`docs/sim.md` §11 item 4,
   the setting that reaches the most abstract states and catches every planted defect within the

@@ -421,8 +421,10 @@ impl hyper_raft::Storage for Wal {
         let range = self.range(low, high)?;
         let mut bytes = 0u64;
         let mut kept = 0usize;
+        // Each entry counted at its body in a message, as the core counts it: a page cut by any
+        // other count is not the core's, which takes the page as cut.
         for entry in range {
-            bytes = bytes.saturating_add(u64::try_from(entry.encoded_len()).unwrap_or(u64::MAX));
+            bytes = bytes.saturating_add(hyper_raft::proto::encoded_bytes(entry));
             if kept > 0 && bytes > max_bytes {
                 break;
             }

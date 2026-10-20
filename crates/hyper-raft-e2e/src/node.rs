@@ -50,14 +50,13 @@ use crate::{
 };
 
 /// The bytes of a member's datagram besides an append's entries: the datagram's header and the
-/// sender's id ([`wire`]), and the message record's header, fixed fields and checksum
-/// (`docs/raft.md` §3.1). The core counts an entry at its encoded bytes
-/// ([`hyper_raft::proto::encoded_bytes`]), so entries bounded to the datagram less this fill it.
-pub const MESSAGE_ROOM: usize = wire::HEADER
-    + 8
-    + hyper_raft::wire::HEADER_BYTES
-    + hyper_raft::wire::MESSAGE_FIXED_BYTES
-    + hyper_raft::wire::CHECKSUM_BYTES;
+/// sender's id ([`wire`]), and what a leader's append takes beside its entries, its record's header,
+/// fixed fields, classic commit and checksum, the most of any message of the core's
+/// ([`hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES`], `docs/raft.md` §3.1). The core counts an
+/// entry at its encoded bytes ([`hyper_raft::proto::encoded_bytes`]), so entries bounded to the
+/// datagram less this fill it. Without the classic commit a full page was 8 bytes too long for its
+/// datagram, and dropped at every send.
+pub const MESSAGE_ROOM: usize = wire::HEADER + 8 + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES;
 
 /// Why the member stopped.
 #[derive(Debug)]

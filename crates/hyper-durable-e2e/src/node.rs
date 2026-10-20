@@ -53,6 +53,9 @@ use hyper_log::{Config as LogConfig, Log, Sealing, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
 use hyper_raft::wire::Record;
 use hyper_raft::{Config, Limits, StateRole, Stated};
+// A member's Raft datagram is framed as hyper-raft-e2e's members frame theirs, so its room beside an
+// append's entries is theirs.
+use hyper_raft_e2e::node::MESSAGE_ROOM;
 use hyper_raft_e2e::run::RunError;
 use hyper_raft_e2e::stream;
 use hyper_raft_e2e::wire::{self, Command, Control, Kind, Op, Outcome, Status};
@@ -71,14 +74,6 @@ pub const GROUP: u128 = 1;
 pub const LIVENESS_GROUP: u128 = 2;
 /// The log's id.
 const LOG_ID: u128 = 0x0068_7970_6572_2d64_7572_6162_6c65;
-
-/// The bytes of a member's datagram besides an append's entries: the datagram's header and the
-/// sender's id, and the message record's header, fixed fields and checksum (hyper-raft-e2e's).
-const MESSAGE_ROOM: usize = wire::HEADER
-    + 8
-    + hyper_raft::wire::HEADER_BYTES
-    + hyper_raft::wire::MESSAGE_FIXED_BYTES
-    + hyper_raft::wire::CHECKSUM_BYTES;
 
 /// The log's settings: segments of 64 blocks, sixty-four of them (16 MiB), the replica's group and
 /// the liveness stream's ([`LIVENESS_GROUP`]), and the writer's measured waits (`Waits::Measured`, a

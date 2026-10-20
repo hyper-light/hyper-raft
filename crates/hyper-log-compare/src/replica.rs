@@ -89,10 +89,20 @@ pub trait Durable: Storage + Sized {
     fn calls(&self) -> Calls;
 }
 
+/// Bytes an entry's encoding in the log adds to its data and context: its kind and its context's
+/// length.
+const ENTRY_OVERHEAD: usize = 1 + 4;
+
+/// Bytes an entry takes in a message beyond those the log stores of it: the core counts an entry
+/// at its body there (`hyper_raft::proto::encoded_bytes`), `hyper_raft::wire::ENTRY_FIXED_BYTES`
+/// besides its data and context, as hyper-durable's store pages (`GroupStore`).
+const IN_MESSAGE_BEYOND_STORED: u64 =
+    (hyper_raft::wire::ENTRY_FIXED_BYTES - ENTRY_OVERHEAD) as u64;
+
 /// An entry's bytes in the log: its kind, its context's length, its context and its data, as
 /// mantle's store encodes it.
 fn encode_entry(e: &Entry) -> Vec<u8> {
-    let mut out = Vec::with_capacity(e.context.len() + e.data.len() + 5);
+    let mut out = Vec::with_capacity(e.context.len() + e.data.len() + ENTRY_OVERHEAD);
     out.push(e.entry_type.byte());
     out.extend_from_slice(&(e.context.len() as u32).to_le_bytes());
     out.extend_from_slice(&e.context);
@@ -176,7 +186,7 @@ pub mod hyper {
 
     use hyper_block::buf::Alignment;
     use hyper_block::sim::SimFile;
-    use hyper_log::{Fetched, GroupLog, Log, LogError};
+    use hyper_log::{Fetched, GroupLog, Log, LogError, Page};
 
     pub struct Store {
         // Dropped before the log, so that its release reaches the owner while it runs.
@@ -201,12 +211,18 @@ pub mod hyper {
             Ok((start.index, last))
         }
 
+        /// As many entries as `max` of what they take in a message admit, as the core counts
+        /// them: each at its stored bytes and those the message adds.
         fn fetch(&self, low: u64, high: u64, max: u64) -> Result<Fetched, StorageError> {
             Counted::bump(&self.counted.fetches);
             let into = self.fetched.take().unwrap_or_default();
+            let page = Page {
+                max_bytes: max,
+                per_entry: IN_MESSAGE_BEYOND_STORED,
+            };
             self.group
                 .borrow()
-                .fetch(low, high, max, into)
+                .fetch(low, high, page, into)
                 .map_err(|e| storage(&e))
         }
 

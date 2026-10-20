@@ -188,6 +188,40 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-19)
+
+- **hyper-durable: a page read from `GroupStore` ran past the core's bound on a message (found by
+  mantle).** The store gave the core's `max_bytes` to hyper-log's fetch, which counted each entry
+  at the bytes the log stores of it (`encode_entry`: its kind, its context's length, its context
+  and its data), 20 fewer than its body in a message (`hyper_raft::proto::encoded_bytes`), and the
+  core takes a page its storage cut as whole (`Log::slice_page`). In mantle a range with
+  `max_size_per_msg` 1,024 and entries of about 50 bytes sent a follower a snapshot had caught up
+  an append of 1,553 bytes, 1,449 of them entries, where the core promises
+  `MESSAGE_RECORD_FIXED_BYTES` and the larger of the bound and one entry; its transport bounds the
+  replication class's frame by that promise and refused the append on all 1,158 retries, and the
+  follower never caught up. Appends of the live tail, which the core pages itself, were within the
+  bound. hyper-log's fetch now counts each entry at its payload and a part the caller states for
+  each (`hyper_log::Page`), the store states the 20 bytes, and the log chooses the core's page
+  before anything is copied; a walk's pages (`LogStore::visit`) are counted the same way. Tests:
+  hyper-durable's `a_page_read_from_the_store_is_the_cores_by_what_its_entries_take_in_a_message`
+  (every bound a page turns at, from the handle's memory and from the log's file),
+  `a_walk_of_the_store_reads_pages_of_the_cores_rule` and
+  `a_learner_caught_up_from_the_log_is_sent_appends_within_the_bound` (before: an append of 5
+  entries, 325 bytes, against a bound of 256), each red before the fix; hyper-log's
+  `a_fetch_counts_each_entry_at_its_payload_and_the_pages_part_for_each`, and the handle's reads
+  held to the log's with a part for each entry. hyper-raft-e2e's `Wal` counted an entry at its
+  whole record, 6 bytes past its body, and cut pages shorter than the core's; it counts the body
+  now. Its pages full to the byte showed the harness's room beside an append's entries 8 bytes
+  short (`node::MESSAGE_ROOM` left out the classic commit every leader's append states): a full
+  page was dropped as too long for its datagram at every send, and in `leader-killed` a member the
+  new leader caught up from its log never caught up (ubuntu-24.04 and macos-15, CI run
+  39366050595). The room is now the datagram's header, the sender and the core's
+  `MESSAGE_RECORD_FIXED_BYTES`, and hyper-durable-e2e, which frames a member's datagram the same
+  way and kept a copy of the short room, takes it
+  (`a_leaders_append_filled_to_the_page_fills_its_datagram`: 65,515 bytes for a datagram of
+  65,507 before). The stores that give the whole range asked (hyper-multilog's test store, the
+  liveness bench's) are cut by the core's own rule.
+
 ### Closed (2026-10-17)
 
 - **hyper-transport, hyper-quic: on Linux's default buffer a measured shared socket refused every

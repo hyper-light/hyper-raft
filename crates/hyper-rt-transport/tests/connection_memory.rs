@@ -293,3 +293,22 @@ fn what_a_server_holds_for_each_connection() {
         );
     }
 }
+
+/// The charge an endpoint makes for each connection's state (`hyper_transport::state_charge`)
+/// covers what one holds of its server's heap, measured: the connections past the first 32, each
+/// settled, add no more than the charge, their rows in the endpoint's tables among it, which grow
+/// with the connections held. What the first connection makes once (its configuration's state) is
+/// no connection's own, so the measure is the difference of two rows.
+#[test]
+fn a_connection_holds_no_more_of_its_server_than_its_charge() {
+    let (made_less, settled_less, _) = row(32);
+    let (made_more, settled_more, _) = row(64);
+    let each = ((settled_more - made_more) - (settled_less - made_less)) / 32;
+    println!("each connection past 32 held {each} B of its server's heap");
+    assert!(each > 0, "a connection held nothing: {each} B");
+    let charge = hyper_transport::state_charge(&admitting(64));
+    assert!(
+        u64::try_from(each).unwrap() <= charge,
+        "a connection held {each} B of its server against a charge of {charge} B"
+    );
+}

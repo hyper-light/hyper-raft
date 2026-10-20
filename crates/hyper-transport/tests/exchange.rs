@@ -460,13 +460,13 @@ fn a_budget_that_cannot_fund_a_head_refuses_it() {
         64 << 20,
         now,
     );
-    // Enough for the connection's window and little else.
+    // Enough for the connection's window and its state, and little else.
     let b = pair.node::<Mantle>(
         2,
         Role::Node,
         pair.book(Role::Node, Role::Node),
         limits(),
-        16_000,
+        16_000 + hyper_transport::state_charge(&limits()),
         now,
     );
     let mut net = Net::new(now, a, b);
@@ -3091,7 +3091,12 @@ fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
     const FRAMES: u32 = 60;
     const FRAME: usize = 1_000;
     // Room for the connection's first window and its streams' heads, and a dozen frames.
-    let budget = first_window() * 2 + 12 * FRAME as u64;
+    // Two first windows and twelve frames, the frames' room as before a connection's state was
+    // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
+    let budget = first_window() * 2
+        + 12 * FRAME as u64
+        + hyper_transport::state_charge(&limits())
+        + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
     let body = [9u8; FRAME];
@@ -3152,7 +3157,12 @@ fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
     const FRAMES: u32 = 60;
     const FRAME: usize = 1_000;
     // Room for the connection's first window and its streams' heads, and a dozen frames.
-    let budget = first_window() * 2 + 12 * FRAME as u64;
+    // Two first windows and twelve frames, the frames' room as before a connection's state was
+    // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
+    let budget = first_window() * 2
+        + 12 * FRAME as u64
+        + hyper_transport::state_charge(&limits())
+        + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
     let frame = |sequence: u32| {
@@ -3269,7 +3279,12 @@ fn a_frame_on_an_idle_lane_is_written_straight_into_its_stream() {
 fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {
     const FRAMES: u32 = 60;
     const FRAME: usize = 1_000;
-    let budget = first_window() * 2 + 12 * FRAME as u64;
+    // Two first windows and twelve frames, the frames' room as before a connection's state was
+    // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
+    let budget = first_window() * 2
+        + 12 * FRAME as u64
+        + hyper_transport::state_charge(&limits())
+        + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Mantle, Mantle>(&pair, limits(), 256 << 20, budget);
     let body = [9u8; FRAME];

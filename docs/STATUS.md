@@ -63,6 +63,18 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-20: in hyper-transport, what a connection holds of its endpoint's memory beside its
+windows is charged as it is held: `CONNECTION_STATE`, 30 KiB, reserved on the window's lane beside
+the connection's first window at its dial and its accept, and given back as it goes; a budget that
+cannot fund it refuses the connection, typed (`docs/transport.md` §4w). Measured, an idle
+connection holds 27.3 to 29.1 KB of its server's heap; `connection_memory::a_connection_holds_no_more_of_its_server_than_its_charge`
+holds each connection past the first 32 of 64 to the charge (27,540 bytes, macOS). An owner can now
+derive its connection bound from its memory instead of stating one (focal's listener: 128):
+`connection_charge::<C>(limits)`, whose state part (`state_charge`) adds the exchange tables a
+connection reserves for its streams (24 bytes a stream), and the endpoint's tables with a row for
+each connection or identity grow with what it holds rather than being allocated to its admission's
+bound (about 650 bytes for each connection admitted, charged to nothing).
+
 Landed 2026-10-20: in hyper-log, a slot the file grows by is written with zeros ahead of its first
 frame, a piece at a time while the device has nothing else to do, each piece no larger than the last
 frame's writes, flushed with its last piece (`Owner::fill_ahead`, `device::Job::Fill`;

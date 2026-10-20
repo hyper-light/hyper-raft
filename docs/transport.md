@@ -1546,6 +1546,49 @@ port 0; flagged first, 19 ports were given twice on Linux), `a_shared_port_is_re
 (flagged first, the second bind succeeded) and `a_joined_port_hands_the_joiner_its_peers_datagrams`;
 hyper-rt-transport's `connection_memory` measurement connects all 256 clients in five runs of five.
 
+## 4w. A connection's state charged as it is held (2026-10-20)
+
+What a connection holds of its endpoint's memory beside its windows and the messages it carries
+(its QUIC state, `hyper_quic::Connection`'s 8,128 bytes inline and what that allocates, its stream
+tables, its rows in the endpoint's own) was charged to nothing: a node's connections were bounded by
+a count its owner stated (focal's listener, 128), not by its memory. Measured, an idle connection
+holds 27.3 to 29.1 KB of its server's heap on macOS and Linux (`docs/benchmarks.md`, "What a server
+holds for each connection"); `CONNECTION_STATE`, 30 KiB, is now charged to the budget on the
+window's lane (accounting only) beside the connection's first window, at its dial and its accept,
+and given back as it goes (`Core::window_grant`, `Endpoint::gone`). A budget that cannot fund it
+refuses the connection as it refuses a first window, typed, and grants nothing; an owner can then
+state its connection bound from its memory and the charge, or let the budget be the bound.
+`connection_memory::a_connection_holds_no_more_of_its_server_than_its_charge` holds the measure to
+the charge on every run: each connection past the first 32 of 64 held 27,540 bytes of its server's
+heap (macOS, a debug build under 24 CPU burners). The exchange tests whose budgets were sized to a
+first window and their frames fund the state and the receive chunk such a budget now takes at the
+handshake (`RECEIVE_CHUNK`), so their frames have the room they had.
+
+Two parts of what a connection holds were sized apart from it, and are now its own. Its exchange
+tables (`Conn::exchanges`, `Conn::by_stream`, 24 bytes a stream) are reserved to the streams it may
+have at once as it is made, so no insert allocates: the measure's 16 streams held 384 bytes of
+them, and focal's listener, whose connections may each have the consensus window's streams and its
+content lane's (142), 3.4 KB, which a constant charge would have missed. The charge is therefore
+`state_charge(limits)`, `CONNECTION_STATE` and the tables `limits.streams_per_connection` sizes,
+and `connection_charge::<C>(limits)` is what an owner divides its endpoint's memory by. And the
+endpoint's tables with a row for each connection or identity (the peers, the admission's
+identities, the windows grown, the handshakes pending, and the lists a turn fills with connection
+keys) were allocated to what admission could hold before any connection came, about 650 bytes for
+each admitted, charged to nothing: an endpoint made for 256 held 318 KB against 152 KB for one,
+and an owner that derived a bound of thousands from its memory would have held megabytes for
+connections it never had. They now start empty and grow with what the endpoint holds, the lists a
+turn fills reserved as the keys grow (`Endpoint::reserve_marks`), so a turn still allocates
+nothing. Measured again (release, macOS): made for 1, 64 and 256, the endpoint held 147, 170 and
+241 KB, the growth now the test's own directory of its clients' certificates (368 bytes each),
+and each connection added 28,764 and 29,386 bytes settled, within its charge of 31,104. The
+exchange table's lists with an entry for each exchange (its heap indices, the touched list, the
+walk's frontier, 32 bytes an exchange) were allocated to the exchange bound likewise, about 2 MB at
+the 65,536 an owner states for thousands of connections; they now grow with the slots the arena
+makes (`Table::made`), the touched list's room still what a settle is due at, so a settle batches
+as it did. `cargo bench -p hyper-transport --bench allocs`, the change against `58d2308` in turn:
+6.35, 10.36 and 10.39 allocations an exchange (no body, 4 KiB and 64 KiB bodies) and 2.02 a lane
+frame, 0.12 reallocations, on both.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

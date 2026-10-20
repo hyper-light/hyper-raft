@@ -8156,6 +8156,20 @@ has arrived for 300 ms.
 
 An idle connection holds about 28 KB of the server's heap, `hyper_quic::Connection`'s 8,128 bytes inline
 among it; the tables admission sizes add about 650 bytes for each connection admitted before any comes.
+
+Again on 2026-10-20, once those tables grow with the connections held (`docs/transport.md` §4w), macOS
+(M5 Max), release:
+
+| Connections | Endpoint made | Settled | Added a connection |
+|---|---|---|---|
+| 1 | 147 KB | 322 KB | 175 KB (the first's one-time state) |
+| 64 | 170 KB | 2.01 MB | 28.8 KB |
+| 256 | 241 KB | 7.76 MB | 29.4 KB |
+
+What the endpoint made for 256 holds past the one made for 1, 368 bytes a client, is the test's own
+directory of its clients' certificates, built with it; the transport's tables hold nothing for a
+connection until it comes, and each adds its rows as it does, within its charge (31,104 bytes for the
+measure's 16 streams).
 Its socket's kernel buffer is apart (charged by the kernel as datagrams wait in it). On Linux the run
 first found the port-0 collision of `docs/transport.md` §4v: one to three clients of 256 never connected.
 

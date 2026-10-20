@@ -2587,6 +2587,10 @@ fn a_reopened_log_sweeps_the_segments_it_recovered() {
         write(&log, &mut models, n);
     }
     check(&log, &models);
+    // The sweeps are counted, and the bytes they copied: what the log wrote a second time.
+    let stats = log.stats(None).unwrap();
+    assert!(stats.sweeps > 0, "{stats:?}");
+    assert!(stats.swept_bytes > 0, "{stats:?}");
 }
 
 /// A log that answered `Full` takes any frame that fits a segment once its groups compact:

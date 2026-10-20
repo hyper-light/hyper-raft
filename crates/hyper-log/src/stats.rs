@@ -52,6 +52,12 @@ pub struct LogStats {
     /// episodes: the log asks again whenever it looks for room, so one bound reached counts as
     /// often as the log looked while it held.
     pub growth_refused: u64,
+    /// Sweeps made: frames that copied the tail segment's live entries ahead of their updates,
+    /// so the tail could be let go when the log had fewer than two segments free.
+    pub sweeps: u64,
+    /// Bytes those sweeps copied, the relocated records laid before the frames' updates: what the
+    /// log wrote a second time, its write amplification's own part.
+    pub swept_bytes: u64,
 }
 
 impl LogStats {
@@ -70,6 +76,8 @@ impl LogStats {
             write: Histogram::new(),
             commit_wait: Histogram::new(),
             growth_refused: 0,
+            sweeps: 0,
+            swept_bytes: 0,
         }
     }
 }
@@ -121,6 +129,9 @@ pub(crate) struct Tally {
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
+    /// Sweeps laid, and the bytes of the records they relocated.
+    pub(crate) sweeps: u64,
+    pub(crate) swept_bytes: u64,
 }
 
 impl Tally {
@@ -133,6 +144,8 @@ impl Tally {
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
+            sweeps: 0,
+            swept_bytes: 0,
         })
     }
 

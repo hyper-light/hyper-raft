@@ -55,6 +55,12 @@ made the empty file, and `DeviceFile::written_in_place` reports it
 (`file::tests::a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was`,
 run with `TMPDIR` on a btrfs: fails without the mark).
 
+Landed 2026-10-19: in hyper-log, `LogStats` counts the sweeps a log laid and the bytes they
+relocated (`sweeps`, `swept_bytes`; `docs/durable.md` §13.1): what a full log wrote a second time.
+focal's event bus at its closed-loop ceiling on CI logged 195 bytes for each 128-byte record whose
+batch bytes are 132, and the sweeps' share of that was not measurable from outside the log.
+`log::a_reopened_log_sweeps_the_segments_it_recovered` checks both move.
+
 Landed 2026-10-19: in hyper-durable, an owner restates its period (`Replica::set_quiet`): a
 commit that moved alone is written once the period stated last has passed, for an owner whose
 period is a measure that moves, as an event-driven owner's is the interval its liveness stream sends

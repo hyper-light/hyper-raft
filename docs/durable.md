@@ -1179,6 +1179,7 @@ and allocates no more on that project's workload.
 | `write` | A histogram of each frame's writes, the frame and its persist record. |
 | `commit_wait` | A histogram of each update's wait, from its submission to the end of the flush that let it be answered: the next frame's, whose record confirms its frame, or its frame's own confirmation's. |
 | `flushing_since` | When the frame or confirmation the device holds went to it, while one does. |
+| `sweeps`, `swept_bytes` | Sweeps laid (frames that copied the tail segment's live entries ahead of their updates, the log having fewer than two segments free), and the bytes of the records they relocated: what the log wrote a second time, its write amplification's own part. |
 | `at` | When the owner answered. |
 
 The thread that does a job's I/O times its writes and its flush apart and carries the times back

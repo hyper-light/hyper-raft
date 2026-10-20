@@ -207,6 +207,20 @@ is worked around.
   CI, the same change in its vendored copy, its relayed cut tests (3 and 5 voters, three rounds
   each) passed 12 of 12 runs on windows-x86_64 and windows-aarch64; without it every round failed
   on both.
+- **hyper-rt `a_request_drained_during_shutdown_is_terminated_on_its_receipt`, windows-11-arm (CI
+  run 39410706279, dial-outcome's): the request refused `ShardGone` in 0.00 s.** The test holds its
+  shard inside a spinning task and queues a shutdown and then a request behind it, and its hold
+  returned once the shard had admitted the task. A shard answers an admission inside its pass over
+  the control channel and takes what is queued behind it in the same pass before it polls what it
+  admitted (`drain_control`, a batch at a time), so a shutdown sent as the admission was answered
+  was taken in that pass, the hold cancelled unpolled, and the request after it refused as gone.
+  Forced in a scratch test (never landed), a hold and a shutdown queued behind a first hold and
+  drained in one pass: admitted, never polled, the next request `ShardGone`, every run. The hold now
+  returns once its task's poll has begun (the task sets a flag first; the wait bounded by the test's
+  `WAIT`). The runtime behaves as documented; the test's precondition was wrong. 500 runs of the
+  file under 24 busy loops on the 18-core Mac passed with the fix, and with the old hold as well:
+  the window is the shard's few instructions between answering the admission and taking its next
+  message, open only while the shard is preempted there and the test thread runs.
 
 ### Closed (2026-10-19)
 

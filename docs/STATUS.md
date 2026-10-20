@@ -55,6 +55,14 @@ made the empty file, and `DeviceFile::written_in_place` reports it
 (`file::tests::a_file_opened_empty_on_btrfs_is_written_in_place_and_one_with_bytes_is_left_as_it_was`,
 run with `TMPDIR` on a btrfs: fails without the mark).
 
+Landed 2026-10-19: in hyper-durable, an owner restates its period (`Replica::set_quiet`): a
+commit that moved alone is written once the period stated last has passed, for an owner whose
+period is a measure that moves, as an event-driven owner's is the interval its liveness stream sends
+at (`docs/durable.md` §15). An owner that states no period in the core's ticks, as focal's event bus
+did (`quiet` zero), wrote each commit alone the moment no write was out: about two log frames for
+each entry at a low steady rate, where one owner period lets the commit ride the next entry's write
+(focal F17). `shell::a_quiet_period_restated_by_the_owner_judges_the_commit_written_alone`.
+
 Landed 2026-10-19: in hyper-log, the sealer forgets the sessions of freed segments from the tail
 after each frame (`Sealer::retain_from_tail`), where it asked whether every session's segment was
 live: segments leave only from the tail and sessions begin only at the head, so the dead are the

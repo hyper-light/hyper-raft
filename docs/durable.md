@@ -1338,7 +1338,9 @@ directory once, at create.
   `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, one page at most (§2.2), takes at most one `Ready`
   (§7's quantum), and writes the
-  commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period.
+  commit alone when the fence or a quiet period asks. `Settings::quiet` is the owner's period;
+  an owner whose period is a measure that moves restates it as it moves (`Replica::set_quiet`), as
+  an event-driven owner's is the interval its liveness stream sends at.
   Elections are by suspicion (L-2, §8), or on the owner's ticks until it elects so: by suspicion, no
   ticks; a drive wakes the core and `Driven::wake` says
   when to drive again; a stalled replica's campaigns are held by the shell, a marked one's by the

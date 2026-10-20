@@ -331,6 +331,85 @@ fn a_follower_past_its_durable_commit_asks_to_be_driven_when_its_quiet_period_en
     assert_eq!(r.deadline(), None, "nothing left to drive it for");
 }
 
+/// An owner whose period is a measure that moves states it as it moves (`Replica::set_quiet`), as
+/// an event-driven owner's is the interval its liveness stream sends at: a commit that moved alone
+/// is written once the period in force has passed, judged by the period stated last, not by the
+/// one it was opened with.
+#[test]
+fn a_quiet_period_restated_by_the_owner_judges_the_commit_written_alone() {
+    let mut s = settings(1, 7);
+    s.quiet = std::time::Duration::from_nanos(10);
+    let mut r: Sim = Replica::open(
+        &s,
+        SimStore::new(3),
+        Kv::new(voters(&[1, 2, 3]), false),
+        Unbounded,
+    )
+    .unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    let last = r.core().raft.log().last_index().unwrap();
+    let log_term = r.core().raft.log().term(last).unwrap();
+    r.step(Message {
+        msg_type: MessageType::MsgAppend,
+        from: 2,
+        to: 1,
+        term: 1,
+        index: last,
+        log_term,
+        commit: last,
+        entries: vec![Entry {
+            index: last + 1,
+            term: 1,
+            data: b"entry".to_vec(),
+            ..Entry::default()
+        }],
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    // The owner's period grows before the commit moves alone.
+    let longer = 1_000_000u64;
+    r.set_quiet(std::time::Duration::from_nanos(longer));
+    r.step(Message {
+        msg_type: MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: 1,
+        commit: last + 1,
+        ..Message::default()
+    })
+    .unwrap();
+    pump(&mut r);
+    assert_eq!(r.applied().index, last + 1);
+    assert!(r.durable_commit() < last + 1);
+    let at = now();
+    let due = r
+        .deadline()
+        .expect("a deadline for the commit applied and unwritten");
+    assert!(
+        due > at + 10 && due <= at + longer,
+        "due {due} at {at}: the period stated last"
+    );
+    // Past the period it opened with and short of the one stated: no write of the commit.
+    let mut out = Output::default();
+    r.drive(at + 20, waker(), &mut out).unwrap();
+    assert_eq!(r.writes().quiet, 0);
+    r.drive(due, waker(), &mut out).unwrap();
+    while r.log_mut().make_durable() {}
+    out.clear();
+    r.drive(due + 1, waker(), &mut out).unwrap();
+    assert_eq!(r.writes().quiet, 1);
+    assert!(r.durable_commit() >= r.applied().index);
+}
+
 /// A write refused for room stalls the replica: inputs are refused `Stalled`, its campaigns held
 /// whatever its detectors say, snapshot reports kept (one a member, members only), and the
 /// refused writes are made again, in order, once the log has room; nothing was lost.

@@ -243,26 +243,70 @@ fn a_compaction_frees_slots_and_writes_resume_as_under_the_bound() {
     assert_eq!(admits_at(&ledger), admits, "the file grew again");
 }
 
-/// Each slot the file grows by is written with zeros once, by the frame that grows into it, and
-/// the zeros are counted (`docs/durable.md` §6.3, §13.1): a log filled to four slots reports the
-/// three it grew by past the first, which a new log zeroes before it counts anything, and the
-/// slots a compaction freed are written again with no zeros more.
+/// No frame zeroes the slot it opens, and under `Waits::Never` nothing is filled ahead: a log
+/// filled to four slots wrote no zeros past its first slot, which a new log zeroes before it
+/// counts anything, and its file ends within the persist area and four slots; the slots a
+/// compaction freed are written again with no zeros either (`docs/durable.md` §6.3, §13.1).
 #[test]
-fn the_zeros_a_log_writes_are_the_slots_it_grew_by_once() {
+fn a_frame_writes_no_zeros_into_the_slot_it_opens() {
     let mut bounded = config();
     bounded.max_segments = 4;
     let log = Log::create(sim(5), bounded, ID).unwrap();
     let mut next = 1;
     assert!(matches!(fill(&log, &mut next), LogError::Full));
     let len = log.with_file(|file| file.len()).unwrap().unwrap();
-    assert_eq!(len, SEGMENT + 4 * SEGMENT);
-    let zeroed = log.stats(None).unwrap().zeroed_bytes;
-    assert_eq!(zeroed, 3 * SEGMENT);
+    assert!(len > SEGMENT + 3 * SEGMENT && len <= SEGMENT + 4 * SEGMENT);
+    let stats = log.stats(None).unwrap();
+    assert_eq!((stats.zeroed_bytes, stats.fills), (0, 0));
     drop(log.close().unwrap());
     let log = Log::create(sim(5), bounded, ID).unwrap();
     assert!(resumed_after_compaction(&log) > 0);
-    assert_eq!(log.stats(None).unwrap().zeroed_bytes, zeroed);
+    assert_eq!(log.stats(None).unwrap().zeroed_bytes, 0);
     drop(log.close().unwrap());
+}
+
+/// A log that fills its slots ahead while idle (`Waits::Measured`) fills only slots its owner
+/// admitted, and holds each slot's admission once: committed when the slot is filled, not again
+/// when a frame opens it. Filled to its gate's bound, every byte its file holds was admitted and
+/// committed, and nothing admitted is left pending once it closes.
+#[test]
+fn a_fill_ahead_holds_only_what_the_gate_admitted_and_each_slot_once() {
+    let budget = SEGMENT + 4 * SEGMENT;
+    let (ledger, with) = gated(budget);
+    let measured = Config {
+        waits: Waits::Measured,
+        ..config()
+    };
+    let log = Log::create_with(sim(6), measured, ID, with).unwrap();
+    let mut next = 1;
+    assert!(matches!(fill(&log, &mut next), LogError::Full));
+    // Full, every slot admitted is open, so no fill is due, and none is under way: a frame that
+    // opened the last one stopped any fill of it between two pieces.
+    let len = log.with_file(|file| file.len()).unwrap().unwrap();
+    let stats = log.stats(None).unwrap();
+    assert!(stats.fills > 0, "the idle log filled no slot ahead");
+    {
+        let l = ledger.lock().unwrap();
+        assert!(l.committed + l.pending <= budget);
+        assert!(
+            len <= l.committed + l.pending,
+            "the file passed what was admitted"
+        );
+        // Every segment the file spans, the persist area and each slot, was committed once,
+        // whether a fill or a frame made it durable: a second commit of one would take bytes no
+        // admission left pending (the ledger's `pending` would pass below zero).
+        assert_eq!(
+            l.committed,
+            len.div_ceil(SEGMENT) * SEGMENT,
+            "the file's segments, each committed once"
+        );
+    }
+    drop(log.close().unwrap());
+    assert_eq!(
+        ledger.lock().unwrap().pending,
+        0,
+        "an admission left pending"
+    );
 }
 
 /// The write that grows the file into a new slot fails (another owner filled the volume): the log

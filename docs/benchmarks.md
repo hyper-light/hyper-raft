@@ -7737,6 +7737,35 @@ and a frame that arrives during it waits for all of it: the cost moves to the ne
 a fill in pieces of the device's largest transfer is where to start if a workload measures growth
 latency.
 
+## hyper-log: zeros ahead of the frames, in pieces (2026-10-20)
+
+focal's event bus (three nodes, one CPU each, 128-byte records, each node's log written in place)
+on one GitHub `ubuntu-24.04` runner whose disk is the `MSFT NVMe Accelerator v1.0` under ext4:
+focal c0e4b6d1, which vendors hyper-raft 0427988 (A: the frame that opens a slot writes the slot's
+zeros under its own flush), against the same tree with `DeviceFile::fills_new_space` false (B: no
+zeros at all), runs
+interleaved, two rounds, 10 s of warm-up and 30 measured, a new log a node each run (focal's A/B
+run 39436443557). Medians of the two rounds; the client's latencies.
+
+| Offered | Window | A records/s | B records/s | A p50 / p99 ms | B p50 / p99 ms |
+|---|---|---|---|---|---|
+| closed loop | 4096 | 183,137 | 511,476 | 20.0 / 39.5 | 8.1 / 20.4 |
+| closed loop | 32768 | 292,738 | 591,518 | 116.6 / 160.4 | 51.1 / 87.4 |
+| 1,000/s | 4096 | 1,000 | 1,000 | 0.66 / 2.32 | 0.78 / 11.19 |
+| 1,000/s | 32768 | 1,000 | 1,000 | 0.62 / 1.96 | 0.80 / 4.08 |
+| 10,000/s | 4096 | 9,996 | 10,000 | 1.19 / 24.40 | 1.74 / 3.71 |
+| 10,000/s | 32768 | 9,998 | 10,000 | 1.18 / 24.48 | 1.75 / 9.25 |
+
+With zeros the disk was the bound: 4.9 GB of the logs' 9.0 GB at the closed loop were zeros
+(focal compare run 39402276086, the same runner type), and the leader's runs waited 23 ms at p99
+at 10,000/s for a write to be issued (focal's stage timing, run 39445571062): a segment of zeros
+under one frame's flush held the three frames of the pipeline behind it. Without them the closed
+loop was not disk-bound, and the 10,000/s tail fell 6.6x; at 1,000/s, where the device idles, each
+frame paid the journal commit the zeros had spared it (p99 2.3 to 11.2 ms, rounds 17.3 and 5.0).
+So the zeros are written ahead, in the time the device has spare, a piece no larger than the last
+frame's writes at a time (`docs/durable.md` §6.3): under load a slot is opened before it is
+filled, and idle it is filled before it is opened.
+
 ## hyper-log: zeros on btrfs, measured and dropped (2026-10-20)
 
 focal's event bus (three nodes, one CPU each, 128-byte records, each node's log on fedora's NVMe,

@@ -585,9 +585,10 @@ fn reclaiming_segments_keeps_every_live_record() {
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert!(recovery.damaged.is_empty());
     check(&log, &models);
-    // The file never grew past its quota.
+    // The file never grew past its bound: the persist area and `max_segments` slots, the next of
+    // which a fill ahead may write before a frame opens it.
     let len = hyper_block::block::BlockFile::len(&closed(log)).unwrap();
-    assert!(len <= cfg.segment_bytes * u64::from(cfg.max_segments));
+    assert!(len <= AREA + cfg.segment_bytes * u64::from(cfg.max_segments));
 }
 
 /// The statistics count every frame, flush, byte and wait the log made (`docs/durable.md`
@@ -596,7 +597,7 @@ fn reclaiming_segments_keeps_every_live_record() {
 /// confirmation the device flushed.
 #[test]
 fn the_statistics_count_each_frame_flush_byte_and_wait() {
-    let log = Log::create(sim(46), config(16, 8), ID).unwrap();
+    let log = Log::create(sim(46), config_now(16, 8), ID).unwrap();
     let counts = |log: &Log<SimFile>| {
         log.with_file(|f| {
             let s = f.stats().unwrap();
@@ -658,7 +659,7 @@ fn the_statistics_count_each_frame_flush_byte_and_wait() {
 #[test]
 fn a_held_flush_shows_in_the_statistics_without_delaying_them() {
     let (device, gated) = held(sim(47));
-    let log = Log::create(device, config(16, 8), ID).unwrap();
+    let log = Log::create(device, config_now(16, 8), ID).unwrap();
     let before = log.stats(None).unwrap();
     gated.hold();
     let shut = gated.released();
@@ -720,7 +721,10 @@ fn many_submitters_share_flushes() {
     for group in 0..16u128 {
         assert_eq!(log.view(group).unwrap().unwrap().last, 20);
     }
-    assert!(syncs <= 320, "{syncs} flushes for 320 updates");
+    // Each slot filled ahead while the log idled flushes once, apart from the frames.
+    let stats = log.stats(None).unwrap();
+    let frames = syncs - stats.fills - stats.fill_failures;
+    assert!(frames <= 320, "{frames} flushes for 320 updates");
 }
 
 /// A replica's update waits for room rather than being refused: through a queue of one,
@@ -754,7 +758,7 @@ fn waiting_submitters_are_never_refused() {
 fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     let file = sim(7);
     let mut models = Models::new();
-    let log = Log::create(file, config(16, 8), ID).unwrap();
+    let log = Log::create(file, config_now(16, 8), ID).unwrap();
     let u = Update {
         entries: Some(entries(1, &[1, 1])),
         ..Update::default()
@@ -776,7 +780,7 @@ fn a_failed_flush_fences_the_log_and_loses_nothing_acknowledged() {
     let file = closed(log);
     file.crash(Crash::LoseAll).unwrap();
     file.clear_faults().unwrap();
-    let (log, recovery) = Log::open(file, config(16, 8), ID).unwrap();
+    let (log, recovery) = Log::open(file, config_now(16, 8), ID).unwrap();
     // Whatever of the lost frame's persist record the failed flush left durable, the frame
     // was never confirmed: nothing of it is restored, and it held no term or vote to keep. A
     // failed flush leaves its writes' durability unknown (Rebello et al., ATC 2020), so the frame
@@ -830,7 +834,7 @@ fn four_frames_with(
     before: u64,
     fault: Fault,
 ) -> Result<(Log<SimFile>, hyper_log::Recovery), LogError> {
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let log = Log::create(sim(seed), cfg, ID).unwrap();
     for i in 1..=4u64 {
         if i == before + 1 {
@@ -1370,7 +1374,7 @@ fn a_damaged_groups_fence_survives_reclaiming_its_segment() {
 /// it: the open after finds the group damaged still, whatever of the first reached the disk.
 #[test]
 fn power_lost_while_fencing_a_damaged_group_leaves_it_damaged() {
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     for ops in 0..8 {
         for seed in 0..4 {
             let file = damaged_group_one(47 + seed, cfg);
@@ -1468,7 +1472,7 @@ fn an_uncertainty_mark_survives_reclaiming_its_segment() {
 #[test]
 fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
     let file = sim(43);
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
@@ -1547,7 +1551,7 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
 fn an_update_is_answered_only_once_its_frame_is_confirmed() {
     for confirmed in [false, true] {
         let file = sim(45);
-        let cfg = config(16, 8);
+        let cfg = config_now(16, 8);
         let log = Log::create(file, cfg, ID).unwrap();
         log.write(
             1,
@@ -1620,7 +1624,7 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
 #[test]
 fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
     let file = sim(40);
-    let cfg = config(16, 8);
+    let cfg = config_now(16, 8);
     let log = Log::create(file, cfg, ID).unwrap();
     log.write(
         1,
@@ -3263,7 +3267,10 @@ fn recorded_regressions_hold() {
 }
 
 /// The settings of `config` with a writer that forms each batch from what is queued, so a
-/// test that holds the writer knows which submissions share a frame.
+/// test that holds the writer knows which submissions share a frame; and that, idle, writes
+/// nothing ahead of the next frame (`Owner::fill_ahead` runs only under `Waits::Measured`), so a
+/// test that aims a fault at a frame's write or flush, or counts the file's I/O against the
+/// frames', meets only the frames' and their confirmations'.
 fn config_now(segment_blocks: u64, max_segments: u32) -> Config {
     Config {
         waits: Waits::Never,

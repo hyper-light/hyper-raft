@@ -816,7 +816,7 @@ An unconfirmed last frame keeps its term and vote; its commit is not kept; its e
 one acknowledged, which a leader may overwrite (Raft, §5.3). Whether the file's end falls inside such
 a frame changes nothing (§6.3).
 
-### 6.3 A slot is written whole before its frames
+### 6.3 A slot is written whole ahead of its frames, while the log idles
 
 On Linux's ext4 and XFS, a write past a file's size, or into an extent allocated and not yet
 written, changes metadata the file system's journal must commit at the next flush: the size, or the
@@ -827,13 +827,35 @@ that extends the file or lands in an unwritten extent (fs/iomap/direct-io.c). So
 grew the file paid a journal commit, a third device flush an append in the bench's closed loop, and a
 frame's confirmation could not be a lone FUA write.
 
-A slot the file grows by is therefore written whole with zeros before its first frame, under that
-frame's own flush (`device::Frame::zero`; the first slot at the log's creation), where the file says
-it pays (`BlockFile::fills_new_space`: a direct file on a file system that allocates in place and
-journals the allocation, ext2, ext3, ext4 and XFS by statfs(2)'s `f_type`, asked once at open; and
-the simulator, which stands for it). Every later frame in the slot is an overwrite of written blocks
+A slot the file grows by is therefore written whole with zeros ahead of its first frame, where the
+file says it pays (`BlockFile::fills_new_space`: a direct file on a file system that allocates in
+place and journals the allocation, ext2, ext3, ext4 and XFS by statfs(2)'s `f_type`, asked once at
+open; and the simulator, which stands for it): the first slot at the log's creation, and each later
+one by the owner while the device has nothing else to do (`Owner::fill_ahead`, `device::Job::Fill`).
+The owner writes the slot past the file's last a piece at a time, each piece no larger than the last
+frame's writes, so a frame that comes while a piece is written waits no longer than behind another
+frame, and flushes the slot with its last piece; the slot's admission (§6) is held then, once, and
+not again when a frame opens it. Every frame in a slot so filled is an overwrite of written blocks
 inside the file's size, a flush of the device's cache alone. A slot reused is written already and is
-not filled again. The zeros are counted (`LogStats::zeroed_bytes`, §13.1).
+not filled again, and nothing is filled ahead while a freed slot would be reused first. Only under
+`Waits::Measured`: whether the device is idle depends on when submissions arrive, and under
+`Waits::Never` (the replica simulation, the recorded-seed equivalence) nothing the writer does may.
+
+A frame that opens a slot not yet filled writes no zeros: it writes into the slot as into any
+unwritten space, and its flush commits the journal as before. A fill a frame overtakes stops there,
+what it filled staying written; the rest of the slot is written by its frames. The zeros were first
+written by the frame that opened the slot, under its own flush (2026-10-07), and every frame behind
+it waited for a whole segment of zeros: on CI's ext4 (the runners' `MSFT NVMe Accelerator`), focal's
+event bus at 10,000 records a second waited 23 ms at p99 for a write to be issued, and its closed
+loop was disk-bound at 183,000 and 293,000 records a second. With no zeros at all the same runner
+did 511,000 and 592,000 (2.8x and 2.0x) and its 10,000/s p99 fell from 24.4 to 3.7 ms, while at
+1,000/s, where the device idles, the zeros had kept p99 at 2.3 ms against 5 to 17 ms without them
+(focal's A/B 39436443557, `docs/benchmarks.md`, "zeros ahead of the frames, in pieces"). Written
+only in the time the device has spare, a slot is filled where that is cheap, and under load its
+frames pay the journal's commit instead of a segment's write. A fill whose write or flush fails
+fences nothing (the owner fills only with every frame confirmed, so the failure reports the zeros
+alone): the slot is not filled ahead again, and its frames write it. The zeros, the pieces and the
+fills are counted (`LogStats::zeroed_bytes`, `fill_pieces`, `fills`, `fill_failures`, §13.1).
 
 Nowhere else are they written. A file system that writes every block out of place by design
 (f2fs, bcachefs) writes a block written ahead again elsewhere, and one that keeps nothing (tmpfs)
@@ -876,16 +898,16 @@ the two rates, so nothing paid for a third of the drive's writes.
   appends a second rise by about 70% (`docs/benchmarks.md`, "a slot written whole before its frames").
   On macOS the zeros showed no gain and a growing frame's 16 MiB of zeros cost a 100 to 200 ms answer,
   so it stays off there, and on Windows, unmeasured.
-- **Not written ahead (measured, ruled 2026-10-07).** Writing a slot's zeros while the writer is
-  idle, ahead of the frame that opens it, was built and measured (`log-zero-ahead`, 3d2b22d), and
-  dropped. The fill is one write and flush of a whole segment, about 5 ms on Linux in Docker's VM at
-  16 MiB, and a frame arriving during it waits for all of it: appends that grew the file averaged
-  6.5 to 7.1 ms with it against 4.8 to 5.6 ms inline with 1 ms between appends, and no better closed
-  loop. A reopen then also searches the filled slot block by block for a frame of a lost header
-  (`recover::lost_headers`), about 1.5 ms more. In steady state the replicas reuse freed slots, so
-  growth is off the hot path (`docs/benchmarks.md`, "zeros written ahead"). If a workload measures
-  growth latency, the place to start is a fill written in pieces of the device's largest single
-  transfer, one a moment the writer is idle, flushed once after the last.
+- **Written ahead in pieces (2026-10-20).** A fill ahead written as one write and flush of a whole
+  segment was built and measured first (`log-zero-ahead`, 3d2b22d, 2026-10-07) and dropped: about
+  5 ms on Linux in Docker's VM at 16 MiB, and a frame arriving during it waited for all of it
+  (appends that grew the file averaged 6.5 to 7.1 ms against 4.8 to 5.6 ms inline with 1 ms between
+  appends). In pieces no larger than the last frame's writes, the most a frame waits is a frame's
+  write. A reopen also searches a filled slot block by block for a frame of a lost header
+  (`recover::lost_headers`), about 1.5 ms. Growth is not off the hot path in steady state as was
+  argued then: a log grows until it holds what its retention keeps, and focal's bus nodes on CI grew
+  their logs by 1.65 GB each in a 40-second closed-loop run (focal compare run 39402276086), every
+  slot of it opened under load.
 
 ## 7. Threading and ownership
 
@@ -1203,7 +1225,8 @@ and allocates no more on that project's workload.
 | `flushing_since` | When the frame or confirmation the device holds went to it, while one does. |
 | `flushed_confirmations` | Confirmations written and flushed where the file could have written them durable on their own, the device having measured the write and flush cheaper (§6.2); each also counts in `flushes`. |
 | `sweeps`, `swept_bytes` | Sweeps laid (frames that copied the tail segment's live entries ahead of their updates, the log having fewer than two segments free), and the bytes of the records they relocated: what the log wrote a second time, its write amplification's own part. |
-| `zeroed_bytes` | Bytes of zeros written over the slots the file grew by, each once, before its first frame (§6.3); each also counts in `bytes`. What growing the log wrote that no record holds: a new log's whole file on its way to the size its retention holds, nothing once it is there. |
+| `zeroed_bytes` | Bytes of zeros written over the slots the file grew by, ahead of their first frames while the device idled (§6.3); each also counts in `bytes`. What growing the log wrote that no record holds: on its way to the size its retention holds, as much of each slot as idle time allowed; nothing once it is there. |
+| `fills`, `fill_pieces`, `fill_failures` | Slots filled ahead whole and flushed, the pieces they were written in (each no larger than the frame before it), and fills whose write or flush failed (the slot then written by its frames, nothing fenced). |
 | `at` | When the owner answered. |
 
 The thread that does a job's I/O times its writes and its flush apart and carries the times back

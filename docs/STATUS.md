@@ -63,6 +63,24 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-20: in hyper-log, a slot the file grows by is written with zeros ahead of its first
+frame, a piece at a time while the device has nothing else to do, each piece no larger than the last
+frame's writes, flushed with its last piece (`Owner::fill_ahead`, `device::Job::Fill`;
+`docs/durable.md` §6.3), and a frame that opens a slot writes no zeros. The frame that opened a slot
+had written a segment of zeros under its own flush, and every frame behind it waited: on CI's ext4,
+focal's event bus at 10,000/s had a p99 of 24.4 ms against 3.7 ms with no zeros at all, and its
+closed loop did 183,000 and 293,000 records a second against 511,000 and 592,000, while at 1,000/s,
+the device idle, the zeros had kept p99 at 2.3 ms against 5 to 17 ms (focal's A/B 39436443557;
+docs/benchmarks.md, "zeros ahead of the frames, in pieces"). Idle, a slot is filled before it is
+opened; under load it is opened first, its frames paying the journal's commit. A fill a frame
+overtakes stops; one that fails fences nothing. Only under `Waits::Measured`: the recorded-seed
+equivalence's hashes are again those of before 863deb6, every one. `LogStats` counts `fills`,
+`fill_pieces` and `fill_failures`. `tests/preallocate.rs`: a frame that opens a slot writes no zeros;
+an idle log fills the next slot in pieces of its frames' size, flushed once; a power cut anywhere in
+a fill leaves every acknowledged entry, nothing damaged (each cut meets a fill); a failed fill fences
+nothing. `growth::a_fill_ahead_holds_only_what_the_gate_admitted_and_each_slot_once`. Tests that aim
+a fault at a frame's I/O, or count it, run under `Waits::Never` (`log.rs`'s `config_now`).
+
 Landed 2026-10-20: in hyper-quic, a probe of the path's MTU that the window and the pacer can carry
 goes before new data (patch Q26, `crates/hyper-quic/VENDORED.md` §37): sent only in the room data
 left, a busy connection's probes starved and its search stayed at 1,200 bytes

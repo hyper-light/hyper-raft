@@ -513,8 +513,10 @@ mod imp {
         }
     }
 
-    /// Lets other sockets of this process bind `socket`'s port as well (`SO_REUSEPORT`), before it
-    /// is bound: a listener and the sockets it connects to its peers share one port.
+    /// Lets other sockets bind `socket`'s port as well (`SO_REUSEPORT`; on Linux those of the same
+    /// effective user, socket(7)): a listener and the sockets it connects to its peers share one
+    /// port. Set before a bind to a named port, which a socket joining one needs, and after a bind to
+    /// port 0, so the kernel chooses a port no socket holds (`UdpSocket::bind_shared`).
     pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
         rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
             .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))

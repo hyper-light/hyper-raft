@@ -237,6 +237,19 @@ is worked around.
   file under 24 busy loops on the 18-core Mac passed with the fix, and with the old hold as well:
   the window is the shard's few instructions between answering the admission and taking its next
   message, open only while the shard is preempted there and the test thread runs.
+- **hyper-rt: a shared UDP socket given port 0 could take a port another process held (found by
+  mantle's process tests).** On adacachy (Linux, 32 cores) two `mantle node` processes held
+  127.0.0.1:59152, each listener bound through hyper-rt-transport's driver to port 0; the node that
+  announced the port was never reached on it, the other refusing its peers' dials for identity (169
+  each), and the test hung. `UdpSocket::bind_shared` set `SO_REUSEPORT` before its bind, and Linux's
+  search for a free port leaves out of the ports in use those held by a socket sharing with the
+  binder's user (`udp_lib_lport_inuse`, net/ipv4/udp.c), in any process. A socket given port 0 now
+  binds before it shares, so it takes a port no socket holds; one that names its port shares first,
+  and still joins (`docs/runtime.md` §5.1). `shared_sockets_given_port_zero_each_take_a_port_no_other_holds`
+  failed on Linux 6.12 in every run before the fix (3, 4 and 3 of 500 sockets) and passes after on
+  Linux and macOS; `a_socket_joining_a_shared_port_takes_its_connected_peers_datagrams` and
+  hyper-rt-transport's `peer_sockets.rs` hold the join on both. TCP's search skips a held port
+  whatever its flags; macOS's skips one for UDP as well.
 
 ### Closed (2026-10-19)
 

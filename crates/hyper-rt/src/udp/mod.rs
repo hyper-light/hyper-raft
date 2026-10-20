@@ -152,12 +152,22 @@ impl UdpSocket {
         }
     }
 
-    /// Binds a non-blocking UDP socket to `addr` that other sockets of this process may bind too
+    /// Binds a non-blocking UDP socket to `addr` that other sockets of this user may bind too
     /// (`SO_REUSEPORT`): the port a listener shares with the sockets it connects to its peers
     /// ([`UdpSocket::connect`]), each of which then takes its peer's datagrams into a receive queue
     /// of its own, as a TCP connection's socket does. Refused `BadConfig` on Windows, where a shared
     /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
     /// whose ports are one socket's each.
+    ///
+    /// A port the kernel chooses (`addr`'s port 0) is chosen before the socket shares it. Linux's
+    /// search for one leaves out of the ports in use those held by a socket that shares its port
+    /// with the binder's user (`udp_lib_lport_inuse`, net/ipv4/udp.c), so a socket that asked with
+    /// `SO_REUSEPORT` already set could be handed a port another socket of the user held, in this
+    /// process or another, and the two then took each other's datagrams. Bound first, it is given a
+    /// port no socket holds; shared after, the sockets that bind that port later still join it, as
+    /// each kernel checks the held socket's flag when another binds (Linux `udp_lib_lport_inuse`
+    /// and `udp_reuseport_add_sock`, XNU `in_pcbbind`). A port named shares before its bind, as a
+    /// socket joining a port it names must.
     pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
@@ -166,8 +176,13 @@ impl UdpSocket {
             });
         }
         let socket = netsys::dgram_socket(Family::of(addr))?;
-        netsys::share_port(&socket)?;
-        netsys::bind(&socket, addr)?;
+        if addr.port() == 0 {
+            netsys::bind(&socket, addr)?;
+            netsys::share_port(&socket)?;
+        } else {
+            netsys::share_port(&socket)?;
+            netsys::bind(&socket, addr)?;
+        }
         Ok(UdpSocket::of(Inner::Real { socket }))
     }
 

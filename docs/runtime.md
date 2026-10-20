@@ -807,6 +807,21 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
 - **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.
+- **A shared port** (`UdpSocket::bind_shared`, `SO_REUSEPORT`): a listener and the sockets it connects
+  to its peers bind one port, each connected socket taking its own peer's datagrams (hyper-rt-transport's
+  driver); Windows refuses one. A port the kernel chooses is chosen before the socket shares it
+  (2026-10-20, found by mantle's process tests: two nodes' listeners on 127.0.0.1:59152, the dials to the
+  node that announced it answered by the other and refused for identity). Linux's search for a port
+  leaves out of the ports in use any held by a socket that shares its port with the binder's user
+  (`udp_lib_lport_inuse`, net/ipv4/udp.c), so with `SO_REUSEPORT` set before its bind a socket could be
+  handed a port another socket of that user held, in any process: 3, 4 and 3 of 500 sockets bound to
+  port 0 in one process on Linux 6.12 (Docker), about the 4.4 a pick at random over its 28,232 ports
+  gives. XNU's search takes only a port no socket holds (`in_pcbbind`); none collided on macOS. Bound
+  first and shared after, none collided in three runs on Linux, and a socket that later binds the port
+  by name still joins it, since both kernels check the held socket's flag as it binds
+  (`tests/udp_shared.rs`; hyper-rt-transport's `tests/peer_sockets.rs` on Linux and macOS). TCP's search
+  refuses a port any socket holds, whatever its flags (`inet_csk_find_open_port` asks
+  `inet_csk_bind_conflict` with `reuseport_ok` false), so `TcpListener::bind_shared` keeps its order.
 - **What a socket holds, bounded and told.** `Io::held_bound` is the most a batched socket holds while it
   lives, and what its owner charges for it: its receive buffers (`batch` of `RECEIVE_BYTES` on Linux, one
   elsewhere), its outbox (`batch` slots, each one datagram or one segmented send of at most

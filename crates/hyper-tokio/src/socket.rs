@@ -550,7 +550,7 @@ impl Socket {
                 self.stats.receive_calls = self.stats.receive_calls.saturating_add(1);
                 let read_ns = self.clock.now_ns();
                 if let Some(taken) = received {
-                    let stamp = taken.stamp.map(|ticks| self.clock.ticks_ns(ticks));
+                    let stamp = taken.stamp.map(|ticks| self.clock.kernel_ns(ticks));
                     let arrival = self.arrival(taken.from, stamp, read_ns);
                     if let Some(bytes) = buffers.first_mut().and_then(|b| b.get_mut(..taken.length))
                     {

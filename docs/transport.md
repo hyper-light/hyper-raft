@@ -499,7 +499,13 @@ owner that wakes late does not blame its peer (`docs/timing.md` §2.4).
   late and never early.
 - macOS: `SO_TIMESTAMP_MONOTONIC`, `mach_absolute_time` taken as UDP input queues the datagram,
   read through `recvmsg(2)` (`src/sys/macos.rs`; `SCM_TIMESTAMP_MONOTONIC`, 0x04, declared there as
-  hyper-timing-trace declares it, since libc does not).
+  hyper-timing-trace declares it, since libc does not). The stamp is the kernel's, in its ticks, and
+  is converted at its rate, × 10⁹ / `hw.tbfrequency`, not at the process's timebase: the two are one
+  fraction for a native process, so its stamps are what they were to the bit, while a process
+  Rosetta 2 translates is shown a timebase of 1/1 against Apple silicon's 24 MHz, and its stamps,
+  converted at that, came out at 3/125 of the clock read around them (docs/runtime.md §5.1;
+  docs/research/timing.md, "Rosetta 2 and the kernel's ticks"). The clock's resolution there
+  is the kernel's tick, 125/3 ns, which its readings step by though its timebase says 1/1.
 - Windows: none taken; a datagram is stamped when it is read. Winsock's receive timestamps
   (`SIO_TIMESTAMPING`, build 20348 and later) are attached by a NIC miniport driver that reports
   timestamping capabilities, with system configuration, and on no loopback path or virtual NIC

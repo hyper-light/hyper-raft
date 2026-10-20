@@ -577,14 +577,21 @@ case, and the loop's costs must not grow with the load.
   (`MIN_SAMPLES`, 59, Wilks) and its window the rule's `N = (z·sd / (h·mean))²` on the warm-up's own
   spread. `tests/spin_by_park_cost.rs`. The CPU clock is read only by a learning shard, around a wait it
   makes, and the second time only after a first (`bd7c0fd`: reading it after every park halved every
-  shard's calibrated batch, 117 to 262 ns an item; `tests/park_cost_reads.rs`).
+  shard's calibrated batch, 117 to 262 ns an item; `tests/park_cost_reads.rs`). On macOS the clock is
+  libc's `CLOCK_THREAD_CPUTIME_ID`, the kernel's ticks at the process's timebase, restated at the
+  kernel's rate (`machine::clock::MachTicks`, §5.1): a process Rosetta 2 translates is shown a
+  timebase of 1/1, and libc's reading alone told it a park cost 3/125 of what it cost (`attribution`'s
+  test holds the clock to `thread_info`'s account and to the shard's clock).
 - **The shard's clock is the cheap one, read once a poll (D3).** On macOS `mach_continuous_time` scaled
   by the timebase as a 32-bit fixed-point ratio, 4.8 ns a read where `CLOCK_MONOTONIC` costs 16.1 ns at
   1 µs resolution (note 42 §4); elsewhere `monotonic_ns`, already the cheap clock there. A step of `p`
   polls reads it `1 + p` times (`2 + p` when its drains or driver did work), where it read
   `CLOCK_MONOTONIC` `2 + 2p` times; a poll that yields cost 47.5 ns and costs 15.9 ns (note 42 §7).
   `SCALE_BITS` (32) is format: the 64×64-bit product cannot overflow 128 bits and the rounding error stays
-  under 10⁻¹¹ of a tick (`machine::clock`'s tests).
+  under 10⁻¹¹ of a tick (`machine::clock`'s tests). A process Rosetta 2 translates reads its continuous
+  time translated, nanoseconds at a timebase of 1/1, and it counts as a native process's does (read
+  beside one, both 1,587.183436 s past `mach_absolute_time`, the time the host had slept), so the
+  shard's clock, the process's own clock on its own timebase, takes no kernel rate.
 - **A poll's end from the counter.** The loop reads the driver's clock once a step and carries that reading
   to the step's polls by the generic timer's counter, CNTVCT_EL0, read without synchronization
   (`machine::clock::Carried`; aarch64 under macOS and Linux, and elsewhere the clock takes every reading);
@@ -790,6 +797,18 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   offset read since the read before the last batch that emptied the socket, and to no earlier than that
   read: late by a step at most, never early (`udp/carry.rs`, as hyper-tokio's `clock::Carry`). macOS's
   offset only grows, by the time the host slept, so the latest one carries a stamp late, never early.
+- **A macOS stamp is in the kernel's ticks.** XNU stamps with its own `mach_absolute_time()`, in its
+  ticks, `hw.tbfrequency` a second, and the age is read on the process's `mach_absolute_time`, in the
+  process's ticks. They are one counter for a native process, the timebase being 10⁹ over that frequency
+  in lowest terms, and not for one Rosetta 2 translates: it is shown a timebase of 1/1 and its own clock
+  in nanoseconds, while the stamp stays in Apple silicon's 24 MHz ticks (docs/research/timing.md,
+  "Rosetta 2 and the kernel's ticks"). Read at the process's timebase alone, a translated process's
+  stamps aged 122/125 of the host's uptime, every arrival fell to the shard clock's zero, and
+  hyper-liveness never judged a pair: mantle's x86_64 nodes on Apple-silicon runners never elected. The stamp
+  is carried into the process's ticks at `10⁹·denom / (hw.tbfrequency·numer)` before the age is taken,
+  the identity for a native process, whose arrivals are what they were to the bit
+  (`machine::clock::MachTicks`, read once a process; `tests/udp_kernel_stamps.rs`, which CI's
+  `translated` job runs under Rosetta 2).
 - **Drops told by the traffic.** On Linux a socket asks for `SO_RXQ_OVFL`: each datagram queued once the
   socket has dropped any for want of room carries the count since the socket was made, and the socket
   keeps the latest (`IoStats::drops`, `Some(0)` until a datagram says more, `None` where the kernel does

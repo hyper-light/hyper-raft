@@ -14,9 +14,10 @@
 //! (hyper-raft docs/timing.md §2.4), so a stamped socket hands each datagram over with the kernel's
 //! receive stamp carried onto the shard's clock ([`crate::shard::ShardContext::now_ns`]), the clock its
 //! timers run on. The kernel stamps on a clock of its own (`CLOCK_REALTIME` on Linux, `mach_absolute_time`
-//! on macOS), so a stamp is carried over by its age: with the stamps' clock read after the receive and the
-//! shard's clock after it, so that a preemption between the two makes the stamp late and never early, the
-//! arrival is `now − (stamps_now − stamp)`. It is held within the read's time and no earlier than the
+//! on macOS, in the kernel's ticks, which a process Rosetta 2 translates does not count in), so a stamp
+//! is carried over by its age: with the stamps' clock read after the receive and the shard's clock after
+//! it, so that a preemption between the two makes the stamp late and never early, the arrival is
+//! `now − (stamps_now − stamp)`. It is held within the read's time and no earlier than the
 //! arrival handed over before it (a socket's queue is first in, first out). On Windows, where only a NIC
 //! miniport stamps and no loopback or virtual NIC does, and in simulation, a datagram is stamped when it
 //! is read.
@@ -484,10 +485,7 @@ impl Batched {
         let (mach, buffer_count) = {
             let mach = match raw {
                 Some(fd) if stamps && macos::enable_stamps(fd) => {
-                    let clock = macos::Clock::new().map_err(|error| RtError::DriverRefused {
-                        call: "mach_timebase_info",
-                        code: error.raw_os_error(),
-                    })?;
+                    let clock = macos::Clock::new()?;
                     stats.kernel_stamps = true;
                     Some(clock)
                 }
@@ -1084,12 +1082,13 @@ impl Batched {
         let Some(taken) = taken else {
             return Ok(ReceiveStep::Skipped);
         };
-        // The stamps' clock first, then the shard's (as on Linux).
+        // The stamps' clock first, then the shard's (as on Linux). The stamp is in the kernel's ticks
+        // and the reading in the process's, which a translated process does not share (`macos`).
         let ticks_now = mach.now_ticks();
         let now_ns = shard_now()?;
         let stamp = taken
             .stamp
-            .map(|ticks| now_ns.saturating_sub(mach.ticks_ns(ticks_now.saturating_sub(ticks))));
+            .map(|ticks| now_ns.saturating_sub(mach.age_ns(ticks_now, ticks)));
         let arrived = arrival(&mut self.latest_ns, taken.from, stamp, now_ns);
         let Some(bytes) = buffer.get_mut(..taken.length) else {
             return Ok(ReceiveStep::Skipped);

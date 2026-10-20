@@ -107,6 +107,15 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-block: translated by Rosetta 2, a segmented file's direct handle reads its pieces as in
+  memory (found 2026-10-20, running hyper-block's tests for x86_64-apple-darwin on the M5 Max).**
+  `segmented::tests::a_segment_written_whole_holds_its_fill_and_takes_no_memory` fails translated,
+  `piece 0 is in memory`, before and after the kernel's-ticks repair below, and passes natively: the
+  resident read (`read_resident_at`, an `mmap` and `mincore` of the piece) answers that a piece
+  written through a handle granted past the cache is held. Not traced yet: a translated process sees
+  4 KiB pages where the kernel keeps 16 KiB, which `mincore`'s answer may straddle. Until it is, the
+  CI job that runs the clocks' crates translated (`translated`) leaves hyper-block out.
+
 - **hyper-rt-transport, hyper-tokio: a driver folds its timer's lateness into `G` only when it finds
   its timer fired in the turn that armed it (found 2026-10-20, by the simulation).** Each turn of
   `poll_event` hands a due timeout to the endpoint (`handle_timeout`) before it looks at its timer, and
@@ -205,6 +214,48 @@ is worked around.
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
 ### Closed (2026-10-20)
+
+- **hyper-rt, hyper-tokio, hyper-timing-trace, hyper-measure, hyper-block: a value the kernel takes in
+  its own ticks was read at the process's timebase, which a process Rosetta 2 translates does not
+  share (found by mantle).** XNU stamps a received datagram (`SCM_TIMESTAMP_MONOTONIC`) with its own
+  `mach_absolute_time()`, in the kernel's ticks, `hw.tbfrequency` a second; a native process's
+  timebase is 10⁹ over that frequency, so the two are one counter, but a translated process is shown a
+  timebase of 1/1 and its own `mach_absolute_time` in nanoseconds while the stamp stays in Apple
+  silicon's 24 MHz ticks (measured on the M5 Max: the stamp of a datagram a translated process sent
+  itself was 1/41.667 of the clock read around it; docs/research/timing.md, "Rosetta 2 and the
+  kernel's ticks"). hyper-rt's receive took the age as `now_ticks − stamp` at the process's timebase,
+  122/125 of the host's uptime, so every arrival fell to the shard clock's zero and hyper-liveness never
+  judged a pair: on mantle's macos-x86_64 runners (x86_64 binaries on Apple-silicon macos-15) a cell of
+  `mantle node` processes stayed at term 0 and its process tests hung to the six-hour limit (mantle runs
+  39394443852, 39410946746, 39424048894); hyper-raft's own x86_64 runner is Intel hardware, where the
+  two are one. The same reading was in hyper-tokio's stamps, hyper-timing-trace's, hyper-measure's
+  `proc_pid_rusage` times (3/125 of `getrusage`'s translated) and libc's
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, which is the kernel's ticks at the process's timebase
+  (gen/clock_gettime.c), read by hyper-rt's long-poll attribution and park cost and by hyper-block's
+  `thread_cpu`: translated, a thread was told 3/125 of its run time. A kernel tick value is now
+  converted at the kernel's rate, `hw.tbfrequency` read once: hyper-rt carries a stamp into the
+  process's ticks before taking its age (`machine::clock::MachTicks`), the identity for a native
+  process, whose arrivals are what they were to the bit; hyper-tokio, hyper-timing-trace and
+  hyper-measure convert at × 10⁹ / `hw.tbfrequency`, the native timebase's own fraction; the thread
+  clock is restated at the kernel's rate. The process's own clocks keep its timebase: its continuous
+  time, the shard's clock, is translated whole (measured: the same 1,587.18 s of sleep past
+  `mach_absolute_time` natively and translated). hyper-tokio's `Clock::resolution` is the kernel's
+  tick where the timebase claims less (a translated clock steps 41 or 42 ns, not 1). Tests, red
+  translated before (`cargo test --target x86_64-apple-darwin` on the M5 Max) and green after, native
+  green both: hyper-rt `tests/udp_kernel_stamps.rs` (a stamped socket and a lent one each send
+  themselves a datagram; before, `arrived at 0 ns, outside the send at 1102708 ns to the receive at
+  2175833 ns`), `attribution`'s and hyper-block's `a_threads_cpu_time_is_the_kernels_account`
+  (`thread_info accounted 1002000 ns, the CPU clock read 24137 ns after it`), and the existing
+  `udp_batched.rs` (three), hyper-tokio `stamps.rs` (two), hyper-timing-trace's
+  `a_datagram_carries_its_kernel_receive_stamp` and hyper-measure's `user_time_is_in_nanoseconds`;
+  unit tests with injected rates (`machine::clock`, hyper-tokio's `sys::macos`): a translated
+  process and a native one read one age and one stamp, and a native one's are the old ones to the
+  bit, over some 4,000 instants each. Three tests' own thread clocks (`long_poll_held.rs`, `attribution_by_step.rs`,
+  `wake_estimate.rs`) read libc's alone and held 41.67 times their turn translated, which the
+  runtime's old reading hid; they read the runtime's now. CI runs these crates translated from now
+  on (`translated`, macos-15). The native receive is unchanged (docs/benchmarks.md, "hyper-rt: a
+  stamp in the kernel's ticks, the receive's cost"). docs/runtime.md §3.9, §5.1; docs/transport.md;
+  docs/timing.md §2.4; docs/tails.md.
 
 - **hyper-transport: a dial that failed as the last one did was told nothing (found by mantle).**
   `Endpoint::connect` promises each dial the lifecycle event it ends in, but a state the owner was

@@ -9438,3 +9438,34 @@ saved and not the whole gain.
 cd crates/hyper-rt-compare && cargo build --release   # on the branch proto-always-kick
 HYPER_RT_KICK_MODE=1 HYPER_RT_KICK_SPIN_NS=300 target/release/hyper-rt-compare hyper pingpong n=20000 warm=2000
 ```
+
+## hyper-rt: a stamp in the kernel's ticks, the receive's cost (2026-10-20)
+
+The repair of a macOS stamp's age (`docs/runtime.md` §5.1, `docs/STATUS.md` closed 2026-10-20): the
+receive carries the kernel's stamp into the process's ticks (`machine::clock::MachTicks::of_kernel`)
+before it takes the age, which for a native process is the stamp itself, one branch on whether the
+two counters are one. `cargo bench -p hyper-rt --bench stamped_receive` times the receive of a stamped
+socket on a shard (`Batched::bind`, the plane socket's): 2,995 rounds (Wilks' least sample for a 95 %
+bound on the p99.9) of 64 datagrams of 64 bytes sent from the shard's thread and then taken, each
+receive call that took one timed, after as many unmeasured; allocator calls and page faults are counted
+over the measured rounds. The tree before (`e4a1434` with the bench added, md5
+`9820b71a27acdbf326d91db1d241eaac`) against the repair (md5 `8fb72ac4308388b412bc302a9aa33123`), six
+ABBA blocks of fresh processes on the M5 Max at load 10.1-12.4, medians of the twelve runs an arm
+(ranges):
+
+| | before | after |
+|---|---|---|
+| receive, ns a datagram, p50 | 611 (482-1,543) | 638 (533-1,546) |
+| receive, ns a datagram, p99 | 13,305 (3,458-24,254) | 13,371 (3,959-21,227) |
+| allocator calls a datagram | 0 | 0 |
+| page faults a datagram | 0 | 0 |
+
+In five of the six blocks the arms' runs interleave; in the first the after's two (533 and 534 ns) sat
+2 and 3 ns above the before's larger.
+The age alone, the same binary alternating 21 turns of a million calls each way on inputs the optimizer
+cannot see: 4.07, 3.91 and 3.20 ns a call now against 4.03, 3.78 and 2.91 before (three runs, medians),
+the branch costing 0.04-0.29 ns, under a cycle, beside a receive of some 600 ns.
+
+```sh
+cargo bench -p hyper-rt --bench stamped_receive     # each tree; the binaries then run ABBA
+```

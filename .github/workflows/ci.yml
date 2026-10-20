@@ -40,6 +40,27 @@ jobs:
           name: gate-progress-${{ matrix.runner }}
           path: target/gate-progress.log
           if-no-files-found: ignore
+  translated:
+    # x86_64 code translated by Rosetta 2 on an Apple-silicon runner, as mantle's macos-x86_64 job runs
+    # its binaries. A translated process is shown a timebase of 1/1 and its own clocks in nanoseconds,
+    # while what the kernel takes in its own ticks (a datagram's receive stamp, a thread's run time, a
+    # process's account) stays in the hardware's 24 MHz ticks, which no native job meets (macos-15-intel
+    # is Intel hardware): read at the process's timebase, every stamp aged most of the host's uptime and
+    # mantle's translated nodes never elected (docs/runtime.md §5.1). The tests of the crates that read
+    # the kernel's ticks: hyper-rt, hyper-tokio, hyper-timing-trace and hyper-measure. hyper-block's
+    # segmented-file test fails translated for a reason of its own (docs/STATUS.md, open defects), so it
+    # is not here yet.
+    runs-on: macos-15
+    # Twice the macos-15 gates job of run 39436648371, 24.5 min for the whole workspace's lints and tests,
+    # a bound this job's four crates do not approach (built for x86_64 and tested translated, 2.4 min
+    # from a cold build on the owner's machine, 2026-10-20): the model job's rule until this job has a
+    # measurement of its own.
+    timeout-minutes: 49
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add x86_64-apple-darwin
+      - run: cargo test --target x86_64-apple-darwin -p hyper-rt -p hyper-tokio -p hyper-timing-trace -p hyper-measure --all-features --locked
   recursion:
     # No runtime recursion (CLAUDE.md §1): scripts/check-recursion.py reads the call graph of every
     # production unit's opt-level-0 IR and refuses a cycle through the workspace's code, after its

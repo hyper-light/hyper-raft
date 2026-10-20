@@ -246,8 +246,10 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
 - **Local health.** A detector that wakes late must not blame its peers (Lifeguard). Arrivals are
   stamped by the kernel when the datagram is received (`SO_TIMESTAMPNS` on Linux,
   `SO_TIMESTAMP_MONOTONIC` on macOS, which XNU stamps with `mach_absolute_time()` as UDP input
-  queues the datagram), so a heartbeat that arrived before its freshness point is fresh however
-  late the process read it; only the send side of a slow node looks slow, which is true. The gap
+  queues the datagram, in the kernel's ticks, read at the kernel's rate since a process Rosetta 2
+  translates is shown another timebase: docs/runtime.md §5.1), so a heartbeat that arrived before
+  its freshness point is fresh however late the process read it; only the send side of a slow node
+  looks slow, which is true. The gap
   the stamp removes was measured: between the kernel's stamp and the process's read, macOS
   p99.9 3.8–4.7 ms and up to 101 ms (100 µs heartbeats, load 17–32), p99.9 73 ms and up to
   125 ms at load 41; Linux p99.9 0.09–0.15 ms, up to 22 ms.

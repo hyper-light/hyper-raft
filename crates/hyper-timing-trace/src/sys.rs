@@ -25,6 +25,9 @@
 //!   message carries a `uint64_t` the kernel takes with `mach_absolute_time()` as UDP input appends
 //!   the datagram to the socket (XNU `bsd/netinet/ip_input.c`, `ip_savecontrol`, called from
 //!   `udp_input` in `udp_usrreq.c`): `setsockopt(2)`, `recvmsg(2)` and the `CMSG_*` walk (libc).
+//!   The stamp is in the kernel's ticks, converted at its rate, `hw.tbfrequency` (`sysctlbyname`,
+//!   libc), which a native process's timebase describes and a process Rosetta 2 translates is not
+//!   shown (its timebase reads 1/1).
 //!   `select(2)` (rustix), which on macOS has no `ppoll` and whose `poll(2)` takes whole
 //!   milliseconds. `fcntl(F_FULLFSYNC)` (rustix's `fcntl_fullfsync`), which asks the drive to
 //!   flush to the media. `getloadavg(3)` (libc).
@@ -98,14 +101,24 @@ mod os {
         _bytes: [u8; CONTROL_BYTES],
     }
 
+    /// Format: nanoseconds in a second (SI units), the unit `hw.tbfrequency` counts ticks in.
+    #[cfg(target_os = "macos")]
+    const SECOND_NS: u64 = 1_000_000_000;
+
     /// The monotonic clock both processes read, as nanoseconds.
     pub(crate) struct Clock {
-        /// `mach_timebase_info`'s ratio: nanoseconds are ticks × `numer` / `denom`.
+        /// `mach_timebase_info`'s ratio: nanoseconds are this process's ticks × `numer` / `denom`.
         #[cfg(target_os = "macos")]
         numer: u64,
         /// See `numer`; never zero.
         #[cfg(target_os = "macos")]
         denom: u64,
+        /// `hw.tbfrequency`: the kernel's ticks a second, which its receive stamps count; never
+        /// zero. A native process's timebase is 10⁹ over it; a process Rosetta 2 translates is
+        /// shown 1/1 while the stamps stay in Apple silicon's 24 MHz ticks (docs/research/timing.md,
+        /// "Rosetta 2 and the kernel's ticks").
+        #[cfg(target_os = "macos")]
+        kernel_hz: u64,
     }
 
     impl Clock {
@@ -127,14 +140,35 @@ mod os {
             // SAFETY: `info` is a live, writable `mach_timebase_info` for the call, which writes
             // that one structure (<mach/mach_time.h>).
             let status = unsafe { libc::mach_timebase_info(&raw mut info) };
-            if status != libc::KERN_SUCCESS || info.denom == 0 {
+            if status != libc::KERN_SUCCESS || info.numer == 0 || info.denom == 0 {
                 return Err(io::Error::other(format!(
                     "mach_timebase_info failed: {status}"
                 )));
             }
+            let mut hz: u64 = 0;
+            let mut length = size_of::<u64>();
+            // SAFETY: the name is NUL-terminated; the out pointer and its length name one live
+            // local `u64`, the sysctl's type (an 8-byte quad, XNU bsd/kern/kern_mib.c); no new
+            // value is written.
+            let read = unsafe {
+                libc::sysctlbyname(
+                    c"hw.tbfrequency".as_ptr(),
+                    (&raw mut hz).cast(),
+                    &raw mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if read != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length != size_of::<u64>() || hz == 0 {
+                return Err(io::Error::other("hw.tbfrequency read no rate"));
+            }
             Ok(Self {
                 numer: u64::from(info.numer),
                 denom: u64::from(info.denom),
+                kernel_hz: hz,
             })
         }
 
@@ -157,12 +191,18 @@ mod os {
             Ok(self.ticks_ns(ticks))
         }
 
-        /// A kernel timestamp as nanoseconds: on macOS `mach_absolute_time` ticks on the
-        /// monotonic clock; on Linux already nanoseconds of `CLOCK_REALTIME`.
+        /// A kernel timestamp as nanoseconds: on macOS the kernel's `mach_absolute_time`, in its
+        /// own ticks, converted at its rate, × 10⁹ / `hw.tbfrequency` (for a native process the
+        /// timebase's own fraction, so the same nanoseconds to the bit), on the monotonic clock; on
+        /// Linux already nanoseconds of `CLOCK_REALTIME`.
         pub(crate) fn kernel_ns(&self, raw: u64) -> u64 {
             #[cfg(target_os = "macos")]
             {
-                self.ticks_ns(raw)
+                let ns = u128::from(raw)
+                    .checked_mul(u128::from(SECOND_NS))
+                    .and_then(|scaled| scaled.checked_div(u128::from(self.kernel_hz)))
+                    .unwrap_or(u128::MAX);
+                u64::try_from(ns).unwrap_or(u64::MAX)
             }
             #[cfg(target_os = "linux")]
             {

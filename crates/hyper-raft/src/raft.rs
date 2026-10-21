@@ -2235,39 +2235,56 @@ impl<S: Storage> Raft<S> {
         let term = self.term;
         self.become_follower(term, 0)
     }
-    /// A leader that stops leading in its term tells the voter it trusts
-    /// that holds the most of its log to campaign at once (a transfer's
-    /// order, Raft dissertation §3.10). Its followers trust its node, which
-    /// lives, and by suspicion nothing else would make them campaign: the
-    /// heir's campaign moves them to its term, where they know no leader.
-    /// An heir that cannot win leaves them so all the same, and they elect
-    /// among themselves.
+    /// A leader that stops leading in its term tells a voter to campaign at
+    /// once (a transfer's order, Raft dissertation §3.10). Its followers
+    /// trust its node, which lives, and by suspicion nothing else would make
+    /// them campaign: the heir's campaign moves them to its term, where they
+    /// know no leader. An heir that cannot win leaves them so all the same,
+    /// and they elect among themselves.
     ///
-    /// Among heirs that hold as much, it takes them in turn, one a hand-over
-    /// (`Watch::handovers`): one that restarted knows nothing of what its
-    /// followers hold, and the heir it names first may be one that cannot
-    /// campaign (a learner by its own configuration) or cannot win, while
-    /// its followers keep their lease on it. A schedule found that with a
-    /// leader that restarted marked (R-7, seed 75 of the faults at rest by
-    /// suspicion): it named the same heir for good.
+    /// The heirs are every other voter, in order: those its detectors trust
+    /// before those they suspect, then the most of its log held first, then
+    /// by id; each hand-over names the next (`Watch::handovers`). A voter it
+    /// suspects is still an heir: a suspicion says it does not hear that
+    /// voter, not that the voter does not hear it, and a leader steps down
+    /// exactly when it hears no quorum, so it may suspect every other voter
+    /// while they all hear and trust it. Handing over to none, it left them
+    /// leaderless for as long as its suspicions lasted (mantle's node
+    /// simulation, a leader whose plane went deaf; mantle's Windows CI, run
+    /// 39503516282). The turn passes over every heir: the heir it names
+    /// first may be dead, or one that cannot campaign (a learner by its own
+    /// configuration) or cannot win, while its followers keep their lease on
+    /// it (R-7, seed 75 of the faults at rest by suspicion: it named the same
+    /// heir for good). Only the order at the step-down knows what each holds:
+    /// a follower's progress is reset, as is a restarted leader's, so the
+    /// orders after it turn through the heirs it trusts and then the rest.
     fn hand_over(&mut self) -> Result<()> {
         let configuration = self.tracker.configuration();
         let heirs = || {
-            self.tracker.iter().filter(|(member, _)| {
-                *member != self.id && configuration.votes(*member) && !self.suspects(*member)
-            })
+            self.tracker
+                .iter()
+                .filter(|(member, _)| *member != self.id && configuration.votes(*member))
+                .map(|(member, progress)| {
+                    (
+                        self.suspects(member),
+                        std::cmp::Reverse(progress.matched),
+                        member,
+                    )
+                })
         };
-        let Some(most) = heirs().map(|(_, progress)| progress.matched).max() else {
-            return Ok(());
-        };
-        let tied = || heirs().filter(|(_, progress)| progress.matched == most);
         let turn = self
             .watch
             .as_ref()
             .map_or(0, |watch| usize::try_from(watch.handovers).unwrap_or(0))
-            .checked_rem(tied().count())
+            .checked_rem(heirs().count())
             .unwrap_or(0);
-        let Some(heir) = tied().map(|(member, _)| member).nth(turn) else {
+        // The heir `turn` places ahead of it: the configuration names a
+        // bounded few members (`Limits::members`), and a hand-over comes once
+        // a step-down and once a round after, so counting each heir's place
+        // costs nothing that matters and allocates nothing.
+        let Some((_, _, heir)) =
+            heirs().find(|key| heirs().filter(|other| other < key).count() == turn)
+        else {
             return Ok(());
         };
         if let Some(watch) = self.watch.as_deref_mut() {
@@ -2680,6 +2697,9 @@ impl<S: Storage> Raft<S> {
         self.lost = None;
         if let Some(watch) = self.watch.as_mut() {
             watch.led = term;
+            // The hand-over at its step-down names the heir that holds the
+            // most, whatever orders it gave in terms it led before.
+            watch.handovers = 0;
         }
         // Its log need not be durable yet: a member that is the one voter
         // is elected before its writes are (`docs/durable.md` §2.1). It

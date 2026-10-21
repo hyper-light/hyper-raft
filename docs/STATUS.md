@@ -215,6 +215,18 @@ is worked around.
 
 ### Closed (2026-10-20)
 
+- **hyper-raft: a leader that suspected every other voter handed over to none (found by mantle).**
+  `Raft::hand_over` took heirs only among the voters the leader trusted, and a leader steps down
+  exactly when it and those it trusts are no quorum, so one that suspected every other voter sent
+  no order while they heard it and trusted it; it could not campaign itself (no quorum it trusts),
+  and the range stayed leaderless as long as its suspicions lasted: for ever under one-way loss
+  (mantle's node simulation, the leader's plane deafened), and on mantle's Windows CI, with no fault
+  injected, for the test's 4.63 s (run 39503516282: term 2's leader on a 2-vCPU runner running
+  seven process tests suspected both followers, stepped down with no heir, both followers trusted
+  it). The heirs are every other voter, trusted before suspected, then by what each holds and by id,
+  each hand-over naming the next over all of them, the turn starting again at each term led
+  (`docs/timing.md` §2.9, "Who the heir is"). Tests in `tests/suspicion.rs`, the first two red on
+  `1b85eaf`, the third with the turn counted from the member's start.
 - **hyper-rt, hyper-tokio, hyper-timing-trace, hyper-measure, hyper-block: a value the kernel takes in
   its own ticks was read at the process's timebase, which a process Rosetta 2 translates does not
   share (found by mantle).** XNU stamps a received datagram (`SCM_TIMESTAMP_MONOTONIC`) with its own

@@ -650,6 +650,97 @@ fn a_leader_that_steps_down_hands_over() {
     assert_eq!(sim.leader(), Some(2), "the one voter it still trusted");
 }
 
+/// A leader whose detectors suspect every other voter steps down and still hands over: a
+/// suspicion says only that it does not hear the voter, not that the voter does not hear it, and
+/// its followers, which hear it and trust it for good, would never campaign. Handing over to
+/// none, it stood leaderless for as long as its suspicions lasted (mantle's node simulation, a
+/// leader whose plane went deaf; mantle's Windows CI, run 39503516282).
+#[test]
+fn a_leader_that_suspects_every_other_voter_hands_over_all_the_same() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    assert_eq!(sim.peek(1).view().role, 0);
+    assert_eq!(
+        sim.count_sent(from, MessageType::MsgTimeoutNow),
+        1,
+        "it told no voter to campaign"
+    );
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "its followers trusted it and no one campaigned"
+    );
+    assert!(sim.leader() != Some(1));
+}
+
+/// Each term a member leads starts its hand-overs from the first heir: the voter it trusts that
+/// holds the most. Leader 1 hands over once, to 2; led again, it steps down trusting only 3, and
+/// names 3, not whichever voter its count from the first term reached.
+#[test]
+fn a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert!(sim.run_until(|sim| sim.leader() == Some(2)));
+    for member in [3, 4, 5] {
+        sim.trust(1, member);
+    }
+    sim.node(2).transfer(1);
+    sim.settle(2);
+    assert!(sim.run_until(|sim| sim.leader() == Some(1)));
+    assert!(sim.run(), "the group never went quiet");
+    let from = sim.sent.len();
+    for member in [2, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 0);
+    let orders: Vec<u64> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .map(|m| m.to)
+        .collect();
+    assert_eq!(orders, [3], "the one voter it still trusted");
+    assert!(sim.run_until(|sim| sim.leader().is_some_and(|l| l != 1)));
+    assert_eq!(sim.leader(), Some(3));
+}
+
+/// A leader's first heir may be dead: at its step-down it names the voter that holds the most of
+/// its log, trusted ones first. Leader 1 of five steps down trusting only 2, which holds an entry
+/// the others lack and is dead; it then suspects 2 as well, and its next hand-overs name the live
+/// voters, which trust it, in turn, and they elect one of themselves. Stepped down, it no longer
+/// knows what each holds (a follower's progress is reset), so those hand-overs turn through every
+/// voter, those it trusts first.
+#[test]
+fn a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over() {
+    let (timing, _) = timing_for(5);
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    sim.cut.extend([3, 4, 5]);
+    sim.node(1).propose(b"only 2 holds it".to_vec());
+    sim.settle(1);
+    assert!(!sim.run_until(|_| false), "a write that cannot commit");
+    sim.stop(2);
+    // Suspected while still cut off, they are sent nothing more and never catch up: 2 alone
+    // holds the most, and the hand-over at the step-down names it, the one voter trusted.
+    for member in [3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 0);
+    sim.suspect(1, 2);
+    sim.cut.clear();
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "every hand-over went to the dead heir"
+    );
+    assert!(![1, 2].contains(&sim.leader().unwrap_or(0)));
+}
+
 /// A leader that removes itself counts its commits by the configuration it wrote, which needs both
 /// of the voters it leaves: with one cut off, the removal waits, and the leader leads on (Ongaro's
 /// thesis §4.2.2). Once the removal is committed and applied, the leader hands the group to a

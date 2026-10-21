@@ -44,7 +44,9 @@ clock, no disk and no network:
   kept for the differential); one that elects by suspicion (timing step L-2, `docs/timing.md` §2.9)
   is told what its owner's detectors believe of the other members (`suspect`, `trust`,
   `restarted`), given its group's measured `Timing`, and woken at its owner's clock (`wake`,
-  `deadline`): an idle group is woken for nothing;
+  `deadline`): an idle group is woken for nothing. A leader those detectors leave no quorum steps
+  down and hands its term to a voter, trusted ones first and suspected ones after, since a voter it
+  does not hear may hear it (`docs/timing.md` §2.9, "Who the heir is");
 - `RawNode::step` gives it what arrived;
 - a `Ready` says what to persist, send and apply; one is taken at a time, and once its write is
   issued (`advance_issued`) the member takes operations again and the next may be taken, up to

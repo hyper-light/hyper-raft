@@ -1503,20 +1503,45 @@ spend a term and depose a leader that never left.
 - **A leader steps down** once it and those it trusts are no quorum of either half (check-quorum
   from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
 - **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
-  dissertation §3.10) to the voter it trusts that holds the most of its log, and among those that
-  hold as much, to each in turn, one a hand-over (`Watch::handovers`): one that restarted knows nothing
-  of what its followers hold, and the first it named may be one that cannot campaign. A leader that
-  restarted marked and could not campaign named a member that was a learner by its own
-  configuration, again and again, while its followers kept their lease on its node (core step R-7,
-  seed 75 of the faults at rest by suspicion). Its followers trust
-  its node, which lives, and on ticks their lease would have run out; nothing else would make them
-  campaign. The schedules found it twice: a leader that removed itself with no voter holding its
-  whole log (seed 7 of the four settings), and one that stepped down for want of a quorum. The
-  heir's campaign moves its voters to a later term, where they know no leader, and an heir that
-  cannot win leaves them there all the same. Until its term moves or it follows another leader of
-  it, a member that led its term and cannot campaign hands over again a round and a draw after the
-  last, as a candidate asks again, for the order may be lost; a member of a later term answers an
-  old order (as it answers an old leader's heartbeat), which moves the sender's term.
+  dissertation §3.10) to a voter, which campaigns at once. Its followers trust its node, which
+  lives, and on ticks their lease would have run out; nothing else would make them campaign. The
+  schedules found it twice: a leader that removed itself with no voter holding its whole log (seed 7
+  of the four settings), and one that stepped down for want of a quorum. The heir's campaign moves
+  its voters to a later term, where they know no leader, and an heir that cannot win leaves them
+  there all the same. Until its term moves or it follows another leader of it, a member that led its
+  term and cannot campaign hands over again a round and a draw after the last, as a candidate asks
+  again, for the order may be lost; a member of a later term answers an old order (as it answers an
+  old leader's heartbeat), which moves the sender's term.
+
+  *Who the heir is* (`Raft::hand_over`). The heirs are every other voter, in order: those the
+  leader's detectors trust before those they suspect, then the most of its log held first, then by
+  id; each hand-over names the next (`Watch::handovers`, from the first again at each term the member
+  leads), so the order at the step-down goes to the trusted voter that holds the most. A voter the
+  leader suspects is still an heir. A suspicion is one-way evidence: that the leader does not hear a
+  voter says nothing of whether the voter hears the leader, and a leader steps down exactly when it
+  and those it trusts are no quorum, so it may suspect every other voter while they all hear it and
+  trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
+  itself (it trusts no quorum), and the range stayed leaderless for as long as its suspicions lasted:
+  for ever under one-way loss (mantle's node simulation, a leader whose plane went deaf, seed 1: it
+  suspected both followers at 9.2 ms and sent no order, and the cell elected again at 335 ms only
+  because the deaf leader's own stream degraded until its followers suspected it by mistake), and
+  on a starved host until its peers' heartbeats came back (mantle's Windows CI, run 39503516282: three
+  `mantle node` processes on a 2-vCPU runner running seven process tests, no fault injected, term
+  2's leader suspected both followers, stepped down with no heir, and both followers trusted it for
+  the test's 4.63 s). The turn passes over every heir, not only those that hold the most: the first
+  may be dead, or one that cannot campaign (a learner by its own configuration) or cannot win while
+  its followers keep their lease on the leader (a leader that restarted marked named such a member
+  again and again, core step R-7, seed 75 of the faults at rest by suspicion). Only the order at the
+  step-down knows what each holds: a follower's progress is reset (`Raft::reset`), as a restarted
+  leader's is, so the orders after it turn through the heirs it trusts and then the rest. Tests
+  (`tests/suspicion.rs`): `a_leader_that_suspects_every_other_voter_hands_over_all_the_same`
+  (leader 1 of three suspects 2 and 3, which trust it for good; on `1b85eaf` no order, `left: 0,
+  right: 1`) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` (leader 1 of five
+  steps down trusting only 2, which alone holds its last entry and is dead, then suspects 2 as well;
+  on `1b85eaf` no leader within the quiet period), each red before; and
+  `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts`, red with the turn counted
+  from the member's start, which at its second step-down named a suspected voter (`[2]`, where it
+  trusted only 3).
 - **What ends a follower's trust in its leader**, besides its detector: a request for votes from
   that leader (a member asks only while it does not lead, and terms only rise at it); its
   incarnation's end (`restarted`); a configuration that names it no voter; and a request from a

@@ -1146,8 +1146,15 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
     one, and judges on its completion: what it judges by is its own device's progress since the
     peer was due. A completion after the expected arrival but before the point does not prove it,
     since a shared journal can stall after it with the peer's flush, asked earlier, still in it.
-  Costs. A crashed peer is detected late by up to the judge's own stall, and by one flush of its own
-  where it had made nothing durable since the point (over 256 seeds of `a_peer_dead_before_...` the
+  - a point once held later is held there and no further (`Pair::held`), whatever the judge's own
+    device does after: restated at every wait, a judge whose every write was slower than the margin
+    held each point past its next wait and suspected a dead peer never, its writes completing all the
+    while (`a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer`, writes of 351 ms against
+    freshnesses of 176 ms: no suspicion in 3.5 s; mantle's pinned suite at `1ccd38d`, a leader whose
+    flushes took 182 to 208 ms logging no suspicion of a dead follower in 4 s). A hold is so bounded
+    by one wait of the judge's own and the margin.
+  Costs. A crashed peer is detected late by up to one of the judge's own stalls and the margin, and
+  by one flush of its own where it had made nothing durable since the point (over 256 seeds of `a_peer_dead_before_...` the
   median time to notice a death rose 3 to 17 ms, the most on macOS from 1,097 to 1,575 ms, one seed).
   A node whose disk stalls for good never suspects anyone, which is safe: its own stream stops, its
   peers suspect it as a crashed node, and it cannot lead, its log writes never completing. Over 256
@@ -1158,7 +1165,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   three freshnesses: no suspicion during it; on `79eb22b` node 1 suspected both peers, 131 and 319
   ms into an 822 ms stall), `a_peer_whose_flushes_stall_alone_is_suspected_as_before`, and
   `a_node_whose_disk_stalls_for_good_suspects_no_one_and_is_suspected` (on `79eb22b` the stalled node
-  suspected both peers silent while it was); `tests/processes.rs`'s stalled member holds no
+  suspected both peers silent while it was), `a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer`
+  (within one write and two freshnesses of the kill); `tests/processes.rs`'s stalled member holds no
   suspicion of the killed one. The trace of every suspicion (`support/record.rs`) restates its rule
   with the node's own proof recorded at each call: a point may pass untold, or be told later, only
   where the call shows that proof outstanding or ended since the peer was heard, or nothing durable

@@ -2108,6 +2108,54 @@ fn a_node_whose_disk_stalls_for_good_suspects_no_one_and_is_suspected() {
     }
 }
 
+/// A judge whose every write is slower than the margins it holds its peers to, its writes still
+/// completing, suspects a dead peer all the same, within one of its writes and the margin past the
+/// point: each wait for a proof of its own holds a passed point once. Restated at every wait, the
+/// point moved past each next one, and the judge suspected no one for as long as its device was slow
+/// (mantle's pinned cluster suite at `1ccd38d`: a leader whose flushes took 182 to 208 ms logged no
+/// suspicion of a dead follower in four seconds).
+#[test]
+fn a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(19, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let (judge, victim) = (0usize, 2usize);
+            sim.nodes[judge].disk_slowed = 2 * freshness;
+            let killed_at = sim.now;
+            sim.nodes[victim].alive = false;
+            let until = killed_at + 20 * freshness;
+            sim.run_while(
+                |sim| sim.nodes[judge].liveness.trust(victim as u64 + 1) != Some(Trust::Suspected),
+                Some(until),
+            );
+            let found = sim.nodes[judge]
+                .suspicions
+                .iter()
+                .find(|s| s.peer == victim as u64 + 1 && s.noticed_ns > killed_at)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} seed {seed}: the judge never suspected the dead peer in {} ms, \
+                         its writes {} ms each",
+                        (until - killed_at) / MS,
+                        2 * freshness / MS
+                    )
+                });
+            let late = sim.latest_late + sim.longest_freeze;
+            assert!(
+                found.noticed_ns <= killed_at + freshness + sim.longest_write + freshness + late,
+                "{name} seed {seed}: noticed {} ms after the kill, past one write ({} ms) and two \
+                 freshnesses ({} ms each)",
+                (found.noticed_ns - killed_at) / MS,
+                sim.longest_write / MS,
+                freshness / MS
+            );
+        }
+    }
+}
+
 /// Every node's device slows for good while its links are young: each flush takes 741 ms more,
 /// the longest write hyper-durable-e2e's `member-stopped` reported on CI's ubuntu-24.04 (run
 /// 37152765895), from the first heartbeat the victim sends on. The links still configure, and a

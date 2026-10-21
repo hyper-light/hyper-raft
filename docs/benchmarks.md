@@ -9536,3 +9536,8 @@ cargo bench -p hyper-liveness --bench allocs   # and from `git archive 79eb22b`,
 cargo bench -p hyper-liveness --bench cost
 HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim
 ```
+
+The one-shot hold (`Pair::held`, the next commit): five alternations at load 9–10 against `79eb22b`,
+whose own runs moved 89–195 ns a heartbeat at 2 nodes and up to 802 at 8, so they tell nothing
+either way; the hold is read only for a point that has passed. 0 allocations, reallocations, bytes
+and faults a heartbeat in every cell.

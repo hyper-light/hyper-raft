@@ -265,6 +265,13 @@ pub(crate) struct Pair {
     /// Whether the owner was last told the peer is suspected: a change is reported only where
     /// what the owner was told differs, and the owner trusts a peer until told otherwise.
     told: bool,
+    /// A passed freshness point the node's own stall held later (`Local::judge`), and the time it
+    /// is judged at: once held, it is held no further, whatever the node's own durability does
+    /// after. Restated at every wait, a judge whose every write was slower than the margin held its
+    /// point past each next one and suspected a dead peer never
+    /// (`a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer`). One for a point other
+    /// than the pair's present one is spent.
+    held: Option<(u64, u64)>,
     counts: Counts,
 }
 
@@ -277,6 +284,7 @@ impl Pair {
             received: Received::default(),
             unheard: Unheard::default(),
             told: false,
+            held: None,
             counts: Counts::default(),
         }
     }
@@ -418,6 +426,15 @@ impl Pair {
         }
     }
 
+    /// How a passed `point` is judged: at the time it was held to, if it was, or as the node's own
+    /// durability holds it now.
+    fn hold(&self, point: u64, local: &Local) -> Held {
+        match self.held {
+            Some((held, at)) if held == point => Held::At(at),
+            _ => local.judge(point, self.margin_ns()),
+        }
+    }
+
     /// When the peer is next judged, while trusted, at `now_ns` and with the node's own
     /// durability: its freshness point, or for one that has passed the time `Local::judge` holds
     /// it to; none while that waits for the node's own proof, whose completion polls the stream.
@@ -427,7 +444,7 @@ impl Pair {
         if point > now_ns {
             return Some(point);
         }
-        match local.judge(point, self.margin_ns()) {
+        match self.hold(point, local) {
             Held::At(at) => Some(at),
             Held::Waiting { .. } => None,
         }
@@ -439,7 +456,7 @@ impl Pair {
     pub(crate) fn trust_at(&self, local: &Local, now_ns: u64) -> Trust {
         match (self.trust(), self.point()) {
             (Trust::Trusted { until_ns }, Some(point)) if until_ns <= now_ns => {
-                match local.judge(point, self.margin_ns()) {
+                match self.hold(point, local) {
                     Held::At(at) => Trust::Trusted { until_ns: at },
                     Held::Waiting { .. } => Trust::Unconfigured,
                 }
@@ -607,9 +624,13 @@ impl Pair {
         let at = match self.point() {
             // Not passed: every poll of every pair, so nothing more is read.
             Some(point) if now_ns < point => return (None, false),
-            Some(point) => match local.judge(point, self.margin_ns()) {
+            Some(point) => match self.hold(point, local) {
                 Held::At(at) if now_ns >= at => Some(at),
-                Held::At(_) => return (None, false),
+                Held::At(at) => {
+                    // Held later: held there, and no further.
+                    self.held = Some((point, at));
+                    return (None, false);
+                }
                 Held::Waiting { probe } => return (None, probe),
             },
             None => None,

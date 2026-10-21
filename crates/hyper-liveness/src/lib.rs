@@ -380,6 +380,32 @@ fn pool_margins(
     }
 }
 
+/// Sends `pair`'s heartbeat due at `now_ns`, if a flush proves it. Whether a flush is wanted: one
+/// proves the heartbeat due, or the next, already due.
+fn send(
+    pair: &mut Pair,
+    peer: PeerId,
+    sender: &pair::Sender,
+    now_ns: u64,
+    message: &mut [u8; MAX_BYTES],
+    out: &mut impl Output,
+) -> bool {
+    match pair.send(sender, now_ns, message) {
+        pair::Sent::Message(length) => {
+            if let Some(message) = message.get(..length) {
+                out.heartbeat(peer, message);
+            }
+            // Its next slot already due (the interval fell while the stream was behind): the
+            // flush that proves it is asked now, and its completion polls the stream. Left to a
+            // wake, it asked none, and only a peer's heartbeat polled it again: a node that heard
+            // none sent nothing more.
+            pair.next_due().is_some_and(|due| due <= now_ns)
+        }
+        pair::Sent::NeedsFlush => true,
+        pair::Sent::Nothing => false,
+    }
+}
+
 /// The earlier of `wake` and `pair`'s next heartbeat due after `now_ns` and freshness point.
 fn earliest(wake: Option<u64>, pair: &Pair, now_ns: u64) -> Option<u64> {
     [
@@ -626,15 +652,7 @@ impl Liveness {
             if let Some(change) = pair.judge(peer, now_ns) {
                 out.change(change);
             }
-            match pair.send(&sender, now_ns, &mut self.message) {
-                pair::Sent::Message(length) => {
-                    if let Some(message) = self.message.get(..length) {
-                        out.heartbeat(peer, message);
-                    }
-                }
-                pair::Sent::NeedsFlush => wants_flush = true,
-                pair::Sent::Nothing => {}
-            }
+            wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, out);
             wake = earliest(wake, pair, now_ns);
         }
         if wants_flush && !self.flushing {

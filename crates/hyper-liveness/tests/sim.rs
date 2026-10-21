@@ -297,6 +297,9 @@ struct Node {
     liveness: Liveness,
     owner: Owner,
     alive: bool,
+    /// Every heartbeat sent the node is lost, frozen or not: it hears no peer, while they hear it
+    /// (mantle's plane deafened).
+    deaf: bool,
     disk_stalled: bool,
     /// What every flush of the node's disk takes past its world's draw: a device slowed for good.
     disk_slowed: u64,
@@ -350,6 +353,9 @@ struct Sim {
     /// how late past what it waits for a poll can come in this run.
     latest_late: u64,
     longest_freeze: u64,
+    /// The longest any write took from its submission to its completion, its queue on the device
+    /// included.
+    longest_write: u64,
 }
 
 impl Sim {
@@ -386,6 +392,7 @@ impl Sim {
                         changes: Vec::new(),
                     },
                     alive: true,
+                    deaf: false,
                     disk_stalled: false,
                     disk_slowed: 0,
                     charged: 0,
@@ -445,6 +452,7 @@ impl Sim {
             configured_at: BTreeMap::new(),
             latest_late: 0,
             longest_freeze: 0,
+            longest_write: 0,
         };
         for node in 0..count {
             if world.busy {
@@ -495,6 +503,7 @@ impl Sim {
         let u = self.streams.unit(&mut self.sim, "disk", node as u64);
         let done = start + quantile(self.world.flush, u) + self.nodes[node].disk_slowed;
         self.nodes[node].disk_busy_until = done;
+        self.longest_write = self.longest_write.max(done - self.now);
         let started = self.now;
         self.writing += 1;
         self.schedule(
@@ -836,6 +845,12 @@ impl Sim {
     }
 
     fn handle(&mut self, event: Event) {
+        // A deaf node hears nothing, frozen or not.
+        if let Event::Arrive { to, .. } = event
+            && self.nodes[to].deaf
+        {
+            return;
+        }
         // A frozen host's owner takes what arrives and completes at its thaw.
         if let Event::Arrive { to: node, .. } | Event::Durable { node, .. } = event
             && self.nodes[node].frozen_until > self.now
@@ -1791,6 +1806,56 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
             noticed[noticed.len() * 9 / 10] / MS,
             noticed[noticed.len() - 1] / MS
         );
+    }
+}
+
+/// A node that hears no peer keeps its streams to them on their schedules: a heartbeat due waits
+/// for no more than the poll that finds it due and the flush that proves it, a timer's lateness, a
+/// freeze and a write the run drew. A stream whose interval fell while it was behind sent the
+/// heartbeat due with its next slot already past, asked no wake for it, and was polled again only
+/// by a peer's heartbeat: a node that heard none sent nothing more, for ever (Linux, seed 175 of
+/// 256 of `a_node_deaf_before_it_has_evidence_suspects_every_peer`: sixteen heartbeats a peer,
+/// then none). In the four worlds, the node deafened after a share of its first heartbeats drawn
+/// from the seed, for two seconds.
+#[test]
+fn a_node_that_hears_no_peer_keeps_its_streams_on_schedule() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(15, 256) {
+            let deaf = 2usize;
+            let mut draw = Seeded::new(stream_seed(seed, "deafen", &[]));
+            let deafen_after = 1 + draw.below(64);
+            let mut sim = Sim::new(3, world, seed);
+            sim.run_while(
+                |sim| (sim.nodes[deaf].log.len() as u64) < deafen_after,
+                None,
+            );
+            sim.nodes[deaf].deaf = true;
+            let until = sim.now + 2_000 * MS;
+            sim.run_while(
+                |sim| {
+                    let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+                    for peer in [1u64, 2] {
+                        let due = sim.nodes[deaf]
+                            .liveness
+                            .report(peer)
+                            .and_then(|report| report.sending_due_ns)
+                            .unwrap_or(sim.now);
+                        assert!(
+                            sim.now.saturating_sub(due) <= behind,
+                            "{name} seed {seed}: the stream to {peer} due at {} ms, {} ms behind \
+                             at {} ms, past the {} ms a poll and a flush may take",
+                            due / MS,
+                            sim.now.saturating_sub(due) / MS,
+                            sim.now / MS,
+                            behind / MS
+                        );
+                    }
+                    true
+                },
+                Some(until),
+            );
+        }
     }
 }
 

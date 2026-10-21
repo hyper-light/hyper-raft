@@ -1107,6 +1107,19 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   flushing is not trusted either (`Refusal::Unproven`). Idle, a node makes at most one liveness
   write per smallest interval among its pairs, shared by every pair; a node whose groups write makes
   none.
+- **A stream keeps its schedule without hearing its peer.** A heartbeat sent whose next slot is
+  already due asks at once for the flush that proves the next (`Liveness::poll`), and its completion
+  polls the stream. Its next slot is due already where the interval fell while the stream was
+  behind: the slot sent is the latest due at the old interval, and the next is one new interval
+  past it. The poll asked no wake for a slot at or before its own time, so the stream was polled
+  again only by what else came, a peer's heartbeat; a node that heard none sent nothing more, for
+  ever (`a_node_that_hears_no_peer_keeps_its_streams_on_schedule`: a node deafened after up to 64 of
+  its heartbeats, its streams never behind by more than a timer's lateness, a freeze and a write the
+  run drew, over 256 seeds of four worlds; red on `1b85eaf` at macOS's seed 6, 21 ms behind past
+  19; found by a node deafened before its evidence in the simulation, Linux's seed 175 of 256,
+  sixteen heartbeats a peer and then none). A node that hears its peers was polled by their heartbeats and sent the slot late by as
+  long, which its peer took as lateness: over 256 seeds of `live_peers_...`, its suspicions of live
+  peers fell from 436 to 425 at the same allowance (4,182.9, 4,181.5).
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at

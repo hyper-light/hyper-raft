@@ -227,6 +227,15 @@ is worked around.
   each hand-over naming the next over all of them, the turn starting again at each term led
   (`docs/timing.md` §2.9, "Who the heir is"). Tests in `tests/suspicion.rs`, the first two red on
   `1b85eaf`, the third with the turn counted from the member's start.
+- **hyper-liveness: a stream whose next slot was due as it sent stopped until a peer's heartbeat
+  polled it (found 2026-10-20, by a node deafened in the simulation).** An interval that fell while the stream was
+  behind left its next slot past at the send, and the poll asked no wake for a past slot: a node that
+  heard none sent nothing more (Linux seed 175 of 256: sixteen heartbeats a peer, then none), and one
+  that heard its peers sent the slot late by the wait for their next heartbeat, which its peers took
+  as lateness. The poll now asks the flush that proves the next slot (`docs/timing.md` §2.8, "A
+  stream keeps its schedule without hearing its peer"). `a_node_that_hears_no_peer_keeps_its_streams_on_schedule`,
+  red on `1b85eaf`; over 256 seeds of the live-peers world the suspicions of live peers fell from 436
+  to 425 at the same allowance.
 - **hyper-rt, hyper-tokio, hyper-timing-trace, hyper-measure, hyper-block: a value the kernel takes in
   its own ticks was read at the process's timebase, which a process Rosetta 2 translates does not
   share (found by mantle).** XNU stamps a received datagram (`SCM_TIMESTAMP_MONOTONIC`) with its own

@@ -223,6 +223,20 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-21)
+
+- **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer
+  (found by mantle).** The flush proof stops every stream on the device at once, and each judge, its
+  own stream stopped too, suspected by a proof it could not produce itself: mantle's cluster suite on
+  one ext4 volume, every all-pairs burst lined up with every node's flushes stalled at once, the
+  cause of its liveness stalls and leader changes on `1b85eaf` as on this branch. A judge whose own
+  proof is outstanding now waits for it, a long stall giving the peer its margin again from its end,
+  and a judge with nothing durable since the point asks for a proof first (Lifeguard's local
+  health, applied to the device: `docs/timing.md` §2.8, "A judge whose own proof stalls"). Costs: a
+  crash is detected late by up to the judge's own stall, or one flush; a node whose disk stalls for
+  good suspects no one, its peers suspecting it. Tests in tests/sim.rs, the shared stall and the
+  stall for good red on `79eb22b`.
+
 ### Closed (2026-10-20)
 
 - **hyper-raft: a leader that suspected every other voter handed over to none (found by mantle).**

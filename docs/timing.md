@@ -1120,6 +1120,49 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   sixteen heartbeats a peer and then none). A node that hears its peers was polled by their heartbeats and sent the slot late by as
   long, which its peer took as lateness: over 256 seeds of `live_peers_...`, its suspicions of live
   peers fell from 436 to 425 at the same allowance (4,182.9, 4,181.5).
+- **A judge whose own proof stalls** (`pair::Local::judge`, `Liveness::own_proof`). The flush proof
+  makes every stream wait on its sender's device, so where nodes share a device a stall of it stops
+  every stream at once, and each judge, its own stream stopped as well, would suspect every peer
+  by a proof it could not produce itself: mantle's cluster suite, its nodes on one ext4 volume (one
+  journal, whose commit every file's fsync waits on), pinned to four CPUs on Linux, saw every
+  all-pairs burst of suspicions line up with every node's flushes stalled at once (polls on time,
+  last heartbeats sent on time, nothing arriving for 145 to 186 ms against bounds of 150 to 186 ms,
+  while nodes' flushes had been in flight 165 to 302 ms), and its A/B of `79eb22b` against `1b85eaf`
+  counted 11 and 12 liveness stalls and 24 and 17 leader changes in ten rounds each, all of that
+  cause. Lifeguard (Dadgar, Phillips and Currey, "Lifeguard: Local Health Awareness for More Accurate
+  Failure Detection", DSN 2018) found SWIM's false positives came from members too slow themselves
+  to process their probes in time, and made a member less hasty to suspect while its own local
+  health is poor; here a judge's own health is its device, which the proof it holds its peers to
+  measures directly. The rule, at a freshness point that has passed, the peer expected a margin
+  before it:
+  - while the judge's own proof is outstanding (its stream wanted one, from the poll that first did,
+    and no write of its own has completed since), it waits: the pair is judged by no point
+    (`Trust::Unconfigured`, which the owner trusts), and asks no wake, since the completion polls;
+  - once that proof comes, a wait at least as long as the margin, which ended after the peer was
+    expected, gives the peer the margin again from its end, since the peer's stream resumes no
+    sooner; the suspicion states that point, and its bound grows by the stall, as `latest_wake`
+    states the owner's own lateness (§2.7). A shorter wait proves nothing past its end;
+  - a judge that has made nothing durable since the point, and has no proof outstanding, asks for
+    one, and judges on its completion: what it judges by is its own device's progress since the
+    peer was due. A completion after the expected arrival but before the point does not prove it,
+    since a shared journal can stall after it with the peer's flush, asked earlier, still in it.
+  Costs. A crashed peer is detected late by up to the judge's own stall, and by one flush of its own
+  where it had made nothing durable since the point (over 256 seeds of `a_peer_dead_before_...` the
+  median time to notice a death rose 3 to 17 ms, the most on macOS from 1,097 to 1,575 ms, one seed).
+  A node whose disk stalls for good never suspects anyone, which is safe: its own stream stops, its
+  peers suspect it as a crashed node, and it cannot lead, its log writes never completing. Over 256
+  seeds of `live_peers_...` the suspicions of live peers fell from 425 to 388 at the same allowance
+  (4,181.5 and 4,203.4). Tests (`tests/sim.rs`, the simulation's `disk_held_until`, which holds every
+  flush of a node, in flight or new, as a journal does):
+  `flushes_stalled_together_as_on_a_shared_volume_are_no_ones_failure` (every node's flushes held
+  three freshnesses: no suspicion during it; on `79eb22b` node 1 suspected both peers, 131 and 319
+  ms into an 822 ms stall), `a_peer_whose_flushes_stall_alone_is_suspected_as_before`, and
+  `a_node_whose_disk_stalls_for_good_suspects_no_one_and_is_suspected` (on `79eb22b` the stalled node
+  suspected both peers silent while it was); `tests/processes.rs`'s stalled member holds no
+  suspicion of the killed one. The trace of every suspicion (`support/record.rs`) restates its rule
+  with the node's own proof recorded at each call: a point may pass untold, or be told later, only
+  where the call shows that proof outstanding or ended since the peer was heard, or nothing durable
+  since the point.
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at

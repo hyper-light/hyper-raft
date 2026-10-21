@@ -303,6 +303,9 @@ struct Node {
     disk_stalled: bool,
     /// What every flush of the node's disk takes past its world's draw: a device slowed for good.
     disk_slowed: u64,
+    /// No flush of the node's completes before this time, in flight or submitted: a journal that
+    /// stalls, as a volume the nodes share stalls for all of them at once.
+    disk_held_until: u64,
     /// The heartbeats taken when the node last charged its detectors an election.
     charged: u64,
     /// The disk's flush queue: one write at a time, as one device.
@@ -395,6 +398,7 @@ impl Sim {
                     deaf: false,
                     disk_stalled: false,
                     disk_slowed: 0,
+                    disk_held_until: 0,
                     charged: 0,
                     disk_busy_until: 0,
                     log: Vec::new(),
@@ -539,7 +543,8 @@ impl Sim {
             .filter(|peer| *peer != id)
             .map(|peer| (peer, n.liveness.trust(peer)))
             .collect();
-        n.record.polled(now, &n.owner.changes[told..], trusts);
+        let own = n.liveness.own_proof();
+        n.record.polled(now, &n.owner.changes[told..], trusts, own);
     }
 
     /// Feeds `node`'s stream a heartbeat from `from`, stamped by the kernel at `stamp`, and records
@@ -551,8 +556,9 @@ impl Sim {
         let outcome = n.liveness.on_heartbeat(peer, bytes, stamp, &mut n.owner);
         let beat = Beat::of(bytes, stamp).expect("the simulation sends heartbeats whole");
         let holds = n.liveness.trust(peer);
+        let own = n.liveness.own_proof();
         n.record
-            .fed(peer, beat, outcome, &n.owner.changes[told..], holds);
+            .fed(peer, beat, outcome, &n.owner.changes[told..], holds, own);
         outcome
     }
 
@@ -794,6 +800,22 @@ impl Sim {
                         stamp: self.now,
                     });
                 }
+            }
+            Ev::Durable {
+                node,
+                write,
+                started,
+            } if self.nodes[node].disk_held_until > self.now => {
+                let held = self.nodes[node].disk_held_until;
+                self.schedule(
+                    held,
+                    node,
+                    Ev::Durable {
+                        node,
+                        write,
+                        started,
+                    },
+                );
             }
             Ev::Durable {
                 node,
@@ -1764,8 +1786,10 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
                 None,
             );
             // A poll comes at most a timer's lateness, or a freeze, past what it waits for: the
-            // latest and the longest this run drew.
-            let late = sim.latest_late + sim.longest_freeze;
+            // latest and the longest this run drew; and a judge with nothing durable since the
+            // point judges on the flush it asks first (`docs/timing.md` §2.8, "A judge whose own
+            // proof stalls"), at most the longest write the run drew.
+            let late = sim.latest_late + sim.longest_freeze + sim.longest_write;
             for node in 0..2usize {
                 let suspicion = sim.nodes[node]
                     .suspicions
@@ -1938,6 +1962,148 @@ fn a_node_that_hears_no_peer_keeps_its_streams_on_schedule() {
                 },
                 Some(until),
             );
+        }
+    }
+}
+
+/// Runs `sim`, configured and doubled, until every live node trusts every live peer, and returns
+/// the longest freshness, `η + α`, any pair holds then.
+fn settled(sim: &mut Sim) -> u64 {
+    sim.run_until_configured();
+    sim.run_until_doubled();
+    let count = sim.nodes.len() as u64;
+    sim.run_while(
+        |sim| {
+            (0..sim.nodes.len()).any(|node| {
+                (1..=count).filter(|p| *p != node as u64 + 1).any(|peer| {
+                    !matches!(
+                        sim.nodes[node].liveness.trust(peer),
+                        Some(Trust::Trusted { .. })
+                    )
+                })
+            })
+        },
+        None,
+    );
+    (0..sim.nodes.len())
+        .flat_map(|node| {
+            let sim = &*sim;
+            (1..=count)
+                .filter(move |p| *p != node as u64 + 1)
+                .filter_map(move |peer| sim.nodes[node].liveness.report(peer)?.freshness)
+        })
+        .max()
+        .map_or(0, |freshness| freshness.as_nanos() as u64)
+}
+
+/// Every node's flushes stall together, as on a volume the nodes share (one journal: every file's
+/// fsync waits on its commit), for three times the longest freshness any pair holds: every
+/// flush-proven stream stops at once, and no node suspects another while its own proof is as stalled
+/// as its peers' (Lifeguard's local health, Dadgar, Phillips and Currey 2018, applied to the flush
+/// proof: `docs/timing.md` §2.8, "A judge whose own proof stalls"). Before, every pair suspected
+/// every other within its freshness: mantle's cluster suite pinned on one Linux volume, every
+/// all-pairs burst lined up with every node's flushes stalled at once (165 to 302 ms).
+#[test]
+fn flushes_stalled_together_as_on_a_shared_volume_are_no_ones_failure() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(16, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let until = from + 3 * freshness;
+            for node in &mut sim.nodes {
+                node.disk_held_until = until;
+            }
+            sim.run_while(|_| true, Some(until));
+            for (index, node) in sim.nodes.iter().enumerate() {
+                let during: Vec<_> = node
+                    .suspicions
+                    .iter()
+                    .filter(|s| s.noticed_ns > from && s.noticed_ns <= until)
+                    .map(|s| (s.peer, (s.noticed_ns - from) / MS))
+                    .collect();
+                assert!(
+                    during.is_empty(),
+                    "{name} seed {seed}: node {} suspected {during:?} (peer, ms into the stall) \
+                     while every flush stalled for {} ms",
+                    index + 1,
+                    (until - from) / MS
+                );
+            }
+        }
+    }
+}
+
+/// One node's flushes stall while the judges' own complete: it is suspected as before, within the
+/// bound each suspicion states.
+#[test]
+fn a_peer_whose_flushes_stall_alone_is_suspected_as_before() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(17, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let stalled = 2usize;
+            let from = sim.now;
+            let until = from + 3 * freshness;
+            sim.nodes[stalled].disk_held_until = until;
+            sim.run_while(|_| true, Some(until));
+            for node in 0..2 {
+                let found = sim.nodes[node]
+                    .suspicions
+                    .iter()
+                    .find(|s| s.peer == stalled as u64 + 1 && s.noticed_ns > from)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name} seed {seed}: node {} never suspected the stall",
+                            node + 1
+                        )
+                    });
+                assert!(
+                    found.noticed_ns <= until,
+                    "{name} seed {seed}: noticed past the stall"
+                );
+                let last = found.last.unwrap();
+                let bound = found.detection.unwrap();
+                assert!(found.at_ns - last.due_ns <= bound.as_nanos() as u64);
+            }
+        }
+    }
+}
+
+/// A node whose own disk stalls for good suspects no one, its own proof never coming, while its
+/// peers suspect it: its stream stops, as a crashed node's does. Safe, since such a node cannot
+/// lead (its log writes never complete) and its peers replace it.
+#[test]
+fn a_node_whose_disk_stalls_for_good_suspects_no_one_and_is_suspected() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(18, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let stalled = 2usize;
+            let from = sim.now;
+            sim.nodes[stalled].disk_stalled = true;
+            // Its peers fall silent too for a while, so that a judge with its proof would suspect
+            // them.
+            let until = from + 3 * freshness;
+            for node in 0..2 {
+                sim.nodes[node].disk_held_until = until;
+            }
+            sim.run_while(|_| true, Some(until));
+            let told: Vec<_> = sim.nodes[stalled]
+                .suspicions
+                .iter()
+                .filter(|s| s.noticed_ns > from)
+                .map(|s| s.peer)
+                .collect();
+            assert!(
+                told.is_empty(),
+                "{name} seed {seed}: the stalled node suspected {told:?}"
+            );
+            sim.run_until_suspected(stalled);
         }
     }
 }

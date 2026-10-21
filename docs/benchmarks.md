@@ -9503,3 +9503,36 @@ cargo bench -p hyper-liveness --bench allocs   # and from `git archive 1b85eaf`,
 cargo bench -p hyper-liveness --bench cost
 HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim
 ```
+
+## hyper-liveness: a judge whose own proof stalls (2026-10-21)
+
+`docs/timing.md` §2.8, "A judge whose own proof stalls". Before is `79eb22b` (a `git archive` of it,
+built in a target directory of its own); after is this change. Apple M5 Max, macOS 26.4.1, shared,
+the benches run alternately.
+
+`cargo bench -p hyper-liveness --bench allocs`, three runs each at load 5–8 (ns a heartbeat sent or
+taken, steady state; then the bootstrap's): 2 nodes 73–79 before, 78–79 after (bootstrap 131–136,
+142–143); 4 nodes 79–83, 86–88 (102–111, 111–119); 8 nodes 110–111, 112–113 (125–127, 136–141); 8
+nodes of 1,000 groups 111–113, 112–113 (114–120, 126–130). 0 allocations, reallocations, bytes and
+minor faults a heartbeat in every cell before and after, and the heartbeats sent and taken the same.
+What a poll pays more: per pair, one branch on the judge's own durability where a point has passed;
+per poll that wants a flush, the stamp of the wait. A first version read every pair's margin through
+a `Duration` at every poll, and judged past a point that had not passed: 2 nodes 96–164 and 8 nodes
+176–307 ns at load 9–10 against 80–120 and 122–179, gone with the margin read only for a point that
+has passed and an early return for one that has not.
+
+`cargo bench -p hyper-liveness --bench cost`, two runs each at load 8–19: messages and flushes a
+second identical (80 and 1.02, 320 and 1.10); pair µs within the noise of the per-group column, which
+neither build changed and which moved twofold between runs.
+
+The simulation (`HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim`): the
+suspicions of live peers 425 before, 388 after, at the same allowance; the time from a young victim's
+kill to every survivor's suspicion, median / 90th percentile / most, macOS 97 / 500 / 1,097 ms and
+101 / 504 / 1,575, busy 105 / 931 / 2,146 and 112 / 931 / 2,146, Linux 54 / 210 / 529 and 57 / 215 /
+529, Windows 542 / 2,147 / 4,066 and 559 / 2,148 / 4,066.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs   # and from `git archive 79eb22b`, alternately
+cargo bench -p hyper-liveness --bench cost
+HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim
+```

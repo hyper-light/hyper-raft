@@ -19,7 +19,11 @@
 //! whose disk stalls therefore stops heartbeating and is suspected as a crashed one is. Each
 //! heartbeat carries the sender's count of durable writes and the age of the latest; a receiver
 //! takes a heartbeat only when the count moved and the flush came after the previous heartbeat was
-//! due, so a sender that heartbeats without flushing is not trusted either.
+//! due, so a sender that heartbeats without flushing is not trusted either. A judge whose own
+//! proof is outstanding judges no peer by it until it comes, and one with nothing durable since a
+//! point asks for a proof first: on a device nodes share, a stall stops every stream at once
+//! (Lifeguard's local health, applied to the device: `docs/timing.md` §2.8, "A judge whose own
+//! proof stalls").
 //!
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
@@ -197,6 +201,18 @@ pub struct Suspicion {
     pub detector: Option<Detector>,
 }
 
+/// What a node knows of its own durability, which a freshness point that passed is judged with
+/// (`docs/timing.md` §2.8, "A judge whose own proof stalls"): its latest durable completion, and the
+/// latest stretch its stream waited for a proof it lacked, from the poll that first wanted one to
+/// the completion that ended it, if one has. An owner may report it as the node's local health.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnProof {
+    /// The latest durable completion reported, on this node's clock.
+    pub durable_ns: Option<u64>,
+    /// The latest wait for a proof: since, and its end.
+    pub waited: Option<(u64, Option<u64>)>,
+}
+
 /// The latest heartbeat taken from a peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Last {
@@ -327,6 +343,13 @@ pub struct Liveness {
     durable: Durable,
     /// Whether a liveness write is out.
     flushing: bool,
+    /// The latest stretch the stream waited for a proof it lacked: from the poll that first wanted
+    /// one to the durable completion that ended it, if one has (`pair::Local`, `docs/timing.md` §2.8,
+    /// "A judge whose own proof stalls").
+    stall: Option<(u64, Option<u64>)>,
+    /// The latest time the stream judged its peers at, a poll's or a heartbeat's arrival: what the
+    /// trust it shows is stated at.
+    judged_ns: u64,
     exposure: Exposure,
     last_poll_ns: Option<u64>,
     /// The earliest heartbeat due and freshness point, as the last poll left them: what
@@ -464,11 +487,11 @@ fn send(
 }
 
 /// The earlier of `wake` and `pair`'s next heartbeat due after `now_ns` and freshness point.
-fn earliest(wake: Option<u64>, pair: &Pair, now_ns: u64) -> Option<u64> {
+fn earliest(wake: Option<u64>, pair: &Pair, local: &pair::Local, now_ns: u64) -> Option<u64> {
     [
         wake,
         pair.next_due().filter(|due| *due > now_ns),
-        pair.deadline(),
+        pair.deadline(local, now_ns),
     ]
     .into_iter()
     .flatten()
@@ -492,6 +515,8 @@ impl Liveness {
             flushes: Flushes::new(),
             durable: Durable::default(),
             flushing: false,
+            stall: None,
+            judged_ns: 0,
             exposure: settings.history,
             last_poll_ns: None,
             next_wake: None,
@@ -559,6 +584,14 @@ impl Liveness {
         let wanted = next.max(taken.saturating_mul(2)).saturating_sub(taken);
         let wait = pair::nanos(slowest).saturating_mul(wanted);
         Some(arrival_ns.saturating_add(wait))
+    }
+
+    /// What the node knows of its own durability, which a point that passed is judged with.
+    fn local(&self) -> pair::Local {
+        pair::Local {
+            durable_ns: self.durable.latest_ns,
+            stall: self.stall,
+        }
     }
 
     /// The widest arrivals the pairs' configurations were made from.
@@ -654,6 +687,12 @@ impl Liveness {
         if write == Write::Liveness {
             self.flushing = false;
         }
+        // Any completion is the device's progress: the stretch the stream waited ends with it.
+        if let Some((since, None)) = self.stall
+            && durable_ns >= since
+        {
+            self.stall = Some((since, Some(durable_ns)));
+        }
     }
 
     /// A liveness message from `from`, received at `arrival_ns` on this node's clock (the kernel's
@@ -674,11 +713,13 @@ impl Liveness {
         }
         let beat = Heartbeat::decode(message)?;
         let granularity = self.granularity();
+        let local = self.local();
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
             granularity,
             exposure: &self.exposure,
             evidence: self.evidence.as_ref(),
+            local,
         };
         let mut changes = [None, None, None];
         let mut taken = pair::Taken::default();
@@ -689,7 +730,8 @@ impl Liveness {
         // The heartbeat moved this pair's freshness point; the others are as the last poll left
         // them. The earliest of the last poll's wake and this pair's is never past the earliest of
         // them all, so an owner that asks before it polls is woken in time, if early.
-        self.next_wake = [self.next_wake, pair.deadline()]
+        self.judged_ns = self.judged_ns.max(arrival_ns);
+        self.next_wake = [self.next_wake, pair.deadline(&local, arrival_ns)]
             .into_iter()
             .flatten()
             .min();
@@ -743,6 +785,7 @@ impl Liveness {
         // The wake to ask, gathered in the same walk: each pair is final once it has been judged
         // and has sent, and a second walk of the map was a tenth of a poll.
         let evidence = self.evidence_at(now_ns);
+        let local = self.local();
         let mut wake: Option<u64> = None;
         for (&peer, pair) in &mut self.pairs {
             pair.attached(now_ns);
@@ -757,14 +800,21 @@ impl Liveness {
                     &self.exposure,
                 );
             }
-            if let Some(change) = pair.judge(peer, now_ns) {
+            let (change, probe) = pair.judge(peer, now_ns, &local);
+            if let Some(change) = change {
                 out.change(change);
             }
+            wants_flush |= probe;
             // Its own stream is read only while the node has no measured evidence.
             let own = self.evidence.is_none().then_some(&mut self.own);
             wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
-            wake = earliest(wake, pair, now_ns);
+            wake = earliest(wake, pair, &local, now_ns);
         }
+        // The stream wants a proof it lacks: from now, unless it has waited since earlier.
+        if wants_flush && !matches!(self.stall, Some((_, None))) {
+            self.stall = Some((now_ns, None));
+        }
+        self.judged_ns = self.judged_ns.max(now_ns);
         if wants_flush && !self.flushing {
             self.flushing = true;
             out.flush();
@@ -801,7 +851,12 @@ impl Liveness {
     fn wake_after(&self, now_ns: u64) -> Option<u64> {
         self.pairs
             .values()
-            .flat_map(|pair| [pair.next_due().filter(|due| *due > now_ns), pair.deadline()])
+            .flat_map(|pair| {
+                [
+                    pair.next_due().filter(|due| *due > now_ns),
+                    pair.deadline(&self.local(), now_ns),
+                ]
+            })
             .flatten()
             .min()
     }
@@ -858,7 +913,10 @@ impl Liveness {
 
     /// What this node believes of `peer`, if they share a group.
     pub fn trust(&self, peer: PeerId) -> Option<Trust> {
-        self.pairs.get(&peer).map(Pair::trust)
+        let local = self.local();
+        self.pairs
+            .get(&peer)
+            .map(|pair| pair.trust_at(&local, self.judged_ns))
     }
 
     /// The peers this node suspects.
@@ -879,6 +937,14 @@ impl Liveness {
     /// schedule and flush taken out): a path for the election law's ballot.
     pub fn round_trip(&self, peer: PeerId) -> Option<&ExchangeRtt> {
         self.pairs.get(&peer).map(Pair::round_trip)
+    }
+
+    /// What this node knows of its own durability ([`OwnProof`]).
+    pub fn own_proof(&self) -> OwnProof {
+        OwnProof {
+            durable_ns: self.durable.latest_ns,
+            waited: self.stall,
+        }
     }
 
     /// What the pair with `peer` has done and promised.

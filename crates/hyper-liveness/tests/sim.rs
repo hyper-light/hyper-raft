@@ -537,13 +537,14 @@ impl Sim {
         let count = self.nodes.len() as u64;
         let n = &mut self.nodes[node];
         let told = n.owner.changes.len();
+        // What the node knew of its own durability as the call judged.
+        let own = n.liveness.own_proof();
         n.liveness.poll(now, &mut n.owner);
         let id = n.owner.id;
         let trusts: Vec<(PeerId, Option<Trust>)> = (1..=count)
             .filter(|peer| *peer != id)
             .map(|peer| (peer, n.liveness.trust(peer)))
             .collect();
-        let own = n.liveness.own_proof();
         n.record.polled(now, &n.owner.changes[told..], trusts, own);
     }
 
@@ -553,10 +554,10 @@ impl Sim {
         let n = &mut self.nodes[node];
         let peer = from as u64 + 1;
         let told = n.owner.changes.len();
+        let own = n.liveness.own_proof();
         let outcome = n.liveness.on_heartbeat(peer, bytes, stamp, &mut n.owner);
         let beat = Beat::of(bytes, stamp).expect("the simulation sends heartbeats whole");
         let holds = n.liveness.trust(peer);
-        let own = n.liveness.own_proof();
         n.record
             .fed(peer, beat, outcome, &n.owner.changes[told..], holds, own);
         outcome
@@ -1196,11 +1197,13 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
         let victim = 3usize;
         // Killed while every survivor trusts it: one that suspected it by a mistake just before
         // would hold that suspicion through the kill and make no new one to measure.
+        // Trusted to a point still ahead: one trusted to a point that passed waits on its judge's
+        // own proof, and is judged at it (`docs/timing.md` §2.8, "A judge whose own proof stalls").
         let trusted = |sim: &Sim| {
             (0..3).all(|node| {
                 matches!(
                     sim.nodes[node].liveness.trust(victim as u64 + 1),
-                    Some(Trust::Trusted { .. })
+                    Some(Trust::Trusted { until_ns }) if until_ns > sim.now
                 )
             })
         };
@@ -1270,7 +1273,7 @@ fn a_stalled_disk_is_suspected_as_a_crash_is() {
                 (0..2).any(|node| {
                     !matches!(
                         sim.nodes[node].liveness.trust(stalled as u64 + 1),
-                        Some(Trust::Trusted { .. })
+                        Some(Trust::Trusted { until_ns }) if until_ns > sim.now
                     )
                 })
             },
@@ -1422,7 +1425,7 @@ fn a_restarted_peer(seed: u64) {
                 sim.nodes[node].restarts.is_empty()
                     || !matches!(
                         sim.nodes[node].liveness.trust(3),
-                        Some(Trust::Trusted { .. })
+                        Some(Trust::Trusted { until_ns }) if until_ns > sim.now
                     )
             })
         },
@@ -1787,9 +1790,18 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
             );
             // A poll comes at most a timer's lateness, or a freeze, past what it waits for: the
             // latest and the longest this run drew; and a judge with nothing durable since the
-            // point judges on the flush it asks first (`docs/timing.md` §2.8, "A judge whose own
-            // proof stalls"), at most the longest write the run drew.
-            let late = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            // point judges on its next completion, its own stream's within its sending interval
+            // (`docs/timing.md` §2.8, "A judge whose own proof stalls"): at most the longest
+            // interval it sends at and the longest write the run drew.
+            let sending = (0..2usize)
+                .flat_map(|node| {
+                    let sim = &sim;
+                    (1..=3u64)
+                        .filter_map(move |peer| sim.nodes[node].liveness.report(peer)?.sending)
+                })
+                .max()
+                .map_or(0, |interval| interval.as_nanos() as u64);
+            let late = sim.latest_late + sim.longest_freeze + sim.longest_write + sending;
             for node in 0..2usize {
                 let suspicion = sim.nodes[node]
                     .suspicions
@@ -1978,7 +1990,7 @@ fn settled(sim: &mut Sim) -> u64 {
                 (1..=count).filter(|p| *p != node as u64 + 1).any(|peer| {
                     !matches!(
                         sim.nodes[node].liveness.trust(peer),
-                        Some(Trust::Trusted { .. })
+                        Some(Trust::Trusted { until_ns }) if until_ns > sim.now
                     )
                 })
             })
@@ -2015,7 +2027,25 @@ fn flushes_stalled_together_as_on_a_shared_volume_are_no_ones_failure() {
             for node in &mut sim.nodes {
                 node.disk_held_until = until;
             }
-            sim.run_while(|_| true, Some(until));
+            // Every pair stays shown judged while its judge waits on its own proof: an owner reads
+            // `Trust::Unconfigured` as a link not judged yet, and read so through a start of slow
+            // first flushes, mantle's nodes on windows-x86_64 elected no one (`b96bed9`).
+            sim.run_while(
+                |sim| {
+                    for (index, node) in sim.nodes.iter().enumerate() {
+                        for peer in (1..=3u64).filter(|p| *p != index as u64 + 1) {
+                            assert_ne!(
+                                node.liveness.trust(peer),
+                                Some(Trust::Unconfigured),
+                                "{name} seed {seed}: node {} showed {peer} unjudged",
+                                index + 1
+                            );
+                        }
+                    }
+                    true
+                },
+                Some(until),
+            );
             for (index, node) in sim.nodes.iter().enumerate() {
                 let during: Vec<_> = node
                     .suspicions

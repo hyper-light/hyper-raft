@@ -89,8 +89,8 @@ pub(crate) enum Entry {
     Holds { peer: PeerId, trust: Option<Trust> },
     /// A heartbeat the node sent `peer`: its run and number.
     Sent { peer: PeerId, run: u64, seq: u64 },
-    /// What the node knows of its own durability after the next call (`Liveness::own_proof`),
-    /// where it moved: what a point that passed is judged with.
+    /// What the node knew of its own durability as the next call judged (`Liveness::own_proof`,
+    /// read before it), where it moved: what a point that passed is judged with.
     Own(OwnProof),
 }
 
@@ -361,10 +361,10 @@ fn judged(refused: Option<Refusal>) -> bool {
     })
 }
 
-/// Whether the node's own durability, `own` after the call, held a point `point` of a peer last
+/// Whether the node's own durability, `own` as the call judged, held a point `point` of a peer last
 /// heard at `heard` past it untold (`docs/timing.md` §2.8, "A judge whose own proof stalls"): its
 /// own wait for a proof under way, or ended since the peer was heard, or nothing of its own made
-/// durable since the point, which it asks a proof for first.
+/// durable since the point, whose next completion it waits for.
 fn held_by_own(own: &OwnProof, heard: u64, point: u64) -> bool {
     matches!(own.waited, Some((_, None)))
         || matches!(own.waited, Some((_, Some(end))) if end >= heard)

@@ -1136,15 +1136,20 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   measures directly. The rule, at a freshness point that has passed, the peer expected a margin
   before it:
   - while the judge's own proof is outstanding (its stream wanted one, from the poll that first did,
-    and no write of its own has completed since), it waits: the pair is judged by no point
-    (`Trust::Unconfigured`, which the owner trusts), and asks no wake, since the completion polls;
+    and no write of its own has completed since), it waits, and asks no wake, since the completion
+    polls; the owner is shown the pair trusted to the point that passed, as before the rule (shown
+    `Trust::Unconfigured`, a pair's state before its first margin, a judged link read as unjudged:
+    `flushes_stalled_together_...` asserts none is);
   - once that proof comes, a wait at least as long as the margin, which ended after the peer was
     expected, gives the peer the margin again from its end, since the peer's stream resumes no
     sooner; the suspicion states that point, and its bound grows by the stall, as `latest_wake`
     states the owner's own lateness (§2.7). A shorter wait proves nothing past its end;
-  - a judge that has made nothing durable since the point, and has no proof outstanding, asks for
-    one, and judges on its completion: what it judges by is its own device's progress since the
-    peer was due. A completion after the expected arrival but before the point does not prove it,
+  - a judge that has made nothing durable since the point, and has no proof outstanding, waits for
+    its next completion and judges on it: what it judges by is its own device's progress since the
+    peer was due. It asks no write for it: its stream asks one within its sending interval, and its
+    log's come as they come, so the rule adds no I/O of its own (a probe write asked at every
+    passed point kept a liveness write queued nearly always while peers' heartbeats came slowly,
+    ahead of the log's on a device whose writes took seconds). A completion after the expected arrival but before the point does not prove it,
     since a shared journal can stall after it with the peer's flush, asked earlier, still in it.
   - a point once held later is held there and no further (`Pair::held`), whatever the judge's own
     device does after: restated at every wait, a judge whose every write was slower than the margin
@@ -1154,8 +1159,9 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
     flushes took 182 to 208 ms logging no suspicion of a dead follower in 4 s). A hold is so bounded
     by one wait of the judge's own and the margin.
   Costs. A crashed peer is detected late by up to one of the judge's own stalls and the margin, and
-  by one flush of its own where it had made nothing durable since the point (over 256 seeds of `a_peer_dead_before_...` the
-  median time to notice a death rose 3 to 17 ms, the most on macOS from 1,097 to 1,575 ms, one seed).
+  by one of its sending intervals and a flush where it had made nothing durable since the point (over
+  256 seeds of `a_peer_dead_before_...` the median time to notice a death rose 3 to 17 ms, the most
+  on macOS from 1,097 to 1,575 ms, one seed; its bound now adds the judge's sending interval).
   A node whose disk stalls for good never suspects anyone, which is safe: its own stream stops, its
   peers suspect it as a crashed node, and it cannot lead, its log writes never completing. Over 256
   seeds of `live_peers_...` the suspicions of live peers fell from 425 to 388 at the same allowance

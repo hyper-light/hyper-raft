@@ -21,7 +21,7 @@
 //! takes a heartbeat only when the count moved and the flush came after the previous heartbeat was
 //! due, so a sender that heartbeats without flushing is not trusted either. A judge whose own
 //! proof is outstanding judges no peer by it until it comes, and one with nothing durable since a
-//! point asks for a proof first: on a device nodes share, a stall stops every stream at once
+//! point waits for its next completion: on a device nodes share, a stall stops every stream at once
 //! (Lifeguard's local health, applied to the device: `docs/timing.md` §2.8, "A judge whose own
 //! proof stalls").
 //!
@@ -800,11 +800,14 @@ impl Liveness {
                     &self.exposure,
                 );
             }
-            let (change, probe) = pair.judge(peer, now_ns, &local);
+            // A judge with nothing durable since a passed point asks no write of its own for it: its
+            // stream asks one within its interval, and its log's writes come as they come. Asked at
+            // every passed point, a liveness write was queued nearly always while peers' heartbeats
+            // came slowly, ahead of the log's on a device whose writes took seconds.
+            let (change, _) = pair.judge(peer, now_ns, &local);
             if let Some(change) = change {
                 out.change(change);
             }
-            wants_flush |= probe;
             // Its own stream is read only while the node has no measured evidence.
             let own = self.evidence.is_none().then_some(&mut self.own);
             wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);

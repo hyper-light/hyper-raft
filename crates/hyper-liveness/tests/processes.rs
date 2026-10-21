@@ -317,13 +317,9 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         sent: Vec::new(),
     };
     let now = clock.now_ns();
+    let own = liveness.own_proof();
     liveness.poll(now, &mut first);
-    record.polled(
-        now,
-        &first.changes,
-        trusts(&liveness, &peers),
-        liveness.own_proof(),
-    );
+    record.polled(now, &first.changes, trusts(&liveness, &peers), own);
     for (peer, run, seq) in first.sent.drain(..) {
         record.sent(peer, run, seq);
     }
@@ -461,6 +457,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
         }
         for (from, at, message) in &inbox {
             let told = asked.changes.len();
+            let own = liveness.own_proof();
             let outcome = liveness.on_heartbeat(*from, message, *at, &mut asked);
             if let Some(beat) = Beat::of(message, *at) {
                 record.fed(
@@ -469,7 +466,7 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
                     outcome,
                     &asked.changes[told..],
                     liveness.trust(*from),
-                    liveness.own_proof(),
+                    own,
                 );
             }
         }
@@ -482,13 +479,9 @@ async fn member(me: u64, nodes: u64, file: std::path::PathBuf) {
             liveness.on_durable(Write::Liveness, started, durable);
         }
         let told = asked.changes.len();
+        let own = liveness.own_proof();
         liveness.poll(now, &mut asked);
-        record.polled(
-            now,
-            &asked.changes[told..],
-            trusts(&liveness, &peers),
-            liveness.own_proof(),
-        );
+        record.polled(now, &asked.changes[told..], trusts(&liveness, &peers), own);
         for (peer, run, seq) in asked.sent.drain(..) {
             record.sent(peer, run, seq);
         }

@@ -38,7 +38,8 @@ pub(crate) struct Local {
 pub(crate) enum Held {
     /// At this time: the point itself, or later where the judge's own proof stalled over it.
     At(u64),
-    /// Not until the judge's own proof comes; `probe` when it must first ask for one.
+    /// Not until the judge's own proof comes; `probe` when none is outstanding and nothing is durable
+    /// since the point, so the judge's next completion, of any write, is what it waits for.
     Waiting { probe: bool },
 }
 
@@ -49,7 +50,7 @@ impl Local {
     /// produce. Once it comes, a stall at least as long as the margin it holds the peer to gives the
     /// peer that margin again from its end, since the peer's stream resumes no sooner; a shorter one
     /// proves nothing past its end. A judge with nothing durable since the point, and no proof
-    /// outstanding, asks for one first, and judges on its completion: what it judges by is its own
+    /// outstanding, waits for its next completion and judges on it: what it judges by is its own
     /// device's progress since the peer was due. Lifeguard's local health (Dadgar, Phillips and
     /// Currey 2018) applied to the flush proof.
     pub(crate) fn judge(&self, point: u64, margin_ns: u64) -> Held {
@@ -451,14 +452,17 @@ impl Pair {
     }
 
     /// The trust the owner is shown at `now_ns`: [`trust`](Self::trust), with a point that has
-    /// passed restated where the node's own durability holds it (`Local::judge`): to the later time,
-    /// or to none, judged by no point, while the node's own proof is outstanding.
+    /// passed restated to the later time the node's own durability holds it to (`Local::judge`).
+    /// While that waits for the node's own proof, the pair shows its own trust, to the point that
+    /// passed, as before the rule: shown judged by no point (`Trust::Unconfigured`, a pair's state
+    /// before its first margin), every judged link read as unjudged to an owner through a start
+    /// whose first flushes took seconds (mantle's real processes on windows-x86_64 at `b96bed9`).
     pub(crate) fn trust_at(&self, local: &Local, now_ns: u64) -> Trust {
         match (self.trust(), self.point()) {
             (Trust::Trusted { until_ns }, Some(point)) if until_ns <= now_ns => {
                 match self.hold(point, local) {
                     Held::At(at) => Trust::Trusted { until_ns: at },
-                    Held::Waiting { .. } => Trust::Unconfigured,
+                    Held::Waiting { .. } => Trust::Trusted { until_ns },
                 }
             }
             (trust, _) => trust,

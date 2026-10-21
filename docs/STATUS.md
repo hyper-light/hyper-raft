@@ -231,11 +231,12 @@ is worked around.
   one ext4 volume, every all-pairs burst lined up with every node's flushes stalled at once, the
   cause of its liveness stalls and leader changes on `1b85eaf` as on this branch. A judge whose own
   proof is outstanding now waits for it, a long stall giving the peer its margin again from its end,
-  and a judge with nothing durable since the point asks for a proof first (Lifeguard's local
+  and a judge with nothing durable since the point waits for its next completion (Lifeguard's local
   health, applied to the device: `docs/timing.md` §2.8, "A judge whose own proof stalls"). A point
   is held once: restated at every wait, a judge whose every write was slower than the margin never
   suspected a dead peer (mantle's pinned suite at `1ccd38d`). Costs: a crash is detected late by up
-  to one of the judge's own stalls and the margin, or one flush; a node whose disk stalls for good
+  to one of the judge's own stalls and the margin, or one sending interval and a flush; a node whose
+  disk stalls for good
   suspects no one, its peers suspecting it. Tests in tests/sim.rs, the shared stall and the
   stall for good red on `79eb22b`.
 

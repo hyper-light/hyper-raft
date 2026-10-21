@@ -237,7 +237,10 @@ is worked around.
   each hand-over naming the next over all of them, the turn starting again at each term led
   (`docs/timing.md` §2.9, "Who the heir is"). A leader that trusts no voter at its step-down orders
   none at once, and decides a round and a draw later: ordered at once, every short stall of a
-  leader's host moved its group's leadership (mantle's cluster tests, run 39525134119). Tests in `tests/suspicion.rs`, the first two red on
+  leader's host moved its group's leadership (mantle's cluster tests, run 39525134119). It orders no
+  heir, nor campaigns, within the election the law expects of its last order: re-ordered a round and
+  a draw apart, stepped-down members forced heirs milliseconds apart and split votes (mantle's suite
+  pinned on Linux at `eb85154`). Tests in `tests/suspicion.rs`, the first two red on
   `1b85eaf`, the third with the turn counted from the member's start.
 - **hyper-liveness: a node all of whose links fell silent before it had evidence judged no peer it
   had heard (found by mantle).** Its pool and its links' estimators were fed nothing more, and only

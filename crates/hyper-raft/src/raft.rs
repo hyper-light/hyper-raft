@@ -2303,6 +2303,7 @@ impl<S: Storage> Raft<S> {
         };
         if let Some(watch) = self.watch.as_deref_mut() {
             watch.handovers = watch.handovers.wrapping_add(1);
+            watch.ordered = Some(watch.now);
         }
         self.send(proto::message(heir, MessageType::MsgTimeoutNow))
     }
@@ -2614,6 +2615,19 @@ impl<S: Storage> Raft<S> {
         if !due {
             return Ok(false);
         }
+        // An order it gave forces a campaign, which the law expects to take an election (`T_E`):
+        // until that has passed since its last order, the member that led neither orders another
+        // heir nor campaigns, or the candidates it made would split the vote. Re-ordered a round and
+        // a draw after the last, a millisecond on loopback, stepped-down members forced a new heir
+        // every 4 to 9 ms, two in one millisecond, and split votes (mantle's cluster suite pinned
+        // on Linux at eb85154, 776 orders in one round of it).
+        if led
+            && let (Some(at), Some(election)) = (watch.ordered, watch.election())
+            && now < at.saturating_add(election)
+        {
+            watch.campaign = Arm::At(at.saturating_add(election));
+            return Ok(false);
+        }
         // The rules that hold a campaign are asked only of one that is due: the owner wakes a
         // member after every call it makes (`Raft::deadline` likewise).
         let held = watch.held;
@@ -2714,6 +2728,7 @@ impl<S: Storage> Raft<S> {
             // The hand-over at its step-down names the heir that holds the
             // most, whatever orders it gave in terms it led before.
             watch.handovers = 0;
+            watch.ordered = None;
         }
         // Its log need not be durable yet: a member that is the one voter
         // is elected before its writes are (`docs/durable.md` §2.1). It

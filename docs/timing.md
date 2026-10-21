@@ -1580,8 +1580,15 @@ spend a term and depose a leader that never left.
   its voters to a later term, where they know no leader, and an heir that cannot win leaves them
   there all the same. Until its term moves or it follows another leader of it, a member that led its
   term and cannot campaign hands over again a round and a draw after the last, as a candidate asks
-  again, for the order may be lost; a member of a later term answers an old order (as it answers an
-  old leader's heartbeat), which moves the sender's term.
+  again, for the order may be lost, but never within the election the law expects (`T_E`,
+  `Timing::election`) of its last order, nor campaigns within it (`Watch::ordered`): each order forces
+  a campaign, and a second before the first can finish makes two candidates that split the vote.
+  Re-ordered a round and a draw after the last, about a millisecond on loopback, stepped-down members
+  forced a new heir every 4 to 9 ms and two within one millisecond, and votes split (mantle's cluster
+  suite pinned on Linux at `eb85154`, 776 orders in one round of it;
+  `a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last`: orders 4.12 ms apart
+  against a `T_E` of 4.40 ms without the rule). A member of a later term answers an old order (as it
+  answers an old leader's heartbeat), which moves the sender's term.
 
   *Who the heir is* (`Raft::hand_over`). The heirs are every other voter, in order: those the
   leader's detectors trust before those they suspect, then the most of its log held first, then by

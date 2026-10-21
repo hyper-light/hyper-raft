@@ -84,6 +84,8 @@ struct Sim {
     now: u64,
     /// Every message sent, in order.
     sent: Vec<Message>,
+    /// When each message in `sent` was sent.
+    sent_at: Vec<u64>,
     /// Members cut off: what is sent to them is lost.
     cut: Vec<u64>,
     /// Who led each term.
@@ -116,6 +118,7 @@ impl Sim {
             sent_count: 0,
             now: 0,
             sent: Vec::new(),
+            sent_at: Vec::new(),
             cut: Vec::new(),
             leaders: BTreeMap::new(),
             timing,
@@ -155,6 +158,7 @@ impl Sim {
         }
         for message in output.messages {
             self.sent.push(message.clone());
+            self.sent_at.push(self.now);
             self.sent_count += 1;
             self.flight
                 .insert((self.now + LATENCY, self.sent_count), message);
@@ -289,6 +293,15 @@ impl Sim {
         assert!(self.run_until(|sim| sim.leader() == Some(id)));
         // Everything in flight lands, and the group goes quiet.
         assert!(self.run(), "the group never went quiet");
+    }
+    /// When `member` sent each hand-over order from `from` on.
+    fn order_times(&self, member: u64, from: usize) -> Vec<u64> {
+        self.sent[from..]
+            .iter()
+            .zip(&self.sent_at[from..])
+            .filter(|(m, _)| m.msg_type == MessageType::MsgTimeoutNow && m.from == member)
+            .map(|(_, at)| *at)
+            .collect()
     }
     fn count_sent(&self, from: usize, kind: MessageType) -> usize {
         self.sent[from..]
@@ -770,6 +783,51 @@ fn a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over
         [1, 2, 4].map(|id| sim.term(id))
     );
     assert!(sim.term(1) > term);
+}
+
+/// A member that led its term orders no heir sooner than the election the law expects (`T_E`)
+/// after its last order: each order forces a campaign, and a second before the first can finish
+/// makes two candidates that split the vote. Leader 1 of five suspects every other voter for good
+/// and hears nothing after its step-down, so its term never moves and it orders for as long as the
+/// run lasts; re-ordered a round and a draw after the last, stepped-down members forced a new heir
+/// every 4 to 9 ms on loopback, and two within one millisecond (mantle's cluster suite at
+/// `eb85154`).
+#[test]
+fn a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last() {
+    let (timing, _) = timing_for(5);
+    let election = timing.election.as_nanos() as u64;
+    let mut sim = Sim::new(5, &Sim::voters(&[1, 2, 3, 4, 5]), timing, 7);
+    sim.found(1);
+    let from = sim.sent.len();
+    for member in [2, 3, 4, 5] {
+        sim.suspect(1, member);
+    }
+    assert_eq!(sim.peek(1).view().role, 0);
+    sim.cut.push(1);
+    let until = sim.now + 20 * election;
+    sim.run_until_time(until, |_| false);
+    let mut orders = Vec::new();
+    for message in &sim.sent[from..] {
+        if message.msg_type == MessageType::MsgTimeoutNow && message.from == 1 {
+            orders.push(message.to);
+        }
+    }
+    assert!(
+        orders.len() >= 2,
+        "it ordered {orders:?}: the test needs it to order again"
+    );
+    let times = sim.order_times(1, from);
+    for pair in times.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= election,
+            "orders {} ns apart, within an expected election of {election} ns: {orders:?}",
+            pair[1] - pair[0]
+        );
+    }
+    assert!(
+        (2..=5).any(|id| sim.peek(id).view().role == 2),
+        "the others elected no one"
+    );
 }
 
 /// Each term a member leads starts its hand-overs from the first heir: the voter it trusts that

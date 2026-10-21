@@ -612,7 +612,9 @@ argument, the configurations and marks it covers, and CTRL mapped onto it; `docs
   trusting none it may be the one that stalled, and its `led` path decides a round and a draw later,
   re-electing it if it trusts a quorum again: ordered at once, every short stall moved the group's
   leadership (mantle run 39525134119; `a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`,
-  red on `757740c`).
+  red on `757740c`). It orders no heir and campaigns not within `Timing::election` of its last order
+  (`Watch::ordered`): a round and a draw apart, its orders forced competing candidates
+  (`a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last`, red at `eb85154`).
 - **Tests**: `tests/repair.rs` gains three: PAR's Figure 4(b) in suffix form (fails on R-5: "no one
   was elected"), a marked log that may lack a committed entry never elected (fails with the
   candidate's own vote counted, and with the voters judging by their logs: "committed another entry

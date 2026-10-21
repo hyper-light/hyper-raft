@@ -650,9 +650,10 @@ fn a_leader_that_steps_down_hands_over() {
     assert_eq!(sim.leader(), Some(2), "the one voter it still trusted");
 }
 
-/// A leader whose detectors suspect every other voter steps down and still hands over: a
-/// suspicion says only that it does not hear the voter, not that the voter does not hear it, and
-/// its followers, which hear it and trust it for good, would never campaign. Handing over to
+/// A leader whose detectors suspect every other voter steps down and still hands over, a round and
+/// a draw later while it suspects them still: a suspicion says only that it does not hear the voter,
+/// not that the voter does not hear it, and its followers, which hear it and trust it for good,
+/// would never campaign. Handing over to
 /// none, it stood leaderless for as long as its suspicions lasted (mantle's node simulation, a
 /// leader whose plane went deaf; mantle's Windows CI, run 39503516282).
 #[test]
@@ -664,16 +665,111 @@ fn a_leader_that_suspects_every_other_voter_hands_over_all_the_same() {
     sim.suspect(1, 2);
     sim.suspect(1, 3);
     assert_eq!(sim.peek(1).view().role, 0);
+    // It may be the one that stalled: no order at once (the next test).
+    assert_eq!(sim.count_sent(from, MessageType::MsgTimeoutNow), 0);
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some()),
+        "its followers trusted it and no one campaigned"
+    );
     assert_eq!(
         sim.count_sent(from, MessageType::MsgTimeoutNow),
         1,
         "it told no voter to campaign"
     );
-    assert!(
-        sim.run_until(|sim| sim.leader().is_some()),
-        "its followers trusted it and no one campaigned"
-    );
     assert!(sim.leader() != Some(1));
+}
+
+/// A leader that suspects every other voter for less than a round, as one whose host stalls does,
+/// steps down and orders no hand-over at once: within a round and a draw it trusts a quorum again and
+/// campaigns, and the group elects it again, its followers having trusted it throughout. Ordered at
+/// the step-down, the heir's campaign moved the group's leadership at every short stall (mantle's
+/// cluster tests on a loaded Linux runner, run 39525134119: the leader elected during a cut lost its
+/// leadership around the rejoin, to the lowest id holding the log, in three tests of three).
+#[test]
+fn a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 7);
+    sim.found(1);
+    let term = sim.term(1);
+    let from = sim.sent.len();
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    assert_eq!(sim.peek(1).view().role, 0);
+    sim.trust(1, 2);
+    sim.trust(1, 3);
+    assert!(sim.run_until(|sim| sim.leader().is_some()));
+    assert_eq!(
+        sim.count_sent(from, MessageType::MsgTimeoutNow),
+        0,
+        "it handed over at its step-down"
+    );
+    assert_eq!(
+        sim.leader(),
+        Some(1),
+        "its stall moved the group's leadership"
+    );
+    assert!(sim.term(1) > term);
+}
+
+/// A leader in the joint configuration that replaces a failed voter with a spare (`{1, 2, 3}` to
+/// `{1, 2, 4}`, 3 dead) suspects the survivor 2 as well and steps down; the heir it trusts is the
+/// spare, which has not taken the joint entry and is a learner by its own configuration, so it
+/// refuses the order; 2 trusts the leader. The group elects all the same within the rounds its
+/// timing states (mantle's `a_follower_lost_for_good_is_replaced_*`, stalled once in five rounds on
+/// a pinned Linux runner at `757740c`).
+#[test]
+fn a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over() {
+    let (timing, _) = timing_for(3);
+    let boot = ConfState {
+        voters: vec![1, 2, 3],
+        learners: vec![4],
+        ..ConfState::default()
+    };
+    let mut sim = Sim::new(4, &boot, timing, 11);
+    sim.found(1);
+    sim.stop(3);
+    sim.suspect(1, 3);
+    sim.cut.push(4);
+    let change = ConfChangeV2 {
+        transition: ConfChangeTransition::Explicit,
+        changes: vec![
+            ConfChangeSingle {
+                change_type: ConfChangeType::AddNode,
+                node_id: 4,
+            },
+            ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode,
+                node_id: 3,
+            },
+        ],
+        context: vec![],
+    };
+    sim.node(1).propose_change(&change);
+    sim.settle(1);
+    let joint = sim.peek(1).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(1).view().commit >= joint));
+    sim.cut.clear();
+    let from = sim.sent.len();
+    let term = sim.term(1);
+    sim.suspect(1, 2);
+    assert_eq!(
+        sim.peek(1).view().role,
+        0,
+        "it kept a quorum of the old half"
+    );
+    // Its first order may go to the spare, which refuses it as a learner; then 2.
+    let elected = sim.run_until(|sim| sim.leader().is_some());
+    let orders: Vec<u64> = sim.sent[from..]
+        .iter()
+        .filter(|m| m.msg_type == MessageType::MsgTimeoutNow)
+        .map(|m| m.to)
+        .collect();
+    assert!(
+        elected,
+        "no leader; orders {orders:?}, terms {:?}",
+        [1, 2, 4].map(|id| sim.term(id))
+    );
+    assert!(sim.term(1) > term);
 }
 
 /// Each term a member leads starts its hand-overs from the first heir: the voter it trusts that

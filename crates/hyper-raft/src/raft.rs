@@ -2230,8 +2230,22 @@ impl<S: Storage> Raft<S> {
     }
     /// Check-quorum, from the detectors (Raft §6.2): a leader they leave no
     /// quorum steps down, and hands over.
+    ///
+    /// It orders a hand-over at once only to a voter it trusts. Trusting none, it may be the one
+    /// that stalled (a host that froze suspects every peer at once), and its followers trust it:
+    /// the `led` path in `wake_follower` decides a round and a draw later, campaigning if it trusts
+    /// a quorum again, which re-elects it, and otherwise handing over over every voter. Ordered at
+    /// the step-down, the heir's campaign moved the group's leadership at every short stall
+    /// (mantle's cluster tests on a loaded Linux runner, run 39525134119).
     fn step_down(&mut self) -> Result<()> {
-        self.hand_over()?;
+        let id = self.id;
+        let configuration = self.tracker.configuration();
+        let trusted_heir = self.tracker.iter().any(|(member, _)| {
+            member != id && configuration.votes(member) && !self.suspects(member)
+        });
+        if trusted_heir {
+            self.hand_over()?;
+        }
         let term = self.term;
         self.become_follower(term, 0)
     }

@@ -1586,8 +1586,22 @@ spend a term and depose a leader that never left.
   *Who the heir is* (`Raft::hand_over`). The heirs are every other voter, in order: those the
   leader's detectors trust before those they suspect, then the most of its log held first, then by
   id; each hand-over names the next (`Watch::handovers`, from the first again at each term the member
-  leads), so the order at the step-down goes to the trusted voter that holds the most. A voter the
-  leader suspects is still an heir. A suspicion is one-way evidence: that the leader does not hear a
+  leads), so the order at the step-down goes to the trusted voter that holds the most. At the
+  step-down it orders at once only where it still trusts a voter: trusting none, it may be the one
+  that stalled (a host that froze suspects every peer at once), while its followers trust it, so
+  the `led` path decides a round and a draw later (`wake_follower`), campaigning if it trusts a
+  quorum again, which re-elects it, and otherwise handing over. Ordered at the step-down, the heir's
+  campaign moved the group's leadership at every short stall: mantle's cluster tests on a loaded
+  Linux runner (run 39525134119, job 118977876472) cut a leader off, let the others elect, rejoined
+  it, and found the leader elected during the cut replaced around the rejoin in three tests of
+  three (`a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`, red on
+  `757740c`). A voter the leader suspects is still an heir. A spare that replaces a failed voter
+  is an heir the leader trusts while it has not taken the joint entry and refuses the order as a
+  learner by its own configuration; the next order goes to the next heir
+  (`a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over`: `{1, 2, 3}` to
+  `{1, 2, 4}`, 3 dead, the leader suspecting 2 as well; orders `[4, 2]` and 2 elected, where on
+  `1b85eaf` the orders were `[4, 4, 4, 4, 4]` and no term moved, the one trusted heir named for
+  good). A suspicion is one-way evidence: that the leader does not hear a
   voter says nothing of whether the voter hears the leader, and a leader steps down exactly when it
   and those it trusts are no quorum, so it may suspect every other voter while they all hear it and
   trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
@@ -1605,8 +1619,8 @@ spend a term and depose a leader that never left.
   step-down knows what each holds: a follower's progress is reset (`Raft::reset`), as a restarted
   leader's is, so the orders after it turn through the heirs it trusts and then the rest. Tests
   (`tests/suspicion.rs`): `a_leader_that_suspects_every_other_voter_hands_over_all_the_same`
-  (leader 1 of three suspects 2 and 3, which trust it for good; on `1b85eaf` no order, `left: 0,
-  right: 1`) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` (leader 1 of five
+  (leader 1 of three suspects 2 and 3, which trust it for good; it orders a round and a draw after
+  its step-down; on `1b85eaf` no order and no leader for the quiet period) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` (leader 1 of five
   steps down trusting only 2, which alone holds its last entry and is dead, then suspects 2 as well;
   on `1b85eaf` no leader within the quiet period), each red before; and
   `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts`, red with the turn counted

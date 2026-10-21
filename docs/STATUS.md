@@ -235,7 +235,9 @@ is worked around.
   seven process tests suspected both followers, stepped down with no heir, both followers trusted
   it). The heirs are every other voter, trusted before suspected, then by what each holds and by id,
   each hand-over naming the next over all of them, the turn starting again at each term led
-  (`docs/timing.md` §2.9, "Who the heir is"). Tests in `tests/suspicion.rs`, the first two red on
+  (`docs/timing.md` §2.9, "Who the heir is"). A leader that trusts no voter at its step-down orders
+  none at once, and decides a round and a draw later: ordered at once, every short stall of a
+  leader's host moved its group's leadership (mantle's cluster tests, run 39525134119). Tests in `tests/suspicion.rs`, the first two red on
   `1b85eaf`, the third with the turn counted from the member's start.
 - **hyper-liveness: a node all of whose links fell silent before it had evidence judged no peer it
   had heard (found by mantle).** Its pool and its links' estimators were fed nothing more, and only

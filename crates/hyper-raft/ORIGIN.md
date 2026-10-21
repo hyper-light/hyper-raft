@@ -608,7 +608,11 @@ argument, the configurations and marks it covers, and CTRL mapped onto it; `docs
   `a_leader_that_suspects_every_other_voter_hands_over_all_the_same` and
   `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` fail on `1b85eaf`;
   `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts` fails with the turn counted
-  from the member's start.
+  from the member's start. At the step-down it orders at once only where it still trusts a voter;
+  trusting none it may be the one that stalled, and its `led` path decides a round and a draw later,
+  re-electing it if it trusts a quorum again: ordered at once, every short stall moved the group's
+  leadership (mantle run 39525134119; `a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`,
+  red on `757740c`).
 - **Tests**: `tests/repair.rs` gains three: PAR's Figure 4(b) in suffix form (fails on R-5: "no one
   was elected"), a marked log that may lack a committed entry never elected (fails with the
   candidate's own vote counted, and with the voters judging by their logs: "committed another entry

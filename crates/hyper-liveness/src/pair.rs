@@ -12,7 +12,7 @@ use crate::codec::{Echo, Heartbeat, MAX_BYTES};
 use crate::{Change, Last, PairReport, PeerId, Refusal, Suspicion};
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
-fn nanos(duration: Duration) -> u64 {
+pub(crate) fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -85,8 +85,10 @@ pub(crate) fn scaled(pool: &Arrivals, window: u64) -> Arrivals {
 
 /// What a poll's send did.
 pub(crate) enum Sent {
-    /// A heartbeat of this many bytes is in the node's buffer.
-    Message(usize),
+    /// A heartbeat of this many bytes is in the node's buffer, and its lateness past the slot after
+    /// the previous heartbeat sent the peer, nanoseconds: what the peer will take it as, but the
+    /// path's delay (`Stream::expected_ns`); `None` for the first.
+    Message(usize, Option<i64>),
     /// A heartbeat is due and no flush proves it.
     NeedsFlush,
     /// Nothing due.
@@ -109,6 +111,10 @@ struct Stream {
     floor_from: u64,
     /// The latest heartbeat's number sent.
     sent: Option<u64>,
+    /// The slot after the latest heartbeat sent, when it was due: the arrival the peer expects of
+    /// the next, but the path's delay. A heartbeat sent past it, a skipped slot's or its own
+    /// lateness, is late by as much at the peer (`docs/timing.md` §2.2).
+    expected_ns: Option<u64>,
 }
 
 /// How a peer from which no heartbeat has come is judged: from when the node first attached the
@@ -165,9 +171,10 @@ struct Received {
     configured_interval: Option<Duration>,
     round_trip: ExchangeRtt,
     /// While the pair has no configuration of its own: the arrivals its margin was imposed from,
-    /// the node's evidence scaled to the link's window and widened by the link's own, and the
-    /// heartbeats taken then.
-    pooled: Option<(Arrivals, u64)>,
+    /// the node's evidence scaled to the link's window and widened by the link's own, the
+    /// heartbeats taken then, and whether that evidence was measured: one that was not is renewed
+    /// as soon as the node's is.
+    pooled: Option<(Arrivals, u64, bool)>,
     /// The interval asked of the peer for the margin of the node's evidence, nanoseconds, where at
     /// the link's own interval that margin promised nothing (`pool_margin`); zero otherwise, and
     /// from the link's first configuration on.
@@ -275,6 +282,19 @@ impl Pair {
             );
             self.unheard.bound = Some(lateness_bound(&behaviour, detector.margin));
         }
+    }
+
+    /// The interval this node's heartbeats to the peer are due at, once the first is scheduled.
+    pub(crate) fn sending_interval(&self) -> Option<Duration> {
+        (self.stream.interval_ns != 0).then(|| Duration::from_nanos(self.stream.interval_ns))
+    }
+
+    /// The interval the peer's heartbeats come at, once one has come.
+    pub(crate) fn heard_interval(&self) -> Option<Duration> {
+        self.received
+            .link
+            .as_ref()
+            .map(|link| link.estimator.interval())
     }
 
     pub(crate) fn configuration(&self) -> Option<Configuration> {
@@ -454,6 +474,10 @@ impl Pair {
             echo,
         };
         let length = beat.encode(out).len();
+        let own = self
+            .stream
+            .expected_ns
+            .map(|expected| i64::try_from(sent_ns.saturating_sub(expected)).unwrap_or(i64::MAX));
         // The slots between the latest heartbeat sent and this one were due while this node was
         // behind and are never sent: the peer takes them as this one's lateness.
         let skipped = self
@@ -468,8 +492,9 @@ impl Pair {
             self.stream.floor_from = sender.durable_count;
         }
         self.stream.next = Some((seq.saturating_add(1), due.saturating_add(interval)));
+        self.stream.expected_ns = Some(due.saturating_add(interval));
         self.counts.sent = self.counts.sent.saturating_add(1);
-        Sent::Message(length)
+        Sent::Message(length, own)
     }
 
     /// The peer's freshness at `now_ns`: a suspicion when it passed.
@@ -563,7 +588,7 @@ impl Pair {
         let link = self.received.link.as_ref()?;
         let margin = link.estimator.margin()?;
         let behaviour = match self.received.pooled {
-            Some((pooled, _)) if self.received.configuration.is_none() => pooled,
+            Some((pooled, ..)) if self.received.configuration.is_none() => pooled,
             _ => link.estimator.arrivals().ok().or(self
                 .received
                 .configuration
@@ -682,9 +707,9 @@ impl Pair {
         // The MTBF is a float division: read only where the margin is renewed.
         if self.received.configuration.is_none()
             && let Some(evidence) = context.evidence
-            && self.pool_margin_due()
+            && self.pool_margin_due(true)
         {
-            self.pool_margin(evidence, granularity, context.exposure.mtbf());
+            self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
         }
         taken.lateness = lateness;
         taken.own = self.received.configuration.is_some();
@@ -693,11 +718,12 @@ impl Pair {
     }
 
     /// Whether the margin of the node's evidence is due, on the configuration's doubling schedule:
-    /// never imposed, or the heartbeats taken have doubled since it was.
-    fn pool_margin_due(&self) -> bool {
-        self.received
-            .pooled
-            .is_none_or(|(_, at)| self.counts.taken >= at.saturating_mul(2))
+    /// never imposed, or the heartbeats taken have doubled since it was; or at once, where it was
+    /// imposed from evidence that was not measured and the node's now is.
+    fn pool_margin_due(&self, measured: bool) -> bool {
+        self.received.pooled.is_none_or(|(_, at, was)| {
+            (measured && !was) || self.counts.taken >= at.saturating_mul(2)
+        })
     }
 
     /// While the pair has no configuration of its own, the margin the node's evidence configures
@@ -714,13 +740,14 @@ impl Pair {
     pub(crate) fn pool_margin(
         &mut self,
         pool: &Arrivals,
+        measured: bool,
         granularity: Duration,
         mtbf: Option<Duration>,
     ) {
         let (Some(election), Some(mtbf)) = (self.election, mtbf) else {
             return;
         };
-        if !self.pool_margin_due() {
+        if !self.pool_margin_due(measured) {
             return;
         }
         let taken = self.counts.taken;
@@ -752,7 +779,7 @@ impl Pair {
             }
         };
         link.estimator.impose(detector.margin);
-        self.received.pooled = Some((behaviour, taken));
+        self.received.pooled = Some((behaviour, taken, measured));
         self.received.pooled_ask_ns = ask_ns;
     }
 
@@ -979,7 +1006,7 @@ mod tests {
                 .unwrap();
             latest = arrival;
         }
-        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
+        pair.pool_margin(&evidence(), true, granularity, exposure.mtbf());
         let until = pair.deadline().expect("judged by the node's evidence");
         assert!(until > latest);
         let Some(Change::Suspected(suspicion)) = pair.judge(2, until) else {
@@ -1022,7 +1049,7 @@ mod tests {
             durable_ns: Some(now),
         };
         let mut out = [0; MAX_BYTES];
-        let Sent::Message(length) = node.send(&sender, now, &mut out) else {
+        let Sent::Message(length, _) = node.send(&sender, now, &mut out) else {
             panic!("due, and a flush proves it");
         };
         let ours = Heartbeat::decode(out.get(..length).unwrap()).unwrap();
@@ -1071,7 +1098,7 @@ mod tests {
             };
             let mut out = [0; MAX_BYTES];
             assert!(
-                matches!(node.send(&sender, now, &mut out), Sent::Message(_)),
+                matches!(node.send(&sender, now, &mut out), Sent::Message(..)),
                 "flush {n}: due and proven"
             );
             // The floor at the latest doubling of the flushes, at or before this one.
@@ -1126,7 +1153,7 @@ mod tests {
         }
         assert_eq!(pair.trust(), Trust::Unconfigured);
         // The node's evidence comes, and the next poll imposes its margin and judges.
-        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
+        pair.pool_margin(&evidence(), true, granularity, exposure.mtbf());
         assert_eq!(pair.trust(), Trust::Suspected, "the margin finds it late");
         let Some(Change::Suspected(suspicion)) = pair.judge(2, latest + MS) else {
             panic!("the suspicion is told");
@@ -1173,8 +1200,8 @@ mod tests {
             unseen: 0.02,
             ..evidence()
         };
-        pair.pool_margin(&evidence, granularity, exposure.mtbf());
-        let (behaviour, _) = pair.received.pooled.expect("a margin is in force");
+        pair.pool_margin(&evidence, true, granularity, exposure.mtbf());
+        let (behaviour, ..) = pair.received.pooled.expect("a margin is in force");
         let costs = Costs {
             election: Duration::from_secs(1),
             mtbf: exposure.mtbf().unwrap(),

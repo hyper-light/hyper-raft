@@ -1277,6 +1277,63 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   `PairReport::freshness` the `η + α` in force, and `PairReport::interval` the interval the peer's
   heartbeats come at, or a longer one asked, judged or not: what an owner waiting on a young link's
   evidence waits past.
+- **Judged with no evidence of its own: a starved pool, and the node's own stream** (§3, item 10).
+  The node's evidence comes from its links' heartbeats; a node all of whose links fell silent
+  before its pool measured anything and before any link configured is fed nothing more, and judged
+  no pair it had heard: as a leader it led for ever and committed nothing, and its followers, which
+  heard it, trusted it for ever (mantle's node simulation, the leader's plane deafened at its
+  election: 36 heartbeats taken, none judged, nothing moved for 3.1 s and for good). Two things it
+  holds still say something:
+  - *its pool's latenesses at their most correlation* (`LinkEstimator::arrivals_most_correlated`).
+    The unseen share is `1/(m + 1)` over `m = n/τ_int` independent arrivals, and `τ_int` is at most
+    `n`: the mean of `n` latenesses of variance `V` has variance `(V/n)(1 + 2·Σ_k (1 − k/n)·ρ_k)`,
+    at most `V` whatever the correlations, and `τ_int` is that over `V/n`. So at least one
+    independent arrival, and an unseen share of at most a half, which no measured `τ_int` exceeds;
+    the mean and deviation are the latenesses' own;
+  - *its own stream*: one more estimator, fed the lateness of each heartbeat the node sends past the
+    slot after the one before it, which is what its peer takes it as but for the path (a skipped
+    slot's wait and the flush's included). It is fed while the node is deaf as while it hears, and
+    measures its own `τ_int` as any link does. Under the pool's premise, that the stalls are the
+    hosts' (§2.6), it stands for the peers' streams as the node's floor stands for their intervals
+    (a peer never heard from, above). It is fed only while the node has no measured evidence.
+
+  Once the pool *starves*, the node's pairs that wait for a margin are judged by the wider of the
+  two, through the same margin as the node's evidence (`Pair::pool_margin`): its interval asked of
+  the peer where the margin at the link's own promises nothing, as it must with an unseen share of a
+  half. The pool starves once it has gone without a heartbeat for as long as the slowest link heard,
+  at the interval it stated, would take alone to bring it to the count at which `τ_int` can first be
+  measured (`LinkEstimator::first_measure`, 56: seven windows of the first level of at least
+  `c = 6`) and at least to twice what it holds (the doubling an estimate is renewed on,
+  `docs/research/timing.md`): never less than 28 of that link's intervals. At the summed rate of the
+  links heard, a pool fed by one slow live link beside a dead peer's starved between the live link's
+  heartbeats (17 polls of `a_peer_dead_before_its_links_have_evidence_...`). A node any of whose
+  links goes on feeding its pool never starves, and waits for the pool's measure as before. Over 256
+  seeds of every test of the simulation the fallback judged at a poll in two: in 8 of the 1,024 runs
+  of `a_peer_dead_before_...`, where the survivor's one live peer went silent for as long (Linux seed
+  80: its heartbeats 25 and then 58 ms apart on a 2 ms link, the other peer dead), with the time to
+  notice the death no worse (median / 90th percentile / most against `1b85eaf`: macOS 97 / 500 /
+  1,097 ms against 94 / 519 / 6,747, busy 105 / 931 / 2,146 against 105 / 947 / 2,146, Linux 54 /
+  210 / 529 against 55 / 214 / 646, Windows 542 / 2,147 / 4,066 against 537 / 2,156 / 4,066); and
+  in `links_young_...`, whose devices slow for good to 741 ms flushes and whose pools do starve, the
+  links still configured (macOS 220–513 s after the slowdown at the default eight seeds against
+  257–618, Linux 276–449 against 280–493; the victim suspected 8–23 s after its kill against 10–19,
+  and 4–8 against 4–8). The starved node is polled at its own heartbeats, so it asks no wake for
+  the starvation: a wake of its own moved every run's timer draws (one more sample of `G` each), and
+  with it every healthy run's numbers, where the fallback judged nothing. A margin a pair took so is
+  renewed at its next heartbeat once the node's evidence is
+  measured (`pool_margin_due`); a poll imposes a first margin only, as before, since one re-imposed
+  at a poll moved a point the pair was held to after it passed, untold (`links_young_...`, 256
+  seeds). A node that never heard a peer has no link to starve and is not covered (`docs/STATUS.md`).
+
+  `a_node_deaf_before_it_has_evidence_suspects_every_peer`: three nodes, one deafened (every
+  heartbeat sent it lost, frozen or not) after a share of the heartbeats it takes before any pair is
+  judged in the same seed's run, drawn from the seed; it must suspect both peers within the bound
+  each suspicion states. On `1b85eaf` it never did, and its run took the simulation's trace bound
+  (157,532 words). Now, over 256 seeds of each world (510, 508, 512 and 512 suspicions; some draws
+  fell past the evidence), from the deafening, median / 90th percentile / most: macOS 295 / 510 /
+  1,789 ms, macOS with its log busy 759 / 1,235 / 3,315 ms, Linux in its VM 108 / 231 / 2,816 ms,
+  Windows' timer and flush 1,207 / 1,750 / 3,076 ms. Fed only the pool's latenesses, a node deafened
+  in its first two never judged: no deviation, and only its own stream had one.
 - **A restart** (§3, item 10). Runs are ordered: a node's run (`Settings::run`) is a count it keeps
   durably and raises at every start, before its stream's first heartbeat. A heartbeat of a later
   run than the latest taken from the peer is reported as `Change::Restarted { peer, at_ns }` before
@@ -2138,6 +2195,12 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     `a_peer_never_heard_from_is_suspected`,
     `a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`), its real
     processes and hyper-durable's shell (`a_leader_killed_before_its_links_have_evidence_is_replaced`).
+  - *A node whose links all fell silent before it had any evidence* gathers none more: no
+    heartbeat feeds its pool and none configures a link, so it judged no peer it had heard (mantle's
+    deaf leader, which led for ever). Once its pool starves, it judges by what its pool's latenesses
+    show at the most correlation they can carry and by its own stream (§2.8, "Judged with no
+    evidence of its own"), both held while it is deaf; a node any of whose links feeds it is
+    unchanged. A node that never heard any peer is not covered (`docs/STATUS.md`).
   - *A restart is not a crash the detectors can miss.* The stream carries the sender's run, a
     count it raises at every start (§2.8), and a later run is an incarnation's end: told to the core (`restarted`), the node is
     trusted and leads nothing it led before. hyper-liveness reports it, `Change::Restarted`, and

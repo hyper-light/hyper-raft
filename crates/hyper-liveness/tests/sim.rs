@@ -1809,6 +1809,89 @@ fn a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_it
     }
 }
 
+/// A node that stops hearing every peer in its links' first heartbeats, before its pool or any of
+/// its links has evidence, while its peers hear it and live: it suspects every peer all the same,
+/// each within the bound its suspicion states. With no evidence of its own, the node judged no pair
+/// it had heard, and as a leader led for ever (mantle's node simulation, the leader's plane
+/// deafened at its election, 36 heartbeats taken and none judged). In the four worlds, the node
+/// deafened after a share, drawn from the seed, of the heartbeats it takes before any pair is
+/// judged in the same seed's run.
+#[test]
+fn a_node_deaf_before_it_has_evidence_suspects_every_peer() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        let mut noticed = Vec::new();
+        for seed in seeds(14, 32) {
+            let deaf = 2usize;
+            let judged = |sim: &Sim| {
+                (1..=3u64)
+                    .filter(|peer| *peer != deaf as u64 + 1)
+                    .any(|peer| {
+                        sim.nodes[deaf]
+                            .liveness
+                            .report(peer)
+                            .is_some_and(|r| r.judged)
+                    })
+            };
+            let taken = |sim: &Sim| -> u64 {
+                (1..=3u64)
+                    .filter_map(|peer| sim.nodes[deaf].liveness.report(peer))
+                    .map(|report| report.taken)
+                    .sum()
+            };
+            let mut twin = Sim::new(3, world, seed);
+            twin.run_while(|sim| !judged(sim), None);
+            let young = taken(&twin);
+            let mut draw = Seeded::new(stream_seed(seed, "deafen", &[]));
+            let deafen_after = 2 + draw.below(young.saturating_sub(2).max(1));
+            let mut sim = Sim::new(3, world, seed);
+            sim.run_while(|sim| taken(sim) < deafen_after && !judged(sim), None);
+            if judged(&sim) {
+                // The draw fell past the evidence in this run: nothing to test.
+                continue;
+            }
+            let deafened_at = sim.now;
+            sim.nodes[deaf].deaf = true;
+            sim.run_while(
+                |sim| {
+                    (1..=3u64)
+                        .filter(|peer| *peer != deaf as u64 + 1)
+                        .any(|peer| sim.nodes[deaf].liveness.trust(peer) != Some(Trust::Suspected))
+                },
+                None,
+            );
+            for peer in (1..=3u64).filter(|peer| *peer != deaf as u64 + 1) {
+                let suspicion = sim.nodes[deaf]
+                    .suspicions
+                    .iter()
+                    .rfind(|s| s.peer == peer)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{name} seed {seed}: no suspicion of {peer}"));
+                if let (Some(last), Some(bound)) = (suspicion.last, suspicion.detection) {
+                    assert!(
+                        suspicion.at_ns - last.due_ns <= bound.as_nanos() as u64,
+                        "{name} seed {seed}: {peer} suspected past its stated bound"
+                    );
+                }
+                noticed.push(suspicion.noticed_ns.saturating_sub(deafened_at));
+            }
+        }
+        noticed.sort_unstable();
+        assert!(
+            !noticed.is_empty(),
+            "{name}: no seed deafened a node before its evidence"
+        );
+        println!(
+            "{name}: {} suspicions by a node deafened before its evidence, {} ms after it at the \
+             median, {} ms at the 90th percentile, {} ms at the most",
+            noticed.len(),
+            noticed[noticed.len() / 2] / MS,
+            noticed[noticed.len() * 9 / 10] / MS,
+            noticed[noticed.len() - 1] / MS
+        );
+    }
+}
+
 /// A node that hears no peer keeps its streams to them on their schedules: a heartbeat due waits
 /// for no more than the poll that finds it due and the flush that proves it, a timer's lateness, a
 /// freeze and a write the run drew. A stream whose interval fell while it was behind sent the

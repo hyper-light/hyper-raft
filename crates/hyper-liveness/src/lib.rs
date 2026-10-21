@@ -44,7 +44,9 @@
 //! flushes. Until a link configures, it is judged by the margin what its node measured of its links
 //! configures for it: the wider of its pool's measure and the widest of its configured links', and
 //! of what the link's own latenesses show; a peer from which nothing has come is judged from the
-//! attach. A receiver expects
+//! attach. A node whose pool starves before it has measured anything, its links silent, judges by
+//! its pool's latenesses at the most correlation they can carry and by its own stream's, which it
+//! keeps sending (`docs/timing.md` §2.8, "Judged with no evidence of its own"). A receiver expects
 //! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
 //! ([`Change::Restarted`]).
 //!
@@ -345,6 +347,28 @@ pub struct Liveness {
     /// again, and a pair judged by its margin would then judge nothing, a peer it had suspected
     /// before it was heard never trusted again on its heartbeats.
     pool_measured: Option<Arrivals>,
+    /// What the pool's latenesses show while it has measured nothing, at the most correlation they
+    /// can carry (`LinkEstimator::arrivals_most_correlated`): part of what judges the node's pairs
+    /// once the pool starves with no other evidence (`docs/timing.md` §2.8, "Judged with no
+    /// evidence of its own").
+    pool_seen: Option<Arrivals>,
+    /// When the pool, fed nothing more, starves: the latest heartbeat's arrival, and the time the
+    /// slowest link heard, at the interval it stated, would take alone to bring it to the count at
+    /// which `τ_int` can first be measured (`LinkEstimator::first_measure`, 56), and at least to
+    /// twice what it holds, the doubling an estimate is renewed on
+    /// (`docs/research/timing.md`, "When to renew an estimate's configuration"): never less than
+    /// 28 of that link's intervals. Kept at each heartbeat taken while the node has no measured
+    /// evidence (`evidence`), and read only then; `None` once its pool has measured. A node any of
+    /// whose links goes on feeding its pool never reaches it.
+    pool_starves_ns: Option<u64>,
+    /// This node's own stream, while the node has no measured evidence: one more estimator, fed the
+    /// lateness of each heartbeat it sends past the slot after the one before it, which is what its
+    /// peer takes it as but for the path (`pair::Sent::Message`). It is fed while the node is deaf
+    /// as while it hears, and measures its `τ_int` as any link does. Under the pool's premise, that
+    /// the stalls are the hosts' (§2.6), it stands for its peers' streams as this node's floor
+    /// stands for their intervals (`Pair::judge_unheard`). Built on the first lateness: one
+    /// allocation, boxed with its ring.
+    own: Own,
     /// The widest arrivals the node's links configured their own detectors from, each measure
     /// the largest over the pairs that have a configuration: kept at each configuration made and
     /// at each pair let go, so it is read without walking the pairs.
@@ -363,6 +387,7 @@ pub struct Liveness {
 fn pool_margins(
     pair: &mut Pair,
     pool: &Arrivals,
+    measured: bool,
     granularity: Duration,
     floor: Option<Duration>,
     mtbf: &mut Option<Option<Duration>>,
@@ -370,7 +395,7 @@ fn pool_margins(
 ) {
     if pair.wants_pool_margin() {
         let mtbf = *mtbf.get_or_insert_with(|| exposure.mtbf());
-        pair.pool_margin(pool, granularity, mtbf);
+        pair.pool_margin(pool, measured, granularity, mtbf);
     }
     if let Some(floor) = floor
         && pair.wants_unheard_margin()
@@ -380,20 +405,52 @@ fn pool_margins(
     }
 }
 
-/// Sends `pair`'s heartbeat due at `now_ns`, if a flush proves it. Whether a flush is wanted: one
-/// proves the heartbeat due, or the next, already due.
+/// This node's own stream, as its peers would take it (`Liveness::own`).
+#[derive(Default)]
+struct Own {
+    estimator: Option<Box<LinkEstimator>>,
+    seq: u64,
+}
+
+impl Own {
+    /// The lateness of a heartbeat sent at `interval`, on the timer granularity `granularity`.
+    fn feed(&mut self, granularity: Duration, lateness: i64, interval: Duration) {
+        if self.estimator.is_none() {
+            self.estimator = LinkEstimator::new(interval, granularity, None)
+                .ok()
+                .map(Box::new);
+        }
+        let Some(estimator) = self.estimator.as_mut() else {
+            return;
+        };
+        estimator.set_granularity(granularity);
+        self.seq = self.seq.saturating_add(1);
+        // A lateness past what a window can sum is refused, as any estimator refuses such an
+        // offset.
+        let _ = estimator.on_lateness(self.seq, lateness);
+    }
+}
+
+/// Sends `pair`'s heartbeat due at `now_ns`, if a flush proves it, feeding `own` its lateness where
+/// given. Whether a flush is wanted: one proves the heartbeat due, or the next, already due.
 fn send(
     pair: &mut Pair,
     peer: PeerId,
     sender: &pair::Sender,
     now_ns: u64,
     message: &mut [u8; MAX_BYTES],
+    own: Option<&mut Own>,
     out: &mut impl Output,
 ) -> bool {
     match pair.send(sender, now_ns, message) {
-        pair::Sent::Message(length) => {
+        pair::Sent::Message(length, lateness) => {
             if let Some(message) = message.get(..length) {
                 out.heartbeat(peer, message);
+            }
+            if let (Some(own), Some(lateness), Some(granularity), Some(interval)) =
+                (own, lateness, sender.granularity, pair.sending_interval())
+            {
+                own.feed(granularity, lateness, interval);
             }
             // Its next slot already due (the interval fell while the stream was behind): the
             // flush that proves it is asked now, and its completion polls the stream. Left to a
@@ -442,6 +499,9 @@ impl Liveness {
             pool: None,
             pool_seq: 0,
             pool_measured: None,
+            pool_seen: None,
+            pool_starves_ns: None,
+            own: Own::default(),
             configured: None,
             evidence: None,
         })
@@ -460,6 +520,45 @@ impl Liveness {
     /// link's bound and so at most the widest's, the bound growing with each measure.
     fn renew_evidence(&mut self) {
         self.evidence = pair::wider(self.pool_measured, self.configured);
+    }
+
+    /// The evidence a poll at `now_ns` judges the pairs that wait for a margin by, and whether it
+    /// is measured: the node's ([`renew_evidence`](Self::renew_evidence)); while it has none and its
+    /// pool has starved (`pool_starves_ns`), the wider of what the pool's latenesses show at the
+    /// most correlation they can carry (`pool_seen`) and what this node's own stream shows, its
+    /// measure or, before it has one, its latenesses at their most correlation (`own`). A node all
+    /// of whose links fell silent before it measured anything is fed nothing more: it judged no
+    /// pair it had heard, and as a leader led for ever (mantle's node simulation). One whose links
+    /// go on feeding its pool waits for the pool's measure, as before.
+    fn evidence_at(&self, now_ns: u64) -> Option<(Arrivals, bool)> {
+        if let Some(evidence) = self.evidence {
+            return Some((evidence, true));
+        }
+        if !self.pool_starves_ns.is_some_and(|at| now_ns >= at) {
+            return None;
+        }
+        let own = self.own.estimator.as_ref().and_then(|own| {
+            own.arrivals()
+                .ok()
+                .or_else(|| own.arrivals_most_correlated())
+        });
+        pair::wider(self.pool_seen, own).map(|seen| (seen, false))
+    }
+
+    /// When the pool starves, from a heartbeat that arrived at `arrival_ns` (`pool_starves_ns`).
+    fn starves(&self, arrival_ns: u64) -> Option<u64> {
+        // The slowest link heard: a link of a peer that died or a path that went still counts its
+        // interval, and at the links' summed rate a pool fed by a slow live link alone starved
+        // between its heartbeats (17 polls of `a_peer_dead_before_its_links_have_evidence_...`).
+        let slowest = self.pairs.values().filter_map(Pair::heard_interval).max()?;
+        let taken = self
+            .pool
+            .as_ref()
+            .map_or(0, |pool| pool.estimates().arrivals);
+        let next = LinkEstimator::first_measure();
+        let wanted = next.max(taken.saturating_mul(2)).saturating_sub(taken);
+        let wait = pair::nanos(slowest).saturating_mul(wanted);
+        Some(arrival_ns.saturating_add(wait))
     }
 
     /// The widest arrivals the pairs' configurations were made from.
@@ -490,7 +589,11 @@ impl Liveness {
         let _ = pool.on_lateness(self.pool_seq, lateness);
         if let Ok(measured) = pool.arrivals() {
             self.pool_measured = Some(measured);
+            self.pool_seen = None;
+            self.pool_starves_ns = None;
             self.renew_evidence();
+        } else if self.pool_measured.is_none() {
+            self.pool_seen = pool.arrivals_most_correlated();
         }
     }
 
@@ -602,6 +705,9 @@ impl Liveness {
         {
             self.feed_pool(lateness, Duration::from_nanos(beat.interval_ns));
         }
+        if self.evidence.is_none() && outcome.is_ok() {
+            self.pool_starves_ns = self.starves(arrival_ns);
+        }
         outcome
     }
 
@@ -636,13 +742,15 @@ impl Liveness {
         let mut mtbf = None;
         // The wake to ask, gathered in the same walk: each pair is final once it has been judged
         // and has sent, and a second walk of the map was a tenth of a poll.
+        let evidence = self.evidence_at(now_ns);
         let mut wake: Option<u64> = None;
         for (&peer, pair) in &mut self.pairs {
             pair.attached(now_ns);
-            if let (Some(evidence), Some(granularity)) = (&self.evidence, granularity) {
+            if let (Some((evidence, measured)), Some(granularity)) = (evidence, granularity) {
                 pool_margins(
                     pair,
-                    evidence,
+                    &evidence,
+                    measured,
                     granularity,
                     floor,
                     &mut mtbf,
@@ -652,7 +760,9 @@ impl Liveness {
             if let Some(change) = pair.judge(peer, now_ns) {
                 out.change(change);
             }
-            wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, out);
+            // Its own stream is read only while the node has no measured evidence.
+            let own = self.evidence.is_none().then_some(&mut self.own);
+            wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
             wake = earliest(wake, pair, now_ns);
         }
         if wants_flush && !self.flushing {

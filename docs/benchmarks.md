@@ -9469,3 +9469,37 @@ the branch costing 0.04-0.29 ns, under a cycle, beside a receive of some 600 ns.
 ```sh
 cargo bench -p hyper-rt --bench stamped_receive     # each tree; the binaries then run ABBA
 ```
+
+## hyper-liveness: a starved node's evidence and a stream's schedule without its peer (2026-10-20)
+
+`docs/timing.md` §2.8, "A stream keeps its schedule without hearing its peer" and "Judged with no
+evidence of its own". Before is `1b85eaf` (a `git archive` of it, built in a target directory of its
+own); after is this change. Apple M5 Max, macOS 26.4.1, the machine shared at the load stated, each
+bench run alternately, base and after.
+
+`cargo bench -p hyper-liveness --bench allocs`, three runs each at load 18–22: every cell 0
+allocations, 0 reallocations, 0 bytes and 0 minor faults a heartbeat before and after, and the
+heartbeats sent and taken the same in every cell (2,310, 5,094/5,095, 29,315/29,313 twice): the
+world is healthy, its pools never starve, and the stream takes the path it took. The ns a heartbeat
+moved tenfold from run to run in both builds at this load (8 nodes, 1 group: 2,009, 2,834, 2,097
+before; 773, 1,790, 925 after), which says nothing either way. What a poll adds where nothing
+starves: a branch on the node's evidence, and per heartbeat sent a comparison of its next slot with
+the poll's time.
+
+`cargo bench -p hyper-liveness --bench cost`, two runs each at load 22–29, pair µs a node a second:
+two peers 5.9–7.7 before, 6.4–8.6 after; eight peers 41.8–61.5 before, 47.3–50.8 after; messages
+and flushes a second identical (80 and 1.02, 320 and 1.10). SWIM's column, code neither build
+changed, moved 9.1–15.0 at two peers and 47.2–65.9 at eight over the same runs: the ranges overlap
+within the machine's noise.
+
+The simulation (`cargo test --release -p hyper-liveness --test sim`, `HYPER_LIVENESS_SEEDS=256`):
+the suspicions of live peers 436 before, 425 after, at the same allowance (4,182.9, 4,181.5); the
+time from a young victim's kill to every survivor's suspicion, median / 90th percentile / most, macOS
+94 / 519 / 6,747 ms before and 97 / 500 / 1,097 after, busy 105 / 947 / 2,146 and 105 / 931 / 2,146,
+Linux 55 / 214 / 646 and 54 / 210 / 529, Windows 537 / 2,156 / 4,066 and 542 / 2,147 / 4,066.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs   # and from `git archive 1b85eaf`, alternately
+cargo bench -p hyper-liveness --bench cost
+HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim
+```

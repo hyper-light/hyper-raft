@@ -107,6 +107,16 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-liveness: a node that never heard any peer judges none (found 2026-10-20, beside the deaf
+  leader below).** A node deaf from its start has no link heard, so no pool to starve and no
+  interval to time a starvation by (`Liveness::starves`), and a peer never heard is judged only by
+  the node's evidence (`Pair::judge_unheard`), which such a node never has: it trusts every peer for
+  ever. Its own stream is measured all the same (`Liveness::own`), and judging its never-heard peers
+  by it would end this, but at every start: a node whose peers have not started yet would suspect
+  them where it now trusts them, and by suspicion a member campaigns only with a quorum it trusts
+  (`docs/timing.md` §2.9), so a cell's first election would wait on its slowest member's first
+  heartbeat. That trade is the consumers' to measure in their start-up tests before it is made.
+
 - **hyper-block: translated by Rosetta 2, a segmented file's direct handle reads its pieces as in
   memory (found 2026-10-20, running hyper-block's tests for x86_64-apple-darwin on the M5 Max).**
   `segmented::tests::a_segment_written_whole_holds_its_fill_and_takes_no_memory` fails translated,
@@ -227,6 +237,14 @@ is worked around.
   each hand-over naming the next over all of them, the turn starting again at each term led
   (`docs/timing.md` §2.9, "Who the heir is"). Tests in `tests/suspicion.rs`, the first two red on
   `1b85eaf`, the third with the turn counted from the member's start.
+- **hyper-liveness: a node all of whose links fell silent before it had evidence judged no peer it
+  had heard (found by mantle).** Its pool and its links' estimators were fed nothing more, and only
+  their measure judged a heard pair with no configuration (`pool_margins` ran only with the node's
+  evidence): mantle's leader deafened at its election, 36 heartbeats taken and none judged, led for
+  ever. Once the pool starves, the node judges by its pool's latenesses at the most correlation they
+  can carry (an unseen share of a half) and by its own stream's, which it keeps measuring while deaf
+  (`docs/timing.md` §2.8, "Judged with no evidence of its own"); a node any of whose links feeds it
+  is unchanged. `a_node_deaf_before_it_has_evidence_suspects_every_peer`, red on `1b85eaf`.
 - **hyper-liveness: a stream whose next slot was due as it sent stopped until a peer's heartbeat
   polled it (found 2026-10-20, by a node deafened in the simulation).** An interval that fell while the stream was
   behind left its next slot past at the send, and the poll asked no wake for a past slot: a node that
@@ -236,6 +254,14 @@ is worked around.
   stream keeps its schedule without hearing its peer"). `a_node_that_hears_no_peer_keeps_its_streams_on_schedule`,
   red on `1b85eaf`; over 256 seeds of the live-peers world the suspicions of live peers fell from 436
   to 425 at the same allowance.
+- **Not a defect, measured: a deaf node's peers suspect it more often.** It cannot hear the interval
+  they ask (it rides their heartbeats), so it keeps its floor, 6–7 times shorter than the asked
+  (6.7 ms against 45 ms on macOS), and each heartbeat they judge is one more chance of a mistake
+  (`docs/timing.md` §2.2). Over 32 seeds and 2 s from a deafening at 300 ms, against the same seed
+  undeafened: macOS 4 against 2 false suspicions, Linux 18 against 8, the busy log and Windows 0 and
+  0 (a scratch test, not landed). Its interval moved less than the undeafened node's (Linux 10
+  moves against 47), and no peer lost a configuration.
+
 - **hyper-rt, hyper-tokio, hyper-timing-trace, hyper-measure, hyper-block: a value the kernel takes in
   its own ticks was read at the process's timebase, which a process Rosetta 2 translates does not
   share (found by mantle).** XNU stamps a received datagram (`SCM_TIMESTAMP_MONOTONIC`) with its own

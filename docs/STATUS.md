@@ -63,6 +63,14 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-21: in hyper-tls, a certificate's Brotli compression (RFC 8879) takes the least
+window holding the certificate whole (RFC 7932 §9.1), where it took Brotli's default 2^22: at the
+amortized quality the binary-tree hasher's forest, two `u32` a window position, was 32 MiB, allocated
+at a server's first handshake and at every client compressing its own certificate. Brotli's
+reference encoder sizes that hasher to a one-shot input the same way (`HashMemAllocInBytes`). A
+burst of 64 handshakes peaked at 38,716 live bytes a connection where it peaked at 541,834; a
+3,000-byte input compresses to within a byte of before (`crates/hyper-tls/VENDORED.md` §10).
+
 Landed 2026-10-20: in hyper-transport, what a connection holds of its endpoint's memory beside its
 windows is charged as it is held: `CONNECTION_STATE`, 30 KiB, reserved on the window's lane beside
 the connection's first window at its dial and its accept, and given back as it goes; a budget that

@@ -33,21 +33,20 @@
 
 #[path = "../../hyper-transport/tests/common/mod.rs"]
 mod common;
+#[path = "footprint/mod.rs"]
+mod footprint;
 
 use std::alloc::{GlobalAlloc as _, Layout, System};
 use std::ffi::{c_char, c_int, c_void};
-use std::io::Read as _;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use common::*;
-use hyper_measure::{alloc, usage};
-use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
-use hyper_rt_transport::{Driver, Io};
-use hyper_transport::{AdmissionLimits, Config, Endpoint, Fixed, Limits};
+use footprint::*;
+use hyper_measure::alloc;
+use hyper_rt::runtime::LocalRuntime;
+use hyper_rt_transport::Driver;
 
 /// The counting allocator, and a histogram of the sizes asked for while a row's histogram is on:
 /// what a burst of handshakes allocates, by size, to tell a transient's makeup.
@@ -107,24 +106,6 @@ unsafe impl std::alloc::GlobalAlloc for Sized {
 
 #[global_allocator]
 static ALLOCATOR: Sized = Sized;
-
-type Drv = Driver<Mantle, Fixed, Book>;
-
-/// Datagrams a system call carries: one QUIC initial window (RFC 9002 §7.2).
-const IO: Io = Io { batch: 10 };
-/// The server's peer id; the clients are 1 to `n`.
-const SERVER: u64 = 0;
-/// The failure guard of a wait.
-const GUARD: Duration = Duration::from_secs(300);
-/// How long the server must receive nothing for its connections to count as settled.
-const QUIET: Duration = Duration::from_millis(500);
-/// Set in the clients' process once its parent closed its standard input: the clients' tasks end.
-static STOP: AtomicBool = AtomicBool::new(false);
-/// The clients that saw their connection made, in the clients' process.
-static CONNECTED: AtomicUsize = AtomicUsize::new(0);
-/// The clients the clients' process is to have connected: all of them, or, stepped, the count its
-/// standard input last named.
-static TARGET: AtomicUsize = AtomicUsize::new(0);
 
 /// aws-lc's live bytes and their highest since the hooks were set, in the server's process.
 static C_LIVE: AtomicI64 = AtomicI64::new(0);
@@ -203,97 +184,6 @@ fn count_aws_lc() {
     assert_eq!(set, 1, "aws-lc's memory functions were set already");
 }
 
-/// A shard with room for `n` clients' tasks, sockets and timers.
-fn runtime(n: usize) -> RuntimeConfig {
-    let room = 4 * n + 64;
-    RuntimeConfig {
-        shards: 1,
-        tasks_per_shard: room,
-        timers_per_shard: room,
-        interests_per_shard: room,
-        ring_entries: 256,
-        step_budget_ns: 1_000_000_000,
-        timer_tick_ns: 100_000,
-        batch: 64,
-        pin: false,
-        cores: Vec::new(),
-        page_bytes: 4096,
-        spin_ns: 0,
-        wake_tracking: None,
-        latency_objective_ns: None,
-    }
-}
-
-/// Admission for `n` identities a connection each; no keep-alive and an idle bound past any row, so
-/// a settled connection sends nothing.
-fn admitting(n: usize) -> Limits {
-    Limits {
-        admission: AdmissionLimits {
-            pending: n + 8,
-            identities: n + 8,
-            connections: n + 8,
-            per_identity: 2,
-        },
-        keep_alive: None,
-        idle_timeout: Duration::from_secs(600),
-        ..limits()
-    }
-}
-
-fn endpoint(
-    root: &[u8],
-    own: &(Vec<u8>, Vec<u8>),
-    peers: &[(&[u8], u64)],
-    listen: bool,
-    limits: Limits,
-) -> Endpoint<Mantle, Fixed, Book> {
-    let mut book = Book::default();
-    for (certificate, peer) in peers {
-        book.add(certificate, *peer, Role::Node);
-    }
-    let config = Config {
-        tls: hyper_transport::tls::Tls::mutual(&credentials(root, &own.0, &own.1), listen).unwrap(),
-        role: Role::Node,
-        limits,
-        congestion: Default::default(),
-    };
-    Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
-}
-
-/// The driver's next event, or none after 5 ms, whichever first.
-async fn turn(driver: &mut Drv) -> Option<hyper_transport::Event<Mantle>> {
-    use std::future::Future;
-    let mut event = std::pin::pin!(driver.event());
-    let mut tick = std::pin::pin!(hyper_rt::futures::sleep(5_000_000));
-    std::future::poll_fn(|context| {
-        if let std::task::Poll::Ready(event) = event.as_mut().poll(context) {
-            return std::task::Poll::Ready(event.ok());
-        }
-        tick.as_mut().poll(context).map(|_| None)
-    })
-    .await
-}
-
-/// The footprint the OS charges this process now, bytes.
-fn footprint() -> i64 {
-    usage::this()
-        .unwrap()
-        .footprint
-        .map_or(0, |bytes| bytes as i64)
-}
-
-/// The socket memory the kernel charges this process's control group, bytes, where it is read
-/// (Linux, cgroup v2's `memory.stat` `sock`): a connection's socket buffers are charged to a
-/// container's limit though no process's footprint holds them.
-fn cgroup_sock() -> Option<i64> {
-    let relative = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = relative.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let stat = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.stat")).ok()?;
-    stat.lines()
-        .find_map(|line| line.strip_prefix("sock "))
-        .and_then(|value| value.trim().parse().ok())
-}
-
 /// What one row measured: the server thread's Rust bytes and the process's footprint once the
 /// server was made and once its `n` connections settled.
 struct Row {
@@ -308,17 +198,6 @@ struct Row {
     os_settled: i64,
     sock_made: Option<i64>,
     sock_settled: Option<i64>,
-}
-
-/// The clients' credentials, written for the clients' process: the root, the server's certificate,
-/// and each client's certificate and key.
-fn write_credentials(dir: &Path, root: &[u8], server: &[u8], clients: &[(Vec<u8>, Vec<u8>)]) {
-    std::fs::write(dir.join("root.der"), root).unwrap();
-    std::fs::write(dir.join("server.der"), server).unwrap();
-    for (index, (certificate, key)) in clients.iter().enumerate() {
-        std::fs::write(dir.join(format!("{index}.der")), certificate).unwrap();
-        std::fs::write(dir.join(format!("{index}.key")), key).unwrap();
-    }
 }
 
 /// One row: a server admitting `n` measured as `n` clients, in a process of their own, connect to it
@@ -369,28 +248,7 @@ fn row(n: usize) -> Row {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        let began = Instant::now();
-        let mut last_received = 0;
-        let mut quiet_since = Instant::now();
-        loop {
-            turn(&mut driver).await;
-            while driver.endpoint().poll_event().is_some() {}
-            let held = driver.endpoint().stats().connections;
-            let received = driver.stats().received + driver.peer_stats().received;
-            if received != last_received {
-                last_received = received;
-                quiet_since = Instant::now();
-            }
-            let sockets_ready = driver.peer_sockets() >= n || !cfg!(unix);
-            if held >= n && sockets_ready && quiet_since.elapsed() >= QUIET {
-                break;
-            }
-            assert!(
-                began.elapsed() < GUARD,
-                "{held} of {n} connections held; endpoint {:?}",
-                driver.endpoint().stats()
-            );
-        }
+        settle(&mut driver, n, &mut |_| {}).await;
         let counts = alloc::read();
         HISTOGRAM.store(false, Ordering::Relaxed);
         let (rust_settled, rust_peak) = (counts.live, counts.peak);
@@ -535,218 +393,27 @@ fn footprint_server() {
 #[test]
 #[ignore = "the clients of a footprint row, run by it in a process of their own"]
 fn footprint_clients() {
-    let Ok(dir) = std::env::var("FOOTPRINT_DIR") else {
-        return;
-    };
-    let dir = Path::new(&dir).to_path_buf();
-    let n: usize = std::env::var("FOOTPRINT_N").unwrap().parse().unwrap();
-    let server_addr: SocketAddr = std::env::var("FOOTPRINT_SERVER").unwrap().parse().unwrap();
-    let root = std::fs::read(dir.join("root.der")).unwrap();
-    let server_cert = std::fs::read(dir.join("server.der")).unwrap();
-    let clients: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
-        .map(|index| {
-            (
-                std::fs::read(dir.join(format!("{index}.der"))).unwrap(),
-                std::fs::read(dir.join(format!("{index}.key"))).unwrap(),
-            )
-        })
-        .collect();
-    // Stepped, each line of standard input names the clients to have connected; else all at once.
-    let stepped = std::env::var("FOOTPRINT_STEPPED").is_ok();
-    TARGET.store(if stepped { 0 } else { n }, Ordering::Relaxed);
-    std::thread::spawn(move || {
-        if stepped {
-            for line in std::io::stdin().lines() {
-                let Ok(line) = line else { break };
-                if let Ok(target) = line.trim().parse() {
-                    TARGET.store(target, Ordering::Relaxed);
-                }
-            }
-        } else {
-            let mut sink = Vec::new();
-            let _ = std::io::stdin().read_to_end(&mut sink);
-        }
-        STOP.store(true, Ordering::Relaxed);
-    });
-    let mut rt = LocalRuntime::new(&runtime(n)).unwrap();
-    rt.block_on(async move {
-        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let to_server = [(server_cert.as_slice(), SERVER)];
-        let mut made = 0;
-        while !STOP.load(Ordering::Relaxed) {
-            let target = TARGET.load(Ordering::Relaxed).min(clients.len());
-            if made >= target {
-                hyper_rt::futures::sleep(5_000_000).await.unwrap();
-                continue;
-            }
-            let client = &clients[made];
-            made += 1;
-            let mut driver: Drv = Driver::bind(
-                endpoint(&root, client, &to_server, false, admitting(1)),
-                loopback,
-                IO,
-            )
-            .unwrap();
-            let now = driver.clock().unwrap();
-            driver.endpoint().connect(now, SERVER, server_addr).unwrap();
-            hyper_rt::futures::spawn_detached(async move {
-                while !STOP.load(Ordering::Relaxed) {
-                    if let Some(event) = turn(&mut driver).await
-                        && matches!(event, hyper_transport::Event::Connected { .. })
-                    {
-                        CONNECTED.fetch_add(1, Ordering::Relaxed);
-                    }
-                    while let Some(event) = driver.endpoint().poll_event() {
-                        if matches!(event, hyper_transport::Event::Connected { .. }) {
-                            CONNECTED.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            })
-            .unwrap();
-        }
-    })
-    .unwrap();
+    run_clients();
 }
 
-/// One sample of a stepped run: the connections held, the OS's footprint, the bytes counted live
-/// (Rust's on the server's thread and aws-lc's), the kernel's socket memory where it is charged
-/// (-1 where not), and the bytes the run held apart from its connections (its churn).
-#[derive(Clone, Copy, Debug)]
-struct Sample {
-    n: f64,
-    footprint: f64,
-    live: f64,
-    sock: f64,
-    noise: f64,
-    /// The highest footprint the OS has charged the process, and the most bytes counted live at
-    /// once: each grows only as the allocator takes pages it never had.
-    peak_footprint: f64,
-    peak_live: f64,
-}
+/// What the stepped run under the platform's allocator reads: the bytes counted live (the server
+/// thread's Rust bytes and aws-lc's) and their highest.
+struct Counted;
 
-/// The highest footprint the OS has charged this process, bytes.
-fn peak_footprint() -> i64 {
-    usage::this()
-        .unwrap()
-        .peak_footprint
-        .map_or(0, |bytes| bytes as i64)
-}
-
-/// The steps a stepped run takes: the connections held at each.
-const STEPS: [usize; 8] = [32, 64, 128, 256, 384, 512, 768, 1024];
-/// The most bytes a step's churn holds apart from the connections, a stand-in for what else a
-/// node holds (its sessions' rows, messages, caches), charged to its budget as the connections are.
-const NOISE_MAX: usize = 24 << 20;
-
-/// A deterministic generator for the churn's sizes.
-fn next(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
-/// A stepped run's server, in a process of its own: its clients' process told each step's count on
-/// its standard input, each step settled and sampled, the churn remade between steps where `noisy`.
-fn stepped_run(noisy: bool) -> Vec<Sample> {
-    let most = *STEPS.last().unwrap();
-    let pki = Pki::new();
-    let server = pki.issue(&name(SERVER));
-    let clients: Vec<(Vec<u8>, Vec<u8>)> = (1..=most as u64)
-        .map(|peer| pki.issue(&name(peer)))
-        .collect();
-    let dir = std::env::temp_dir().join(format!("learning-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    write_credentials(&dir, &pki.root, &server.0, &clients);
-    let peers: Vec<(Vec<u8>, u64)> = clients
-        .iter()
-        .enumerate()
-        .map(|(index, client)| (client.0.clone(), index as u64 + 1))
-        .collect();
-    let root = pki.root.clone();
-    let mut rt = LocalRuntime::new(&runtime(most)).unwrap();
-    rt.block_on(async move {
-        use std::io::Write as _;
-        let peers: Vec<(&[u8], u64)> = peers
-            .iter()
-            .map(|(certificate, peer)| (certificate.as_slice(), *peer))
-            .collect();
-        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+impl Probe for Counted {
+    fn begin(&self) {
         alloc::begin();
-        let mut driver: Drv = Driver::bind(
-            endpoint(&root, &server, &peers, true, admitting(most)),
-            loopback,
-            IO,
-        )
-        .unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["footprint_clients", "--exact", "--ignored", "--nocapture"])
-            .env("FOOTPRINT_DIR", &dir)
-            .env("FOOTPRINT_N", most.to_string())
-            .env("FOOTPRINT_STEPPED", "1")
-            .env("FOOTPRINT_SERVER", driver.local_addr().unwrap().to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let mut churn: Vec<Vec<u8>> = Vec::new();
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut samples = Vec::new();
-        for target in STEPS {
-            writeln!(stdin, "{target}").unwrap();
-            stdin.flush().unwrap();
-            let began = Instant::now();
-            let mut last_received = 0;
-            let mut quiet_since = Instant::now();
-            loop {
-                turn(&mut driver).await;
-                while driver.endpoint().poll_event().is_some() {}
-                let held = driver.endpoint().stats().connections;
-                let received = driver.stats().received + driver.peer_stats().received;
-                if received != last_received {
-                    last_received = received;
-                    quiet_since = Instant::now();
-                }
-                let sockets_ready = driver.peer_sockets() >= target || !cfg!(unix);
-                if held >= target && sockets_ready && quiet_since.elapsed() >= QUIET {
-                    break;
-                }
-                assert!(began.elapsed() < GUARD, "{held} of {target} held");
-            }
-            // The churn remade: what it held let go, then blocks of random sizes to a random
-            // total, each written so its pages are resident, as a node's rows are.
-            churn.clear();
-            churn.shrink_to_fit();
-            let mut noise = 0usize;
-            if noisy {
-                let total = (next(&mut state) as usize) % NOISE_MAX;
-                while noise < total {
-                    let size = 1024 + (next(&mut state) as usize) % (1 << 20);
-                    let mut block = vec![0u8; size];
-                    block.iter_mut().step_by(4096).for_each(|byte| *byte = 1);
-                    noise += size;
-                    churn.push(block);
-                }
-            }
-            samples.push(Sample {
-                n: driver.endpoint().stats().connections as f64,
-                footprint: footprint() as f64,
-                live: (alloc::read().live + C_LIVE.load(Ordering::Relaxed)) as f64,
-                sock: cgroup_sock().map_or(-1.0, |sock| sock as f64),
-                noise: noise as f64,
-                peak_footprint: peak_footprint() as f64,
-                peak_live: (alloc::read().peak + C_PEAK.load(Ordering::Relaxed)) as f64,
-            });
-        }
+    }
+    fn measures(&self, _driver: &mut Drv) -> Vec<f64> {
+        let counts = alloc::read();
+        vec![
+            (counts.live + C_LIVE.load(Ordering::Relaxed)) as f64,
+            (counts.peak + C_PEAK.load(Ordering::Relaxed)) as f64,
+        ]
+    }
+    fn end(&self) {
         alloc::end();
-        drop(stdin);
-        child.wait().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        samples
-    })
-    .unwrap()
+    }
 }
 
 /// A stepped run's server, in a process of its own (run by the learning measurement).
@@ -757,85 +424,7 @@ fn learning_server() {
         return;
     };
     count_aws_lc();
-    for sample in stepped_run(noisy == "1") {
-        println!(
-            "SAMPLE {} {} {} {} {} {} {}",
-            sample.n,
-            sample.footprint,
-            sample.live,
-            sample.sock,
-            sample.noise,
-            sample.peak_footprint,
-            sample.peak_live
-        );
-    }
-}
-
-/// The least squares fit of `y` on `xs` (each row its regressors) with an intercept: the
-/// coefficients, the intercept first, by the normal equations.
-fn least_squares(xs: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
-    let k = xs[0].len() + 1;
-    let mut a = vec![vec![0.0f64; k + 1]; k];
-    for (row, &target) in xs.iter().zip(y) {
-        let mut full = vec![1.0];
-        full.extend_from_slice(row);
-        for i in 0..k {
-            for j in 0..k {
-                a[i][j] += full[i] * full[j];
-            }
-            a[i][k] += full[i] * target;
-        }
-    }
-    // Gauss-Jordan with partial pivoting.
-    for col in 0..k {
-        let pivot = (col..k)
-            .max_by(|&p, &q| a[p][col].abs().total_cmp(&a[q][col].abs()))
-            .unwrap();
-        a.swap(col, pivot);
-        let div = a[col][col];
-        if div.abs() < 1e-12 {
-            return vec![f64::NAN; k];
-        }
-        for value in &mut a[col][col..] {
-            *value /= div;
-        }
-        let pivot_row = a[col].clone();
-        for (index, row) in a.iter_mut().enumerate() {
-            if index != col {
-                let factor = row[col];
-                for (value, pivot) in row[col..].iter_mut().zip(&pivot_row[col..]) {
-                    *value -= factor * pivot;
-                }
-            }
-        }
-    }
-    (0..k).map(|i| a[i][k]).collect()
-}
-
-fn samples_of(noisy: bool) -> Vec<Sample> {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["learning_server", "--exact", "--ignored", "--nocapture"])
-        .env("LEARNING_NOISY", if noisy { "1" } else { "0" })
-        .stderr(Stdio::inherit())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "the stepped run's server failed");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix("SAMPLE "))
-        .map(|line| {
-            let v: Vec<f64> = line.split(' ').map(|f| f.parse().unwrap()).collect();
-            Sample {
-                n: v[0],
-                footprint: v[1],
-                live: v[2],
-                sock: v[3],
-                noise: v[4],
-                peak_footprint: v[5],
-                peak_live: v[6],
-            }
-        })
-        .collect()
+    print_samples(&stepped_run(noisy == "1", Counted));
 }
 
 /// How well each way a node could learn what a connection costs it, on the host it runs on, learns
@@ -853,55 +442,44 @@ fn samples_of(noisy: bool) -> Vec<Sample> {
 #[ignore = "a measurement: cargo test --release -p hyper-rt-transport --test connection_footprint -- --ignored --nocapture how_well"]
 fn how_well_each_way_learns_what_a_connection_costs() {
     println!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
-    let clean = samples_of(false);
-    let ns: Vec<Vec<f64>> = clean.iter().map(|s| vec![s.n]).collect();
-    let truth = least_squares(&ns, &clean.iter().map(|s| s.footprint).collect::<Vec<_>>())[1];
-    let truth_live = least_squares(&ns, &clean.iter().map(|s| s.live).collect::<Vec<_>>())[1];
+    let live = |s: &Sample| s.measures[0];
+    let peak_live = |s: &Sample| s.measures[1];
+    let clean = samples_of("learning_server", false);
+    let truth = slope(&clean, |s| s.footprint);
+    let truth_live = slope(&clean, live);
     let sock = clean[0].sock >= 0.0;
-    let truth_sock = if sock {
-        least_squares(&ns, &clean.iter().map(|s| s.sock).collect::<Vec<_>>())[1]
-    } else {
-        0.0
-    };
+    let truth_sock = if sock { slope(&clean, |s| s.sock) } else { 0.0 };
     println!(
         "host charges {truth:.0} B a connection (counted live {truth_live:.0} B); kernel sockets {truth_sock:.0} B"
     );
-    let noisy = samples_of(true);
+    let noisy = samples_of("learning_server", true);
     println!(
         "| after step | n | footprint ~ n | footprint ~ n + other | live ~ n + other, scaled | live alone | live x peak ratio | kernel ~ n |"
     );
     println!("|---|---|---|---|---|---|---|---|");
-    let err = |estimate: f64, truth: f64| {
-        format!(
-            "{:.0} B ({:+.0}%)",
-            estimate,
-            (estimate / truth - 1.0) * 100.0
-        )
-    };
     for k in 2..noisy.len() {
         let seen = &noisy[..=k];
-        let fp: Vec<f64> = seen.iter().map(|s| s.footprint).collect();
-        let live: Vec<f64> = seen.iter().map(|s| s.live).collect();
-        let only_n: Vec<Vec<f64>> = seen.iter().map(|s| vec![s.n]).collect();
-        let with_other: Vec<Vec<f64>> = seen.iter().map(|s| vec![s.n, s.noise]).collect();
-        let e1 = least_squares(&only_n, &fp)[1];
-        let e2 = least_squares(&with_other, &fp)[1];
-        let live_each = least_squares(&with_other, &live)[1];
+        let e1 = slope(seen, |s| s.footprint);
+        let e2 = slope_beside_churn(seen, |s| s.footprint);
+        let live_each = slope_beside_churn(seen, live);
         // The allocator's and pages' share: footprint against counted live bytes, the churn's
         // variation identifying it.
-        let ratio = least_squares(&seen.iter().map(|s| vec![s.live]).collect::<Vec<_>>(), &fp)[1];
+        let lives: Vec<Vec<f64>> = seen.iter().map(|s| vec![live(s)]).collect();
+        let ratio = least_squares(
+            &lives,
+            &seen.iter().map(|s| s.footprint).collect::<Vec<_>>(),
+        )[1];
         let e3 = live_each * ratio;
         // The allocator's share from the high-water marks, which only grow as it takes pages it
         // never had: footprint's against counted live's.
-        let peaks: Vec<Vec<f64>> = seen.iter().map(|s| vec![s.peak_live]).collect();
+        let peaks: Vec<Vec<f64>> = seen.iter().map(|s| vec![peak_live(s)]).collect();
         let peak_ratio = least_squares(
             &peaks,
             &seen.iter().map(|s| s.peak_footprint).collect::<Vec<_>>(),
         )[1];
         let e5 = live_each * peak_ratio;
         let e4 = if sock {
-            let socks: Vec<f64> = seen.iter().map(|s| s.sock).collect();
-            err(least_squares(&only_n, &socks)[1], truth_sock)
+            err(slope(seen, |s| s.sock), truth_sock)
         } else {
             "-".to_owned()
         };

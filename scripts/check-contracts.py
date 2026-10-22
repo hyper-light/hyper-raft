@@ -91,6 +91,19 @@ UNSAFE_ALLOWED = {
         "pthread_getcpuclockid and clock_gettime; thread_info (macOS); QueryThreadCycleTime and GetThreadTimes (Windows): per-thread CPU clocks",
     "crates/hyper-rt/src/waker.rs":
         "RawWakerVTable over the Copy task word (docs/runtime.md §3.2)",
+    "crates/hyper-rt-transport/tests/connection_footprint.rs":
+        "std::alloc::GlobalAlloc over hyper-measure's counting allocator, and aws-lc's "
+        "CRYPTO_set_mem_functions with malloc, realloc and free over System, each block carrying "
+        "its size (what a connection costs its host; measurement only)",
+    "crates/hyper-rt-transport/tests/connection_heap.rs":
+        "std::alloc::GlobalAlloc over mimalloc's, aws-lc's CRYPTO_set_mem_functions over mi_malloc "
+        "and mi_free, and mimalloc's heap API (mi_heap_new, mi_heap_set_default, "
+        "mi_heap_visit_blocks, mi_heap_collect, mi_process_info): a connection's cost read from a "
+        "heap of its own (measurement only)",
+    "crates/hyper-heap/src/lib.rs":
+        "mimalloc's heap API through libmimalloc-sys: mi_heap_new, mi_heap_set_default, "
+        "mi_heap_get_default, mi_heap_get_backing, mi_heap_collect, mi_heap_visit_blocks and its "
+        "area visitor, mi_heap_delete, mi_is_in_heap_region (a thread's work on a heap of its own)",
     "crates/hyper-measure/src/alloc.rs":
         "std::alloc::GlobalAlloc over System (the counting allocator; measurement only)",
     "crates/hyper-measure/src/faults.rs":

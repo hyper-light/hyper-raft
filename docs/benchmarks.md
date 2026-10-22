@@ -8197,6 +8197,10 @@ what its `n` connections added while they connected and settled, divided by `n`;
 | | 256 | 30.4–31.8 KB | 3.9–4.1 KB | 54.8–56.6 KB | 1.58–1.60 | |
 | | 1,024 | 25.4–29.8 KB | 3.6–4.3 KB | 52.7–56.4 KB | 1.66–1.82 | |
 
+(Corrected 2026-10-21: the control group's `sock` counted the clients' process too, which ran in
+the same group; the server's own sockets hold 4,096 B a connection, "What a connection holds, read
+from a heap of its own".)
+
 What a connection costs its host is not one number: it is 1.3 to 2.5 times what the program
 itself holds, by the host's allocator, its page (a 16 KiB page on Apple silicon), the C library
 beside Rust and, on Linux in a container, the kernel's socket memory charged to the container's
@@ -8244,6 +8248,51 @@ learned from the same samples carries the churn's error back in. The parts that 
 ones read where the memory is held and nothing else is: the counted bytes, and the kernel's socket
 memory where a control group charges it. What is missing is the allocator's own account of the
 connections' pages, which neither a process's footprint nor a count of requests gives.
+
+## What a connection holds, read from a heap of its own (2026-10-21)
+
+`cargo test --release -p hyper-rt-transport --test connection_heap -- --ignored --nocapture
+how_well`. The stepped runs of the section above, under mimalloc (focal's allocator, at the version
+focal pins), the server's work for its connections on a heap of its own: a mimalloc heap made the
+server thread's default while its driver turns and given back while the churn is made, aws-lc's
+allocations routed to mimalloc (`CRYPTO_set_mem_functions`), so the heap's pages hold the
+connections' work and nothing else. Read from the heap's pages (`mi_heap_visit_blocks`): its blocks
+in use (each block's usable size) and its pages' blocks made (in use or free). The endpoint itself
+observes the heap's bytes in use as a node does (`Endpoint::wants_observation`, `Driver::observe`,
+docs/transport.md §4x) and reports what it learned a connection holds. Per connection held:
+
+| | macOS 26 arm64 | Linux 6 x86_64 (fedora) |
+|---|---|---|
+| clean: footprint's slope (the process) | 26,514 B | 38,507 B |
+| clean: heap's pages' slope | 32,357 B | 37,220 B |
+| clean: heap in use, slope | 29,561 B | 34,821 B |
+| clean: counted live (requests), slope | 26,795 B | 31,498 B |
+| clean: kernel, the driver's sockets (`SO_MEMINFO`) | none charged | 4,096 B |
+| noisy, steps 3→8: heap in use on connections | 31,735 → 30,024 B | 36,331 → 34,398 B |
+| noisy, steps 3→8: heap's pages on connections | 35,653 → 33,267 B | 40,956 → 36,876 B |
+| noisy, steps 3→8: footprint on connections | +356% → −8% | +331% → +29% |
+| the endpoint's learned charge, clean, at 32, 128, 1,024 | 33,665, 31,497, 29,637 B | 36,215, 37,085, 37,597 B |
+| the endpoint's learned charge, noisy, at 128 and 1,024 | 32,143, 30,102 B | 36,987, 37,148 B |
+
+The heap's account is steady under the churn where the footprint's is not: in use on connections,
+the noisy run's estimate is within 7% of the clean slope at 128 connections and within 2% from 512
+on, on both hosts; an earlier pair of runs gave the same (Linux 34,935 B clean, the noisy run −1% to
+−5% of the footprint; macOS 29,751 B clean). The endpoint's own charge is the heap in use past what
+its work held with no connection, over the connections held, with Linux's kernel holdings beside it:
+it reads high at a few connections, where the endpoint's tables grown for them are shared among
+few, and settles on the slope (macOS 29,637 B at 1,024 against 29,561 B). macOS's footprint grew
+less per connection than the heap's own bytes in use: the pages the connections' blocks took had
+been held by the process already (its setup made a thousand certificates on the same thread first),
+so a footprint is no truth of what a piece of work holds even with nothing churning. The heap's
+pages' blocks past those in use (7–10%) are free blocks the heap keeps for its next allocations.
+
+The Linux control group's `sock` (12,205 and 12,288 B a connection in these runs and in "What the
+operating system charges a server for each connection") counts every process in the group: the
+clients' process ran in the same one, and each client's socket is charged there too. The server's
+own sockets hold 4,096 B a connection (`SO_MEMINFO`'s queue and forward allocation, per socket).
+
+Windows was not run: the runner's repository sync failed for the session's every synced command
+(`jupiter did not answer in 15s`) while unsynced commands ran.
 
 ## An exchange by the server's connections, a socket each (2026-10-17)
 

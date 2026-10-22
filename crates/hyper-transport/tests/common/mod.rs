@@ -335,6 +335,7 @@ pub fn limits() -> Limits {
         max_responses: 16,
         // A full 16 MiB window of unread data, packed: 16 MiB / 65,527 B, and one.
         receive_chunks: (16 << 20) / hyper_transport::RECEIVE_CHUNK + 1,
+        retry_bytes: None,
     }
 }
 

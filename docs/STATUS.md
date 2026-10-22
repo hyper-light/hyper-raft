@@ -63,6 +63,30 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-21: in hyper-transport, a connection's state is charged what it holds on the host
+the endpoint runs on, learned there, where it was `CONNECTION_STATE`'s 30 KiB, measured on two hosts
+(`docs/transport.md` §4x). The owner runs the endpoint's work on a heap of its own (the new
+hyper-heap crate: a mimalloc first-class heap, `OnHeap`, `held_here`) and observes its bytes in use
+when the endpoint wants (`Endpoint::wants_observation`, `Driver::observe`, which adds Linux's kernel
+socket holdings, hyper-rt's `QueueCharge::held` from `SO_MEMINFO`): first as the endpoint is made,
+then as its connections double, halve or turn over, with nothing in flight. The connections' state is
+one reservation trued up to what the heap holds past the endpoint's own and its receive pool (what
+the budget cannot fund recorded, the next connection refused at its first window); one connection
+more is charged what one held on average; before any observation, its structures' own bytes
+(`state_charge::<C>`, the least). Ways measured under churn on three hosts: the footprint regressed
+on connections erred +19% to +392%, the program's own count of its requests 5–27% short; the heap's
+bytes in use within 7% at 128 connections and 2% from 512 (`docs/benchmarks.md`, "How a node could
+learn what a connection costs it, under churn", "What a connection holds, read from a heap of its
+own"). `Reservation::absorb` and `Reservation::split` let one reservation hold a sum. The first
+observations of focal's listener found admission reserving each identity's list of connections to
+`per_identity`, which focal states as the listener's whole bound: 115,400 bytes an identity at 2,885
+connections, charged to nothing, megabytes at a bound a node's memory funds; the list now grows with
+what the identity holds, and the listener's learned charge fell from 160,204 to 29,295 bytes a
+connection (`docs/transport.md` §4x). An owner may state what the handshakes in progress may hold
+before an unproven address is answered with a Retry (`Limits::retry_bytes`, msquic's
+`RetryMemoryLimit` rule), each counted at the learned charge, where half the pending places, a count
+an owner deriving its places from its memory makes tens of thousands, was the only rule.
+
 Landed 2026-10-21: in hyper-tls, a certificate's Brotli compression (RFC 8879) takes the least
 window holding the certificate whole (RFC 7932 §9.1), where it took Brotli's default 2^22: at the
 amortized quality the binary-tree hasher's forest, two `u32` a window position, was 32 MiB, allocated

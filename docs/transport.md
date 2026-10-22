@@ -1548,6 +1548,9 @@ hyper-rt-transport's `connection_memory` measurement connects all 256 clients in
 
 ## 4w. A connection's state charged as it is held (2026-10-20)
 
+(Its constant, `CONNECTION_STATE`, is now learned where the endpoint runs: §4x. The test named below
+is now `a_connection_holds_at_least_what_it_is_charged_before_anything_is_observed`.)
+
 What a connection holds of its endpoint's memory beside its windows and the messages it carries
 (its QUIC state, `hyper_quic::Connection`'s 8,128 bytes inline and what that allocates, its stream
 tables, its rows in the endpoint's own) was charged to nothing: a node's connections were bounded by
@@ -1588,6 +1591,82 @@ makes (`Table::made`), the touched list's room still what a settle is due at, so
 as it did. `cargo bench -p hyper-transport --bench allocs`, the change against `58d2308` in turn:
 6.35, 10.36 and 10.39 allocations an exchange (no body, 4 KiB and 64 KiB bodies) and 2.02 a lane
 frame, 0.12 reallocations, on both.
+
+## 4x. A connection's state learned on the host it runs on (2026-10-21)
+
+§4w charged each connection `CONNECTION_STATE`, 30 KiB, rounded from the Rust bytes an idle
+connection asked for on the two hosts measured. That number is the code's, the allocator's and the
+host's, and a node runs on hosts no one measured: under each host's own allocator a connection cost
+36.3 to 37.3 KB of the process's footprint on macOS, 34.9 to 38.5 KB on Linux and 36.6 KB on Windows,
+and under mimalloc, focal's allocator, 29.6 KB of its heap on macOS and 34.8 KB on Linux, with 4,096
+bytes of kernel socket memory beside it on Linux that no footprint holds (docs/benchmarks.md, "What
+a connection holds, read from a heap of its own"). A charge below that let a node's connections take
+memory its budget had given to something else; one above it refused connections the node could hold.
+The charge is now learned where the endpoint runs.
+
+**What is measured.** The owner runs the endpoint's work on a heap of its own (hyper-heap: one of
+mimalloc's first-class heaps, made the thread's default while the owner's task is polled). Every
+block that work allocates, aws-lc's included where its allocations go through mimalloc, is on that
+heap's pages, and a block freed anywhere goes back to its page: the heap's bytes in use are what the
+work holds, the allocator's rounding of each block included, and nothing else's. The ways that read
+a process instead were measured first and fail under churn: the footprint regressed on the
+connections held erred by +19% to +392% while other memory came and went (the allocator keeps the
+pages others freed), and the bytes the program counts it asked for fell 5–27% short of the
+allocator's account. The heap's bytes in use regressed on the connections reproduced the clean
+run's within 6% at 128 connections and 1% from 512 on, on both hosts, under the same churn.
+
+**When.** An observation is wanted when nothing is in flight that it would count as a connection's
+state (no exchange open, no handshake pending or dial under way, no event waiting, no lane frame
+queued; `Endpoint::wants_observation`) and the account is due one: its first, which the owner makes
+as it makes the endpoint, then each time the connections held double or halve, or as many
+connections are made as were held at the last (the population turned over). Walking a heap's pages
+costs in proportion to the connections held; made at each doubling, it is paid once for as many
+connections as it visits, a constant a connection at any count.
+
+**What is charged.** The connections' state is one reservation on the window's lane (accounting
+only), trued up at each observation to what the work holds past what it held with no connection
+(the first observation) and past the receive pool (charged as the pool, apart), with the kernel's
+holdings for the driver's sockets beside it where the platform charges the process for them (Linux's
+`SO_MEMINFO`: what each socket's queue holds and what the kernel reserved ahead of it,
+`Driver::kernel_held`). A true-up the budget cannot fund is recorded (`StateStats::unfunded`) and
+the next connection is charged as learned, so a budget that cannot hold what the connections hold
+refuses the next one, typed, at its first window. A connection made between observations is charged
+what one held on average at the last, never less than its structures' own bytes; one that goes gives
+back its share, the last one the rest. Before any observation, and for an owner that makes none, a
+connection is charged its structures' own bytes (`state_charge`): the connection itself, its QUIC
+state inline among them, and its exchange tables, 8,912 bytes under the tests' limits, the least a
+connection holds on any host, so a bound an owner derives from its memory and that charge is one
+its memory reaches first. `connection_memory`'s test holds that floor below what each connection
+holds; `connection_heap::an_endpoint_on_a_heap_of_its_own_charges_its_connections_what_they_hold`
+holds the charge to what the heap says, to the byte.
+
+What the heap keeps between its live blocks (its pages' free blocks, 7 to 10% of what the
+connections hold in the measurement) is the allocator's, kept for the work's next allocations: a
+node's envelope leaves a quarter of its memory to the allocator and the kernel for it.
+
+**What the first observations found.** focal's listener, observed so, charged 160,204 bytes a
+connection where the measurement's endpoint held 35 KB. Its heap's blocks by size
+(`hyper_heap::sizes_here`) held one block of 128 KiB for each connection: each identity's list of
+the connections it holds was reserved to `per_identity` as admission first saw it, and focal states
+that bound as the listener's whole (one identity may hold every connection), so every agent held room
+for every connection — 40 bytes each, 115,400 bytes an identity at the 2,885 the test's listener
+funded, 53,640 at the 1,341 a node's listener funded before, charged to nothing, and megabytes at
+the bound a node's memory funds. An identity's list now grows with what it holds, its room reserved
+before anything moves (`Admission::admit`; `an_identity_holds_room_for_what_it_holds_not_its_bound`),
+and the same listener charges 29,295 bytes a connection.
+
+**When a handshake is answered with a Retry.** A handshake from an address not yet proven was
+answered with a Retry once half the pending places were taken (RFC 9000 §8.1.2, Retry under load). An
+owner that derives its places from its memory, as focal's listener now does, makes them tens of
+thousands, and the crypto of every one of them would be done before the first Retry. An owner may
+now state what the handshakes in progress may hold instead (`Limits::retry_bytes`), each counted at
+what a connection is charged as it is made, learned where the endpoint runs, as Microsoft's msquic
+counts its handshakes' memory against its `RetryMemoryLimit`, 65/65535 of the memory available by
+default (msquic `docs/Settings.md`; `QuicBindingShouldRetryConnection`, `src/core/binding.c`).
+Without one, the rule of half the places holds. `responses::a_retry_comes_once_the_handshakes_hold_what_the_owner_allows_them`.
+
+The ways measured, the rule's figures and the runs: docs/benchmarks.md, "How a node could learn what
+a connection costs it, under churn" and "What a connection holds, read from a heap of its own".
 
 ## 5. Consumers
 

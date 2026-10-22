@@ -466,7 +466,7 @@ fn a_budget_that_cannot_fund_a_head_refuses_it() {
         Role::Node,
         pair.book(Role::Node, Role::Node),
         limits(),
-        16_000 + hyper_transport::state_charge(&limits()),
+        16_000 + hyper_transport::state_charge::<Mantle>(&limits()),
         now,
     );
     let mut net = Net::new(now, a, b);
@@ -3095,7 +3095,7 @@ fn a_lossless_frame_waits_for_the_budget_and_is_never_skipped() {
     // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
     let budget = first_window() * 2
         + 12 * FRAME as u64
-        + hyper_transport::state_charge(&limits())
+        + hyper_transport::state_charge::<Mantle>(&limits())
         + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
@@ -3161,7 +3161,7 @@ fn a_held_lanes_frame_waits_for_its_owner_not_the_budget() {
     // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
     let budget = first_window() * 2
         + 12 * FRAME as u64
-        + hyper_transport::state_charge(&limits())
+        + hyper_transport::state_charge::<Mantle>(&limits())
         + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Kept, Kept>(&pair, limits(), 256 << 20, budget);
@@ -3283,7 +3283,7 @@ fn a_lossy_frame_the_budget_cannot_hold_is_skipped_and_counted() {
     // charged; and the state, and the receive chunk a budget past one chunk funds at the handshake.
     let budget = first_window() * 2
         + 12 * FRAME as u64
-        + hyper_transport::state_charge(&limits())
+        + hyper_transport::state_charge::<Mantle>(&limits())
         + hyper_transport::RECEIVE_CHUNK as u64;
     let pair = Pair::new();
     let mut net = connected_budgets::<Mantle, Mantle>(&pair, limits(), 256 << 20, budget);

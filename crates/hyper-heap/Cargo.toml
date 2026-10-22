@@ -1,0 +1,22 @@
+[package]
+name = "hyper-heap"
+description = "A thread's work on a heap of its own: what that work holds, read where it is held (mimalloc's first-class heaps)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# mimalloc's heap API (the `extended` bindings: mi_heap_new, mi_heap_set_default, mi_heap_visit_blocks,
+# mi_is_in_heap_region), at the version focal's binary allocates through.
+libmimalloc-sys.workspace = true
+# A future polled on a heap holds its future in place, projected without `unsafe` of this crate's.
+pin-project-lite.workspace = true
+
+[dev-dependencies]
+# The tests allocate through mimalloc, as a binary that uses this crate does.
+mimalloc.workspace = true
+
+[lints]
+workspace = true

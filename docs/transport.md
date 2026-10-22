@@ -1820,6 +1820,43 @@ Tests (hyper-rt `udp::batched::tests` and `tests/udp_batched.rs`):
 - `exchanges::every_class_of_exchange_crosses_on_a_hyper_rt_shard`: the asker's ring grew on Linux
   and stayed at one buffer elsewhere, and its charge is exactly what it grew by.
 
+## 4ab. A wait holds none of the pool (2026-10-22)
+
+focal's deliver run with 500 agents (CI 39745325712, each agent a client of its own whose events
+tail waits at the node for a delivery) committed 4,885 writes in 512 seconds of the 350 a second
+offered, refused none, and finished no message's lifecycle, its node at 21% of a CPU. The listener's
+stream pool (§4g) held 142 streams, every one granted, with 360 connections waiting for one; of the
+121,144 pages its tails read, 120,644 had been held at the node. A held page is an exchange whose
+reply waits for an event, and it held its stream, and with it the pool's credit, for its whole wait.
+A connection holding one was not idle, so nothing was taken back from it, and every write queued at
+its asker behind the waits.
+
+A wait does none of the work the pool admits. Breakwater issues credit for the server's work (Cho et
+al., OSDI 2020), and Kafka holds a fetch that waits for data in its purgatory (`DelayedFetch`), apart
+from the request handlers that serve. So an exchange of a kind its owner says waits
+(`Classes::waits`) is parked as its head arrives (`Pool::park`):
+
+- **A stream of its own.** Its connection's stream limit becomes its grant plus its parked exchanges
+  (`Share::limit`), so its peer may open what the pool grants it while the wait is held.
+- **No open one in the pool's accounts.** A connection whose only open exchanges are parked is idle,
+  and while another waits its grant is taken back with the parked streams kept.
+- **Bounds.** A connection parks only while its grant and its parked exchanges together are fewer
+  than the streams one connection may hold (`Limits::streams_per_connection`). Past that, an
+  exchange is served in the pool's account and counted (`PoolStats::parks_refused`). A parked
+  exchange's stream goes when it ends (`Pool::unpark`) and is granted to no other; its stream limit
+  is set before its reply finishes, as a served one's is (§4g).
+- **What is told.** `PoolStats::{parked, parks, parks_refused}`.
+
+Tests:
+- `pool::tests::a_parked_exchange_holds_a_stream_of_its_own_and_none_of_the_pools`: parked beside the
+  grant; the connection idle with the parked stream kept, its grant reclaimed for one waiting; the
+  stream gone with it.
+- `pool::tests::parking_stops_at_the_streams_one_connection_may_hold`.
+- `exchange::a_parked_wait_holds_none_of_the_pool`: through a pool of one, a held wait and five
+  requests behind it, every request answered while the wait is held, and the wait's stream gone with
+  its answer. Of a server whose classes park nothing, the same five are not served while the wait is
+  held.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

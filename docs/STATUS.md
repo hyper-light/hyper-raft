@@ -63,6 +63,18 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-22: in hyper-transport, an exchange that waits on its owner's event (a long poll,
+`Classes::waits`) holds none of the stream pool's credit: parked as its head arrives, it holds a
+stream of its own, within the streams one connection may hold, and is no open one in the pool's
+accounts, so a connection holding only waits is idle and its grant goes to those waiting
+(`Pool::park`, `Share::limit`, `PoolStats::{parked, parks, parks_refused}`). focal's deliver run
+of 500 agents committed 10 writes a second of the 350 offered with its node at 21% of a CPU: its
+pool's 142 streams were all granted to connections whose tails' pages were held at the node, and
+360 waited behind them. Kafka holds a waiting fetch in its purgatory, apart from the handlers that
+serve; Breakwater credits the server's work, which a wait does none of (`docs/transport.md`
+§4ab). Test: through a pool of one, five requests behind a held wait are answered while it is
+held, and none is where nothing parks (`exchange::a_parked_wait_holds_none_of_the_pool`).
+
 Landed 2026-10-22: in hyper-rt, a driver's receive ring holds what its drains needed, from one
 64 KiB buffer up to its batch, where it held the whole batch from the moment it was made, resident
 and charged whether the endpoint received anything or not (2 MiB for a client of one connection on

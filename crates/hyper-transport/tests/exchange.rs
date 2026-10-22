@@ -659,6 +659,97 @@ fn a_pooled_peer_holds_back_what_the_pool_cannot_take() {
     assert!(pool.granted <= 3, "{pool:?}");
 }
 
+/// A pooled server parks an exchange that waits on its owner's event (a long poll,
+/// `Classes::waits`): parked as its head arrives, it holds a stream of its own and none of the
+/// pool's, so a pool of one serves every request its peer asks while the wait is held, and the
+/// wait's stream goes with its answer (docs/transport.md §4ab). The same wait asked of a server
+/// whose classes park nothing holds the pool's one stream, and the requests behind it wait at
+/// their asker: focal's deliver run of 500 agents, each connection's long poll holding the pool,
+/// committed 10 writes a second of the 350 offered.
+#[test]
+fn a_parked_wait_holds_none_of_the_pool() {
+    let pair = Pair::new();
+    let mut pooled = limits();
+    pooled.stream_credit = hyper_transport::StreamCredit::Pooled { initial: 1 };
+    /// One exchange of `kind` asked of node 2: a snapshot, the wait, or a get.
+    fn ask<A, B>(net: &mut Net<Node<A>, Node<B>>, asker: &mut Asker, kind: Kind, seed: u8)
+    where
+        A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+        B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    {
+        let class = if kind == Kind::Snapshot {
+            Class::Bulk
+        } else {
+            Class::Request
+        };
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (kind, class),
+                seed,
+                Some(100),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    // Parked: the wait is held, and the requests behind it are answered.
+    let mut net = connected_sizing::<PooledWaits, PooledWaits>(&pair, pooled, 256 << 20, 1);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.hold_replies = true;
+    ask(&mut net, &mut asker, Kind::Snapshot, 0);
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        net.b.stats().pool.parked == 1
+    });
+    for seed in 1..6 {
+        ask(&mut net, &mut asker, Kind::Get, seed);
+    }
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        server.answered == 5
+    });
+    let pool = net.b.stats().pool;
+    assert_eq!((pool.parked, pool.parks), (1, 1), "{pool:?}");
+    assert!(pool.granted <= 1, "{pool:?}");
+    server.hold_replies = false;
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        asker.finished()
+    });
+    assert_eq!(server.answered, 6);
+    assert!(asker.asked.iter().all(|asked| asked.refused.is_none()));
+    assert_eq!(
+        net.b.stats().pool.parked,
+        0,
+        "the wait's stream went with it"
+    );
+    // Not parked: the wait holds the pool's one stream, and nothing behind it is served.
+    let mut net = connected_sizing::<Pooled, Pooled>(&pair, pooled, 256 << 20, 1);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.hold_replies = true;
+    ask(&mut net, &mut asker, Kind::Snapshot, 0);
+    for seed in 1..6 {
+        ask(&mut net, &mut asker, Kind::Get, seed);
+    }
+    for _ in 0..TURNS {
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+        if !net.exchange() {
+            break;
+        }
+    }
+    assert_eq!(
+        server.answered, 0,
+        "a request was served past the held wait"
+    );
+    assert_eq!(net.b.stats().pool.parked, 0);
+}
+
 /// A pooled server's stream goes back to its peer with the reply that ends its exchange, in the
 /// reply's datagrams (hyper-quic `VENDORED.md` §29): through a pool of one, twenty exchanges asked
 /// in turn take two datagrams of each side's an exchange (40 and 40). When the stream went back

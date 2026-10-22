@@ -63,6 +63,19 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-22: in hyper-rt, a driver's receive ring holds what its drains needed, from one
+64 KiB buffer up to its batch, where it held the whole batch from the moment it was made, resident
+and charged whether the endpoint received anything or not (2 MiB for a client of one connection on
+Linux; focal-load's 500 agents came to 1.04 GiB). A drain that took more than the ring holds wants
+what it took, one that stopped with its last call full wants twice the ring (an unstamped Linux
+socket's backlog is found by doubling), and a spell of as many drains as the ring holds that wanted
+fewer shrinks it to the most they wanted (`Ring::wants`). hyper-rt-transport's driver resizes it
+after each turn, charging a growth to the endpoint's budget first (`Endpoint::reserve_own`) and
+giving a shrink back; a refused growth leaves the ring as it was. The owner charges what a driver
+holds as it is made (`least_bytes`), and `Driver::observe` keeps the ring's growth out of the
+connections' learned state. Over its life a ring allocates at most its bound plus one buffer a drain
+(`docs/transport.md` §4aa).
+
 Landed 2026-10-21: in hyper-transport, a connection's state is charged what it holds on the host
 the endpoint runs on, learned there, where it was `CONNECTION_STATE`'s 30 KiB, measured on two hosts
 (`docs/transport.md` §4x). The owner runs the endpoint's work on a heap of its own (the new

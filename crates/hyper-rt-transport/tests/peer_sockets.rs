@@ -276,9 +276,9 @@ fn a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own() 
                 socket => socket.unwrap(),
             };
             assert_eq!(socket.shares_port().unwrap(), apart == 1);
-            let batched = hyper_rt::udp::Batched::new(socket, IO, false).unwrap();
+            let batched = hyper_rt::udp::Batched::lent(socket, false).unwrap();
             let mut server: Drv =
-                Driver::new(endpoint(&pki, &two, &one.0, CLIENT, true), batched).unwrap();
+                Driver::new(endpoint(&pki, &two, &one.0, CLIENT, true), batched, IO).unwrap();
             let server_addr = server.local_addr().unwrap();
             let mut client: Drv =
                 Driver::bind(endpoint(&pki, &one, &two.0, SERVER, false), loopback, IO).unwrap();

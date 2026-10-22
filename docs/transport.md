@@ -1767,6 +1767,59 @@ host's wall clock (`StdSystemTime`, the server's `TimeSource`), not the world's:
 virtual time. A driver's timer granularity is never measured on the simulation (`docs/STATUS.md`, open
 defects), so every host runs a seed at RFC 9002's 1 ms.
 
+## 4aa. A receive ring holds what its drains needed (2026-10-22)
+
+A driver's ring (§4h) held `Io::batch` buffers of 64 KiB from the moment it was made. On Linux each
+buffer is zeroed as it is allocated, so all of them were resident, and its owner charged them all
+too: focal charged every endpoint `Io::held_bound` of a batch of 32, 4.2 MiB on Linux, whatever it
+received. A focal agent is a client with one connection, and its endpoint's 2 MiB of ring buffers
+was most of what it held. focal's load generator, running 500 agents in one process, used 1.04 GiB,
+1,000 agents would reach its container's 2 GiB, and one charge of 4.2 MiB per endpoint priced every
+small client like a node at full load.
+
+The ring now starts with one buffer and holds as many as its drains have needed (hyper-rt's
+`Ring::wants`, its doc gives the rule):
+
+- **Growth.** A drain that took more messages than the ring holds, more than one call's worth,
+  wants as many buffers as it took. A drain that stopped with its last call full may have left more
+  in the socket. It wants twice what the ring holds: on Linux, a socket without the kernel's receive
+  stamps takes one call a drain, because `FIONREAD` reports only the next datagram, so its backlog
+  can only be found by doubling.
+- **Shrinking.** After as many drains as the ring holds buffers, if none wanted that many, the ring
+  wants the most any of them did. If they wanted exactly what it holds, it starts counting a new
+  spell. So the ring shrinks only after a spell as long as its own size, and a ring that a burst
+  filled shrinks again once its traffic is quiet.
+- **Who changes it.** The driver resizes the ring after each turn's drains (`Driver::size_ring`). It
+  reserves what a growth adds from the endpoint's budget on `Lane::Window` (`Endpoint::reserve_own`),
+  takes the grant into one reservation, and gives the bytes back as the ring shrinks. A growth the
+  budget refuses, or the allocator does, leaves the ring as it was until a drain wants more again;
+  meanwhile its sockets take what they hold in more calls. The owner charges what a driver holds
+  as it is made (`hyper_rt_transport::least_bytes`: one buffer, a batch's headers and the lent
+  listener socket).
+- **The learned state.** What the ring grows by is allocated while the driver runs, on the heap the
+  owner reads (§4x), and is charged as the ring's, so `Driver::observe` subtracts it
+  (`Ring::grown_bytes`). The first buffer was made with the driver, off that heap.
+- **Bounds.** At most `Io::batch` buffers. A resize allocates or frees only the difference. Over the
+  ring's life a growth either makes again what a shrink freed or takes the ring past any size it held
+  before, and a shrink frees at most one buffer for each drain of the spell it waited for. The ring
+  therefore allocates at most its bound plus one buffer per drain over its life.
+  `udp::batched::tests::a_ring_allocates_at_most_a_buffer_a_drain` checks this over 100,000 seeded drains.
+
+A socket handed to `Driver::new` lets go of any receive buffers of its own
+(`Batched::release_buffers`), since the driver receives into its ring. focal had handed its adopted
+sockets over holding a batch of their own as well.
+
+Tests (hyper-rt `udp::batched::tests` and `tests/udp_batched.rs`):
+- `a_ring_wants_what_a_drain_took_within_its_bound`, `a_ring_shrinks_to_the_most_once_it_served_as_many_drains_as_it_holds`,
+  `a_spell_that_wanted_the_whole_ring_ends_and_a_quiet_one_shrinks_it`,
+  `a_drain_that_left_more_doubles_the_ring`, `a_ring_kept_asks_again_only_once_a_drain_wants_more`
+  and `a_ring_allocates_at_most_a_buffer_a_drain`: the rule on every platform.
+- On Linux, over real sockets: `a_ring_grows_to_what_a_drain_took_and_the_next_takes_one_call`
+  (five datagrams take five calls into one buffer, and the four after the resize take one) and
+  `a_drain_that_leaves_more_doubles_the_ring` (an unstamped socket's ring goes 1, 2, 4, 8).
+- `exchanges::every_class_of_exchange_crosses_on_a_hyper_rt_shard`: the asker's ring grew on Linux
+  and stayed at one buffer elsewhere, and its charge is exactly what it grew by.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

@@ -1533,6 +1533,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         self.core.budget.reserve(bytes, Lane::Class(class))
     }
 
+    /// Bytes the endpoint's driver holds for its sockets past what its owner charged as it made
+    /// the driver (its receive ring's growth), from the budget on [`Lane::Window`]: accounting
+    /// only, as the windows and the receive pool's chunks are. Given back with
+    /// [`Endpoint::release`].
+    pub fn reserve_own(&mut self, bytes: u64) -> Result<Reservation, Refusal> {
+        self.core.budget.reserve(bytes, Lane::Window)
+    }
+
     /// Give a reservation back to the budget: a frame's, or one the owner reserved. A lossless frame
     /// that waited for the budget is reserved again now.
     pub fn release(&mut self, reservation: Reservation) {

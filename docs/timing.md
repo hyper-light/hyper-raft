@@ -246,38 +246,24 @@ now gives the base from the detector and the span from the ballot (`docs/benchma
 - **Local health.** A detector that wakes late must not blame its peers (Lifeguard). Arrivals are
   stamped by the kernel when the datagram is received (`SO_TIMESTAMPNS` on Linux,
   `SO_TIMESTAMP_MONOTONIC` on macOS, which XNU stamps with `mach_absolute_time()` as UDP input
-  queues the datagram), so a heartbeat that arrived before its freshness point is fresh however
-  late the process read it; only the send side of a slow node looks slow, which is true. The gap
+  queues the datagram, in the kernel's ticks, read at the kernel's rate since a process Rosetta 2
+  translates is shown another timebase: docs/runtime.md §5.1), so a heartbeat that arrived before
+  its freshness point is fresh however late the process read it; only the send side of a slow node
+  looks slow, which is true. The gap
   the stamp removes was measured: between the kernel's stamp and the process's read, macOS
   p99.9 3.8–4.7 ms and up to 101 ms (100 µs heartbeats, load 17–32), p99.9 73 ms and up to
   125 ms at load 41; Linux p99.9 0.09–0.15 ms, up to 22 ms.
 - **Local health against the flush proof.** A node whose own log stalls must not blame its peers
   for lateness its disk may share (Lifeguard's local health, carried from the node's wakes to its
-  durability). A peer's next heartbeat leaves only once the peer's log made a write durable after
+  durability): a peer's next heartbeat leaves only once the peer's log made a write durable after
   the latest was due (§2.1), so a stall of a disk two nodes share holds both nodes' heartbeats
-  alike. A freshness point is judged only once this node has made a write durable since it took
-  the heartbeat the point follows; from that write the peer is given the time the point gave it
-  from the heartbeat, which is what a heartbeat proved as the disk came back takes to arrive
-  (`pair::Deferred`, `PairReport::deferred`). A node whose disk runs judges as before: it makes a
-  write durable at least once an interval, its own heartbeats' proofs, well inside a freshness
-  window wherever `α` exceeds its mean flush, and an ordinary run defers nothing (the simulation's
-  busy world, eight seeds, configured and doubled: no deferral on any pair, the configuration times
-  the same to the nanosecond as without the rule). A node whose own disk stalls holds its judgments
-  for as long, which costs it nothing it could use: a vote, a campaign and a held commit each need
-  its own write durable, and reads are confirmed by a quorum, never by a lease (`docs/raft.md`
-  §1, ReadIndex), so a leader that holds its judgment serves nothing stale. A peer that died in the stall is
-  suspected after it, at the point its last heartbeat set, noticed no later than that point gave
-  from the heartbeat, counted from the node's first write durable after; the peers whose disks run
-  suspect it within their stated bound meanwhile. Found by focal's event bus on one machine's disk
-  (2026-10-18): one stall of 584–587 ms in every node's log flush in the same second left no
-  heartbeat proved, each node suspected both others, and the leader, left no trusted quorum,
-  stepped down and was elected again, the step-down costing about a second and a redirect storm
-  its clients' lanes could not hold. Tests: `sim::a_stall_every_nodes_disk_shares_suspects_no_one`
-  (fails without the rule: "node 1 suspected 2 across a stall every disk shared"),
-  `sim::a_peer_killed_while_this_nodes_disk_stalls_is_suspected_once_it_is_back`, and
-  `processes::a_stalled_disk_and_a_killed_node_are_suspected_and_no_live_one_is`, whose stalled
-  member now holds the killed one trusted until its disk is resumed and suspects it after; every
-  record traces the deferrals step for step (`record::Tracer::excused`).
+  alike. Found by focal's event bus on one machine's disk (2026-10-18): one stall of 584–587 ms in
+  every node's log flush in the same second left no heartbeat proved, each node suspected both
+  others, and the leader, left no trusted quorum, stepped down and was elected again; and by
+  mantle's cluster suite on one ext4 volume (2026-10-20). The rule in force is §2.8's, "A judge whose
+  own proof stalls" (`pair::Local::judge`): a first version of it (`pair::Deferred`, 2026-10-18)
+  judged a point once any write of the node's was durable after the heartbeat it followed, and gave
+  way to it when the two lines of the shared repository met (2026-10-22).
 
 ### 2.5 What a test does
 
@@ -1132,6 +1118,76 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   flushing is not trusted either (`Refusal::Unproven`). Idle, a node makes at most one liveness
   write per smallest interval among its pairs, shared by every pair; a node whose groups write makes
   none.
+- **A stream keeps its schedule without hearing its peer.** A heartbeat sent whose next slot is
+  already due asks at once for the flush that proves the next (`Liveness::poll`), and its completion
+  polls the stream. Its next slot is due already where the interval fell while the stream was
+  behind: the slot sent is the latest due at the old interval, and the next is one new interval
+  past it. The poll asked no wake for a slot at or before its own time, so the stream was polled
+  again only by what else came, a peer's heartbeat; a node that heard none sent nothing more, for
+  ever (`a_node_that_hears_no_peer_keeps_its_streams_on_schedule`: a node deafened after up to 64 of
+  its heartbeats, its streams never behind by more than a timer's lateness, a freeze and a write the
+  run drew, over 256 seeds of four worlds; red on `1b85eaf` at macOS's seed 6, 21 ms behind past
+  19; found by a node deafened before its evidence in the simulation, Linux's seed 175 of 256,
+  sixteen heartbeats a peer and then none). A node that hears its peers was polled by their heartbeats and sent the slot late by as
+  long, which its peer took as lateness: over 256 seeds of `live_peers_...`, its suspicions of live
+  peers fell from 436 to 425 at the same allowance (4,182.9, 4,181.5).
+- **A judge whose own proof stalls** (`pair::Local::judge`, `Liveness::own_proof`). The flush proof
+  makes every stream wait on its sender's device, so where nodes share a device a stall of it stops
+  every stream at once, and each judge, its own stream stopped as well, would suspect every peer
+  by a proof it could not produce itself: mantle's cluster suite, its nodes on one ext4 volume (one
+  journal, whose commit every file's fsync waits on), pinned to four CPUs on Linux, saw every
+  all-pairs burst of suspicions line up with every node's flushes stalled at once (polls on time,
+  last heartbeats sent on time, nothing arriving for 145 to 186 ms against bounds of 150 to 186 ms,
+  while nodes' flushes had been in flight 165 to 302 ms), and its A/B of `79eb22b` against `1b85eaf`
+  counted 11 and 12 liveness stalls and 24 and 17 leader changes in ten rounds each, all of that
+  cause. Lifeguard (Dadgar, Phillips and Currey, "Lifeguard: Local Health Awareness for More Accurate
+  Failure Detection", DSN 2018) found SWIM's false positives came from members too slow themselves
+  to process their probes in time, and made a member less hasty to suspect while its own local
+  health is poor; here a judge's own health is its device, which the proof it holds its peers to
+  measures directly. The rule, at a freshness point that has passed, the peer expected a margin
+  before it:
+  - while the judge's own proof is outstanding (its stream wanted one, from the poll that first did,
+    and no write of its own has completed since), it waits, and asks no wake, since the completion
+    polls; the owner is shown the pair trusted to the point that passed, as before the rule (shown
+    `Trust::Unconfigured`, a pair's state before its first margin, a judged link read as unjudged:
+    `flushes_stalled_together_...` asserts none is);
+  - once that proof comes, a wait at least as long as the margin, which ended after the peer was
+    expected, gives the peer the margin again from its end, since the peer's stream resumes no
+    sooner; the suspicion states that point, and its bound grows by the stall, as `latest_wake`
+    states the owner's own lateness (§2.7). A shorter wait proves nothing past its end;
+  - a judge that has made nothing durable since the point, and has no proof outstanding, waits for
+    its next completion and judges on it: what it judges by is its own device's progress since the
+    peer was due. It asks no write for it: its stream asks one within its sending interval, and its
+    log's come as they come, so the rule adds no I/O of its own (a probe write asked at every
+    passed point kept a liveness write queued nearly always while peers' heartbeats came slowly,
+    ahead of the log's on a device whose writes took seconds). A completion after the expected arrival but before the point does not prove it,
+    since a shared journal can stall after it with the peer's flush, asked earlier, still in it.
+  - a point once held later is held there and no further (`Pair::held`), whatever the judge's own
+    device does after: restated at every wait, a judge whose every write was slower than the margin
+    held each point past its next wait and suspected a dead peer never, its writes completing all the
+    while (`a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer`, writes of 351 ms against
+    freshnesses of 176 ms: no suspicion in 3.5 s; mantle's pinned suite at `1ccd38d`, a leader whose
+    flushes took 182 to 208 ms logging no suspicion of a dead follower in 4 s). A hold is so bounded
+    by one wait of the judge's own and the margin.
+  Costs. A crashed peer is detected late by up to one of the judge's own stalls and the margin, and
+  by one of its sending intervals and a flush where it had made nothing durable since the point (over
+  256 seeds of `a_peer_dead_before_...` the median time to notice a death rose 3 to 17 ms, the most
+  on macOS from 1,097 to 1,575 ms, one seed; its bound now adds the judge's sending interval).
+  A node whose disk stalls for good never suspects anyone, which is safe: its own stream stops, its
+  peers suspect it as a crashed node, and it cannot lead, its log writes never completing. Over 256
+  seeds of `live_peers_...` the suspicions of live peers fell from 425 to 388 at the same allowance
+  (4,181.5 and 4,203.4). Tests (`tests/sim.rs`, the simulation's `disk_held_until`, which holds every
+  flush of a node, in flight or new, as a journal does):
+  `flushes_stalled_together_as_on_a_shared_volume_are_no_ones_failure` (every node's flushes held
+  three freshnesses: no suspicion during it; on `79eb22b` node 1 suspected both peers, 131 and 319
+  ms into an 822 ms stall), `a_peer_whose_flushes_stall_alone_is_suspected_as_before`, and
+  `a_node_whose_disk_stalls_for_good_suspects_no_one_and_is_suspected` (on `79eb22b` the stalled node
+  suspected both peers silent while it was), `a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer`
+  (within one write and two freshnesses of the kill); `tests/processes.rs`'s stalled member holds no
+  suspicion of the killed one. The trace of every suspicion (`support/record.rs`) restates its rule
+  with the node's own proof recorded at each call: a point may pass untold, or be told later, only
+  where the call shows that proof outstanding or ended since the peer was heard, or nothing durable
+  since the point.
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at
@@ -1289,6 +1345,63 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   `PairReport::freshness` the `η + α` in force, and `PairReport::interval` the interval the peer's
   heartbeats come at, or a longer one asked, judged or not: what an owner waiting on a young link's
   evidence waits past.
+- **Judged with no evidence of its own: a starved pool, and the node's own stream** (§3, item 10).
+  The node's evidence comes from its links' heartbeats; a node all of whose links fell silent
+  before its pool measured anything and before any link configured is fed nothing more, and judged
+  no pair it had heard: as a leader it led for ever and committed nothing, and its followers, which
+  heard it, trusted it for ever (mantle's node simulation, the leader's plane deafened at its
+  election: 36 heartbeats taken, none judged, nothing moved for 3.1 s and for good). Two things it
+  holds still say something:
+  - *its pool's latenesses at their most correlation* (`LinkEstimator::arrivals_most_correlated`).
+    The unseen share is `1/(m + 1)` over `m = n/τ_int` independent arrivals, and `τ_int` is at most
+    `n`: the mean of `n` latenesses of variance `V` has variance `(V/n)(1 + 2·Σ_k (1 − k/n)·ρ_k)`,
+    at most `V` whatever the correlations, and `τ_int` is that over `V/n`. So at least one
+    independent arrival, and an unseen share of at most a half, which no measured `τ_int` exceeds;
+    the mean and deviation are the latenesses' own;
+  - *its own stream*: one more estimator, fed the lateness of each heartbeat the node sends past the
+    slot after the one before it, which is what its peer takes it as but for the path (a skipped
+    slot's wait and the flush's included). It is fed while the node is deaf as while it hears, and
+    measures its own `τ_int` as any link does. Under the pool's premise, that the stalls are the
+    hosts' (§2.6), it stands for the peers' streams as the node's floor stands for their intervals
+    (a peer never heard from, above). It is fed only while the node has no measured evidence.
+
+  Once the pool *starves*, the node's pairs that wait for a margin are judged by the wider of the
+  two, through the same margin as the node's evidence (`Pair::pool_margin`): its interval asked of
+  the peer where the margin at the link's own promises nothing, as it must with an unseen share of a
+  half. The pool starves once it has gone without a heartbeat for as long as the slowest link heard,
+  at the interval it stated, would take alone to bring it to the count at which `τ_int` can first be
+  measured (`LinkEstimator::first_measure`, 56: seven windows of the first level of at least
+  `c = 6`) and at least to twice what it holds (the doubling an estimate is renewed on,
+  `docs/research/timing.md`): never less than 28 of that link's intervals. At the summed rate of the
+  links heard, a pool fed by one slow live link beside a dead peer's starved between the live link's
+  heartbeats (17 polls of `a_peer_dead_before_its_links_have_evidence_...`). A node any of whose
+  links goes on feeding its pool never starves, and waits for the pool's measure as before. Over 256
+  seeds of every test of the simulation the fallback judged at a poll in two: in 8 of the 1,024 runs
+  of `a_peer_dead_before_...`, where the survivor's one live peer went silent for as long (Linux seed
+  80: its heartbeats 25 and then 58 ms apart on a 2 ms link, the other peer dead), with the time to
+  notice the death no worse (median / 90th percentile / most against `1b85eaf`: macOS 97 / 500 /
+  1,097 ms against 94 / 519 / 6,747, busy 105 / 931 / 2,146 against 105 / 947 / 2,146, Linux 54 /
+  210 / 529 against 55 / 214 / 646, Windows 542 / 2,147 / 4,066 against 537 / 2,156 / 4,066); and
+  in `links_young_...`, whose devices slow for good to 741 ms flushes and whose pools do starve, the
+  links still configured (macOS 220–513 s after the slowdown at the default eight seeds against
+  257–618, Linux 276–449 against 280–493; the victim suspected 8–23 s after its kill against 10–19,
+  and 4–8 against 4–8). The starved node is polled at its own heartbeats, so it asks no wake for
+  the starvation: a wake of its own moved every run's timer draws (one more sample of `G` each), and
+  with it every healthy run's numbers, where the fallback judged nothing. A margin a pair took so is
+  renewed at its next heartbeat once the node's evidence is
+  measured (`pool_margin_due`); a poll imposes a first margin only, as before, since one re-imposed
+  at a poll moved a point the pair was held to after it passed, untold (`links_young_...`, 256
+  seeds). A node that never heard a peer has no link to starve and is not covered (`docs/STATUS.md`).
+
+  `a_node_deaf_before_it_has_evidence_suspects_every_peer`: three nodes, one deafened (every
+  heartbeat sent it lost, frozen or not) after a share of the heartbeats it takes before any pair is
+  judged in the same seed's run, drawn from the seed; it must suspect both peers within the bound
+  each suspicion states. On `1b85eaf` it never did, and its run took the simulation's trace bound
+  (157,532 words). Now, over 256 seeds of each world (510, 508, 512 and 512 suspicions; some draws
+  fell past the evidence), from the deafening, median / 90th percentile / most: macOS 295 / 510 /
+  1,789 ms, macOS with its log busy 759 / 1,235 / 3,315 ms, Linux in its VM 108 / 231 / 2,816 ms,
+  Windows' timer and flush 1,207 / 1,750 / 3,076 ms. Fed only the pool's latenesses, a node deafened
+  in its first two never judged: no deviation, and only its own stream had one.
 - **A restart** (§3, item 10). Runs are ordered: a node's run (`Settings::run`) is a count it keeps
   durably and raises at every start, before its stream's first heartbeat. A heartbeat of a later
   run than the latest taken from the peer is reported as `Change::Restarted { peer, at_ns }` before
@@ -1528,20 +1641,66 @@ spend a term and depose a leader that never left.
 - **A leader steps down** once it and those it trusts are no quorum of either half (check-quorum
   from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
 - **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
-  dissertation §3.10) to the voter it trusts that holds the most of its log, and among those that
-  hold as much, to each in turn, one a hand-over (`Watch::handovers`): one that restarted knows nothing
-  of what its followers hold, and the first it named may be one that cannot campaign. A leader that
-  restarted marked and could not campaign named a member that was a learner by its own
-  configuration, again and again, while its followers kept their lease on its node (core step R-7,
-  seed 75 of the faults at rest by suspicion). Its followers trust
-  its node, which lives, and on ticks their lease would have run out; nothing else would make them
-  campaign. The schedules found it twice: a leader that removed itself with no voter holding its
-  whole log (seed 7 of the four settings), and one that stepped down for want of a quorum. The
-  heir's campaign moves its voters to a later term, where they know no leader, and an heir that
-  cannot win leaves them there all the same. Until its term moves or it follows another leader of
-  it, a member that led its term and cannot campaign hands over again a round and a draw after the
-  last, as a candidate asks again, for the order may be lost; a member of a later term answers an
-  old order (as it answers an old leader's heartbeat), which moves the sender's term.
+  dissertation §3.10) to a voter, which campaigns at once. Its followers trust its node, which
+  lives, and on ticks their lease would have run out; nothing else would make them campaign. The
+  schedules found it twice: a leader that removed itself with no voter holding its whole log (seed 7
+  of the four settings), and one that stepped down for want of a quorum. The heir's campaign moves
+  its voters to a later term, where they know no leader, and an heir that cannot win leaves them
+  there all the same. Until its term moves or it follows another leader of it, a member that led its
+  term and cannot campaign hands over again a round and a draw after the last, as a candidate asks
+  again, for the order may be lost, but never within the election the law expects (`T_E`,
+  `Timing::election`) of its last order, nor campaigns within it (`Watch::ordered`): each order forces
+  a campaign, and a second before the first can finish makes two candidates that split the vote.
+  Re-ordered a round and a draw after the last, about a millisecond on loopback, stepped-down members
+  forced a new heir every 4 to 9 ms and two within one millisecond, and votes split (mantle's cluster
+  suite pinned on Linux at `eb85154`, 776 orders in one round of it;
+  `a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last`: orders 4.12 ms apart
+  against a `T_E` of 4.40 ms without the rule). A member of a later term answers an old order (as it
+  answers an old leader's heartbeat), which moves the sender's term.
+
+  *Who the heir is* (`Raft::hand_over`). The heirs are every other voter, in order: those the
+  leader's detectors trust before those they suspect, then the most of its log held first, then by
+  id; each hand-over names the next (`Watch::handovers`, from the first again at each term the member
+  leads), so the order at the step-down goes to the trusted voter that holds the most. At the
+  step-down it orders at once only where it still trusts a voter: trusting none, it may be the one
+  that stalled (a host that froze suspects every peer at once), while its followers trust it, so
+  the `led` path decides a round and a draw later (`wake_follower`), campaigning if it trusts a
+  quorum again, which re-elects it, and otherwise handing over. Ordered at the step-down, the heir's
+  campaign moved the group's leadership at every short stall: mantle's cluster tests on a loaded
+  Linux runner (run 39525134119, job 118977876472) cut a leader off, let the others elect, rejoined
+  it, and found the leader elected during the cut replaced around the rejoin in three tests of
+  three (`a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`, red on
+  `757740c`). A voter the leader suspects is still an heir. A spare that replaces a failed voter
+  is an heir the leader trusts while it has not taken the joint entry and refuses the order as a
+  learner by its own configuration; the next order goes to the next heir
+  (`a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over`: `{1, 2, 3}` to
+  `{1, 2, 4}`, 3 dead, the leader suspecting 2 as well; orders `[4, 2]` and 2 elected, where on
+  `1b85eaf` the orders were `[4, 4, 4, 4, 4]` and no term moved, the one trusted heir named for
+  good). A suspicion is one-way evidence: that the leader does not hear a
+  voter says nothing of whether the voter hears the leader, and a leader steps down exactly when it
+  and those it trusts are no quorum, so it may suspect every other voter while they all hear it and
+  trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
+  itself (it trusts no quorum), and the range stayed leaderless for as long as its suspicions lasted:
+  for ever under one-way loss (mantle's node simulation, a leader whose plane went deaf, seed 1: it
+  suspected both followers at 9.2 ms and sent no order, and the cell elected again at 335 ms only
+  because the deaf leader's own stream degraded until its followers suspected it by mistake), and
+  on a starved host until its peers' heartbeats came back (mantle's Windows CI, run 39503516282: three
+  `mantle node` processes on a 2-vCPU runner running seven process tests, no fault injected, term
+  2's leader suspected both followers, stepped down with no heir, and both followers trusted it for
+  the test's 4.63 s). The turn passes over every heir, not only those that hold the most: the first
+  may be dead, or one that cannot campaign (a learner by its own configuration) or cannot win while
+  its followers keep their lease on the leader (a leader that restarted marked named such a member
+  again and again, core step R-7, seed 75 of the faults at rest by suspicion). Only the order at the
+  step-down knows what each holds: a follower's progress is reset (`Raft::reset`), as a restarted
+  leader's is, so the orders after it turn through the heirs it trusts and then the rest. Tests
+  (`tests/suspicion.rs`): `a_leader_that_suspects_every_other_voter_hands_over_all_the_same`
+  (leader 1 of three suspects 2 and 3, which trust it for good; it orders a round and a draw after
+  its step-down; on `1b85eaf` no order and no leader for the quiet period) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` (leader 1 of five
+  steps down trusting only 2, which alone holds its last entry and is dead, then suspects 2 as well;
+  on `1b85eaf` no leader within the quiet period), each red before; and
+  `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts`, red with the turn counted
+  from the member's start, which at its second step-down named a suspected voter (`[2]`, where it
+  trusted only 3).
 - **What ends a follower's trust in its leader**, besides its detector: a request for votes from
   that leader (a member asks only while it does not lead, and terms only rise at it); its
   incarnation's end (`restarted`); a configuration that names it no voter; and a request from a
@@ -2125,6 +2284,12 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
     `a_peer_never_heard_from_is_suspected`,
     `a_peer_dead_before_its_links_have_evidence_is_suspected_once_a_sibling_has_its_own`), its real
     processes and hyper-durable's shell (`a_leader_killed_before_its_links_have_evidence_is_replaced`).
+  - *A node whose links all fell silent before it had any evidence* gathers none more: no
+    heartbeat feeds its pool and none configures a link, so it judged no peer it had heard (mantle's
+    deaf leader, which led for ever). Once its pool starves, it judges by what its pool's latenesses
+    show at the most correlation they can carry and by its own stream (§2.8, "Judged with no
+    evidence of its own"), both held while it is deaf; a node any of whose links feeds it is
+    unchanged. A node that never heard any peer is not covered (`docs/STATUS.md`).
   - *A restart is not a crash the detectors can miss.* The stream carries the sender's run, a
     count it raises at every start (§2.8), and a later run is an incarnation's end: told to the core (`restarted`), the node is
     trusted and leads nothing it led before. hyper-liveness reports it, `Change::Restarted`, and

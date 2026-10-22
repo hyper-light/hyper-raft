@@ -126,6 +126,63 @@ fn the_largest_datagram_is_what_the_socket_sends() {
     }
 }
 
+/// A leader's append whose entries fill a member's page goes in one datagram, framed and sealed as
+/// a member sends it (`node.rs`): the page is the datagram less `MESSAGE_ROOM` (the member's
+/// `max_size_per_msg`), and beside its entries an append takes its record's fixed part, the classic
+/// commit every leader's append states among it (`hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES`).
+/// A room that left the classic commit out was 8 bytes short: a full page was dropped as too long
+/// at every send, and a member its leader caught up from the log never caught up (`leader-killed`,
+/// CI run 39366050595, once the log's pages were the core's to the byte).
+#[test]
+fn a_leaders_append_filled_to_the_page_fills_its_datagram() {
+    use hyper_raft::proto::{Entry, Message, MessageType};
+    use hyper_raft::wire::Record;
+    let datagram = wire::MAX_DATAGRAM;
+    let room = datagram - hyper_raft_e2e::node::MESSAGE_ROOM;
+    let fixed = hyper_raft::wire::ENTRY_FIXED_BYTES;
+    // Entries of a write's size, the last taking what is left of the page.
+    let mut entries = Vec::new();
+    let mut left = room;
+    while left > 0 {
+        let data = if left >= 2 * (fixed + 40) {
+            40
+        } else {
+            left - fixed
+        };
+        entries.push(Entry {
+            index: 10 + entries.len() as u64,
+            term: 2,
+            data: vec![7; data],
+            ..Entry::default()
+        });
+        left -= fixed + data;
+    }
+    let bytes: u64 = entries.iter().map(hyper_raft::proto::encoded_bytes).sum();
+    assert_eq!(bytes, room as u64, "the entries fill the page");
+    let append = Message {
+        msg_type: MessageType::MsgAppend,
+        from: 1,
+        to: 2,
+        term: 2,
+        index: 9,
+        log_term: 2,
+        commit: 9,
+        classic: Some(9),
+        entries,
+        ..Message::default()
+    };
+    let mut buffer = Vec::new();
+    wire::begin(&mut buffer, Kind::Raft);
+    wire::put_u64(&mut buffer, 1);
+    append.encode(&mut buffer);
+    assert_eq!(
+        buffer.len(),
+        datagram,
+        "the room is what an append takes beside its entries"
+    );
+    assert!(wire::seal(&mut buffer, datagram), "a full page is sent");
+}
+
 /// A member's report reads back as written, its core's suspicions and campaign among it: what a
 /// failure's dump states of each member's elections.
 #[test]

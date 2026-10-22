@@ -48,7 +48,11 @@ Each platform's own accounting is the source, read per process without privilege
   `ri_energy_nj` and `ri_penergy_nj` (energy, all cores and performance cores), `ri_instructions`
   and `ri_cycles`, `ri_pkg_idle_wkups` and `ri_interrupt_wkups`, `ri_phys_footprint` and
   `ri_lifetime_max_phys_footprint`, `ri_diskio_bytesread` and `ri_diskio_byteswritten`, the user
-  and system times. The heartbeat cost runs already read `RUSAGE_INFO_V4`.
+  and system times. The heartbeat cost runs already read `RUSAGE_INFO_V4`. The times are the
+  kernel's ticks, converted at its rate, 10⁹ / `hw.tbfrequency` (hyper-measure's `usage.rs`): a
+  process Rosetta 2 translates is shown a timebase of 1/1 against Apple silicon's 24 MHz, and read at
+  that its user time was 3/125 of getrusage(2)'s (docs/research/timing.md, "Rosetta 2 and the
+  kernel's ticks").
 - **Linux**: `getrusage` and `/proc/<pid>/io` (`write_bytes`), `perf_event_open` for instructions
   and cycles, `/proc/<pid>/status` (`VmHWM`) for the peak; energy from the powercap interface
   (RAPL) where the hardware has it and the host lets it be read, which is per package, not per

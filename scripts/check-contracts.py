@@ -57,7 +57,9 @@ UNSAFE_ALLOWED = {
         "and a timed wait's kevent through libc (its NOTE_CRITICAL timer, which rustix's timer "
         "filter does not set)",
     "crates/hyper-rt/src/machine/clock.rs":
-        "clock_gettime and mach_absolute_time through libc; QueryPerformanceCounter (the monotonic clock)",
+        "clock_gettime and mach_absolute_time through libc; QueryPerformanceCounter (the monotonic clock); "
+        "mach_timebase_info and sysctlbyname(hw.tbfrequency) through libc (macOS's process and kernel tick "
+        "rates, docs/runtime.md §5.1)",
     "crates/hyper-rt/src/machine/facts.rs":
         "sysctlbyname, host_statistics and the IOKit power-source query (macOS); GetSystemInfo, GlobalMemoryStatusEx, GetLogicalProcessorInformation, GetSystemPowerStatus (Windows)",
     "crates/hyper-rt/src/machine/probes.rs":
@@ -112,8 +114,9 @@ UNSAFE_ALLOWED = {
         "K32GetProcessMemoryInfo through windows-sys (page-fault counts)",
     "crates/hyper-measure/src/usage.rs":
         "proc_pid_rusage(RUSAGE_INFO_V6) through a declaration of <libproc.h>, with "
-        "rusage_info_v6 declared here from <sys/resource.h>, and mach_timebase_info through libc "
-        "(macOS); sysconf(_SC_CLK_TCK) (Linux), getrusage(2) (other Unix) and getloadavg(3) "
+        "rusage_info_v6 declared here from <sys/resource.h>, and sysctlbyname(hw.tbfrequency), the "
+        "kernel's tick rate its times count, through libc (macOS); sysconf(_SC_CLK_TCK) (Linux), "
+        "getrusage(2) (other Unix) and getloadavg(3) "
         "through libc; Win32 OpenProcess, CloseHandle, GetProcessTimes, QueryProcessCycleTime and "
         "K32GetProcessMemoryInfo through windows-sys: a process's account; measurement only",
     "crates/hyper-measure/src/wake.rs":
@@ -145,7 +148,8 @@ UNSAFE_ALLOWED = {
         "IOCTL_DISK_GET_LENGTH_INFO (a device's capacity) and GetFileInformationByHandleEx's "
         "FileStorageInfo (the sector sizes of a file's volume)",
     "crates/hyper-block/src/threads/macos.rs":
-        "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling)",
+        "proc_pidinfo and sysctlbyname (the process's threads and the workqueue's thread ceiling); "
+        "pthread_mach_thread_np and thread_info (a test's account of a thread's CPU time)",
     "crates/hyper-tokio/src/sys/linux.rs":
         "sendmmsg(2), recvmmsg(2) and the UDP_SEGMENT and UDP_GRO options and control messages (udp(7)); "
         "SO_TIMESTAMPNS and its SCM_TIMESTAMPNS control message (socket(7)); clock_gettime(2); "
@@ -153,7 +157,8 @@ UNSAFE_ALLOWED = {
     "crates/hyper-tokio/src/sys/macos.rs":
         "recvmsg(2), SO_TIMESTAMP_MONOTONIC and its SCM_TIMESTAMP_MONOTONIC control message (the "
         "kernel's receive stamp, which rustix's recvmsg drops); mach_absolute_time and "
-        "mach_timebase_info (the clock it stamps on); FIONREAD (the bytes a receive queue holds)",
+        "mach_timebase_info (the clock it stamps on) and sysctlbyname(hw.tbfrequency) (the kernel's "
+        "tick rate its stamps count); FIONREAD (the bytes a receive queue holds)",
     "crates/hyper-tokio/src/sys/windows.rs":
         "QueryPerformanceCounter and QueryPerformanceFrequency through windows-sys (the host's "
         "monotonic clock); ioctlsocket(FIONREAD) (the bytes a receive queue holds)",
@@ -162,7 +167,8 @@ UNSAFE_ALLOWED = {
     "crates/hyper-timing-trace/src/sys.rs":
         "libc's setsockopt(2) of SO_TIMESTAMPNS / SO_TIMESTAMP_MONOTONIC, recvmsg(2) and the "
         "CMSG_* walk of its receive-timestamp control message (rustix's recvmsg drops it); on "
-        "macOS libc's mach_absolute_time, mach_timebase_info and getloadavg(3), and rustix's "
+        "macOS libc's mach_absolute_time, mach_timebase_info, sysctlbyname(hw.tbfrequency) and "
+        "getloadavg(3), and rustix's "
         "select(2), unsafe for I/O safety only (the trace recorder; measurement only)",
 }
 

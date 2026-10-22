@@ -273,6 +273,41 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-liveness: a node that never heard any peer judges none (found 2026-10-20, beside the deaf
+  leader below).** A node deaf from its start has no link heard, so no pool to starve and no
+  interval to time a starvation by (`Liveness::starves`), and a peer never heard is judged only by
+  the node's evidence (`Pair::judge_unheard`), which such a node never has: it trusts every peer for
+  ever. Its own stream is measured all the same (`Liveness::own`), and judging its never-heard peers
+  by it would end this, but at every start: a node whose peers have not started yet would suspect
+  them where it now trusts them, and by suspicion a member campaigns only with a quorum it trusts
+  (`docs/timing.md` §2.9), so a cell's first election would wait on its slowest member's first
+  heartbeat. That trade is the consumers' to measure in their start-up tests before it is made.
+
+- **hyper-block: translated by Rosetta 2, a segmented file's direct handle reads its pieces as in
+  memory (found 2026-10-20, running hyper-block's tests for x86_64-apple-darwin on the M5 Max).**
+  `segmented::tests::a_segment_written_whole_holds_its_fill_and_takes_no_memory` fails translated,
+  `piece 0 is in memory`, before and after the kernel's-ticks repair below, and passes natively: the
+  resident read (`read_resident_at`, an `mmap` and `mincore` of the piece) answers that a piece
+  written through a handle granted past the cache is held. Not traced yet: a translated process sees
+  4 KiB pages where the kernel keeps 16 KiB, which `mincore`'s answer may straddle. Until it is, the
+  CI job that runs the clocks' crates translated (`translated`) leaves hyper-block out.
+
+- **hyper-rt-transport, hyper-tokio: a driver folds its timer's lateness into `G` only when it finds
+  its timer fired in the turn that armed it (found 2026-10-20, by the simulation).** Each turn of
+  `poll_event` hands a due timeout to the endpoint (`handle_timeout`) before it looks at its timer, and
+  the timer for the next deadline then replaces the one that fired, unread; `fired`, which folds the
+  wait (`Lateness::on_wait`) and tells the endpoint (`Endpoint::set_granularity`), runs only when a
+  deadline passes inside a turn, between the turn's reading of the clock and its timer's poll, which a
+  simulated clock never does. hyper-rt-transport's `tests/simulation.rs` world run for 5 s of virtual
+  time with scratch prints (never landed): every due timeout its three drivers handled, 82 over three
+  runs, keep-alives among them, had the driver's timer armed for it, and none was folded, so the
+  endpoints kept RFC 9002's 1 ms (`K_GRANULARITY`). hyper-tokio's `poll_event` takes the same order.
+  Open: fold a wait at the turn that finds its deadline passed (a wait that reached its deadline,
+  whatever ended it: hyper-liveness's rule, `docs/timing.md` §2.4), which moves the windows' tuning
+  (`Window::tune`) from 1 ms to the measured `G` on every host, so it lands measured with the
+  consumers' suites. A simulated driver then floors `G` at the virtual clock's step, a nanosecond, not
+  at the host clock's resolution `Driver::with_ring` reads (`hyper_rt::machine::clock::resolution_ns`:
+  1 µs on macOS, 100 ns on Windows), or one seed's run would differ from host to host.
 - **hyper-raft: on the swarm's quarter network one group's liveness phase does not converge (found
   2026-10-17).** With the swarm's losses and repeats narrowed to a quarter (`docs/sim.md` §11 item 4,
   the setting that reaches the most abstract states and catches every planted defect within the
@@ -354,6 +389,188 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-21)
+
+- **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer
+  (found by mantle).** The flush proof stops every stream on the device at once, and each judge, its
+  own stream stopped too, suspected by a proof it could not produce itself: mantle's cluster suite on
+  one ext4 volume, every all-pairs burst lined up with every node's flushes stalled at once, the
+  cause of its liveness stalls and leader changes on `1b85eaf` as on this branch. A judge whose own
+  proof is outstanding now waits for it, a long stall giving the peer its margin again from its end,
+  and a judge with nothing durable since the point waits for its next completion (Lifeguard's local
+  health, applied to the device: `docs/timing.md` §2.8, "A judge whose own proof stalls"). A point
+  is held once: restated at every wait, a judge whose every write was slower than the margin never
+  suspected a dead peer (mantle's pinned suite at `1ccd38d`). Costs: a crash is detected late by up
+  to one of the judge's own stalls and the margin, or one sending interval and a flush; a node whose
+  disk stalls for good
+  suspects no one, its peers suspecting it. Tests in tests/sim.rs, the shared stall and the
+  stall for good red on `79eb22b`.
+
+### Closed (2026-10-20)
+
+- **hyper-raft: a leader that suspected every other voter handed over to none (found by mantle).**
+  `Raft::hand_over` took heirs only among the voters the leader trusted, and a leader steps down
+  exactly when it and those it trusts are no quorum, so one that suspected every other voter sent
+  no order while they heard it and trusted it; it could not campaign itself (no quorum it trusts),
+  and the range stayed leaderless as long as its suspicions lasted: for ever under one-way loss
+  (mantle's node simulation, the leader's plane deafened), and on mantle's Windows CI, with no fault
+  injected, for the test's 4.63 s (run 39503516282: term 2's leader on a 2-vCPU runner running
+  seven process tests suspected both followers, stepped down with no heir, both followers trusted
+  it). The heirs are every other voter, trusted before suspected, then by what each holds and by id,
+  each hand-over naming the next over all of them, the turn starting again at each term led
+  (`docs/timing.md` §2.9, "Who the heir is"). A leader that trusts no voter at its step-down orders
+  none at once, and decides a round and a draw later: ordered at once, every short stall of a
+  leader's host moved its group's leadership (mantle's cluster tests, run 39525134119). It orders no
+  heir, nor campaigns, within the election the law expects of its last order: re-ordered a round and
+  a draw apart, stepped-down members forced heirs milliseconds apart and split votes (mantle's suite
+  pinned on Linux at `eb85154`). Tests in `tests/suspicion.rs`, the first two red on
+  `1b85eaf`, the third with the turn counted from the member's start.
+- **hyper-liveness: a node all of whose links fell silent before it had evidence judged no peer it
+  had heard (found by mantle).** Its pool and its links' estimators were fed nothing more, and only
+  their measure judged a heard pair with no configuration (`pool_margins` ran only with the node's
+  evidence): mantle's leader deafened at its election, 36 heartbeats taken and none judged, led for
+  ever. Once the pool starves, the node judges by its pool's latenesses at the most correlation they
+  can carry (an unseen share of a half) and by its own stream's, which it keeps measuring while deaf
+  (`docs/timing.md` §2.8, "Judged with no evidence of its own"); a node any of whose links feeds it
+  is unchanged. `a_node_deaf_before_it_has_evidence_suspects_every_peer`, red on `1b85eaf`.
+- **hyper-liveness: a stream whose next slot was due as it sent stopped until a peer's heartbeat
+  polled it (found 2026-10-20, by a node deafened in the simulation).** An interval that fell while the stream was
+  behind left its next slot past at the send, and the poll asked no wake for a past slot: a node that
+  heard none sent nothing more (Linux seed 175 of 256: sixteen heartbeats a peer, then none), and one
+  that heard its peers sent the slot late by the wait for their next heartbeat, which its peers took
+  as lateness. The poll now asks the flush that proves the next slot (`docs/timing.md` §2.8, "A
+  stream keeps its schedule without hearing its peer"). `a_node_that_hears_no_peer_keeps_its_streams_on_schedule`,
+  red on `1b85eaf`; over 256 seeds of the live-peers world the suspicions of live peers fell from 436
+  to 425 at the same allowance.
+- **Not a defect, measured: a deaf node's peers suspect it more often.** It cannot hear the interval
+  they ask (it rides their heartbeats), so it keeps its floor, 6–7 times shorter than the asked
+  (6.7 ms against 45 ms on macOS), and each heartbeat they judge is one more chance of a mistake
+  (`docs/timing.md` §2.2). Over 32 seeds and 2 s from a deafening at 300 ms, against the same seed
+  undeafened: macOS 4 against 2 false suspicions, Linux 18 against 8, the busy log and Windows 0 and
+  0 (a scratch test, not landed). Its interval moved less than the undeafened node's (Linux 10
+  moves against 47), and no peer lost a configuration.
+
+- **hyper-rt, hyper-tokio, hyper-timing-trace, hyper-measure, hyper-block: a value the kernel takes in
+  its own ticks was read at the process's timebase, which a process Rosetta 2 translates does not
+  share (found by mantle).** XNU stamps a received datagram (`SCM_TIMESTAMP_MONOTONIC`) with its own
+  `mach_absolute_time()`, in the kernel's ticks, `hw.tbfrequency` a second; a native process's
+  timebase is 10⁹ over that frequency, so the two are one counter, but a translated process is shown a
+  timebase of 1/1 and its own `mach_absolute_time` in nanoseconds while the stamp stays in Apple
+  silicon's 24 MHz ticks (measured on the M5 Max: the stamp of a datagram a translated process sent
+  itself was 1/41.667 of the clock read around it; docs/research/timing.md, "Rosetta 2 and the
+  kernel's ticks"). hyper-rt's receive took the age as `now_ticks − stamp` at the process's timebase,
+  122/125 of the host's uptime, so every arrival fell to the shard clock's zero and hyper-liveness never
+  judged a pair: on mantle's macos-x86_64 runners (x86_64 binaries on Apple-silicon macos-15) a cell of
+  `mantle node` processes stayed at term 0 and its process tests hung to the six-hour limit (mantle runs
+  39394443852, 39410946746, 39424048894); hyper-raft's own x86_64 runner is Intel hardware, where the
+  two are one. The same reading was in hyper-tokio's stamps, hyper-timing-trace's, hyper-measure's
+  `proc_pid_rusage` times (3/125 of `getrusage`'s translated) and libc's
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, which is the kernel's ticks at the process's timebase
+  (gen/clock_gettime.c), read by hyper-rt's long-poll attribution and park cost and by hyper-block's
+  `thread_cpu`: translated, a thread was told 3/125 of its run time. A kernel tick value is now
+  converted at the kernel's rate, `hw.tbfrequency` read once: hyper-rt carries a stamp into the
+  process's ticks before taking its age (`machine::clock::MachTicks`), the identity for a native
+  process, whose arrivals are what they were to the bit; hyper-tokio, hyper-timing-trace and
+  hyper-measure convert at × 10⁹ / `hw.tbfrequency`, the native timebase's own fraction; the thread
+  clock is restated at the kernel's rate. The process's own clocks keep its timebase: its continuous
+  time, the shard's clock, is translated whole (measured: the same 1,587.18 s of sleep past
+  `mach_absolute_time` natively and translated). hyper-tokio's `Clock::resolution` is the kernel's
+  tick where the timebase claims less (a translated clock steps 41 or 42 ns, not 1). Tests, red
+  translated before (`cargo test --target x86_64-apple-darwin` on the M5 Max) and green after, native
+  green both: hyper-rt `tests/udp_kernel_stamps.rs` (a stamped socket and a lent one each send
+  themselves a datagram; before, `arrived at 0 ns, outside the send at 1102708 ns to the receive at
+  2175833 ns`), `attribution`'s and hyper-block's `a_threads_cpu_time_is_the_kernels_account`
+  (`thread_info accounted 1002000 ns, the CPU clock read 24137 ns after it`), and the existing
+  `udp_batched.rs` (three), hyper-tokio `stamps.rs` (two), hyper-timing-trace's
+  `a_datagram_carries_its_kernel_receive_stamp` and hyper-measure's `user_time_is_in_nanoseconds`;
+  unit tests with injected rates (`machine::clock`, hyper-tokio's `sys::macos`): a translated
+  process and a native one read one age and one stamp, and a native one's are the old ones to the
+  bit, over some 4,000 instants each. Three tests' own thread clocks (`long_poll_held.rs`, `attribution_by_step.rs`,
+  `wake_estimate.rs`) read libc's alone and held 41.67 times their turn translated, which the
+  runtime's old reading hid; they read the runtime's now. CI runs these crates translated from now
+  on (`translated`, macos-15). The native receive is unchanged (docs/benchmarks.md, "hyper-rt: a
+  stamp in the kernel's ticks, the receive's cost"). docs/runtime.md §3.9, §5.1; docs/transport.md;
+  docs/timing.md §2.4; docs/tails.md.
+
+- **hyper-transport: a dial that failed as the last one did was told nothing (found by mantle).**
+  `Endpoint::connect` promises each dial the lifecycle event it ends in, but a state the owner was
+  already told waited as nothing, so a dial that failed in the state the owner had polled last was
+  not told. On mantle's Windows runners a cut of about 18 s outlasted two failed dials: the node was
+  told `Closed`, `Unreachable` for its first redial and nothing for its second, and since it redials
+  on those events it never dialed again; the peer stayed unreachable after the path healed (its link
+  at `dials 3, ended 2`, the endpoint's entry `conn None dialing false unreachable Some(None)
+  reported true`). A dial during which the peer connected in and went, the owner polling neither,
+  was lost the same way. A dial that fails with no connection up now forgets what the owner was told
+  (`Core::dial_failed`), so its `Unreachable` is told; one waiting unpolled stands for it, and a dial
+  failing beside a connection the peer opened tells nothing again (`docs/transport.md` §4y). Tests:
+  `a_dial_failing_as_the_last_one_did_is_told_all_the_same` (before: `dial 2: []`) and
+  `a_dial_ending_after_its_peer_came_and_went_unpolled_is_told` (before: `[]`), red before the fix;
+  `a_dial_ending_while_its_peer_is_connected_tells_nothing_new` holds the rest. In mantle's Windows
+  CI, the same change in its vendored copy, its relayed cut tests (3 and 5 voters, three rounds
+  each) passed 12 of 12 runs on windows-x86_64 and windows-aarch64; without it every round failed
+  on both.
+- **hyper-rt `a_request_drained_during_shutdown_is_terminated_on_its_receipt`, windows-11-arm (CI
+  run 39410706279, dial-outcome's): the request refused `ShardGone` in 0.00 s.** The test holds its
+  shard inside a spinning task and queues a shutdown and then a request behind it, and its hold
+  returned once the shard had admitted the task. A shard answers an admission inside its pass over
+  the control channel and takes what is queued behind it in the same pass before it polls what it
+  admitted (`drain_control`, a batch at a time), so a shutdown sent as the admission was answered
+  was taken in that pass, the hold cancelled unpolled, and the request after it refused as gone.
+  Forced in a scratch test (never landed), a hold and a shutdown queued behind a first hold and
+  drained in one pass: admitted, never polled, the next request `ShardGone`, every run. The hold now
+  returns once its task's poll has begun (the task sets a flag first; the wait bounded by the test's
+  `WAIT`). The runtime behaves as documented; the test's precondition was wrong. 500 runs of the
+  file under 24 busy loops on the 18-core Mac passed with the fix, and with the old hold as well:
+  the window is the shard's few instructions between answering the admission and taking its next
+  message, open only while the shard is preempted there and the test thread runs.
+- **hyper-rt: a shared UDP socket given port 0 could take a port another process held (found by
+  mantle's process tests).** On adacachy (Linux, 32 cores) two `mantle node` processes held
+  127.0.0.1:59152, each listener bound through hyper-rt-transport's driver to port 0; the node that
+  announced the port was never reached on it, the other refusing its peers' dials for identity (169
+  each), and the test hung. `UdpSocket::bind_shared` set `SO_REUSEPORT` before its bind, and Linux's
+  search for a free port leaves out of the ports in use those held by a socket sharing with the
+  binder's user (`udp_lib_lport_inuse`, net/ipv4/udp.c), in any process. A socket given port 0 now
+  binds before it shares, so it takes a port no socket holds; one that names its port shares first,
+  and still joins (`docs/runtime.md` §5.1). `shared_sockets_given_port_zero_each_take_a_port_no_other_holds`
+  failed on Linux 6.12 in every run before the fix (3, 4 and 3 of 500 sockets) and passes after on
+  Linux and macOS; `a_socket_joining_a_shared_port_takes_its_connected_peers_datagrams` and
+  hyper-rt-transport's `peer_sockets.rs` hold the join on both. TCP's search skips a held port
+  whatever its flags; macOS's skips one for UDP as well.
+
+### Closed (2026-10-19)
+
+- **hyper-durable: a page read from `GroupStore` ran past the core's bound on a message (found by
+  mantle).** The store gave the core's `max_bytes` to hyper-log's fetch, which counted each entry
+  at the bytes the log stores of it (`encode_entry`: its kind, its context's length, its context
+  and its data), 20 fewer than its body in a message (`hyper_raft::proto::encoded_bytes`), and the
+  core takes a page its storage cut as whole (`Log::slice_page`). In mantle a range with
+  `max_size_per_msg` 1,024 and entries of about 50 bytes sent a follower a snapshot had caught up
+  an append of 1,553 bytes, 1,449 of them entries, where the core promises
+  `MESSAGE_RECORD_FIXED_BYTES` and the larger of the bound and one entry; its transport bounds the
+  replication class's frame by that promise and refused the append on all 1,158 retries, and the
+  follower never caught up. Appends of the live tail, which the core pages itself, were within the
+  bound. hyper-log's fetch now counts each entry at its payload and a part the caller states for
+  each (`hyper_log::Page`), the store states the 20 bytes, and the log chooses the core's page
+  before anything is copied; a walk's pages (`LogStore::visit`) are counted the same way. Tests:
+  hyper-durable's `a_page_read_from_the_store_is_the_cores_by_what_its_entries_take_in_a_message`
+  (every bound a page turns at, from the handle's memory and from the log's file),
+  `a_walk_of_the_store_reads_pages_of_the_cores_rule` and
+  `a_learner_caught_up_from_the_log_is_sent_appends_within_the_bound` (before: an append of 5
+  entries, 325 bytes, against a bound of 256), each red before the fix; hyper-log's
+  `a_fetch_counts_each_entry_at_its_payload_and_the_pages_part_for_each`, and the handle's reads
+  held to the log's with a part for each entry. hyper-raft-e2e's `Wal` counted an entry at its
+  whole record, 6 bytes past its body, and cut pages shorter than the core's; it counts the body
+  now. Its pages full to the byte showed the harness's room beside an append's entries 8 bytes
+  short (`node::MESSAGE_ROOM` left out the classic commit every leader's append states): a full
+  page was dropped as too long for its datagram at every send, and in `leader-killed` a member the
+  new leader caught up from its log never caught up (ubuntu-24.04 and macos-15, CI run
+  39366050595). The room is now the datagram's header, the sender and the core's
+  `MESSAGE_RECORD_FIXED_BYTES`, and hyper-durable-e2e, which frames a member's datagram the same
+  way and kept a copy of the short room, takes it
+  (`a_leaders_append_filled_to_the_page_fills_its_datagram`: 65,515 bytes for a datagram of
+  65,507 before). The stores that give the whole range asked (hyper-multilog's test store, the
+  liveness bench's) are cut by the core's own rule.
+
 ### Closed (2026-10-18)
 
 - **hyper-raft: commits on entries held in memory, across fates (core step R-8, building).** A
@@ -402,7 +619,10 @@ is worked around.
   `sim::a_stall_every_nodes_disk_shares_suspects_no_one` (fails without the rule),
   `sim::a_peer_killed_while_this_nodes_disk_stalls_is_suspected_once_it_is_back`, and the processes
   test's stalled member, now resumed; the records carry each node's durable writes and the tracer
-  checks every deferral (`docs/timing.md` §2.4).
+  checks every deferral (`docs/timing.md` §2.4). Gave way on 2026-10-22, when the shared repository's
+  two lines met, to the rule main had built from the same finding with mantle's
+  (`pair::Local::judge`, "A judge whose own proof stalls", `docs/timing.md` §2.8, closed 2026-10-20
+  and 2026-10-21 below): its tests replaced these.
 - **hyper-rt-transport: the shared-port driver test unwrapped Winsock's refusal.** Since 0802a05
   Windows refuses a shared bind before any socket is bound (`netsys::port_sharing`), and
   `a_driver_given_a_socket_bound_with_its_port_shared_gives_each_peer_its_own` unwrapped it on both

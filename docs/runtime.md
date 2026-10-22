@@ -591,14 +591,21 @@ case, and the loop's costs must not grow with the load.
   (`MIN_SAMPLES`, 59, Wilks) and its window the rule's `N = (z·sd / (h·mean))²` on the warm-up's own
   spread. `tests/spin_by_park_cost.rs`. The CPU clock is read only by a learning shard, around a wait it
   makes, and the second time only after a first (`bd7c0fd`: reading it after every park halved every
-  shard's calibrated batch, 117 to 262 ns an item; `tests/park_cost_reads.rs`).
+  shard's calibrated batch, 117 to 262 ns an item; `tests/park_cost_reads.rs`). On macOS the clock is
+  libc's `CLOCK_THREAD_CPUTIME_ID`, the kernel's ticks at the process's timebase, restated at the
+  kernel's rate (`machine::clock::MachTicks`, §5.1): a process Rosetta 2 translates is shown a
+  timebase of 1/1, and libc's reading alone told it a park cost 3/125 of what it cost (`attribution`'s
+  test holds the clock to `thread_info`'s account and to the shard's clock).
 - **The shard's clock is the cheap one, read once a poll (D3).** On macOS `mach_continuous_time` scaled
   by the timebase as a 32-bit fixed-point ratio, 4.8 ns a read where `CLOCK_MONOTONIC` costs 16.1 ns at
   1 µs resolution (note 42 §4); elsewhere `monotonic_ns`, already the cheap clock there. A step of `p`
   polls reads it `1 + p` times (`2 + p` when its drains or driver did work), where it read
   `CLOCK_MONOTONIC` `2 + 2p` times; a poll that yields cost 47.5 ns and costs 15.9 ns (note 42 §7).
   `SCALE_BITS` (32) is format: the 64×64-bit product cannot overflow 128 bits and the rounding error stays
-  under 10⁻¹¹ of a tick (`machine::clock`'s tests).
+  under 10⁻¹¹ of a tick (`machine::clock`'s tests). A process Rosetta 2 translates reads its continuous
+  time translated, nanoseconds at a timebase of 1/1, and it counts as a native process's does (read
+  beside one, both 1,587.183436 s past `mach_absolute_time`, the time the host had slept), so the
+  shard's clock, the process's own clock on its own timebase, takes no kernel rate.
 - **A poll's end from the counter.** The loop reads the driver's clock once a step and carries that reading
   to the step's polls by the generic timer's counter, CNTVCT_EL0, read without synchronization
   (`machine::clock::Carried`; aarch64 under macOS and Linux, and elsewhere the clock takes every reading);
@@ -804,6 +811,18 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   offset read since the read before the last batch that emptied the socket, and to no earlier than that
   read: late by a step at most, never early (`udp/carry.rs`, as hyper-tokio's `clock::Carry`). macOS's
   offset only grows, by the time the host slept, so the latest one carries a stamp late, never early.
+- **A macOS stamp is in the kernel's ticks.** XNU stamps with its own `mach_absolute_time()`, in its
+  ticks, `hw.tbfrequency` a second, and the age is read on the process's `mach_absolute_time`, in the
+  process's ticks. They are one counter for a native process, the timebase being 10⁹ over that frequency
+  in lowest terms, and not for one Rosetta 2 translates: it is shown a timebase of 1/1 and its own clock
+  in nanoseconds, while the stamp stays in Apple silicon's 24 MHz ticks (docs/research/timing.md,
+  "Rosetta 2 and the kernel's ticks"). Read at the process's timebase alone, a translated process's
+  stamps aged 122/125 of the host's uptime, every arrival fell to the shard clock's zero, and
+  hyper-liveness never judged a pair: mantle's x86_64 nodes on Apple-silicon runners never elected. The stamp
+  is carried into the process's ticks at `10⁹·denom / (hw.tbfrequency·numer)` before the age is taken,
+  the identity for a native process, whose arrivals are what they were to the bit
+  (`machine::clock::MachTicks`, read once a process; `tests/udp_kernel_stamps.rs`, which CI's
+  `translated` job runs under Rosetta 2).
 - **Drops told by the traffic.** On Linux a socket asks for `SO_RXQ_OVFL`: each datagram queued once the
   socket has dropped any for want of room carries the count since the socket was made, and the socket
   keeps the latest (`IoStats::drops`, `Some(0)` until a datagram says more, `None` where the kernel does
@@ -821,16 +840,25 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
 - **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.
-- **A shared port is its listener's alone** (2026-10-17). `UdpSocket::bind_shared` binds a port that the
-  sockets a listener connects to its peers then join (`UdpSocket::join_shared`, `SO_REUSEPORT`). It binds
-  before it sets the flag, so the port is one no other socket holds: a held port is refused `AddrInUse`,
-  and port 0 is given a port of its own. Flagged before its bind, a socket asking Linux for port 0 could be
-  given a port another of the user's flagged sockets held, in any process: the kernel's search for a free
-  port passes over a port held by a socket it may share with (`udp_lib_lport_inuse` marks none), and the
-  two sockets then split the port's datagrams by hash. Of 1,024 such binds, 19 ports were given twice;
-  of 256 clients of one server, one to three never heard it in four runs of five, each sharing its port
-  with another client (`tests/udp_shared_port.rs`; hyper-rt-transport's `connection_memory`). macOS gives
-  no held port to a port-0 bind, and both kernels take the flag set after the bind (measured).
+- **A shared port is its listener's alone** (2026-10-17; found again by mantle on 2026-10-20). `UdpSocket::bind_shared`
+  binds a port that the sockets a listener connects to its peers then join (`UdpSocket::join_shared`,
+  `SO_REUSEPORT`), each connected socket taking its own peer's datagrams (hyper-rt-transport's driver);
+  Windows refuses one. It binds before it sets the flag, so the port is one no other socket holds: a held
+  port is refused `AddrInUse`, and port 0 is given a port of its own. Flagged before its bind, a socket
+  asking Linux for port 0 could be given a port another of the user's flagged sockets held, in any
+  process: the kernel's search for a free port leaves out of the ports in use any held by a socket that
+  shares its port with the binder's user (`udp_lib_lport_inuse`, net/ipv4/udp.c), and the two sockets then
+  split the port's datagrams by hash. Of 1,024 such binds, 19 ports were given twice; 3, 4 and 3 of 500
+  sockets bound so in one process on Linux 6.12, about the 4.4 a pick at random over its 28,232 ports
+  gives; of 256 clients of one server, one to three never heard it in four runs of five, each sharing its
+  port with another client; mantle's process tests had two nodes' listeners on 127.0.0.1:59152, the dials
+  to the node that announced it answered by the other and refused for identity. XNU's search takes only a
+  port no socket holds (`in_pcbbind`), and both kernels take the flag set after the bind, a socket that
+  joins later by name still joining it, as each checks the held socket's flag as it binds (Linux
+  `udp_reuseport_add_sock`; measured). TCP's search refuses a port any socket holds, whatever its flags
+  (`inet_csk_find_open_port` asks `inet_csk_bind_conflict` with `reuseport_ok` false), so
+  `TcpListener::bind_shared` keeps its order. Tests: `tests/udp_shared_port.rs`, `tests/udp_shared.rs`;
+  hyper-rt-transport's `connection_memory` and `tests/peer_sockets.rs`.
 - **What a socket holds, bounded and told.** `Io::held_bound` is the most a batched socket holds while it
   lives, and what its owner charges for it: its receive buffers (`batch` of `RECEIVE_BYTES` on Linux, one
   elsewhere), its outbox (`batch` slots, each one datagram or one segmented send of at most
@@ -1306,6 +1334,23 @@ Gilbert–Elliott loss, path and interface MTU, NAT expiry). hyper-rt keeps it a
   listener and focal's local clients need them.
 - **Completions from simulated devices** through the same `Waker` seam as §7.
 
+**A bounded run** (2026-10-20). `run_until_idle` returns only once no shard has work and no deadline
+remains, and a world of nodes always has one (a node's heartbeats and liveness, its transport's
+keep-alive and idle timers), so it never returns from one, and the loop's pump was private, so a caller
+could not build a bounded run from `step` and `advance`. `SimRuntime::run_until(deadline_ns) -> u64` is the
+same loop stopped at a deadline: every event due at or before it is taken (a shard's timer, a datagram's
+arrival, and the work each wakes, the work their tasks make at that instant among it), none due after it,
+and the clock is left at `deadline_ns`; a deadline at or before now takes what is due now and moves the
+clock nowhere. The next call goes on as if the run had not stopped, so a world run in slices sees what it
+sees run in one, each event at the same time, and its harness checks its invariants between slices and
+waits on the facts it needs a slice at a time. Its steps are bounded as `run_until_idle`'s are: it stops
+only once no shard has work at the time it reached, and returns the steps it took. `tests/sim_run_until.rs`:
+on two shards whose tasks run forever (periodic timers of 3 and 7 ms, a datagram sent each 3 ms on a path of
+5 ms), each slice of 2 ms takes exactly the closed form of what is due by its end, each event at the time it
+was due, the clock at the slice's end; on a jittered path the world in twenty slices sees what it sees in
+one, every event at the same time and in the same order with the same fabric counts, one seed gives one run
+and another another. Both fail with an event at a slice's end left to the next (`<` for `<=`).
+
 ## 12. Measurement and tests
 
 Benchmarks (`docs/benchmarks.md`, hardware, date and command each), each row against what each consumer
@@ -1371,6 +1416,15 @@ endpoints on one shard:
 
 Not yet a like-for-like comparison: hyper-tokio's scenario runs its ends in two processes, this one on one
 thread. §12's row runs both drivers the same way.
+
+**On the simulation runtime** (2026-10-20). The driver and the plane's socket run on `SimRuntime`'s shards
+as they are: `Driver::bind` finds no shared port on the fabric and binds one socket that takes every peer, as
+on Windows, and `PlaneSocket::bind` takes a fabric port. A node is a future `spawn_on` takes, its plane's
+receive among its awaits (hyper-datagram's `Fence` is `Sync`), and a world of nodes runs in slices of
+`run_until` (§11). `tests/simulation.rs` runs three nodes on three shards, mutual TLS and a seeded QUIC
+layer each, two clients each asking a request of 256 KiB, sending a lane frame and sealing a plane message
+keyed from its connection's exporter, the server answering and echoing; two runs from one seed give the same
+reports, virtual times and fabric counts (`docs/transport.md` §4z).
 
 ## 15. Open items, to settle before the part that rests on them
 

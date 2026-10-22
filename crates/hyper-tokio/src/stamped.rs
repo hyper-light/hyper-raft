@@ -144,7 +144,7 @@ impl Stamped {
         let Some(taken) = received else {
             return Ok(Taken::Unreadable);
         };
-        let stamp = taken.stamp.map(|ticks| self.clock.ticks_ns(ticks));
+        let stamp = taken.stamp.map(|ticks| self.clock.kernel_ns(ticks));
         Ok(Taken::Datagram(
             taken.length,
             self.arrival(taken.from, stamp, read_ns),

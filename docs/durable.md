@@ -1360,8 +1360,15 @@ directory once, at create.
   `GroupStore` (`src/hyperlog.rs`) is hyper-log's group handle, each write one update cut into
   frame-sized parts and answered once every part is; an owner with nothing else to do for the
   group waits on it for the oldest write's answer (`GroupStore::wait`, the log's own wait for each
-  part) and drives after, as focal's `wait_persisted` does. `RamStore` (`src/memory.rs`)
-  completes each write as it is submitted, depth one, slates' case and the simplest test store.
+  part) and drives after, as focal's `wait_persisted` does. A store pages its reads as the core
+  pages (`LogStore::entries`, and `visit`'s pages): each entry counted at what it takes in a
+  message (`EntryRef::encoded_bytes`), for the core takes a page its storage cut as whole.
+  `GroupStore` has hyper-log count each entry at its stored bytes and the 20 its term, index and
+  lengths add in a message (`hyper_log::Page`), so the log chooses the core's page before anything
+  is copied; counted by the stored bytes alone, a page ran past the core's bound on an append
+  (mantle, 2026-10-19: 1,553 bytes where `max_size_per_msg` was 1,024, refused by its transport on
+  every retry). `RamStore` (`src/memory.rs`) completes each write as it is submitted, depth one,
+  slates' case and the simplest test store.
 - **A store's hold** (`src/store.rs`): `LogStore::Hold`, `held` and `release`, and
   `Fault::Held` (§2.4). hyper-log's handle, the RAM store and the tests' stores hold nothing
   (`Infallible`). `tests/shell.rs` holds a write whose entry needs a precondition until its

@@ -2155,6 +2155,34 @@ high-water mark and refuses any datagram that arrives out of order, where hyper-
 window accepts a verified late datagram once; and slates' keys are not yet tied to a session
 (mantle audit §11.8), where hyper-datagram's come from the QUIC connection's exporter.
 
+## The plane's peers in the order of their ids (2026-10-20)
+
+`Plane` kept its peers in a `HashMap` of the standard library's random hasher and `flush` walked it,
+so one flush's datagrams to several peers left in an order drawn per process, which set two runs of
+one seed of mantle's node simulation apart (`docs/transport.md` §4z). The peers are now a `Vec` sorted
+by id, each found by binary search, flushed in that order. A peer is found for every message queued
+and every datagram opened.
+
+`cargo bench -p hyper-datagram --bench round` (added with the change: the allocation bench's round,
+timed, 32,000 datagrams a cell after 100 rounds) on the M5 Max above, macOS 26.4.1, 2026-10-20 at
+04:18 PDT, load average 7 to 12 from the machine's other sessions. Before is `ba0c87b` with the bench
+copied in; the two binaries alternated in four ABBA blocks of fresh processes. Nanoseconds a message,
+median (least–most) of 8 runs each:
+
+| Peers | Message | Messages a datagram | Before, `HashMap` | After, sorted `Vec` |
+|---|---|---|---|---|
+| 1 | 16 B | 66 | 15.5 (15.2–22.5) | 11.4 (11.2–14.7) |
+| 1 | 128 B | 9 | 65.3 (63.2–68.6) | 59.5 (57.7–60.9) |
+| 1 | 1,024 B | 1 | 463.2 (450.8–483.0) | 456.4 (442.1–488.5) |
+| 16 | 16 B | 66 | 16.0 (15.6–16.6) | 13.5 (13.2–13.8) |
+| 16 | 128 B | 9 | 67.5 (65.7–70.2) | 63.6 (62.8–65.4) |
+| 16 | 1,024 B | 1 | 490.2 (471.9–501.0) | 474.1 (457.5–478.1) |
+
+At 16 B a message's peer lookup is a large part of its cost: a quarter less time with one peer, a
+sixth less with sixteen, whose search takes four comparisons where the hash took one probe; at
+1,024 B, one message a datagram, the seal is the cost and the two are even. Allocations,
+reallocations, bytes asked and minor faults (`--bench allocs`): 0 in every cell, before and after.
+
 ## Commands for the plane
 
 ```sh
@@ -2163,6 +2191,9 @@ cargo test -p hyper-datagram
 
 # Allocations per datagram.
 cargo bench -p hyper-datagram --bench allocs
+
+# Time a message of a round, one peer and sixteen.
+cargo bench -p hyper-datagram --bench round
 
 # The comparison, slates as it builds, then slates with its ARMv8 crypto.
 cd crates/hyper-datagram-compare && cargo build --release
@@ -9689,3 +9720,106 @@ What it shows:
 - **The tail.** p99 is the round trip with no write out to wait on, and one or two flushes where
   the probe has yet to reach far enough (its doubling starts from what came), and at sixty-four
   clients, where a leader frees its window to a follower only on durable answers.
+
+## hyper-rt: a stamp in the kernel's ticks, the receive's cost (2026-10-20)
+
+The repair of a macOS stamp's age (`docs/runtime.md` §5.1, `docs/STATUS.md` closed 2026-10-20): the
+receive carries the kernel's stamp into the process's ticks (`machine::clock::MachTicks::of_kernel`)
+before it takes the age, which for a native process is the stamp itself, one branch on whether the
+two counters are one. `cargo bench -p hyper-rt --bench stamped_receive` times the receive of a stamped
+socket on a shard (`Batched::bind`, the plane socket's): 2,995 rounds (Wilks' least sample for a 95 %
+bound on the p99.9) of 64 datagrams of 64 bytes sent from the shard's thread and then taken, each
+receive call that took one timed, after as many unmeasured; allocator calls and page faults are counted
+over the measured rounds. The tree before (`e4a1434` with the bench added, md5
+`9820b71a27acdbf326d91db1d241eaac`) against the repair (md5 `8fb72ac4308388b412bc302a9aa33123`), six
+ABBA blocks of fresh processes on the M5 Max at load 10.1-12.4, medians of the twelve runs an arm
+(ranges):
+
+| | before | after |
+|---|---|---|
+| receive, ns a datagram, p50 | 611 (482-1,543) | 638 (533-1,546) |
+| receive, ns a datagram, p99 | 13,305 (3,458-24,254) | 13,371 (3,959-21,227) |
+| allocator calls a datagram | 0 | 0 |
+| page faults a datagram | 0 | 0 |
+
+In five of the six blocks the arms' runs interleave; in the first the after's two (533 and 534 ns) sat
+2 and 3 ns above the before's larger.
+The age alone, the same binary alternating 21 turns of a million calls each way on inputs the optimizer
+cannot see: 4.07, 3.91 and 3.20 ns a call now against 4.03, 3.78 and 2.91 before (three runs, medians),
+the branch costing 0.04-0.29 ns, under a cycle, beside a receive of some 600 ns.
+
+```sh
+cargo bench -p hyper-rt --bench stamped_receive     # each tree; the binaries then run ABBA
+```
+
+## hyper-liveness: a starved node's evidence and a stream's schedule without its peer (2026-10-20)
+
+`docs/timing.md` §2.8, "A stream keeps its schedule without hearing its peer" and "Judged with no
+evidence of its own". Before is `1b85eaf` (a `git archive` of it, built in a target directory of its
+own); after is this change. Apple M5 Max, macOS 26.4.1, the machine shared at the load stated, each
+bench run alternately, base and after.
+
+`cargo bench -p hyper-liveness --bench allocs`, three runs each at load 18–22: every cell 0
+allocations, 0 reallocations, 0 bytes and 0 minor faults a heartbeat before and after, and the
+heartbeats sent and taken the same in every cell (2,310, 5,094/5,095, 29,315/29,313 twice): the
+world is healthy, its pools never starve, and the stream takes the path it took. The ns a heartbeat
+moved tenfold from run to run in both builds at this load (8 nodes, 1 group: 2,009, 2,834, 2,097
+before; 773, 1,790, 925 after), which says nothing either way. What a poll adds where nothing
+starves: a branch on the node's evidence, and per heartbeat sent a comparison of its next slot with
+the poll's time.
+
+`cargo bench -p hyper-liveness --bench cost`, two runs each at load 22–29, pair µs a node a second:
+two peers 5.9–7.7 before, 6.4–8.6 after; eight peers 41.8–61.5 before, 47.3–50.8 after; messages
+and flushes a second identical (80 and 1.02, 320 and 1.10). SWIM's column, code neither build
+changed, moved 9.1–15.0 at two peers and 47.2–65.9 at eight over the same runs: the ranges overlap
+within the machine's noise.
+
+The simulation (`cargo test --release -p hyper-liveness --test sim`, `HYPER_LIVENESS_SEEDS=256`):
+the suspicions of live peers 436 before, 425 after, at the same allowance (4,182.9, 4,181.5); the
+time from a young victim's kill to every survivor's suspicion, median / 90th percentile / most, macOS
+94 / 519 / 6,747 ms before and 97 / 500 / 1,097 after, busy 105 / 947 / 2,146 and 105 / 931 / 2,146,
+Linux 55 / 214 / 646 and 54 / 210 / 529, Windows 537 / 2,156 / 4,066 and 542 / 2,147 / 4,066.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs   # and from `git archive 1b85eaf`, alternately
+cargo bench -p hyper-liveness --bench cost
+HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim
+```
+
+## hyper-liveness: a judge whose own proof stalls (2026-10-21)
+
+`docs/timing.md` §2.8, "A judge whose own proof stalls". Before is `79eb22b` (a `git archive` of it,
+built in a target directory of its own); after is this change. Apple M5 Max, macOS 26.4.1, shared,
+the benches run alternately.
+
+`cargo bench -p hyper-liveness --bench allocs`, three runs each at load 5–8 (ns a heartbeat sent or
+taken, steady state; then the bootstrap's): 2 nodes 73–79 before, 78–79 after (bootstrap 131–136,
+142–143); 4 nodes 79–83, 86–88 (102–111, 111–119); 8 nodes 110–111, 112–113 (125–127, 136–141); 8
+nodes of 1,000 groups 111–113, 112–113 (114–120, 126–130). 0 allocations, reallocations, bytes and
+minor faults a heartbeat in every cell before and after, and the heartbeats sent and taken the same.
+What a poll pays more: per pair, one branch on the judge's own durability where a point has passed;
+per poll that wants a flush, the stamp of the wait. A first version read every pair's margin through
+a `Duration` at every poll, and judged past a point that had not passed: 2 nodes 96–164 and 8 nodes
+176–307 ns at load 9–10 against 80–120 and 122–179, gone with the margin read only for a point that
+has passed and an early return for one that has not.
+
+`cargo bench -p hyper-liveness --bench cost`, two runs each at load 8–19: messages and flushes a
+second identical (80 and 1.02, 320 and 1.10); pair µs within the noise of the per-group column, which
+neither build changed and which moved twofold between runs.
+
+The simulation (`HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim`): the
+suspicions of live peers 425 before, 388 after, at the same allowance; the time from a young victim's
+kill to every survivor's suspicion, median / 90th percentile / most, macOS 97 / 500 / 1,097 ms and
+101 / 504 / 1,575, busy 105 / 931 / 2,146 and 112 / 931 / 2,146, Linux 54 / 210 / 529 and 57 / 215 /
+529, Windows 542 / 2,147 / 4,066 and 559 / 2,148 / 4,066.
+
+```sh
+cargo bench -p hyper-liveness --bench allocs   # and from `git archive 79eb22b`, alternately
+cargo bench -p hyper-liveness --bench cost
+HYPER_LIVENESS_SEEDS=256 cargo test --release -p hyper-liveness --test sim
+```
+
+The one-shot hold (`Pair::held`, the next commit): five alternations at load 9–10 against `79eb22b`,
+whose own runs moved 89–195 ns a heartbeat at 2 nodes and up to 802 at 8, so they tell nothing
+either way; the hold is read only for a point that has passed. 0 allocations, reallocations, bytes
+and faults a heartbeat in every cell.

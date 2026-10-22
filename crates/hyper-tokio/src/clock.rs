@@ -13,7 +13,9 @@
 //!   carried by the least offset it may have been taken on (`Carry`), and held within the read's
 //!   time and no earlier than the stamp of the datagram read before it from the socket, whose
 //!   queue is first in, first out.
-//! - macOS: `mach_absolute_time`, the clock `SO_TIMESTAMP_MONOTONIC` stamps on.
+//! - macOS: `mach_absolute_time`, the clock `SO_TIMESTAMP_MONOTONIC` stamps on, the stamps in the
+//!   kernel's ticks and converted at its rate (`hw.tbfrequency`), which is the process's timebase
+//!   only where the process runs natively (`sys::macos`).
 //! - Windows: `QueryPerformanceCounter`. Winsock's receive timestamps (`SIO_TIMESTAMPING`, Windows
 //!   10 build 20348) are taken by a NIC miniport driver that reports timestamping capabilities, and
 //!   none is taken on loopback or a virtual NIC (`docs/research/timing.md`), so a datagram is
@@ -90,7 +92,8 @@ impl Clock {
 
     /// The least step the clock's readings take, which bounds how late a wait read exactly on time
     /// was (`hyper_timing::Lateness`). On macOS a tick of `mach_absolute_time`, `numer / denom`
-    /// nanoseconds (125/3 on Apple silicon), rounded up; on Windows a count of
+    /// nanoseconds (125/3 on Apple silicon), rounded up, or the kernel's tick where that is larger
+    /// (a process Rosetta 2 translates is shown 1/1, its clock stepping 125/3); on Windows a count of
     /// `QueryPerformanceCounter`, a second over `QueryPerformanceFrequency`, rounded up. Linux
     /// states no step for `CLOCK_MONOTONIC`'s readings: `clock_getres(2)` reports its timers'
     /// resolution, a jiffy where the kernel has no high-resolution timers, and a wait's lateness
@@ -110,10 +113,11 @@ impl Clock {
         }
     }
 
-    /// A macOS kernel stamp, `mach_absolute_time` ticks, as nanoseconds on this clock.
+    /// A macOS kernel stamp, the kernel's `mach_absolute_time` in its own ticks, as nanoseconds on
+    /// this clock: at the kernel's rate, which a translated process's timebase is not.
     #[cfg(target_os = "macos")]
-    pub(crate) fn ticks_ns(&self, ticks: u64) -> u64 {
-        self.os.ticks_ns(ticks)
+    pub(crate) fn kernel_ns(&self, ticks: u64) -> u64 {
+        self.os.kernel_ns(ticks)
     }
 }
 

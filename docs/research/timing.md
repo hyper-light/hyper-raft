@@ -441,6 +441,54 @@ with a 1 ms cap; latency tiers 0–5 scale `{3, 2, 1, −2, 3, 3}`, caps `{1, 5,
 a `uint64_t`; `<sys/socket.h>`); `SO_TIMESTAMP` attaches `getmicrotime()`, microseconds of wall
 time. macOS's `setsockopt(2)` page documents neither.
 
+**Rosetta 2 and the kernel's ticks (sources and a measurement, 2026-10-20).** A time the kernel takes
+itself and hands a process is in the kernel's ticks; a process's `mach_timebase_info` describes its own
+clocks, which are the kernel's only where the process runs natively.
+- *The stamp.* `ip_savecontrol` stamps with the kernel's `mach_absolute_time()` (bsd/netinet/ip_input.c
+  lines 3448-3457 at apple-oss-distributions/xnu `xnu-12377.121.6`; IPv6 the same,
+  bsd/netinet6/ip6_input.c lines 1874-1883). Nothing in either path asks whether the receiver is
+  translated.
+- *The kernel's rate.* `hw.tbfrequency` reads `gPEClockFrequencyInfo.timebase_frequency_hz` as an
+  8-byte quad (bsd/kern/kern_mib.c lines 683-689, declared `CTLTYPE_QUAD` at line 986). On Apple silicon
+  the platform expert hands that frequency to the timebase callback as `timebase_num`, with
+  `timebase_den` 1 (pexpert/arm/pe_init.c lines 598-599), and `timebase_callback` sets the timebase to
+  10⁹ over it in lowest terms (osfmk/arm/rtclock.c lines 118-137): 125/3 for 24 MHz. On Intel the
+  frequency is 10⁹ (pexpert/i386/pe_identify_machine.c line 47) and the timebase 1/1
+  (osfmk/i386/rtclock.c lines 410-414). So 10⁹ / `hw.tbfrequency` is the kernel's own nanoseconds a
+  tick on both.
+- *The translated process's clock.* Apple: "The value returned by the mach_absolute_time function is
+  different for native and translated processes, and doesn't necessarily correspond to the number of
+  nanoseconds since boot" ("Addressing architectural differences in your macOS code", section "Apply
+  Timebase Information to Mach Absolute Time Values", developer.apple.com, read 2026-10-20). Apple's
+  "About the Rosetta translation environment" says nothing of clocks.
+- *Other kernel ticks a process is handed.* `proc_pid_rusage`'s `ri_user_time` and `ri_system_time` are a
+  task's `total_user` and `total_system` (`fill_task_rusage`, osfmk/kern/bsd_kern.c lines 1166-1167),
+  kernel ticks; `proc_pidinfo(PROC_PIDTASKINFO)`'s totals the same. libc's
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` is `__thread_selfusage()`, the kernel's
+  `recount_current_thread_time_mach` (bsd/kern/kern_resource.c lines 3606-3613, osfmk/kern/thread.c
+  lines 2254-2265), × the process's `numer / denom` (gen/clock_gettime.c lines 105-135 at
+  apple-oss-distributions/Libc `Libc-1752.120.2`). `getrusage(2)`, `thread_info` (`time_value_t`) and
+  `kevent` timers in `NOTE_NSECONDS` are converted by the kernel itself.
+- *Measured* on the M5 Max (macOS 26.4.1, build 25E253), each probe a C program built for arm64 and for
+  x86_64, the latter run under Rosetta 2 (`sysctl.proc_translated` 1):
+
+  | Reading | native arm64 | x86_64 under Rosetta |
+  |---|---|---|
+  | `mach_timebase_info` | 125/3 | 1/1 |
+  | `hw.tbfrequency` | 24,000,000 | 24,000,000 |
+  | a datagram's stamp against `mach_absolute_time` read around it | within, ratio 1.000 | 1/41.667 of it |
+  | `mach_absolute_time`'s least step | 1 tick, 41.67 ns | 41 or 42 ns (333,130 and 666,298 of a million) |
+  | CPU time after a busy loop: `getrusage`, `thread_info` | 117.9, 118.3 ms | 57.4, 57.4 ms |
+  | `CLOCK_THREAD_CPUTIME_ID` | 118.3 ms | 1.4 ms |
+  | `proc_pid_rusage` user+system, × timebase and × 10⁹ / `hw.tbfrequency` | 117.9 and 117.9 ms | 1.4 and 57.4 ms |
+  | `mach_continuous_time` less `mach_absolute_time` | 1,587.183436 s | 1,587.183436 s |
+  | kqueue `NOTE_NSECONDS` timers of 1, 5 and 20 ms, median of 20 waits | 1.09, 5.02, 20.10 ms | 1.03, 5.06, 20.07 ms |
+
+  A translated process's own clocks, absolute and continuous, are translated whole (the time the host
+  slept included) and agree with `CLOCK_UPTIME_RAW` and `CLOCK_MONOTONIC_RAW`; every value the kernel
+  takes in its own ticks is left in them. So a kernel tick value is converted at 10⁹ /
+  `hw.tbfrequency`, never at the process's timebase, and the process's own readings keep its timebase.
+
 **Linux `socket(7)`, `SO_TIMESTAMPNS`**: an `SCM_TIMESTAMPNS` control message with a
 `struct timespec` of `CLOCK_REALTIME` at the datagram's reception. **The kernel configuration**
 (`/proc/config.gz`) of Docker Desktop's linuxkit 6.12.76 has `CONFIG_HZ=1000`, `CONFIG_NO_HZ_IDLE=y`

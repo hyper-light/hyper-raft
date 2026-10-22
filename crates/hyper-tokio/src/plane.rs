@@ -145,3 +145,26 @@ impl PlaneSocket {
         Poll::Pending
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task that awaits the plane's receive may be moved to another thread with its future (tokio's
+    /// multi-threaded `spawn`): the future holds the owner's fence across its await, and a fence is
+    /// `Sync`. Checked when the test compiles: the future is made and never polled.
+    #[test]
+    fn a_planes_receive_is_a_send_future() {
+        fn send<F: std::future::Future + Send>(future: F) -> F {
+            future
+        }
+        fn receive<'a>(
+            socket: &'a mut PlaneSocket,
+            plane: &'a mut Plane,
+            fence: &'a dyn Fence,
+        ) -> impl std::future::Future<Output = Result<usize, Error>> + Send + 'a {
+            send(socket.receive(plane, fence, |_, _| {}))
+        }
+        let _ = receive;
+    }
+}

@@ -8208,6 +8208,43 @@ The 64-connection row first measured a server's peak live bytes at 541,834 a con
 32 MiB, Brotli's certificate compression with its default window (`crates/hyper-tls/VENDORED.md`
 §10), since fixed; the rows above are after it.
 
+## How a node could learn what a connection costs it, under churn (2026-10-21)
+
+`cargo test --release -p hyper-rt-transport --test connection_footprint -- --ignored --nocapture
+how_well`. A charge learned on the host a node runs on has only what the node can read there: the
+footprint the OS charges the process, the bytes the program counts live (the server thread's Rust
+bytes and aws-lc's, as above), and, on Linux in a container, the socket memory its control group is
+charged. The stepped server (`learning_server`, a process of its own) holds 32, 64, 128, 256, 384,
+512, 768 and 1,024 connections in turn and samples each step once its connections settle; in the
+noisy run it also remakes, between steps, a churn of blocks of random sizes (1 KiB to 1 MiB) to a
+random total below 24 MiB, a stand-in for what else a node holds and frees (sessions' rows,
+messages), and known to it as a node's budget knows its charges. The truth is the clean run's slope
+of footprint on connections; each way's estimate is made from the noisy run's samples up to each
+step. Error against the truth, over steps 3 to 8 (128 to 1,024 connections), the hosts' own
+allocators:
+
+| Way | macOS 26 arm64 | Linux 6 x86_64 | Windows 11 x86_64 |
+|---|---|---|---|
+| truth: footprint a connection, clean | 36,325 B | 34,918 B | 36,622 B |
+| counted live a connection, clean | 26,591 B | 30,539 B | 29,279 B |
+| footprint on connections | +114% to +392% | +32% to +184% | +19% to +162% |
+| footprint on connections and other holdings | +89% to +377% | +9% to +80% | −4% to +12% |
+| counted live on both, scaled by footprint on live | −17% to +45% | −3% to +5% | −12% to −9% |
+| counted live on both | −27% to −24% | −11% to −5% | −21% to −12% |
+| counted live on both, scaled by peaks' ratio | −3% to +35% | −11% to −1% | −15% to −8% |
+| Linux control group's socket memory on connections | | 12,288 B, exact | |
+
+What the OS charges cannot be regressed out of the footprint while anything else allocates: the
+allocator keeps the pages the churn freed (a footprint is a high-water mark more than a count), and
+the error is largest exactly where the churn is largest against the connections. The program's own
+count is steady (the counted-live column moves by a few per cent from step to step, within 4% of the
+clean run's on every host), but short of the truth by the allocator's rounding and pages, by host:
+24–27% on macOS, 5–11% on Linux, 12–21% on Windows. Scaling it by a ratio of footprint to live
+learned from the same samples carries the churn's error back in. The parts that are exact are the
+ones read where the memory is held and nothing else is: the counted bytes, and the kernel's socket
+memory where a control group charges it. What is missing is the allocator's own account of the
+connections' pages, which neither a process's footprint nor a count of requests gives.
+
 ## An exchange by the server's connections, a socket each (2026-10-17)
 
 The bench of the next section (`cargo bench -p hyper-rt-transport --bench connections`), run again once

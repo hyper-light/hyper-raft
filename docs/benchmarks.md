@@ -8173,6 +8173,41 @@ measure's 16 streams).
 Its socket's kernel buffer is apart (charged by the kernel as datagrams wait in it). On Linux the run
 first found the port-0 collision of `docs/transport.md` §4v: one to three clients of 256 never connected.
 
+## What the operating system charges a server for each connection (2026-10-21)
+
+`cargo test --release -p hyper-rt-transport --test connection_footprint -- --ignored --nocapture
+what_the_os`. "What a server holds for each connection" counts the bytes the server's thread asks
+Rust's allocator for; this counts what that misses. Each row is a server process of its own (no
+memory an earlier row freed is reused), its clients in another, so the process's footprint is the
+server's: the OS's account of it (`hyper_measure::usage`: macOS's physical footprint, Linux's
+resident set, Windows's working set), the server thread's Rust bytes (`hyper_measure::alloc`), and
+aws-lc's own allocations, counted through `CRYPTO_set_mem_functions` (they go to `malloc`, not
+through Rust's allocator); on Linux, the socket memory the kernel charges the process's control
+group (cgroup v2 `memory.stat` `sock`), which no process footprint holds. Each row's figures are
+what its `n` connections added while they connected and settled, divided by `n`; three rows each.
+
+| Host | n | Rust | aws-lc | OS footprint | footprint ÷ (Rust + aws-lc) | kernel socket memory |
+|---|---|---|---|---|---|---|
+| macOS 26, arm64 (16 KiB pages) | 64 | 28.7 KB | 3.5 KB | 75.0–76.5 KB | 2.33–2.37 | not charged to the process |
+| | 256 | 28.9–29.1 KB | 4.3 KB | 53.8–55.6 KB | 1.63–1.66 | |
+| Linux 6, x86_64 (fedora, glibc) | 64 | 31.4–32.6 KB | 3.5 KB | 71.8–75.8 KB | 1.99–2.17 | 12,352 B |
+| | 256 | 30.6–31.6 KB | 3.9 KB | 48.5–49.8 KB | 1.37–1.44 | 12,304 B |
+| | 1,024 | 25.4–26.1 KB | 3.5–3.6 KB | 36.8–38.2 KB | 1.27–1.28 | 12,292 B |
+| Windows 11, x86_64 | 64 | 32.4–36.1 KB | 3.5–4.0 KB | 90.5–97.3 KB | 2.43–2.54 | not charged to the process |
+| | 256 | 30.4–31.8 KB | 3.9–4.1 KB | 54.8–56.6 KB | 1.58–1.60 | |
+| | 1,024 | 25.4–29.8 KB | 3.6–4.3 KB | 52.7–56.4 KB | 1.66–1.82 | |
+
+What a connection costs its host is not one number: it is 1.3 to 2.5 times what the program
+itself holds, by the host's allocator, its page (a 16 KiB page on Apple silicon), the C library
+beside Rust and, on Linux in a container, the kernel's socket memory charged to the container's
+limit; and it falls with the connections held as the endpoint's tables amortize. `CONNECTION_STATE`'s
+30 KiB, rounded from the Rust bytes alone, charged a Linux container's connection three fifths of
+the 49 KB or so it costs there. A charge a node can trust is learned on the host it runs on.
+
+The 64-connection row first measured a server's peak live bytes at 541,834 a connection: one block of
+32 MiB, Brotli's certificate compression with its default window (`crates/hyper-tls/VENDORED.md`
+§10), since fixed; the rows above are after it.
+
 ## An exchange by the server's connections, a socket each (2026-10-17)
 
 The bench of the next section (`cargo bench -p hyper-rt-transport --bench connections`), run again once

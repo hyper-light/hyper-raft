@@ -916,6 +916,7 @@ dependencies = [
 name = "hyper-rt-transport"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-sys",
  "hyper-datagram",
  "hyper-measure",
  "hyper-rt",

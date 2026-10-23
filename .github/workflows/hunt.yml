@@ -1,0 +1,32 @@
+name: hunt
+
+# A branch named hunt/<anything> runs the hunt for hyper-log's power-loss hang on linux/arm64
+# (scripts/hunt-power-loss.sh): the gates are not run here, and nothing here runs on any other
+# branch.
+on:
+  push:
+    branches: ["hunt/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  power-loss:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [single, whole]
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: sudo apt-get install -y -qq gdb > /dev/null
+      - run: bash scripts/hunt-power-loss.sh ${{ matrix.lane }} 75
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hunt-${{ matrix.lane }}-${{ matrix.shard }}
+          path: target/hunt/

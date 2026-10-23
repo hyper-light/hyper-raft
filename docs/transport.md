@@ -1942,6 +1942,22 @@ Without the tolerance it carries 21.2% and 6.0%; with the window bounded by the 
 over 10 Mbit/s and 20 ms with ±10 ms of jitter: without Q28 a node woke at 19.65 s and asked to wake
 then again.
 
+## 4ad. A connection ID retired while its packets travel (2026-10-22)
+
+A server moves off the client's first connection ID, which carries no reset token, at the client's
+first NEW_CONNECTION_ID, and retires it (upstream quinn's rule). Its packets with that ID are still
+in flight, and on a path that reorders some arrive after the RETIRE_CONNECTION_ID. The client's
+endpoint had stopped routing the ID at once: it dropped them and answered each with a stateless
+reset. The congestion harness met one in 14 of 84 runs over jitter of ±10 to ±80 ms on paths of 20,
+100 and 300 ms, every law, before the tolerance of reordering (§4ac) as after it.
+
+A retired ID now routes to its connection for three probe timeouts more, Chromium's rule
+(`QuicSelfIssuedConnectionIdManager`, `3 * pto_delay`) and the span RFC 9001 §6.5 keeps old read keys
+for packets in flight, at most as many as the connection issues (patch Q29,
+`crates/hyper-quic/VENDORED.md` §39). None of the 84 runs meets a reset. Tests:
+`tests::a_retired_cid_routes_for_three_probe_timeouts`,
+`congestion::a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

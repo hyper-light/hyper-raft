@@ -1851,6 +1851,7 @@ impl Connection {
                         .push_back(EndpointEventInner::NeedIdentifiers(now, num_new_cid));
                 }
             }
+            Timer::RetiredCid => self.on_retired_cid_timeout(now),
             Timer::MaxAckDelay => {
                 trace!("max ack delay reached");
                 // This timer is only armed in the Data space
@@ -4275,16 +4276,54 @@ impl Connection {
         now: Instant,
         sequence: u64,
     ) -> Result<(), TransportError> {
-        let allow_more_cids = self
-            .local_cid_state
-            .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
-        self.endpoint_events
-            .push_back(EndpointEventInner::RetireConnectionId(
-                now,
-                sequence,
-                allow_more_cids,
-            ));
+        let limit = self.peer_params.issue_cids_limit();
+        // A frame repeated retires nothing and asks for nothing: a second new CID for one retired
+        // would pass the peer's limit (upstream's endpoint found the ID gone and issued none)
+        let Some(allow_more_cids) = self.local_cid_state.on_cid_retirement(sequence, limit)? else {
+            return Ok(());
+        };
+        if allow_more_cids {
+            self.endpoint_events
+                .push_back(EndpointEventInner::NeedIdentifiers(now, 1));
+        }
+        // The retired ID routes to the connection for three probe timeouts more: what the peer
+        // sent with it before its RETIRE_CONNECTION_ID may arrive after it on a path that reorders,
+        // and unrouted it was dropped and answered with a stateless reset. Chromium keeps a retired
+        // ID so (`QuicSelfIssuedConnectionIdManager`, `3 * pto_delay`), as RFC 9001 §6.5 keeps old
+        // read keys for packets still in flight. No more are kept than the connection issues; the
+        // oldest stops routing past that.
+        match now.checked_add(self.pto(SpaceId::Data).saturating_mul(3)) {
+            Some(until) => {
+                let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+                if let Some(oldest) = self.local_cid_state.retire_later(sequence, until, cap) {
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::RetireConnectionId(oldest));
+                }
+                self.reset_retired_cid_timer();
+            }
+            None => self
+                .endpoint_events
+                .push_back(EndpointEventInner::RetireConnectionId(sequence)),
+        }
         Ok(())
+    }
+
+    /// Stops routing the retired connection IDs whose time has come
+    fn on_retired_cid_timeout(&mut self, now: Instant) {
+        // Bounded by the IDs kept routing, at most what the connection issues
+        while let Some(sequence) = self.local_cid_state.retired_due(now) {
+            self.endpoint_events
+                .push_back(EndpointEventInner::RetireConnectionId(sequence));
+        }
+        self.reset_retired_cid_timer();
+    }
+
+    /// Arms the timer for the next retired connection ID to stop routing, or stops it
+    fn reset_retired_cid_timer(&mut self) {
+        match self.local_cid_state.next_retired() {
+            Some(at) => self.timers.set(Timer::RetiredCid, at),
+            None => self.timers.stop(Timer::RetiredCid),
+        }
     }
 
     fn on_new_connection_id(
@@ -5225,7 +5264,12 @@ impl Connection {
     pub(crate) fn is_idle(&self) -> bool {
         Timer::VALUES
             .iter()
-            .filter(|&&t| !matches!(t, Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard))
+            .filter(|&&t| {
+                !matches!(
+                    t,
+                    Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard | Timer::RetiredCid
+                )
+            })
             .filter_map(|&t| Some((t, self.timers.get(t)?)))
             .min_by_key(|&(_, time)| time)
             .is_none_or(|(timer, _)| timer == Timer::Idle)

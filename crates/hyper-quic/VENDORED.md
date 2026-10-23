@@ -1414,3 +1414,40 @@ nine tenths of its in-order twin; without Q27, 21.2% and 6.0%);
 `congestion::every_wake_on_a_path_that_reorders_does_what_is_due_at_its_time` (BBR at 10 Mbit/s and
 20 ms with ±10 ms; without Q28 a node woke at 19.65 s and asked to wake then again). The unit tests,
 congestion, e2e, geo and handshake suites pass.
+
+## 39. A connection ID the peer retired routes for three probe timeouts more (2026-10-22)
+
+Patch Q29 departs from upstream's endpoint, which stopped routing a connection ID the moment the
+peer's RETIRE_CONNECTION_ID arrived. The peer sends that frame after its last packet with the ID, but
+a path that reorders delivers such packets after it: the endpoint dropped each, its data to be sent
+again, and answered it with a stateless reset. A server meets this on every connection over such a
+path: at the client's first NEW_CONNECTION_ID it moves off the client's first connection ID, which
+carries no reset token, and retires it (upstream's `on_new_connection_id`), its packets with that ID
+still in flight. In the congestion harness, jitter of ±10 to ±80 ms each way on paths of 20, 100 and
+300 ms, every law, 14 of 84 runs met a stateless reset (`Run::arrive` refuses one), on `25cf889` as
+after Q27 and Q28.
+
+A connection now keeps a retired ID routing for three probe timeouts (`CidState::retire_later`,
+`Timer::RetiredCid`): Chromium's rule (`QuicSelfIssuedConnectionIdManager::OnRetireConnectionIdFrame`,
+`3 * pto_delay`), and the span RFC 9001 §6.5 keeps old read keys for packets still in flight. RFC 9000
+§5.1.1 has an issuer accept an ID until its peer retires it and leaves what comes after to the issuer.
+The connection asks its endpoint for the replacement at once (`NeedIdentifiers`), as upstream did beside
+the unrouting; `EndpointEventInner::RetireConnectionId` now names only the ID to stop routing. No more
+are kept routing than the connection issues (`TransportParameters::issue_cids_limit`, at most
+`LOC_CID_COUNT`); past that the oldest retired stops at once, which costs only what was still on its
+way with it.
+
+A RETIRE_CONNECTION_ID repeated (its packet sent again and both arriving) retires nothing and asks for
+nothing (`CidState::on_cid_retirement` answers `None`). Upstream's endpoint had made a repeat harmless
+by finding the ID already gone and issuing none; asked for at the retirement instead, a repeat that
+came before the first replacement was counted asked for a second, past the peer's limit. Twelve e2e
+handshakes at a time against an upstream server, four rounds: 13 of 48 closed with
+CONNECTION_ID_LIMIT_ERROR without the check, every one a run that took a repeat (26 repeats); none of
+48 with it, 52 repeats taken.
+
+Tests: `connection::cid_state::tests::a_retired_id_routes_until_its_time_and_no_more_are_kept_than_the_cap`
+and `a_repeated_retirement_retires_nothing_and_asks_for_nothing`;
+`tests::a_retired_cid_routes_for_three_probe_timeouts` (a packet held behind its RETIRE_CONNECTION_ID
+reaches its connection, and the ID stops routing after; without Q29 the packet never reached it);
+`congestion::a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id` (BBR at ±20 ms
+each way on 20 ms; without Q29 a stateless reset). The 84 runs: none meets a stateless reset.

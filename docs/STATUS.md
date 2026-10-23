@@ -63,6 +63,13 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-22: in hyper-quic, a connection ID the peer retired routes to its connection for three
+probe timeouts more (patch Q29, `crates/hyper-quic/VENDORED.md` §39; `docs/transport.md` §4ad), where
+the endpoint stopped routing it as the RETIRE_CONNECTION_ID arrived: on a path that reorders, the
+packets sent with it before were dropped and each answered with a stateless reset, 14 of 84 runs of
+the congestion harness over jitter of ±10 to ±80 ms (a server retires the client's first ID on
+every connection). Chromium keeps a retired ID so (`3 * pto_delay`), and RFC 9001 §6.5 old keys.
+
 Landed 2026-10-22: in hyper-quic, a connection's loss thresholds learn what a path that reorders
 shows (patch Q27, `crates/hyper-quic/VENDORED.md` §38; `docs/transport.md` §4ac). RFC 9002's fixed
 thresholds, three packets and 9/8 of the round trip, declared packets lost that arrived, each a

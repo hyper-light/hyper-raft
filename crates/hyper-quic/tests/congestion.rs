@@ -1558,6 +1558,23 @@ fn every_wake_on_a_path_that_reorders_does_what_is_due_at_its_time() {
     );
 }
 
+/// A connection keeps what its peer sent with a connection ID it retired. A server switches from the
+/// client's first connection ID at the client's first NEW_CONNECTION_ID and retires it, and on a
+/// path whose jitter passes its delay, ±20 ms each way on 20 ms, packets the server sent with the
+/// old ID arrive after its RETIRE_CONNECTION_ID: the client's endpoint had unrouted the ID, dropped
+/// them, and answered each with a stateless reset, which `Run::arrive` refuses. A retired ID now
+/// routes for three probe timeouts more (patch Q29).
+#[test]
+fn a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id() {
+    let pki = Pki::new();
+    let path = Scenario {
+        jitter_ns: 20 * MS,
+        ..scenario(10_000_000, 20, 20)
+    };
+    let measured = measure(path, Law::Bbr, &pki);
+    assert!(measured.closed.is_none(), "{:?}", measured.closed);
+}
+
 /// The table of `docs/benchmarks.md`, "A path that reorders": each law over 10 Mbit/s and 100 ms
 /// for 20 s, with jitter each way that reorders and the same jitter kept in order.
 #[test]

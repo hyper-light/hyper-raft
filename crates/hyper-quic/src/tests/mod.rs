@@ -2552,6 +2552,51 @@ fn cid_retirement() {
     );
 }
 
+/// A connection ID the peer retired routes to its connection for three probe timeouts more (patch
+/// Q29): a packet the peer sent with it before its RETIRE_CONNECTION_ID, arriving after it, reaches the
+/// connection, where the endpoint had unrouted the ID, dropped the packet and answered it with a
+/// stateless reset; once the three probe timeouts pass, the ID routes no more.
+#[test]
+fn a_retired_cid_routes_for_three_probe_timeouts() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    // A client packet with the server's current connection ID, held back
+    pair.client_conn_mut(client_ch).ping();
+    pair.client.drive(pair.time, pair.server.addr);
+    pair.client.delay_outbound();
+    // The server asks the client to retire the IDs before 1: the client moves to another and
+    // retires the old, and the server takes its RETIRE_CONNECTION_ID before the held packet
+    let now = pair.time;
+    pair.server_conn_mut(server_ch).rotate_local_cid(1, now);
+    pair.drive();
+    assert_eq!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
+    let pings = pair.server_conn_mut(server_ch).stats().frame_rx.ping;
+    let routed = pair.server.endpoint.known_cids();
+    pair.client.finish_delay();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats().frame_rx.ping,
+        pings + 1,
+        "the held packet reached its connection"
+    );
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+    // Its three probe timeouts pass: the ID routes no more
+    let retired_at = pair.time;
+    for _ in 0..16 {
+        if pair.server.endpoint.known_cids() < routed {
+            break;
+        }
+        let Some(next) = pair.server.next_wakeup() else {
+            break;
+        };
+        pair.time = pair.time.max(next);
+        pair.server.drive(pair.time, pair.client.addr);
+    }
+    assert_eq!(pair.server.endpoint.known_cids(), routed - 1);
+    assert!(pair.time > retired_at);
+}
+
 #[test]
 fn finish_stream_flow_control_reordered() {
     let _guard = subscribe();

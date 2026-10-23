@@ -194,7 +194,10 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   EUROCRYPT 2013; DupLESS, USENIX Security 2013, R §5) within one parent: two different plaintexts
   share a key, and so nonces, only if their 256-bit hashes collide; what the stored bytes tell is
   that two files are equal, which their keyed names tell already (§7); and the key is the parent's,
-  so it erases with it. The caller's contract is that the hash is of exactly the plaintext sealed.
+  so it erases with it. The caller's contract is that the hash is of exactly the plaintext sealed;
+  a whole file sealed by `sealed_file::seal_content` keeps it by construction, the SHA-256 of
+  exactly the bytes it seals taken by the writer itself, so a store that names its chunks by
+  another hash (focal's BLAKE3) has nothing to keep paired.
   A stored header resumed for resealing was considered and refused: it would rest nonce uniqueness
   on the caller keeping header and plaintext paired, where a derived key rests it on the hash.
 - **Sizes follow from plaintext.** A segment of `n` bytes is `n + 16` stored bytes, so a byte's stored

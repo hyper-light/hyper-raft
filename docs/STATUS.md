@@ -63,6 +63,17 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-23: in hyper-quic, BBR paced at its model's rate, its least round trip taken only
+from packets in order (patches Q32 and Q33, `crates/hyper-quic/VENDORED.md` §42 and §43;
+`docs/transport.md` §4ag). Held by its window of twice its product and paced at five quarters of it,
+BBR kept about a product queued: at a drop-tail queue of one product it lost 2,634 packets where
+NewReno lost 215, now 195. A packet acknowledged while one sent before it is not gives BBR no round
+trip, as on a path that reorders it is one that overtook the rest: with 5% of the packets skipping
+the delay, as netem's `reorder` sends them, BBR's least round trip was a millisecond and it carried
+27.0% of the link, now 96.3%; ±60 ms of jitter 11.2% → 95.0%. slates' bake-off: BBR's ping p99 against
+the best 1.484 → 1.125 (geomean), its worst 4.00 → 1.81, its Jain index at 20 and 100 ms 0.533 →
+0.829. BBR draws its gain cycle's phases from the connection's seed, so a seeded run replays.
+
 Landed 2026-10-23: in hyper-quic, a pacer credits the same bytes however often it is asked (patch
 Q31, `crates/hyper-quic/VENDORED.md` §41; `docs/transport.md` §4af), where it truncated each refill to
 whole bytes and moved its clock to the call: a connection asked every microsecond while it waited
@@ -336,22 +347,13 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
-- **hyper-quic: BBR's window on a path whose overtaking packets skip most of its delay (found
-  2026-10-22, by `congestion::print_the_reordering_table`; 2026-10-23, by
-  `print_the_skipping_table`: at 10 Mbit/s and 80 ms with 5% of the packets skipping the delay, as
-  netem's `reorder` sends them, BBR carries 24.0% with a least round trip of 1 ms, its losses all
-  spurious and few since Q30. Sampling a round trip only from a packet that overtook none, once the
-  path has shown reordering (TCP's RFC 7323 §4.3 choice), took it to 95.8%, but over jitter it
-  overstates the least round trip and BBR, unpaced, then overflowed its queue (6,802 declared losses
-  at ±40 ms against 36): it lands with BBR's pacing rate).** With ±60 ms of jitter each way on a
-  path of 50 ms each way, a packet's one-way delay runs from nothing to 110 ms; its round trip
-  sampled from the packets that overtook, BBR's least round trip was 3.6 ms, and its window, twice
-  the bandwidth times it, 10 KB: it carried 9.1% of the link where the same jitter kept in order
-  carries 93.3%, with no loss its tolerance of reordering left undeclared. BBR's model takes the
-  least round trip as the path's (`BBR.min_rtt`, draft-ietf-ccwg-bbr), which a path of several
-  routes, or netem's `reorder` sending some packets with no delay at all, makes the fastest route's.
-  Open: a window that covers what the slower packets keep in flight.
-
+- **hyper-quic: BBR's window overflows a queue of one product under heavy jitter (found 2026-10-23).**
+  Paced at its model's rate, its least round trip from packets in order (patch Q33), BBR carries
+  96.2% of 10 Mbit/s at 100 ms with ±40 ms of jitter each way but declares 2,619 packets lost, where,
+  window-held and its least round trip the fast tail's, it declared 37: its least round trip is near
+  the path's propagation now, and BBR v1's window of twice its product overflows a queue of one
+  product when jitter bunches its acknowledgements. BBRv2's bound on what is in flight after loss
+  (`inflight_hi`, draft-ietf-ccwg-bbr) is the answer.
 - **hyper-quic: a loss-based law's cut for a loss found spurious stands (found 2026-10-22).** With
   ±20 ms of jitter each way at 10 Mbit/s and 100 ms and the tolerance of reordering, NewReno, CUBIC
   and Copa declared 24, 21 and 16 packets lost, every one acknowledged afterwards, and carried
@@ -1127,8 +1129,7 @@ is worked around.
   Copa wrote the same 495 rows of slates' bake-off byte for byte. BBR's goodput shortfall went from
   1.075 to 1.020.
 
-  Open: BBR states no pacing rate. A sender its window holds therefore keeps about a product of queue
-  (ping p99 about twice the round trip); Chromium paces at its model's rate.
+  BBR states its pacing rate since 2026-10-23 (patch Q33, `crates/hyper-quic/VENDORED.md` §43).
 - **hyper-transport: a consumer that could not take more queued its producers' frames without
   bound.** A bus node whose subscriber fell behind took every publish into memory, its subscriber's
   lag growing for as long as the publisher outran it (2.5 s at the median). `Endpoint::hold_lane`

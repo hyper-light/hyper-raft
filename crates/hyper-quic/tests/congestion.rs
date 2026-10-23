@@ -1596,6 +1596,78 @@ fn a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id() 
     assert!(measured.closed.is_none(), "{:?}", measured.closed);
 }
 
+/// BBR paced at its model's rate keeps its queue short: at a drop-tail queue of one bandwidth-delay
+/// product it loses no more than NewReno, which fills the queue by design (BBR's goal, Cardwell et
+/// al., "BBR: Congestion-Based Congestion Control", ACM Queue 2016: deliver at the bottleneck's rate
+/// with the least queue). Paced at five quarters of its window a round trip, its window twice the
+/// product and its queue overflowing, BBR lost 2,634 packets over 10 Mbit/s and 100 ms where
+/// NewReno lost 215.
+#[test]
+fn bbr_at_a_queue_of_one_product_loses_no_more_than_newreno() {
+    let pki = Pki::new();
+    let path = scenario(10_000_000, 100, 20);
+    let bbr = measure(path, Law::Bbr, &pki);
+    let newreno = measure(path, Law::NewReno, &pki);
+    println!(
+        "10M 100ms: BBR lost {} of {} (carried {:.1}%), NewReno {} of {} ({:.1}%)",
+        bbr.lost_packets,
+        bbr.sent_packets,
+        percent(bbr.carried_ppm),
+        newreno.lost_packets,
+        newreno.sent_packets,
+        percent(newreno.carried_ppm)
+    );
+    assert!(bbr.closed.is_none() && newreno.closed.is_none());
+    assert!(
+        bbr.lost_packets <= newreno.lost_packets,
+        "BBR lost {}, NewReno {}",
+        bbr.lost_packets,
+        newreno.lost_packets
+    );
+}
+
+/// A path where a share of the packets skips its delay, as netem's `reorder` sends them, is carried
+/// by BBR as the same delays kept in order. Its least round trip came from the packets that skipped,
+/// a millisecond where the rest took 80, and its window, twice its bandwidth times that, held it to
+/// a seventh of the link paced; a packet acknowledged while one sent before it is not now gives it no
+/// round trip. **The rule:** each path keeps nine tenths of its twin's share (as
+/// [`a_reordering_path_is_carried_as_its_jitter_kept_in_order`]).
+#[test]
+fn a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order() {
+    let pki = Pki::new();
+    let mut failed = Vec::new();
+    for skip_ppm in [10_000, 50_000] {
+        let path = Scenario {
+            skip_ppm,
+            ..scenario(10_000_000, 80, 20)
+        };
+        let twin = measure(
+            Scenario {
+                reorders: false,
+                ..path
+            },
+            Law::Bbr,
+            &pki,
+        );
+        let skipping = measure(path, Law::Bbr, &pki);
+        let row = format!(
+            "{}% skipping at 80 ms, BBR: carried {:.1}%, in order {:.1}%; least round trip {:?}",
+            skip_ppm / 10_000,
+            percent(skipping.carried_ppm),
+            percent(twin.carried_ppm),
+            skipping.min_rtt
+        );
+        println!("{row}");
+        if skipping.closed.is_some() || twin.closed.is_some() {
+            failed.push(format!("closed: {row}"));
+        }
+        if skipping.carried_ppm * 10 < twin.carried_ppm * 9 {
+            failed.push(format!("under nine tenths of its twin: {row}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// The table of `docs/benchmarks.md`, "A path that reorders": each law over 10 Mbit/s and 100 ms
 /// for 20 s, with jitter each way that reorders and the same jitter kept in order.
 #[test]

@@ -9929,3 +9929,64 @@ that, holds it near a quarter of the link whatever its losses (`docs/STATUS.md`,
 ```sh
 cargo test -p hyper-quic --release --test congestion -- --ignored --nocapture print_the_skipping_table
 ```
+
+## hyper-quic: BBR paced at its model's rate, its least round trip from packets in order (2026-10-23)
+
+`docs/transport.md` §4ag, patches Q32 and Q33 (`crates/hyper-quic/VENDORED.md` §42, §43). The two
+tables of "a path that reorders" and "a share of packets skips its delay", every law, after the patch
+(BBR's draws now seeded from its connection's, so every run replays):
+
+| Path | Law | carried (declared lost, spurious) | kept in order |
+|---|---|---|---|
+| ±0 ms each way, 10 Mbit/s 100 ms | NewReno | 97.0% (215, 0) | 97.0% |
+| ±0 ms each way, 10 Mbit/s 100 ms | Cubic | 97.2% (314, 0) | 97.2% |
+| ±0 ms each way, 10 Mbit/s 100 ms | Bbr | 96.8% (195, 0) | 96.8% |
+| ±0 ms each way, 10 Mbit/s 100 ms | Copa | 97.2% (0, 0) | 97.2% |
+| ±5 ms each way, 10 Mbit/s 100 ms | NewReno | 43.2% (7, 7) | 96.6% |
+| ±5 ms each way, 10 Mbit/s 100 ms | Cubic | 46.5% (7, 7) | 97.2% |
+| ±5 ms each way, 10 Mbit/s 100 ms | Bbr | 96.9% (279, 6) | 96.7% |
+| ±5 ms each way, 10 Mbit/s 100 ms | Copa | 56.2% (8, 8) | 76.9% |
+| ±10 ms each way, 10 Mbit/s 100 ms | NewReno | 40.5% (8, 8) | 96.0% |
+| ±10 ms each way, 10 Mbit/s 100 ms | Cubic | 33.5% (11, 11) | 97.2% |
+| ±10 ms each way, 10 Mbit/s 100 ms | Bbr | 96.8% (229, 18) | 95.8% |
+| ±10 ms each way, 10 Mbit/s 100 ms | Copa | 21.9% (7, 7) | 78.1% |
+| ±20 ms each way, 10 Mbit/s 100 ms | NewReno | 34.6% (16, 16) | 96.0% |
+| ±20 ms each way, 10 Mbit/s 100 ms | Cubic | 41.8% (19, 19) | 97.2% |
+| ±20 ms each way, 10 Mbit/s 100 ms | Bbr | 97.1% (341, 37) | 95.5% |
+| ±20 ms each way, 10 Mbit/s 100 ms | Copa | 25.6% (15, 15) | 44.6% |
+| ±40 ms each way, 10 Mbit/s 100 ms | NewReno | 26.2% (20, 20) | 95.3% |
+| ±40 ms each way, 10 Mbit/s 100 ms | Cubic | 43.5% (26, 26) | 97.1% |
+| ±40 ms each way, 10 Mbit/s 100 ms | Bbr | 96.2% (2619, 149) | 94.2% |
+| ±40 ms each way, 10 Mbit/s 100 ms | Copa | 1.7% (4, 4) | 27.9% |
+| ±60 ms each way, 10 Mbit/s 100 ms | NewReno | 18.9% (25, 25) | 86.0% |
+| ±60 ms each way, 10 Mbit/s 100 ms | Cubic | 51.8% (38, 38) | 96.1% |
+| ±60 ms each way, 10 Mbit/s 100 ms | Bbr | 95.0% (1553, 56) | 91.3% |
+| ±60 ms each way, 10 Mbit/s 100 ms | Copa | 6.2% (18, 18) | 1.3% |
+| 0% skipping, 10 Mbit/s 80 ms | NewReno | 97.1% (173, 0; 81.0 ms) | 97.1% |
+| 0% skipping, 10 Mbit/s 80 ms | Cubic | 97.2% (249, 0; 81.0 ms) | 97.2% |
+| 0% skipping, 10 Mbit/s 80 ms | Bbr | 96.8% (160, 0; 81.0 ms) | 96.8% |
+| 0% skipping, 10 Mbit/s 80 ms | Copa | 96.8% (0, 0; 81.0 ms) | 96.8% |
+| 1% skipping, 10 Mbit/s 80 ms | NewReno | 60.5% (43, 43; 2.0 ms) | 97.0% |
+| 1% skipping, 10 Mbit/s 80 ms | Cubic | 67.2% (49, 49; 2.9 ms) | 97.2% |
+| 1% skipping, 10 Mbit/s 80 ms | Bbr | 92.5% (97, 48; 2.0 ms) | 97.2% |
+| 1% skipping, 10 Mbit/s 80 ms | Copa | 49.3% (43, 43; 3.8 ms) | 95.4% |
+| 5% skipping, 10 Mbit/s 80 ms | NewReno | 38.2% (46, 46; 1.0 ms) | 97.0% |
+| 5% skipping, 10 Mbit/s 80 ms | Cubic | 46.6% (52, 52; 1.0 ms) | 97.2% |
+| 5% skipping, 10 Mbit/s 80 ms | Bbr | 96.3% (1034, 218; 1.0 ms) | 97.1% |
+| 5% skipping, 10 Mbit/s 80 ms | Copa | 22.2% (39, 39; 1.0 ms) | 47.5% |
+| 25% skipping, 10 Mbit/s 80 ms | NewReno | 54.1% (53, 53; 1.0 ms) | 96.7% |
+| 25% skipping, 10 Mbit/s 80 ms | Cubic | 96.4% (59, 59; 1.0 ms) | 97.2% |
+| 25% skipping, 10 Mbit/s 80 ms | Bbr | 97.3% (1361, 147; 1.0 ms) | 95.6% |
+| 25% skipping, 10 Mbit/s 80 ms | Copa | 1.7% (5, 5; 1.0 ms) | 2.2% |
+
+slates' bake-off after the patch (every BBR row moved against `c8c3cb6`, no other law's; the other
+laws' ratios move only with the best of each cell):
+
+| law | ping p99 vs best (geomean) | worst p99 vs best | goodput shortfall (geomean) | disqualified by |
+|---|---|---|---|---|
+| NewReno | 1.389 | 15.38 (loss 5% 100M 20ms seed 3) | 3.030 | stalled: loss 5% 100M 100ms seed 1 (11 runs) |
+| Cubic | 1.346 | 9.63 (loss 5% 100M 100ms seed 3) | 2.680 | stalled: loss 1% 100M 100ms seed 1 (10 runs) |
+| Bbr | 1.125 | 1.81 (same-RTT fairness 10M 100ms seed 2) | 1.013 | Jain 0.829: RTT fairness 20/100 ms seed 1 (3 runs) |
+| Copa | 1.038 | 2.48 (step to 2M 10M 100ms seed 1) | 1.224 | — |
+
+Before (`c8c3cb6`): BBR 1.484, worst 4.00 (buffer 4 BDP), goodput 1.019, Jain 0.533.

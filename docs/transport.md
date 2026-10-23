@@ -619,8 +619,8 @@ The law has three layers:
 
 **Pacing.** A controller states its pacing rate (`Controller::pacing_rate`, bytes a second), and the
 path's pacer refills at it. `None` keeps the connection's rule, 5/4 of the window per smoothed round
-trip (RFC 9002 §7.7). Copa states `2·cwnd/RTTstanding` (§2.1); NewReno, CUBIC and BBR keep the
-connection's rule. Measured on the harness below, Copa alone emptied its queue at the same intervals
+trip (RFC 9002 §7.7). Copa states `2·cwnd/RTTstanding` (§2.1), and BBR its model's rate since
+§4ag; NewReno and CUBIC keep the connection's rule. Measured on the harness below, Copa alone emptied its queue at the same intervals
 paced either way on three of focal's five paths. It carried the same share at 10 Mbit/s and 20 ms
 beside NewReno and CUBIC. Its rate held within 1.6% of its median at 100 Mbit/s and 20 ms, so pacing
 on the standing round trip drives no oscillation.
@@ -2009,6 +2009,40 @@ the rule, not a fault: what is sent is the same.
 
 Tests: `connection::pacing::tests::the_credit_is_the_same_however_often_the_pacer_is_asked`,
 `a_wait_is_never_due_when_asked`.
+
+## 4ag. BBR paced at its model's rate, its least round trip from packets in order (2026-10-23)
+
+BBR computed its pacing rate and never gave it to the pacer, which sent five quarters of its window a
+round trip: held by a window of twice its product, it kept about a product queued, its ping p99 about
+twice the round trip, and at a drop-tail queue of one product, 10 Mbit/s and 100 ms, it lost 2,634
+packets where NewReno lost 215. It now states the rate (Chromium's `PacingRate`, patch Q33,
+`crates/hyper-quic/VENDORED.md` §43), and loses 195.
+
+Paced, BBR's model holds it, and its least round trip, where packets overtake one another, is the
+fastest route's: QUIC samples the largest packet acknowledged (RFC 9002 §5.1), the one that overtook.
+With 5% of the packets skipping the delay (netem's `reorder`, §4ae) it read 1 ms where the rest took
+80, and BBR carried 14.6% of the link. A packet acknowledged while one sent before it is not now gives
+BBR no round trip, its delivery rate standing, as TCP samples the gap-filling segment (RFC 7323 §4.3);
+RFC 9002's own round trip is sampled as before, so no other law sees a change. BBR draws its gain
+cycle's phases from the connection's seed (patch Q32, §42), as its phase now moves what it sends.
+
+| Path, BBR | before | paced | paced, round trips in order |
+|---|---|---|---|
+| 10 Mbit/s, 100 ms | 96.6% (2,634 lost) | 96.8% (195) | 96.8% (195) |
+| ±20 ms each way | 98.5% (916) | 93.4% (55) | 97.1% (341) |
+| ±40 ms each way | 96.0% (37) | 75.8% (43) | 96.2% (2,619) |
+| ±60 ms each way | 11.2% | 10.3% | 95.0% |
+| 80 ms, 5% skipping | 27.0% | 14.6% | 96.3% |
+| 80 ms, 25% skipping | 28.8% | 25.6% | 97.3% |
+
+slates' bake-off: BBR's ping p99 against the best 1.484 → 1.125 (geomean), its worst 4.00 → 1.81, its
+Jain index at 20 and 100 ms 0.533 → 0.829; no other law's row moved. Open: at ±40 ms the window of
+twice the product, its round trip now near the path's propagation, overflows a queue of one product
+(2,619 declared losses where 37), BBRv2's `inflight_hi` the bound (`docs/STATUS.md`).
+
+Tests: `congestion::bbr_at_a_queue_of_one_product_loses_no_more_than_newreno`,
+`congestion::a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order`,
+`congestion::bbr::tests::a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`.
 
 ## 5. Consumers
 

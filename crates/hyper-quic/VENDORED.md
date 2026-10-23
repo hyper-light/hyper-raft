@@ -1451,3 +1451,46 @@ and `a_repeated_retirement_retires_nothing_and_asks_for_nothing`;
 reaches its connection, and the ID stops routing after; without Q29 the packet never reached it);
 `congestion::a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id` (BBR at ±20 ms
 each way on 20 ms; without Q29 a stateless reset). The 84 runs: none meets a stateless reset.
+
+slates' bake-off against `cd90e5b`: 33 of its 672 rows move, on paths that do not reorder, every law's
+somewhere, the shares in both directions (BBR at 100 Mbit/s and 300 ms the most, 93.4 → 82.4% in one
+seed and 100.2 → 150.6% in another, past 100% the warm-up's, §30). With `Timer::RetiredCid` never
+armed every row is as `cd90e5b`'s: the timer's wakes, one each a retirement, shift each run's events.
+What a wake changes is not an app-limited mark (§30): with a wake's polls marking none, the same 33
+rows move. It is being traced; a wake that finds nothing due should change nothing.
+
+## 40. The time threshold covers the longest a spurious loss took (2026-10-23)
+
+Patch Q30 narrows §38's time threshold. §38 added RACK's reordering window to RFC 9002's threshold,
+9/8 of the larger of the smoothed and latest round trips, in steps of a quarter of the least round
+trip. Where a share of the packets skips the path's delay, as netem's `reorder` sends them (the
+reordering focal's comparison runs apply), both terms rest on the packets that overtook: QUIC samples
+a round trip only from the largest packet acknowledged (RFC 9002 §5.1), and there that is the one
+that skipped, so at 10 Mbit/s and 80 ms with 5% skipping each way the least round trip read 1 ms and
+the smoothed one about 64 ms while the rest took 80 and more. Each later packet acknowledged declared
+the rest lost, and the window, a quarter of a millisecond a round trip, never caught up: BBR declared
+921 packets lost, every one spurious.
+
+The threshold is now RFC 9002's or the longest a spurious loss took, whichever is longer, with the
+reordering window on top (`Reordering::time_threshold`). A packet as late as one that was declared
+lost and arrived is not declared lost again: Chromium's adaptive time threshold raises its fraction
+of the round trip until each spurious loss would not have been declared
+(`GeneralLossAlgorithm::SpuriousLossDetected`); here the time a spurious loss took is the bound
+itself, as QUIC's round trip under reordering is the overtaking packets'. Nothing changes until a
+spurious loss: slates' bake-off against `ea7d228` changes only its reordering trial's rows.
+
+Measured (`congestion::print_the_skipping_table`, `docs/benchmarks.md`): with 5% skipping, declared
+losses BBR 921 → 21, NewReno 120 → 53, CUBIC 170 → 51, every one spurious, and the shares carried
+NewReno 12.1 → 35.6%, CUBIC 13.2 → 51.7%, Copa 11.1 → 22.2%; with 25%, CUBIC 6.0 → 96.7%. BBR stays
+near a quarter (21.8 → 24.0%): its window is twice its bandwidth times the least round trip, a
+millisecond (`docs/STATUS.md`, open defects). Over jitter that reorders, ±40 and ±60 ms each way on
+100 ms, NewReno 19.6 → 26.2% and 3.8 → 18.9%, CUBIC 30.7 → 43.8% and 7.2 → 50.5%; BBR 96.0–100.1%
+where it carried 96.2–98.4% up to ±40 ms. Two cells fell: NewReno at ±20 ms, 41.0 → 34.6%, still cut
+by each of its 16 spurious losses (§38's open item), and Copa at ±40 ms, 20.4 → 1.7%, at its
+two-datagram floor, the jitter read as queue, as its twin kept in order sits at 19.4%.
+
+Tests: `connection::reordering::tests::the_time_threshold_covers_the_longest_a_spurious_loss_took`;
+`tests::a_packet_as_late_as_a_spurious_loss_is_not_declared_lost_again` (a PING held 50 ms is
+declared lost and acknowledged after; one held 40 ms then is not declared; without Q30 it is, two
+spurious losses where one is). hyper-sim's `Path::overtaking` lets a measured path's draws overtake,
+for the table's skipping paths.

@@ -23,9 +23,18 @@
 //!   than the window holds (±40 ms of jitter at 10 Mbit/s and 100 ms overtook by 44 with a window
 //!   of 16). The time threshold is what still finds a loss then, as RACK uses no count once it has
 //!   seen reordering (RFC 8985 §6.2);
-//! - the time threshold gains a reordering window, a quarter of the least round trip for each round
-//!   trip that saw a spurious loss (RACK's `reo_wnd_mult`), never past the longer of the smoothed
-//!   round trip and the longest a spurious loss took.
+//! - the time threshold is at least the longest a spurious loss took (Chromium's adaptive time
+//!   threshold raises its fraction of the round trip to cover each, `SpuriousLossDetected`), and
+//!   gains a reordering window on top, a quarter of the least round trip for each round trip that
+//!   saw a spurious loss (RACK's `reo_wnd_mult`), never past the longer of the smoothed round trip
+//!   and the longest a spurious loss took.
+//!
+//! Where a share of the packets skips the path's delay, as netem's `reorder` sends them, QUIC's
+//! round trips are those packets', a millisecond against 80 for the rest, and RFC 9002's threshold
+//! of 9/8 of them declared the rest lost on each later packet acknowledged; the window, in steps of
+//! a quarter of that millisecond, never caught up. BBR at 10 Mbit/s and 80 ms with 5% skipping
+//! declared 921 packets lost, every one spurious, and with the threshold covering what they took,
+//! 21.
 //!
 //! RACK bounds its window by the smoothed round trip, which TCP samples from the segment that fills
 //! a gap, the late one (RFC 7323 §4.3). QUIC samples only the largest packet acknowledged (RFC 9002
@@ -97,9 +106,24 @@ impl Reordering {
         u64::from(configured).saturating_add(self.extra_packets)
     }
 
+    /// The time threshold now: RFC 9002's, `rfc`, or the longest a spurious loss took if longer,
+    /// and the reordering window on top. A packet late by what a spurious loss showed is not
+    /// declared lost again, as Chromium's adaptive time threshold covers the time a spurious loss
+    /// needed (`GeneralLossAlgorithm::SpuriousLossDetected`): RFC 9002's rests on the round trip
+    /// QUIC samples from the packets that overtook, short of what the late ones take.
+    pub(super) fn time_threshold(
+        &self,
+        rfc: Duration,
+        min_rtt: Duration,
+        srtt: Duration,
+    ) -> Duration {
+        rfc.max(self.late)
+            .saturating_add(self.extra_delay(min_rtt, srtt))
+    }
+
     /// What the time threshold gains now: the reordering window, `window_quarters · min_rtt / 4`,
     /// never past the longer of `srtt` and the longest a spurious loss took.
-    pub(super) fn extra_delay(&self, min_rtt: Duration, srtt: Duration) -> Duration {
+    fn extra_delay(&self, min_rtt: Duration, srtt: Duration) -> Duration {
         min_rtt
             .checked_div(WINDOW_STEP_DIVISOR)
             .unwrap_or(Duration::ZERO)
@@ -295,6 +319,22 @@ mod tests {
             reordering.declared.len() <= 3,
             "older declarations forgotten"
         );
+    }
+
+    /// The time threshold covers the longest a spurious loss took, whatever RFC 9002's: a packet
+    /// as late as one that was declared lost and arrived is not declared lost again.
+    #[test]
+    fn the_time_threshold_covers_the_longest_a_spurious_loss_took() {
+        let start = Instant::now();
+        let (rfc, min_rtt, srtt) = (MS * 9, MS, MS * 8);
+        let mut reordering = Reordering::default();
+        assert_eq!(reordering.time_threshold(rfc, min_rtt, srtt), rfc);
+        reordering.on_declared_lost(sent_at(&[3], start), 9, start + MS * 9, MS * 200, 64);
+        reordering.on_acknowledged((3, 3), start + MS * 80, 9, 10, 3);
+        let threshold = reordering.time_threshold(rfc, min_rtt, srtt);
+        assert!(threshold >= MS * 80, "{threshold:?}");
+        // The window on top is a quarter of the least round trip a round trip
+        assert_eq!(threshold, MS * 80 + min_rtt / 4);
     }
 
     /// An acknowledgement of packets never declared lost changes nothing.

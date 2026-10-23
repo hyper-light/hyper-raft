@@ -9895,3 +9895,37 @@ rate, it keeps about a bandwidth-delay product queued once the window holds it (
 cargo test -p hyper-quic --release --test congestion -- --ignored --nocapture print_the_reordering_table
 cargo test -p hyper-quic --release --test congestion -- --ignored --nocapture the_congestion_bakeoff_over_slates_grid
 ```
+
+## hyper-quic: a path where a share of packets skips its delay (2026-10-23)
+
+`docs/transport.md` §4ae, patch Q30 (`crates/hyper-quic/VENDORED.md` §40). Each law over 10 Mbit/s
+and 80 ms (a drop-tail queue of one bandwidth-delay product) for 20 s of simulated time, measured
+after the warm-up's quarter, with that share of each direction's datagrams crossing with no delay and
+overtaking the rest, as netem's `reorder` sends them, and the same delays kept in order. "Before Q30"
+is `ea7d228`'s tolerance on the same harness. Every run is its seed's, exactly.
+
+| Skipping each way | Law | before Q30: carried (declared lost, spurious) | Q30: carried (declared lost, spurious; least round trip) | kept in order |
+|---|---|---|---|---|
+| 0% | NewReno | 97.1% (173, 0) | 97.1% (173, 0; 81.0 ms) | 97.1% |
+| 0% | Cubic | 97.2% (249, 0) | 97.2% (249, 0; 81.0 ms) | 97.2% |
+| 0% | Bbr | 98.8% (5049, 0) | 98.8% (5049, 0; 81.0 ms) | 98.8% |
+| 0% | Copa | 96.8% (0, 0) | 96.8% (0, 0; 81.0 ms) | 96.8% |
+| 1% | NewReno | 39.4% (69, 69) | 65.0% (54, 54; 1.0 ms) | 97.0% |
+| 1% | Cubic | 38.5% (63, 63) | 64.3% (48, 48; 1.0 ms) | 97.2% |
+| 1% | Bbr | 15.4% (47, 47) | 57.8% (55, 49; 2.1 ms) | 98.1% |
+| 1% | Copa | 36.5% (90, 90) | 49.7% (44, 44; 11.5 ms) | 95.4% |
+| 5% | NewReno | 12.1% (120, 120) | 35.6% (53, 53; 1.0 ms) | 97.0% |
+| 5% | Cubic | 13.2% (170, 170) | 51.7% (51, 51; 1.0 ms) | 97.2% |
+| 5% | Bbr | 21.8% (921, 921) | 24.0% (21, 21; 1.0 ms) | 97.2% |
+| 5% | Copa | 11.1% (95, 95) | 22.2% (39, 39; 1.0 ms) | 47.5% |
+| 25% | NewReno | 4.2% (148, 148) | 55.1% (51, 51; 1.0 ms) | 96.7% |
+| 25% | Cubic | 6.0% (306, 306) | 96.7% (55, 55; 1.0 ms) | 97.2% |
+| 25% | Bbr | 22.8% (1,213, 1,208) | 28.3% (25, 25; 1.0 ms) | 96.7% |
+| 25% | Copa | 1.7% (30, 30) | 1.7% (5, 5; 1.0 ms) | 2.2% |
+
+BBR's least round trip is the skipping packets' millisecond, and its window, twice its bandwidth times
+that, holds it near a quarter of the link whatever its losses (`docs/STATUS.md`, open defects).
+
+```sh
+cargo test -p hyper-quic --release --test congestion -- --ignored --nocapture print_the_skipping_table
+```

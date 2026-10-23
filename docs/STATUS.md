@@ -63,6 +63,14 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-23: in hyper-quic, a connection's time threshold is at least the longest a spurious
+loss took (patch Q30, `crates/hyper-quic/VENDORED.md` §40; `docs/transport.md` §4ae). Where a share
+of the packets skips the path's delay, as netem's `reorder` sends them, QUIC's round trips are those
+packets' (1 ms against 80 at 10 Mbit/s and 80 ms), and RFC 9002's threshold over them declared the
+rest lost: with 5% skipping BBR declared 921 packets lost, all spurious, now 21, and NewReno, CUBIC
+and Copa carry 2 to 4 times what they did (35.6, 51.7 and 22.2%); CUBIC carries 96.7% at 25%. Nothing changes until a spurious
+loss: slates' bake-off moves only its reordering trial.
+
 Landed 2026-10-22: in hyper-quic, a connection ID the peer retired routes to its connection for three
 probe timeouts more (patch Q29, `crates/hyper-quic/VENDORED.md` §39; `docs/transport.md` §4ad), where
 the endpoint stopped routing it as the RETIRE_CONNECTION_ID arrived: on a path that reorders, the
@@ -323,7 +331,13 @@ Found under load or by a fault a test injected. They are traced as far as the ev
 is worked around.
 
 - **hyper-quic: BBR's window on a path whose overtaking packets skip most of its delay (found
-  2026-10-22, by `congestion::print_the_reordering_table`).** With ±60 ms of jitter each way on a
+  2026-10-22, by `congestion::print_the_reordering_table`; 2026-10-23, by
+  `print_the_skipping_table`: at 10 Mbit/s and 80 ms with 5% of the packets skipping the delay, as
+  netem's `reorder` sends them, BBR carries 24.0% with a least round trip of 1 ms, its losses all
+  spurious and few since Q30. Sampling a round trip only from a packet that overtook none, once the
+  path has shown reordering (TCP's RFC 7323 §4.3 choice), took it to 95.8%, but over jitter it
+  overstates the least round trip and BBR, unpaced, then overflowed its queue (6,802 declared losses
+  at ±40 ms against 36): it lands with BBR's pacing rate).** With ±60 ms of jitter each way on a
   path of 50 ms each way, a packet's one-way delay runs from nothing to 110 ms; its round trip
   sampled from the packets that overtook, BBR's least round trip was 3.6 ms, and its window, twice
   the bandwidth times it, 10 KB: it carried 9.1% of the link where the same jitter kept in order

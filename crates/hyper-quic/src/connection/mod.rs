@@ -2587,14 +2587,15 @@ impl Connection {
             return;
         };
         let rtt = self.path.rtt.conservative();
-        // RFC 9002's time threshold, and the reordering window spurious losses have added to it
-        let loss_delay = cmp::max(
-            float::scale_duration(rtt, self.config.time_threshold),
-            TIMER_GRANULARITY,
-        )
-        .saturating_add(
-            self.reordering
-                .extra_delay(self.path.rtt.min(), self.path.rtt.get()),
+        // RFC 9002's time threshold, or the longest a spurious loss took, and the reordering window
+        // spurious losses have added to it (`reordering.rs`)
+        let loss_delay = self.reordering.time_threshold(
+            cmp::max(
+                float::scale_duration(rtt, self.config.time_threshold),
+                TIMER_GRANULARITY,
+            ),
+            self.path.rtt.min(),
+            self.path.rtt.get(),
         );
         let lost =
             self.find_lost_packets(now, pn_space, largest_acked_packet, loss_delay, due_to_ack);

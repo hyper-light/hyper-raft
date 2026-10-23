@@ -42,9 +42,11 @@ use hyper_quic::{
     ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, Endpoint,
     EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
 };
-use hyper_sim::net::{Fate, Link, Loss, Marking, Net, NetLimits, Path, Ticket};
+use hyper_sim::net::{
+    Fate, Link, Loss, Marking, Measured as Propagation, Net, NetLimits, Path, Ticket,
+};
 use hyper_sim::{
-    Clock, Discipline, Fifo, Limits, NodeId, Record, SimError, Source, Step, World, twice,
+    Clock, Discipline, Fifo, Limits, NodeId, PPM, Record, SimError, Source, Step, World, twice,
 };
 
 const MS: u64 = 1_000_000;
@@ -112,6 +114,9 @@ struct Scenario {
     /// Whether a datagram may overtake an earlier one: with jitter, the path reorders; without, it
     /// keeps each flow's order, its datagrams queued behind a slower one.
     reorders: bool,
+    /// The share of datagrams, parts per million, that cross with no delay, overtaking the rest,
+    /// as netem's `reorder` sends a share of packets at once (`tc-netem(8)`).
+    skip_ppm: u32,
     /// At this time the bottleneck's rate becomes the second value, both ways.
     step: Option<(u64, u64)>,
     /// Where measurement starts, if not a quarter of the run.
@@ -134,7 +139,8 @@ impl Scenario {
     /// path that draws them, and the datagrams each way no more than the bottleneck carries over
     /// the run at its peak rate, each of the smallest size, beside what it holds at the start.
     fn trace_words(&self) -> usize {
-        let draws = u64::from(self.loss != Loss::NONE) + u64::from(self.jitter_ns != 0);
+        let draws = u64::from(self.loss != Loss::NONE)
+            + u64::from(self.jitter_ns != 0 || self.skip_ppm != 0);
         let carried = u128::from(self.peak_rate()) * u128::from(self.end()) / 8_000_000_000;
         let datagrams =
             (u64::try_from(carried).unwrap() + self.bytes_one_way()) / SMALLEST_DATAGRAM;
@@ -223,6 +229,7 @@ fn scenario(rate_bits_per_second: u64, rtt_ms: u64, seconds: u64) -> Scenario {
         loss: Loss::NONE,
         jitter_ns: 0,
         reorders: true,
+        skip_ppm: 0,
         step: None,
         warm_ns: None,
     }
@@ -568,6 +575,8 @@ struct Measured {
     sent_packets: u64,
     lost_packets: u64,
     spurious_losses: u64,
+    /// The client's least round trip at the end
+    min_rtt: Duration,
 }
 
 struct Run {
@@ -635,7 +644,18 @@ impl Run {
             .collect();
         for (flow, spec) in flows.iter().zip(specs) {
             let one_way = spec.rtt_ns.unwrap_or(scenario.rtt_ns) / 2;
-            let path = if scenario.reorders && scenario.jitter_ns != 0 {
+            let path = if scenario.skip_ppm != 0 {
+                // A share with no delay, the rest with the path's: a step in the distribution
+                let skip = scenario.skip_ppm.min(PPM - 1);
+                let grid: &'static [u32] = Vec::leak(vec![0, skip, skip + 1, PPM]);
+                let values: &'static [u64] = Vec::leak(vec![0, 0, one_way, one_way]);
+                let measured = Path::measured(Propagation::new(grid, values)?);
+                if scenario.reorders {
+                    measured.overtaking()
+                } else {
+                    measured
+                }
+            } else if scenario.reorders && scenario.jitter_ns != 0 {
                 Path::reordering(one_way, scenario.jitter_ns)
             } else {
                 Path::in_order(one_way, scenario.jitter_ns)
@@ -978,6 +998,7 @@ impl Run {
                 sent_packets: path.as_ref().map_or(0, |path| path.sent_packets),
                 lost_packets: path.as_ref().map_or(0, |path| path.lost_packets),
                 spurious_losses: path.as_ref().map_or(0, |path| path.spurious_losses),
+                min_rtt: path.as_ref().map_or(Duration::ZERO, |path| path.min_rtt),
                 pings,
                 ping_p99_ns,
                 carried_ppm: carried * 1_000_000 / could.max(1),
@@ -1605,6 +1626,45 @@ fn print_the_reordering_table() {
                 percent(reordering.carried_ppm),
                 reordering.lost_packets,
                 reordering.spurious_losses,
+                percent(twin.carried_ppm)
+            );
+        }
+    }
+}
+
+/// The table of `docs/benchmarks.md`, "A path where a share of packets skips its delay": each law
+/// over 10 Mbit/s and 80 ms for 20 s, with that share of the datagrams each way crossing with no
+/// delay, as netem's `reorder` sends them, and the same delays kept in order.
+#[test]
+#[ignore = "the skipping table of docs/benchmarks.md: a measurement, run by hand"]
+fn print_the_skipping_table() {
+    let pki = Pki::new();
+    println!(
+        "| Skipping each way | Law | carried (declared lost, spurious; least round trip) | kept in order |"
+    );
+    println!("|---|---|---|---|");
+    for skip in [0, 10_000, 50_000, 250_000] {
+        for law in Law::BAKEOFF {
+            let path = Scenario {
+                skip_ppm: skip,
+                ..scenario(10_000_000, 80, 20)
+            };
+            let skipping = measure(path, law, &pki);
+            let twin = measure(
+                Scenario {
+                    reorders: false,
+                    ..path
+                },
+                law,
+                &pki,
+            );
+            println!(
+                "| {:.0}% | {law:?} | {:.1}% ({}, {}; {:.1} ms) | {:.1}% |",
+                f64::from(skip) / 10_000.0,
+                percent(skipping.carried_ppm),
+                skipping.lost_packets,
+                skipping.spurious_losses,
+                skipping.min_rtt.as_secs_f64() * 1_000.0,
                 percent(twin.carried_ppm)
             );
         }

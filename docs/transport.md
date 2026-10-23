@@ -1958,6 +1958,40 @@ for packets in flight, at most as many as the connection issues (patch Q29,
 `tests::a_retired_cid_routes_for_three_probe_timeouts`,
 `congestion::a_path_whose_jitter_passes_its_delay_keeps_what_was_sent_with_a_retired_id`.
 
+## 4ae. A path where a share of the packets skips its delay (2026-10-23)
+
+netem's `reorder`, the reordering focal's comparison runs apply, sends a share of the packets with no
+delay at all. QUIC samples its round trip from the largest packet acknowledged (RFC 9002 §5.1), and
+there that is a packet that skipped: at 10 Mbit/s and 80 ms with 5% skipping each way the least
+round trip read 1 ms and the smoothed one about 64 ms, while the rest of the packets took 80 and
+more. §4ac's time threshold rested on those, and the reordering window grew a quarter of a
+millisecond a round trip: every later packet acknowledged declared the rest lost.
+
+The time threshold is now at least the longest a spurious loss took (patch Q30,
+`crates/hyper-quic/VENDORED.md` §40), as Chromium's adaptive threshold covers each spurious loss's
+time. hyper-sim's `Path::overtaking` lets a measured path's draws overtake one another, and the
+congestion harness's `skip_ppm` sends that share of each direction's datagrams with no delay
+(`congestion::print_the_skipping_table`, `docs/benchmarks.md`):
+
+| Skipping each way | BBR | NewReno | CUBIC | Copa |
+|---|---|---|---|---|
+| 1% | 15.4 → 57.8% | 39.4 → 65.0% | 38.5 → 64.3% | 36.5 → 49.7% |
+| 5% | 21.8 → 24.0% (921 → 21 spurious) | 12.1 → 35.6% | 13.2 → 51.7% | 11.1 → 22.2% |
+| 25% | 22.8 → 28.3% | 4.2 → 55.1% | 6.0 → 96.7% | 1.7 → 1.7% |
+
+The same delays kept in order carry 96.7–98.8% for every law but Copa, which falls with the jitter
+whether or not it reorders (47.5% at 5%). What holds BBR is its window,
+twice its bandwidth times the least round trip, the skipping packets' millisecond. Sampling a round
+trip only from a packet that overtook none, once the path has shown reordering, as TCP samples the
+segment that fills a gap (RFC 7323 §4.3), took BBR to 95.8% at 5% and 95.0% at 25%, and its least
+round trip to 79 ms; but over jitter it overstates the least round trip, a packet in order being a
+slow one, and BBR, paced at five quarters of its window rather than at its model's rate, then kept a
+window the queue overflowed: 6,802 packets declared lost at ±40 ms, where it declared 36. That
+sampling lands with BBR's pacing (`docs/STATUS.md`, open defects).
+
+Tests: `tests::a_packet_as_late_as_a_spurious_loss_is_not_declared_lost_again`,
+`connection::reordering::tests::the_time_threshold_covers_the_longest_a_spurious_loss_took`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

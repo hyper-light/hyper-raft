@@ -72,7 +72,10 @@ trip, as on a path that reorders it is one that overtook the rest: with 5% of th
 the delay, as netem's `reorder` sends them, BBR's least round trip was a millisecond and it carried
 27.0% of the link, now 96.3%; ±60 ms of jitter 11.2% → 95.0%. slates' bake-off: BBR's ping p99 against
 the best 1.484 → 1.125 (geomean), its worst 4.00 → 1.81, its Jain index at 20 and 100 ms 0.533 →
-0.829. BBR draws its gain cycle's phases from the connection's seed, so a seeded run replays.
+0.829. BBR draws its gain cycle's phases from the connection's seed, so a seeded run replays. Its
+statistics report the rate it paces at (patch Q34, §44): they said zero until its model had a
+bandwidth, while it paced at its start-up's rate, and hyper-transport's `PathFacts::pacing_rate`
+with them.
 
 Landed 2026-10-23: in hyper-quic, a pacer credits the same bytes however often it is asked (patch
 Q31, `crates/hyper-quic/VENDORED.md` §41; `docs/transport.md` §4af), where it truncated each refill to
@@ -347,6 +350,17 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-rt: `tests/service_resources.rs` counts a page fault in a rare hot round (found
+  2026-10-23).** It asserts no minor fault in any of its 3,000 hot rounds, and one round of a run
+  takes one now and then: CI 39933369713 (windows-11-arm, round 1150) and 39861203071 (main,
+  `translated`, round 0); on a Windows x86-64 machine 1 run in 210, at round 2398. The fault is
+  the process's, and not one of the runtime's allocations (none in any hot round). The class is
+  the one this test met before, a code path first run in a measured round (the observer's first
+  yield, `observer`'s comment), but a working-set watch naming the faulted page (each page added
+  between two snapshots of the working set, by region and mapped file) saw no fault in 2,700 runs,
+  with one snapshot a run as with two a round: what the watch's own calls run first, before the
+  measured rounds, is among the suspects, and no page is named yet. Not re-run past: a batch's CI
+  is green when this test passes in it.
 - **hyper-quic: BBR's window overflows a queue of one product under heavy jitter (found 2026-10-23).**
   Paced at its model's rate, its least round trip from packets in order (patch Q33), BBR carries
   96.2% of 10 Mbit/s at 100 ms with ±40 ms of jitter each way but declares 2,619 packets lost, where,

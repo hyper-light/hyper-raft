@@ -1992,6 +1992,24 @@ sampling lands with BBR's pacing (`docs/STATUS.md`, open defects).
 Tests: `tests::a_packet_as_late_as_a_spurious_loss_is_not_declared_lost_again`,
 `connection::reordering::tests::the_time_threshold_covers_the_longest_a_spurious_loss_took`.
 
+## 4af. A pacer credits the same bytes however often it is asked (2026-10-23)
+
+The pacer (§4d, "Pacing") refilled its bucket each time it was asked and short of tokens, truncating
+the credit to whole bytes and moving its clock to the call: a connection asked again and again while
+it waited lost up to a byte each time. At 10 Mbit/s and 100 ms, asked every microsecond for a
+millisecond, it credited 1,000 bytes where 1,562 were bought. It now credits the whole bytes the time
+bought and moves its clock on by just the time they took; a wait is never due before a whole byte
+more (patch Q31, `crates/hyper-quic/VENDORED.md` §41). slates' bake-off: every law's summary as
+before or better (BBR's ping p99 geomean 1.490 → 1.484, Copa's goodput shortfall 1.284 → 1.270).
+
+Found while tracing why Q29's retirement timer moved bake-off rows (§4ad): a pacer short of tokens
+sleeps until its bucket holds a whole burst, upstream's rule to batch its wakes, and a connection
+woken sooner sends what the bucket holds then, so a paced sender's bursts follow its wakes. That is
+the rule, not a fault: what is sent is the same.
+
+Tests: `connection::pacing::tests::the_credit_is_the_same_however_often_the_pacer_is_asked`,
+`a_wait_is_never_due_when_asked`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

@@ -1456,8 +1456,14 @@ slates' bake-off against `cd90e5b`: 33 of its 672 rows move, on paths that do no
 somewhere, the shares in both directions (BBR at 100 Mbit/s and 300 ms the most, 93.4 → 82.4% in one
 seed and 100.2 → 150.6% in another, past 100% the warm-up's, §30). With `Timer::RetiredCid` never
 armed every row is as `cd90e5b`'s: the timer's wakes, one each a retirement, shift each run's events.
-What a wake changes is not an app-limited mark (§30): with a wake's polls marking none, the same 33
-rows move. It is being traced; a wake that finds nothing due should change nothing.
+What a wake changes, traced to the event (loss 0%, 1 Mbit/s and 20 ms, seed 3, BBR): a pacer short
+of tokens sleeps until its bucket holds a whole burst (`Pacer::wait`, upstream's rule, to batch its
+wakes), but a connection woken sooner for any reason sends what the bucket holds then. At 462.755 ms
+the client's retirement timer woke it and it sent 6 datagrams that, without the timer, went with a
+seventh at the pacer's own wake, 470.027 ms. A paced sender's bursts follow its wakes: what it sends
+is the same, when the bucket lets it go is not, and each run's later events move with it. Not an
+app-limited mark (§30): with a wake's polls marking none, the same 33 rows move. The bake-off's
+summary is as `cd90e5b`'s within its third decimal (BBR's ping p99 geomean 1.498 → 1.490).
 
 ## 40. The time threshold covers the longest a spurious loss took (2026-10-23)
 
@@ -1494,3 +1500,31 @@ Tests: `connection::reordering::tests::the_time_threshold_covers_the_longest_a_s
 declared lost and acknowledged after; one held 40 ms then is not declared; without Q30 it is, two
 spurious losses where one is). hyper-sim's `Path::overtaking` lets a measured path's draws overtake,
 for the table's skipping paths.
+
+## 41. A pacer credits the same bytes however often it is asked (2026-10-23)
+
+Patch Q31 departs from upstream's pacer (`connection/pacing.rs`). Asked whether a datagram may go and
+short of tokens, it refilled its bucket for the time since it last did, truncated the credit to whole
+bytes and moved its clock to the call: what a fraction of a byte took was lost at every call. A
+connection asked again and again while it waited lost up to a byte each time, a share of its rate
+that grows with how often it is asked: at 10 Mbit/s and 100 ms, its window's rule refilling 1.5625
+bytes a microsecond, asked every microsecond for a millisecond it credited 1,000 bytes where 1,562
+were bought (a rate a controller states, 1.25 a microsecond: 1,000 where 1,250). A busy endpoint asks
+its connections often, and a connection woken while it waits for the pacer asks it each time.
+
+The bucket now credits the whole bytes the time bought and moves its clock on by just the time they
+took, rounded up; what a fraction of a byte took waits for the next refill (`Pacer::refill`). A bucket
+that fills keeps nothing past its capacity, as before. A wait is the deficit's time from that clock,
+rounded up, so it is never due before a whole byte more is bought (`Pacer::wait`): the window's rule,
+five quarters of the window a smoothed round trip, and a stated rate share both, in integers, where the
+window's rule computed in floating point.
+
+slates' bake-off against Q30 (`cf9849b`): most rows move, every law's pacing credited exactly; the
+summary is as before or better for every law. Ping p99 against the best, geometric mean: NewReno 1.408
+→ 1.386, CUBIC 1.353 → 1.343, BBR 1.490 → 1.484, Copa 1.035 → 1.036; goodput shortfall NewReno 3.142 →
+3.144, CUBIC 2.780 → 2.780, BBR 1.020 → 1.019, Copa 1.284 → 1.270; Copa's worst p99 3.12 → 2.48;
+CUBIC stalled in 10 runs, where 11.
+
+Tests: `connection::pacing::tests::the_credit_is_the_same_however_often_the_pacer_is_asked` (fails on
+upstream's: 1,000 bytes for 1,562), `a_wait_is_never_due_when_asked`; every pacing test passes as it
+was.

@@ -63,6 +63,12 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-23: in hyper-quic, a pacer credits the same bytes however often it is asked (patch
+Q31, `crates/hyper-quic/VENDORED.md` §41; `docs/transport.md` §4af), where it truncated each refill to
+whole bytes and moved its clock to the call: a connection asked every microsecond while it waited
+credited 1,000 bytes of the 1,562 its rate bought at 10 Mbit/s and 100 ms. slates' bake-off: every
+law's summary as before or better.
+
 Landed 2026-10-23: in hyper-quic, a connection's time threshold is at least the longest a spurious
 loss took (patch Q30, `crates/hyper-quic/VENDORED.md` §40; `docs/transport.md` §4ae). Where a share
 of the packets skips the path's delay, as netem's `reorder` sends them, QUIC's round trips are those

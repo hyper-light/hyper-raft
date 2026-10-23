@@ -63,6 +63,23 @@ since open, no constant; `LogStats::flushed_confirmations` counts the choice. `t
 drive whose durable write costs more confirms by flushing after the one durable write that measured
 it; one whose flush costs more confirms durable throughout.
 
+Landed 2026-10-22: in hyper-quic, a connection's loss thresholds learn what a path that reorders
+shows (patch Q27, `crates/hyper-quic/VENDORED.md` §38; `docs/transport.md` §4ac). RFC 9002's fixed
+thresholds, three packets and 9/8 of the round trip, declared packets lost that arrived, each a
+congestion event: BBR at 10 Mbit/s and 100 ms with ±20 ms of jitter each way carried 21.2% of the
+link, and focal's work among 500 agents took 3.2 s a write at the median and 33 s at the 99th
+percentile over a 40 ms path that reorders. A packet declared lost and acknowledged afterwards (a
+spurious loss, `PathStats::spurious_losses`) raises the packet threshold to its distance plus one
+and widens a reordering window on the time threshold, RACK's quarter of the least round trip a round
+trip (RFC 8985 §6.2), bounded by the longer of the smoothed round trip and the longest a spurious
+loss took: QUIC samples its round trip from the largest packet acknowledged, the packet that
+overtook, and at ±40 ms the smoothed round trip read 33 to 75 ms against packets taking up to 180.
+Sixteen recovery periods without one return the thresholds to the RFC's. BBR now carries 98.4% at
+±20 ms and 96.2% at ±40 ms, as with the same jitter kept in order (98.1%, 97.4%). With it, patch
+Q28: a probe timeout that a loss time held back fires in the wake that ends the loss time, where the
+connection asked to be woken at the time it was woken
+(`congestion::a_reordering_path_is_carried_as_its_jitter_kept_in_order`).
+
 Landed 2026-10-22: in hyper-transport, an exchange that waits on its owner's event (a long poll,
 `Classes::waits`) holds none of the stream pool's credit: parked as its head arrives, it holds a
 stream of its own, within the streams one connection may hold, and is no open one in the pool's
@@ -297,6 +314,25 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
+
+- **hyper-quic: BBR's window on a path whose overtaking packets skip most of its delay (found
+  2026-10-22, by `congestion::print_the_reordering_table`).** With ±60 ms of jitter each way on a
+  path of 50 ms each way, a packet's one-way delay runs from nothing to 110 ms; its round trip
+  sampled from the packets that overtook, BBR's least round trip was 3.6 ms, and its window, twice
+  the bandwidth times it, 10 KB: it carried 9.1% of the link where the same jitter kept in order
+  carries 93.3%, with no loss its tolerance of reordering left undeclared. BBR's model takes the
+  least round trip as the path's (`BBR.min_rtt`, draft-ietf-ccwg-bbr), which a path of several
+  routes, or netem's `reorder` sending some packets with no delay at all, makes the fastest route's.
+  Open: a window that covers what the slower packets keep in flight.
+
+- **hyper-quic: a loss-based law's cut for a loss found spurious stands (found 2026-10-22).** With
+  ±20 ms of jitter each way at 10 Mbit/s and 100 ms and the tolerance of reordering, NewReno, CUBIC
+  and Copa declared 24, 21 and 16 packets lost, every one acknowledged afterwards, and carried
+  41.0%, 36.7% and 23.8% of the link against 96.6%, 97.2% and 44.8% with the jitter kept in order:
+  each declaration cut a window that a 100 ms round trip regrows slowly. RFC 9438 §4.9.2 lets CUBIC
+  restore the state it saved before a congestion event once its loss proves spurious, a QUIC packet
+  acknowledged after it was declared lost, while the window is still below what it was (quiche's
+  `rollback`, Linux's undo); NewReno's and Copa's are owed with it.
 
 - **hyper-liveness: a node that never heard any peer judges none (found 2026-10-20, beside the deaf
   leader below).** A node deaf from its start has no link heard, so no pool to starve and no
@@ -1398,9 +1434,9 @@ crates' open work; then each consumer's switch-over (mantle note 32 §5, each pr
      instructions an exchange or a MiB, spread over its patches (`docs/benchmarks.md`, "hyper-quic
      against upstream quinn-proto").
    - From slates' congestion bake-off (`docs/transport.md` §4d): Copa's slow start at a large
-     product (5.5–7.6% of 100 Mbit/s at 300 ms), tolerance of reordering (slates' adaptive
-     tolerance), Copa's answer to a step down, and slates' 1 ms pacing quantum with its
-     two-datagram floor.
+     product (5.5–7.6% of 100 Mbit/s at 300 ms), Copa's answer to a step down, and slates' 1 ms
+     pacing quantum with its two-datagram floor. Tolerance of reordering is in (`docs/transport.md`
+     §4ac).
    - hyper-transport's stream window: its ceiling, `2 · 1,024 · d`, kept upstream quinn's fixed span
      bound from closing a connection, which hyper-quic's bound no longer does (its VENDORED.md §26);
      what should bound one stream's window below its connection's is owed.

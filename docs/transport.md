@@ -699,9 +699,8 @@ Open:
   hyper-quic's assembler closing a connection under its own sender's losses
   (`crates/hyper-quic/VENDORED.md` §26).
 - **Still to come**, from the grid: Copa's slow start at 100 Mbit/s and 300 ms, which leaves it at
-  5.5–7.6% of the link; tolerance of reordering (RFC 9002's fixed packet threshold reads ±10 ms of it
-  as loss, slates' adaptive tolerance is not ported); Copa's answer to a step down; and slates' 1 ms
-  pacing quantum with its two-datagram floor.
+  5.5–7.6% of the link; Copa's answer to a step down; and slates' 1 ms pacing quantum with its
+  two-datagram floor. Tolerance of reordering, slates' adaptive tolerance, is in (§4ac).
 
 ## 4e. The handshake at a geographic distance (2026-10-04)
 
@@ -1856,6 +1855,92 @@ Tests:
   requests behind it, every request answered while the wait is held, and the wait's stream gone with
   its answer. Of a server whose classes park nothing, the same five are not served while the wait is
   held.
+
+## 4ac. A path that reorders (2026-10-22)
+
+focal's work among 500 agents (compare/work-faults, 2026-10-22) was measured on a 40 ms path with
+each impairment added alone: delay alone answered a write at 125 ms at the median and 230 ms at the
+99th percentile; 2% loss on top, 193 and 553 ms; ±20 ms of jitter, 204 ms and 1.6 s; and 5% of the
+packets reordered, 3.2 s and 33 s. Reordering was the collapse. RFC 9002 declares a packet lost once
+three packets sent after it are acknowledged, or once 9/8 of the round trip has passed since it was
+sent and a later one is acknowledged (§6.1). A path that reorders delivers packets later than either
+allows, so each is declared lost although it arrives, its data sent again, and each declaration is
+a congestion event. In hyper-quic's own harness, BBR at 10 Mbit/s and 100 ms with ±20 ms of jitter
+each way carried a fifth of the link. RFC 9002 §6.1.1 expects what RACK does in TCP, a threshold
+raised after spurious losses, to be "at least as useful in QUIC", and §6.1.2 lets the time
+threshold adapt.
+
+A connection's loss thresholds now learn what its path shows (`connection/reordering.rs`, patch Q27,
+`crates/hyper-quic/VENDORED.md` §38; ported from slates' `transport::reorder`, with three
+departures that measurement found):
+
+- **The evidence.** A packet declared lost that the peer acknowledges afterwards was reordered, not
+  lost (`PathStats::spurious_losses`). It shows how far out of order it came, the largest packet
+  acknowledged when it was declared less its own number, and how long it took, its send to that
+  acknowledgement.
+- **The packet threshold** rises to the distance plus one, as Chromium's adaptive threshold and
+  Linux's `tp->reordering` do. slates bounded it by the packets a window holds. A packet is
+  overtaken by every packet acknowledged while it travels, though, and those leave the flight: at
+  ±40 ms BBR's window held 16 packets and a packet was overtaken by 44. RACK counts no packets once
+  it has seen reordering (RFC 8985 §6.2); the time threshold is what still finds a loss.
+- **The time threshold** gains a reordering window, a quarter of the least round trip for each round
+  trip that saw a spurious loss (RACK's `reo_wnd_mult`), the round trip RACK's `dsack_round` in packet
+  numbers: once a packet sent after the window last widened is acknowledged.
+- **Its bound.** RACK's window "MUST be bounded, and this bound SHOULD be SRTT" (RFC 8985 §3.3.2).
+  TCP samples its round trip from the segment that fills a gap, the late one (RFC 7323 §4.3); QUIC
+  samples only the largest packet acknowledged (RFC 9002 §5.1), and under reordering that is the
+  packet that overtook the rest. At ±40 ms the smoothed round trip read 33 to 75 ms where packets
+  took up to 180, and a window bounded by it left 1,836 of 1,840 declarations spurious and BBR at
+  54.8% of the link. The bound is the longer of the smoothed round trip and the longest a spurious
+  loss took: a round trip of the path's own late packets.
+- **Its end.** Sixteen recovery periods (RFC 9002 §7.3.2) that begin with no spurious loss between
+  them return both thresholds to the RFC's (RACK's `reo_wnd_persist`). slates counted each
+  detection of losses as a recovery; on a path that also loses, sixteen came within a round trip or
+  two, and the tolerance was forgotten as often as it was learned.
+- **Bounds.** A declared loss is remembered for one probe timeout, the time within which its
+  acknowledgement is expected (RFC 9002 §6.2.1), and no more of them than a window holds for each
+  round trip the probe timeout spans; the oldest goes first, costing only its evidence.
+
+A probe timeout that a loss time held back now fires in the wake that ends the loss time (patch
+Q28). RFC 9002 arms the probe timeout only once no loss time is set (§6.2.1, Appendix A.8), and a
+reordering window makes a loss time end after the probe timeout of the newest ack-eliciting packet:
+the connection then armed the probe timeout in the past and asked to be woken at the time it had
+been woken, which the harness refused (`Run::fire`).
+
+Measured by `congestion::print_the_reordering_table` (`docs/benchmarks.md`, "hyper-quic: a path that
+reorders"), 10 Mbit/s and 100 ms for 20 s, the share of the link each law carried after the warm-up
+with RFC 9002's fixed thresholds and with the tolerance, beside the same jitter kept in order:
+
+| Jitter each way | BBR | NewReno | CUBIC | Copa |
+|---|---|---|---|---|
+| ±5 ms | 69.7 → 97.2% (97.1%) | 7.2 → 43.2% (96.6%) | 9.7 → 46.5% (97.2%) | 46.8 → 56.2% (76.9%) |
+| ±10 ms | 44.1 → 96.7% (94.5%) | 4.2 → 40.5% (96.0%) | 5.6 → 33.5% (97.2%) | 6.9 → 21.9% (78.1%) |
+| ±20 ms | 21.2 → 98.4% (98.1%) | 2.6 → 41.0% (96.6%) | 3.1 → 36.7% (97.2%) | 3.6 → 23.8% (44.8%) |
+| ±40 ms | 6.0 → 96.2% (97.4%) | 1.7 → 19.6% (95.6%) | 2.7 → 30.7% (97.1%) | 1.7 → 20.4% (19.4%) |
+| ±60 ms | 4.6 → 9.1% (93.3%) | 1.6 → 3.8% (86.7%) | 2.0 → 7.2% (96.1%) | 1.1 → 1.1% (1.3%) |
+
+- **BBR**, focal's law, carries a path that reorders as the same jitter kept in order up to ±40 ms
+  each way: at ±20 ms it declared 1,662 packets lost, 64 of them spurious, where the RFC's
+  thresholds declared 7,533, every one spurious.
+- **The loss-based laws** declare few losses with the tolerance (24 at ±20 ms for NewReno, every one
+  spurious), but each cut a window that a 100 ms round trip regrows slowly, so they stay at a third
+  to two fifths of the link. Restoring the state from before a cut whose loss proves spurious (RFC
+  9438 §4.9.2) is owed (`docs/STATUS.md`, open defects).
+- **Copa** collapses under jitter kept in order as well, the jitter read as queue in its standing
+  round trip (slates' `docs/wip/BENCHMARKS.md`, "Remote pulls under horrific networks: delay jitter
+  collapses Copa").
+- **At ±60 ms**, one-way delays of nothing to 110 ms on a 50 ms path, BBR's least round trip is
+  that of the packets that overtook, 3.6 ms, and its window of twice the bandwidth times it carries
+  9.1% with nothing lost; the same jitter kept in order carries 93.3% (`docs/STATUS.md`, open
+  defects).
+
+Tests: `congestion::a_reordering_path_is_carried_as_its_jitter_kept_in_order`, at ±20 ms and ±40 ms
+each way on 10 Mbit/s and 100 ms for 20 s: BBR keeps nine tenths of what the same jitter kept in
+order carries (the bar `harm_bar` sets), and the path does reorder past the RFC's thresholds.
+Without the tolerance it carries 21.2% and 6.0%; with the window bounded by the smoothed round trip,
+54.8% at ±40 ms. `congestion::every_wake_on_a_path_that_reorders_does_what_is_due_at_its_time`, BBR
+over 10 Mbit/s and 20 ms with ±10 ms of jitter: without Q28 a node woke at 19.65 s and asked to wake
+then again.
 
 ## 5. Consumers
 

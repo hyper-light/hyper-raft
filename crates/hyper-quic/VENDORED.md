@@ -1365,3 +1365,52 @@ the moment the idle connection's first window has carried no probe: 318 datagram
 during the transfer and ended at 65,527; without Q26, 14,377, its one probe starved by the pacer).
 `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` and every MTU test pass unchanged; on arm64
 Linux the peer_sockets test passed 40 runs of 40.
+
+## 38. Loss thresholds that learn a path's reordering, and a probe timeout a loss time held back (2026-10-22)
+
+Patch Q27 departs from upstream's fixed loss thresholds, RFC 9002's three packets
+(`TransportConfig::packet_threshold`) and 9/8 of the round trip (`time_threshold`), which stay the
+floor. RFC 9002 §6.1.1 names RACK's raised threshold as expected to be "at least as useful in QUIC",
+and §6.1.2 lets the time threshold adapt. `connection/reordering.rs` holds one connection's
+tolerance, learned in its Data space from spurious losses, packets declared lost that the peer
+acknowledges afterwards (`PathStats::spurious_losses`; `docs/transport.md` §4ac gives the rules and
+their sources):
+
+- the packet threshold rises to a spurious loss's distance plus one;
+- the time threshold gains a reordering window, a quarter of the least round trip for each round
+  trip with a spurious loss (RACK's `reo_wnd_mult`, the round trip in packet numbers), bounded by
+  the longer of the smoothed round trip and the longest a spurious loss took;
+- sixteen recovery periods begun with no spurious loss return both to the floor (RACK's
+  `reo_wnd_persist`);
+- a declaration is remembered for a probe timeout, no more of them than a window holds for each
+  round trip in it.
+
+The ACK frame's ranges are checked against the remembered declarations before the frame's newly
+acknowledged packets are taken, so an acknowledgement that names only packets already declared
+lost still teaches. A congestion event begins a recovery period as RFC 9002 §7.3.2 has it, a lost
+packet sent after the current period began (`Reordering::on_congestion_event`, beside the
+controller's own); an ECN mark is no loss recovery and begins none.
+
+Patch Q28 changes `on_loss_detection_timeout`. Upstream returns after a time-threshold detection,
+having armed the probe timeout if no loss time remains; a loss time holds the probe timeout back
+(RFC 9002 Appendix A.8), so the probe timeout can then be due already, and the connection asked to be
+woken at the time it was woken, its probe sent only at that second wake. With a reordering window a
+loss time ends after the newest ack-eliciting packet's probe timeout often: the congestion harness's
+`Run::fire` refused a server's wake at ±40 ms of jitter. The probe timeout now fires in the same
+wake.
+
+Measured (`congestion::print_the_reordering_table`, `docs/benchmarks.md`, "hyper-quic: a path that
+reorders"): BBR at 10 Mbit/s and 100 ms carried 69.7%, 44.1%, 21.2% and 6.0% of the link with ±5,
+±10, ±20 and ±40 ms of jitter each way, and now 97.2%, 96.7%, 98.4% and 96.2%, as the same jitter
+kept in order carries (97.1%, 94.5%, 98.1%, 97.4%). slates' bake-off against the parent: 660 of
+672 rows the same byte for byte, every path that does not reorder; its reordering ±10 ms trial
+carried 45.5–46.5% for BBR and 3.9–10.6% for the others, now 93.5–94.9% and 24.2–34.2%.
+
+Tests: `connection::reordering::tests` (a spurious loss widens the tolerance once a round trip, the
+tolerance is bounded by what the path showed, a quiet path returns to the floor with its memory
+bounded, an acknowledgement of nothing declared changes nothing);
+`congestion::a_reordering_path_is_carried_as_its_jitter_kept_in_order` (BBR at ±20 and ±40 ms keeps
+nine tenths of its in-order twin; without Q27, 21.2% and 6.0%);
+`congestion::every_wake_on_a_path_that_reorders_does_what_is_due_at_its_time` (BBR at 10 Mbit/s and
+20 ms with ±10 ms; without Q28 a node woke at 19.65 s and asked to wake then again). The unit tests,
+congestion, e2e, geo and handshake suites pass.

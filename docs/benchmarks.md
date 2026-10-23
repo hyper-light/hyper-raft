@@ -9823,3 +9823,75 @@ The one-shot hold (`Pair::held`, the next commit): five alternations at load 9�
 whose own runs moved 89–195 ns a heartbeat at 2 nodes and up to 802 at 8, so they tell nothing
 either way; the hold is read only for a point that has passed. 0 allocations, reallocations, bytes
 and faults a heartbeat in every cell.
+
+## hyper-quic: a path that reorders (2026-10-22)
+
+`docs/transport.md` §4ac, patches Q27 and Q28 (`crates/hyper-quic/VENDORED.md` §38). Each law over
+10 Mbit/s and 100 ms (a drop-tail queue of one bandwidth-delay product) for 20 s of simulated time,
+measured after the warm-up's quarter, with jitter of each width each way that reorders, and with the
+same jitter kept in order. "RFC 9002 thresholds" is this tree with the tolerance held at the
+thresholds' floor (an acknowledgement shows no loss spurious); the parent `25cf889` gives the same
+shares (BBR 44.1% at ±10 ms and 21.2% at ±20 ms). Every run is its seed's, exactly.
+
+| Jitter each way | Law | RFC 9002 thresholds: carried (declared lost) | with the tolerance: carried (declared lost, spurious) | jitter kept in order: carried |
+|---|---|---|---|---|
+| ±0 ms | NewReno | 97.0% (215) | 97.0% (215, 0) | 97.0% |
+| ±0 ms | Cubic | 97.2% (314) | 97.2% (314, 0) | 97.2% |
+| ±0 ms | Bbr | 97.8% (4,978) | 97.8% (4,978, 0) | 97.8% |
+| ±0 ms | Copa | 97.2% (0) | 97.2% (0, 0) | 97.2% |
+| ±5 ms | NewReno | 7.2% (38) | 43.2% (7, 7) | 96.6% |
+| ±5 ms | Cubic | 9.7% (37) | 46.5% (7, 7) | 97.2% |
+| ±5 ms | Bbr | 69.7% (5,710) | 97.2% (1,475, 36) | 97.1% |
+| ±5 ms | Copa | 46.8% (1,802) | 56.2% (8, 8) | 76.9% |
+| ±10 ms | NewReno | 4.2% (50) | 40.5% (8, 8) | 96.0% |
+| ±10 ms | Cubic | 5.6% (64) | 33.5% (11, 11) | 97.2% |
+| ±10 ms | Bbr | 44.1% (9,936) | 96.7% (767, 45) | 94.5% |
+| ±10 ms | Copa | 6.9% (332) | 21.9% (7, 7) | 78.1% |
+| ±20 ms | NewReno | 2.6% (74) | 41.0% (24, 24) | 96.6% |
+| ±20 ms | Cubic | 3.1% (121) | 36.7% (21, 21) | 97.2% |
+| ±20 ms | Bbr | 21.2% (7,533) | 98.4% (1,662, 64) | 98.1% |
+| ±20 ms | Copa | 3.6% (132) | 23.8% (16, 16) | 44.8% |
+| ±40 ms | NewReno | 1.7% (83) | 19.6% (37, 37) | 95.6% |
+| ±40 ms | Cubic | 2.7% (172) | 30.7% (48, 48) | 97.1% |
+| ±40 ms | Bbr | 6.0% (1,610) | 96.2% (63, 63) | 97.4% |
+| ±40 ms | Copa | 1.7% (154) | 20.4% (43, 43) | 19.4% |
+| ±60 ms | NewReno | 1.6% (90) | 3.8% (82, 82) | 86.7% |
+| ±60 ms | Cubic | 2.0% (158) | 7.2% (124, 124) | 96.1% |
+| ±60 ms | Bbr | 4.6% (1,031) | 9.1% (250, 250) | 93.3% |
+| ±60 ms | Copa | 1.1% (64) | 1.1% (34, 34) | 1.3% |
+
+What the rows say:
+
+- **BBR** carries a path that reorders as the same jitter kept in order up to ±40 ms each way. Its
+  other declared losses are the queue's: without jitter it loses 4,978 of 25,476
+  packets at the drop-tail queue, being paced at RFC 9002's five quarters of its window a round trip
+  rather than at its model's rate (`docs/STATUS.md`, "BBR states no pacing rate").
+- **NewReno and CUBIC** at ±20 ms declare 24 and 21 losses with the tolerance, every one spurious,
+  against 74 and 121 without, and carry 16 and 12 times as much; each declaration still cuts a
+  window a 100 ms round trip regrows slowly, the cut that RFC 9438 §4.9.2 lets a sender restore
+  (open in `docs/STATUS.md`).
+- **Copa** falls with the jitter whether or not it reorders (76.9% at ±5 ms kept in order, 1.3% at
+  ±60 ms).
+- **At ±60 ms**, one-way delays from nothing to 110 ms, BBR's least round trip is 3.6 ms, the packets
+  that overtook, and its window carries 9.1% with every declared loss spurious (open in
+  `docs/STATUS.md`).
+
+slates' bake-off (`the_congestion_bakeoff_over_slates_grid`, 56 trials of four laws at three seeds),
+the parent `25cf889` against this change: 660 of its 672 rows are the same byte for byte, every path
+that does not reorder among them. The other 12 are its reordering ±10 ms trial (10 Mbit/s, 100 ms),
+seeds 1 to 3:
+
+| Law | carried before → after | ping p99 before → after |
+|---|---|---|
+| BBR | 45.5–46.5% → 93.5–94.9% | 141–183 → 211–214 ms |
+| NewReno | 3.9–4.9% → 26.3–28.6% | 123–129 → 118–119 ms |
+| CUBIC | 5.0–5.7% → 26.5–30.2% | 122–130 → 117–118 ms |
+| Copa | 5.2–10.6% → 24.2–34.2% | 117–118 → 118–119 ms |
+
+BBR's ping p99 rises as it fills the link: paced at five quarters of its window, not its model's
+rate, it keeps about a bandwidth-delay product queued once the window holds it (`docs/STATUS.md`).
+
+```sh
+cargo test -p hyper-quic --release --test congestion -- --ignored --nocapture print_the_reordering_table
+cargo test -p hyper-quic --release --test congestion -- --ignored --nocapture the_congestion_bakeoff_over_slates_grid
+```

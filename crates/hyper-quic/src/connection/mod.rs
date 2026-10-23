@@ -51,6 +51,9 @@ use copies::copy_spacing;
 mod losses;
 pub(crate) use losses::{Ledger, LossFit, LossMemory};
 
+mod reordering;
+use reordering::Reordering;
+
 mod datagrams;
 use datagrams::DatagramState;
 
@@ -207,6 +210,8 @@ pub struct Connection {
     /// What the path's losses say of their bursts: the endpoint's memory of the remote when the
     /// connection began, and what the connection counted since (`losses.rs`)
     ledger: Ledger,
+    /// The loss thresholds widened by the spurious losses the path has shown (`reordering.rs`)
+    reordering: Reordering,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -379,6 +384,7 @@ impl Connection {
             resume,
             received_eliciting: None,
             ledger: Ledger::new(losses),
+            reordering: Reordering::default(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: Spaces::new(initial_space, PacketSpace::new(now), PacketSpace::new(now)),
@@ -2136,11 +2142,25 @@ impl Connection {
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
+        let next_packet = self.spaces.get(space).next_packet_number;
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
             // A packet declared lost that the peer acknowledges was reordered, not lost
             self.ledger
                 .acknowledged(space, *range.start(), *range.end());
+            // ... and widens the tolerance of reordering before this acknowledgement's losses
+            // are looked for
+            if space == SpaceId::Data && self.reordering.remembers_declared_losses() {
+                let spurious = self.reordering.on_acknowledged(
+                    (*range.start(), *range.end()),
+                    now,
+                    ack.largest,
+                    next_packet,
+                    self.config.packet_threshold,
+                );
+                self.stats.path.spurious_losses =
+                    self.stats.path.spurious_losses.saturating_add(spurious);
+            }
             for (&pn, _) in self.spaces.get(space).sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
@@ -2458,7 +2478,18 @@ impl Connection {
             // Time threshold loss Detection
             self.detect_lost_packets(now, pn_space, false);
             self.set_loss_detection_timer(now);
-            return;
+            // A loss time holds the probe timeout back (RFC 9002 §6.2.1 arms it only once no loss
+            // time is), so the probe timeout armed now may be due already: a loss time later than
+            // it, as the reordering window makes one, ends after it. It fires in this wake, or the
+            // connection would ask to be woken again at the time it was woken.
+            let probe_due = self.loss_time_and_space().is_none()
+                && self
+                    .timers
+                    .get(Timer::LossDetection)
+                    .is_some_and(|due| due <= now);
+            if !probe_due {
+                return;
+            }
         }
 
         let (_, space) = match self.pto_time_and_space(now) {
@@ -2555,12 +2586,37 @@ impl Connection {
             return;
         };
         let rtt = self.path.rtt.conservative();
+        // RFC 9002's time threshold, and the reordering window spurious losses have added to it
         let loss_delay = cmp::max(
             float::scale_duration(rtt, self.config.time_threshold),
             TIMER_GRANULARITY,
+        )
+        .saturating_add(
+            self.reordering
+                .extra_delay(self.path.rtt.min(), self.path.rtt.get()),
         );
         let lost =
             self.find_lost_packets(now, pn_space, largest_acked_packet, loss_delay, due_to_ack);
+        if pn_space == SpaceId::Data && !lost.packets.is_empty() {
+            // A declared loss is remembered for a probe timeout, and no more of them than the
+            // packets a window holds for each round trip it spans: no more are sent within it
+            let memory = self.pto(SpaceId::Data);
+            let round_trips = memory
+                .as_nanos()
+                .div_ceil(self.path.rtt.get().as_nanos().max(1));
+            let cap = u128::from(self.window_packets()).saturating_mul(round_trips);
+            // Each is still held: they are taken once their losses are handled, below
+            let sent = &self.spaces.get(SpaceId::Data).sent_packets;
+            self.reordering.on_declared_lost(
+                lost.packets
+                    .iter()
+                    .filter_map(|&packet| sent.get(&packet).map(|info| (packet, info.time_sent))),
+                largest_acked_packet,
+                now,
+                memory,
+                usize::try_from(cap).unwrap_or(usize::MAX),
+            );
+        }
 
         if let Some(largest_lost_sent) = lost.largest_sent {
             self.on_packets_lost(now, pn_space, loss_delay, largest_lost_sent, &lost);
@@ -2597,8 +2653,10 @@ impl Connection {
             persistent_congestion: false,
         };
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
-        // Packet numbers are below 2^62
-        let packet_threshold = u64::from(self.config.packet_threshold);
+        // Packet numbers are below 2^62; RFC 9002's threshold, raised by spurious losses
+        let packet_threshold = self
+            .reordering
+            .packet_threshold(self.config.packet_threshold);
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
@@ -2730,10 +2788,22 @@ impl Connection {
                 lost.bytes,
             );
             self.resume.on_congestion(&mut *self.path.congestion);
+            self.reordering.on_congestion_event(largest_lost_sent, now);
             // Entering recovery reduces the window; a loss within a recovery period does not
             // (RFC 9002 §7.3.2), and gets no extra packet
             self.recovery_packet |= self.path.congestion.window() < window;
         }
+    }
+
+    /// The packets a congestion window holds, one at least: what a round trip sends
+    fn window_packets(&self) -> u64 {
+        let mtu = u64::from(self.path.current_mtu());
+        self.path
+            .congestion
+            .window()
+            .checked_div(mtu)
+            .unwrap_or(0)
+            .max(1)
     }
 
     fn loss_time_and_space(&self) -> Option<(Instant, SpaceId)> {

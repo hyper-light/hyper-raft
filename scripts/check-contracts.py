@@ -80,8 +80,9 @@ UNSAFE_ALLOWED = {
         "getsockopt(SO_MEMINFO), the kernel's account of a receive queue (docs/transport.md §4i)",
     "crates/hyper-rt/tests/console_close.rs":
         "CreatePipe, CreatePseudoConsole, ClosePseudoConsole, the process-thread attribute list and "
-        "CreateProcessW, WaitForSingleObject and GetExitCodeProcess through windows-sys: a child run "
-        "on a pseudoconsole the test closes, a real CTRL_CLOSE_EVENT (tests only, docs/runtime.md §6.1)",
+        "CreateProcessW, CreateEventW, OpenEventW and SetEvent (the child's word that it has subscribed), "
+        "WaitForSingleObject and GetExitCodeProcess through windows-sys: a child run on a pseudoconsole "
+        "the test closes, a real CTRL_CLOSE_EVENT (tests only, docs/runtime.md §6.1)",
     "crates/hyper-rt/tests/udp_batched.rs":
         "setsockopt(SO_NO_CHECK) through libc, which the runtime has no call for: a socket whose "
         "segmented sends the kernel refuses (tests only, docs/transport.md §4h)",

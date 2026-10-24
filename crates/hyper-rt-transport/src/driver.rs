@@ -398,6 +398,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 self.writable = None;
                 outcome?;
                 fired = true;
+                #[allow(clippy::disallowed_macros, clippy::print_stderr)]
+                {
+                    eprintln!(
+                        "DIAGDRV {:?} listener writable fired",
+                        shard_now().map(std::time::Duration::from_nanos)
+                    );
+                }
             }
         }
         for peer in &mut self.peers {
@@ -718,6 +725,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             .saturating_add(sent.saturating_mul(held.segment))
             .min(held.bytes.len());
         if held.done < held.bytes.len() {
+            #[allow(clippy::disallowed_macros, clippy::print_stderr)]
+            {
+                eprintln!(
+                    "DIAGDRV {:?} held: {} of {} bytes to {} left",
+                    shard_now().map(std::time::Duration::from_nanos),
+                    held.bytes.len().saturating_sub(held.done),
+                    held.bytes.len(),
+                    held.to
+                );
+            }
             return Some(held);
         }
         self.outgoing = held.bytes;

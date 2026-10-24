@@ -40,6 +40,8 @@ before the part that rests on them is built.
 | AFD | the `IOCTL_AFD_POLL` technique of wepoll and mio (`mio/src/sys/windows/afd.rs`); SLATES-RT `afd.rs` | NON-PEER-REVIEWED |
 | AFUNIX | Microsoft, "AF_UNIX comes to Windows" (Windows Command Line blog, 2017-12-19: Insider build 17063, first released in Windows 10 1803), and `SIO_AF_UNIX_GETPEERPID` in `afunix.h`, `_WSAIOR(IOC_VENDOR, 256)`, read at windows-sys 0.61.2 (`docs/research/runtime-sources.md` §3) | vendor |
 | SELFPIPE | D. J. Bernstein, "The self-pipe trick"; POSIX `sigaction`, async-signal-safe functions (XSH 2.4.3) | NON-PEER-REVIEWED; primary |
+| CONSOLE | Microsoft Learn, Windows Console: HandlerRoutine (Remarks, Timeouts; Console-Docs `docs/handlerroutine.md` at `0b1b2c46f29b`), SetConsoleCtrlHandler (Remarks; at `425fa47db4c9`), ClosePseudoConsole (Remarks; at `d297f58259a4`), read 2026-10-24 | vendor |
+| HOLDERS | how three runtimes answer a console close: libuv `src/win/signal.c` at `b5eb41d882f7` (`uv__signal_control_handler`); Go `src/runtime/os_windows.go` at `cb8219a0716c` (`ctrlHandler`; golang/go#41884) and `testdata/testwinsignal/main.go` at `f02108636c3b`; .NET `src/libraries/Microsoft.Extensions.Hosting/src/Internal/ConsoleLifetime.netcoreapp.cs` at `68df93051437` (`HandleWindowsShutdown`) | primary (source) |
 | RFC5482 | TCP User Timeout Option | primary |
 | RFC896 | Congestion Control in IP/TCP Internetworks (Nagle) | primary |
 | NOTSENT | `TCP_NOTSENT_LOWAT`, read at Linux `v6.12` (`tcp_stream_memory_free`, `tcp_sendmsg_locked`, `tcp_poll`) and XNU `xnu-12377.121.6` (`tcp_notsent_lowat_check`, `sowriteable`, `sosendcheck`) (`docs/research/runtime-sources.md` §1) | primary (source) |
@@ -1036,7 +1038,8 @@ Ctrl-Break, close, logoff and shutdown (Windows).
 **Done** (2026-10-06), with one change: on Unix the subscribers are woken by **one signal thread** that
 reads the self-pipe, not by each shard awaiting the pipe, so one pipe serves any number of subscribers
 without one draining it for the rest; Windows' handler, on the OS's thread, wakes them directly. A kind
-with a subscriber is handled on Windows (the default end does not run). `tests/signals.rs` (Unix).
+with a subscriber is handled on Windows (the default end does not run; a close or a shutdown is held, below).
+`tests/signals.rs` (Unix), `tests/console_close.rs` (Windows).
 
 **A kind that arrives with no subscriber** keeps its default action on Unix: the signal thread restores
 `SIG_DFL` and raises it (mantle's review, finding 7). That restore races a new subscription's installation.
@@ -1051,6 +1054,57 @@ and only then publishes its mask, so a restore that hands it a signal is never u
 
 Both orders are loom-checked (the first from both starting states). A restore that never rechecks fails
 the first model, and a claim that publishes before resetting fails the second.
+
+**Windows' close and shutdown end the process as the handler returns, so the handler holds them
+(2026-10-24, found by mantle).** `on_control` returned TRUE as soon as it had marked and woken the
+subscribers of a kind. For Ctrl-C and Ctrl-Break that is the whole contract: handled, the process goes
+on. For `CTRL_CLOSE_EVENT` and `CTRL_SHUTDOWN_EVENT` it is not: "Return TRUE. In this case, no other
+handler functions are called and the system terminates the process" [CONSOLE, HandlerRoutine,
+Remarks]. A subscriber woken by a close raced the end its own handler's return began, so mantle
+subscribed on Windows to Ctrl-C and Ctrl-Break alone. At `628111e` a child subscribed to the close
+and closed through a pseudoconsole was ended with `STATUS_CONTROL_C_EXIT` (0xC000013A) before its stop
+wrote anything, 10 of 10 on windows-2025 and 10 of 10 on windows-11-arm (hunt run 40104162470).
+
+Now the handler, for a close or a shutdown some subscriber took, returns only after `HOLD_MS`, and the
+process ends when its owner ends it or at the OS's time-out for the event, whichever comes first:
+- The OS runs the handler on a thread it makes for the event and ends the process at the event's
+  time-out whether the handler has returned or not: a close at `SPI_GETHUNGAPPTIMEOUT`, 5,000 ms by
+  default; a shutdown at `SPI_GETWAITTOKILLTIMEOUT`, 5,000 ms, or in a service at
+  `SPI_GETWAITTOKILLSERVICETIMEOUT`, 20,000 ms [CONSOLE, HandlerRoutine, Timeouts]. `HOLD_MS` is
+  20,000, the longest of those defaults, so under them the OS's end comes first and the hold never cuts
+  a stop shorter than the OS allows; it bounds the thread where the OS ends nothing. Measured: a child
+  that never ended after a close was ended by the OS 4,989 to 5,004 ms after it, with the hold at
+  20 s and at 60 s alike, on both Windows runners (hunt run 40104131817). Both runner images hold
+  `WaitToKillServiceTimeout` at 5,000, below the table's 20,000.
+- The time-out the system holds is not read: `SystemParametersInfoW` is in user32.dll, and a process
+  that loads user32.dll or gdi32.dll is no longer sent logoff and shutdown events [CONSOLE,
+  SetConsoleCtrlHandler, Remarks]. A time-out configured above 20 s is cut at 20 s.
+- The owner's exit ends the hold, not its subscription's end: `ExitProcess` ends the held thread with
+  the others, and what the owner does after its stop (its last lines, its runtime's end) runs too.
+  Ending the hold when the woken subscribers said their stops were done would let the OS end the
+  process at that moment, cutting what followed. .NET's host holds a
+  shutdown the same way for that reason ("block this thread completely and let the main routine
+  exit", `HandleWindowsShutdown`), libuv holds a close (`Sleep(INFINITE)`) and Go a close, a logoff
+  and a shutdown (`block()`, golang/go#41884) [HOLDERS]; those three hold without a bound, this one
+  is bounded (CLAUDE.md §2).
+- A logoff is not held. Only services receive it ("Note that this signal is received only by
+  services"), and a service runs on after it: its default handler "does not call ExitProcess when
+  processing the CTRL_LOGOFF_EVENT ... This allows the service to continue running after the user logs
+  off" [CONSOLE, HandlerRoutine]. Held, it would keep the OS's thread for nothing, and the OS runs
+  one handler call at a time: with a Ctrl-Break held 2 s, the second Break's call began
+  as the first returned (2,004 ms on windows-2025, 2,014 ms on windows-11-arm; 5 to 6 ms apart
+  unheld; hunt run 40103290332), so a held logoff would hold back every event after it, a shutdown
+  among them (DERIVED). libuv leaves logoff and shutdown to the services' own notification [HOLDERS].
+- Ctrl-C and Ctrl-Break have no time-out and do not end a process that handled them; they are not held.
+
+`tests/console_close.rs` delivers a real close: the child runs on a pseudoconsole the test closes
+("Closing a pseudoconsole will send CTRL_CLOSE_EVENT to each client application that is still
+connected" [CONSOLE, ClosePseudoConsole]), stops in order on it (a write made durable) and ends its
+process itself with a code of its own. Red at `628111e` (10 of 10 failed on each Windows runner,
+above); green with the hold, 10 of 10 on each, the same test failing 10 of 10 with the hold switched
+off in a diag build (hunt run 40104131817). A close through the console window's `WM_CLOSE`, as Go's
+test delivers it, reached no child on windows-2025 (hunt run 40103290332), so the test closes a
+pseudoconsole, the path the API reference states.
 
 ### 6.2 Stdio
 
@@ -1399,7 +1453,7 @@ The files to be listed in `scripts/check-contracts.py`, each with the interface 
 | `src/sys/epoll.rs` | none expected (rustix) |
 | `src/sys/windows/{iocp,afd,net}.rs` | completion ports, `NtDeviceIoControlFile` for AFD, Winsock |
 | `src/sys/{linux,macos,windows}/udp.rs` | `sendmmsg`/`recvmmsg`, `UDP_SEGMENT`/`UDP_GRO`, receive stamps (from hyper-tokio's `sys`, which is listed today) |
-| `src/sys/signal.rs` | `sigaction`; `SetConsoleCtrlHandler` |
+| `src/sys/signal.rs` | `sigaction`; `SetConsoleCtrlHandler`, `Sleep` (a close's or a shutdown's hold) |
 | `src/sys/peer.rs` | `SIO_AF_UNIX_GETPEERPID`, `OpenProcessToken` (Windows) |
 | `src/machine/facts.rs`, `src/machine/pin.rs` | `sysctlbyname`, thread affinity |
 | `src/thread_clock.rs` | per-thread CPU clocks |

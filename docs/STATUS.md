@@ -528,6 +528,23 @@ is worked around.
 
 ### Closed (2026-10-24)
 
+- **hyper-rt: on Windows a console close or a shutdown ended the process as the handler returned,
+  before a subscriber's orderly stop (found by mantle).** The console handler returned TRUE as soon as
+  it had woken the subscribers, and for a close or a shutdown the system then ends the process
+  (HandlerRoutine: "Return TRUE. In this case, no other handler functions are called and the system
+  terminates the process"), so mantle stopped in order on Windows only for Ctrl-C and Ctrl-Break. At
+  `628111e` (the line mantle vendors, whose handler was main's) a child subscribed to the close and
+  closed through a pseudoconsole was ended with `STATUS_CONTROL_C_EXIT` before its stop, 10 of 10 on
+  windows-2025 and on windows-11-arm (hunt run 40104162470). The handler now holds its return from a
+  close or a shutdown it handled for 20 s, the longest of the OS's default time-outs for them (5 s for
+  a close, 20 s for a service's shutdown), so the process ends when its owner's stop ends it, or at
+  the OS's time-out: a child that never ended was still ended 4,989 to 5,004 ms after the close, the
+  hold at 20 s or 60 s alike (hunt run 40104131817). A logoff, which reaches only services and ends
+  none, is not held (`docs/runtime.md` §6.1). Test:
+  `console_close::a_console_close_waits_for_the_subscribers_orderly_stop`, a real close delivered
+  through a pseudoconsole, red at `628111e` 10 of 10 on both Windows runners and green after 10 of 10
+  (hunt run 40104131817).
+
 - **hyper-quic: on the line mantle vendors, a connection on a Windows loopback went silent for a
   probe timeout right after its handshake (found by mantle; the cause was the MTU probe Q25 holds
   here since 2026-10-17, below).** mantle's cell tests failed on Windows only, on silences of 0.87 to

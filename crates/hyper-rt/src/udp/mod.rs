@@ -548,6 +548,12 @@ impl UdpSocket {
     }
 }
 
+/// DIAG (hunt branch): the datagrams moved since the last call, a line each, Windows only.
+#[cfg(windows)]
+pub fn diag_take() -> Vec<String> {
+    netsys::diag_take()
+}
+
 /// A call's outcome: done, or nothing now (await the edge and call again).
 enum Outcome<T> {
     Done(T),

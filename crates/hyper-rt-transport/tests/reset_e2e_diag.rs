@@ -311,6 +311,8 @@ fn e3_clients_each_on_a_thread_of_its_own() {
     let server_addr: SocketAddr = addr_rx.recv().unwrap();
     for client in 0..CLIENTS {
         let (root, own, other) = (root.clone(), one.clone(), two.0.clone());
+        #[cfg(windows)]
+        let _ = hyper_rt::udp::diag_take();
         let line = std::thread::spawn(move || {
             let mut rt = LocalRuntime::new(&config()).unwrap();
             rt.block_on(async move {
@@ -352,6 +354,23 @@ fn e3_clients_each_on_a_thread_of_its_own() {
         .join()
         .unwrap();
         println!("DIAG e3 {line}");
+        #[cfg(windows)]
+        {
+            let log = hyper_rt::udp::diag_take();
+            let slow = line.contains("replied true in") && {
+                let at = line.find("replied true in ").map_or(0, |at| at + 16);
+                let rest = &line[at..];
+                let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(0);
+                let unit = &rest[end..];
+                let value: f64 = rest[..end].parse().unwrap_or(0.0);
+                !(unit.starts_with("µs") || (unit.starts_with("ms") && value < 20.0))
+            };
+            if slow {
+                for entry in log {
+                    println!("DIAG e3 log {entry}");
+                }
+            }
+        }
     }
     let _ = std::thread::sleep(Duration::from_millis(300));
     stop_tx.send(()).unwrap();

@@ -275,7 +275,9 @@ is worked around.
   `Batched::join_shared_lent`). Windows is refused before any socket is made. Test:
   `udp_shared::a_shared_port_is_refused_to_a_second_listener`, red at `2b13b15` on Linux 6.19.10
   and Darwin 25.4 (the second bind succeeded), green after with hyper-rt's UDP suites and
-  hyper-rt-transport's on both (`docs/transport.md` §4w, `docs/runtime.md` §5.1).
+  hyper-rt-transport's on both; `peer_sockets::a_second_driver_on_a_held_port_is_refused`, the
+  driver's own listener asked twice, red at `628111e` on Darwin 25.4 (the second driver bound)
+  (`docs/transport.md` §4w, `docs/runtime.md` §5.1).
 
 ### Closed (2026-10-21)
 

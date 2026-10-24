@@ -1565,8 +1565,11 @@ and a second node on a node's port fails at once; the peers' sockets join with t
 their bind (`Batched::join_shared_lent`), which both kernels judge against the held socket's flag at
 that bind, so a listener's flag set after its own bind serves them (main's measurement, §4v there).
 The line `main` is on made this change on 2026-10-17 (`0802a05`); this is the same change on the line
-mantle vendors. Test: hyper-rt's `udp_shared::a_shared_port_is_refused_to_a_second_listener`, red at
-`2b13b15` on both (the second bind succeeded), and hyper-rt-transport's suites on Linux and macOS.
+mantle vendors. Tests: hyper-rt's `udp_shared::a_shared_port_is_refused_to_a_second_listener`, red at
+`2b13b15` on both (the second bind succeeded), and hyper-rt-transport's
+`peer_sockets::a_second_driver_on_a_held_port_is_refused`, a second `Driver::bind` on a held port,
+red at `628111e` on Darwin 25.4 (the second driver bound) and refused `AddrInUse` after on every
+target, Windows' plain listener included.
 
 ## 5. Consumers
 

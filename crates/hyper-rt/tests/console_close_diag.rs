@@ -6,6 +6,9 @@
 //! - P: the child runs on a pseudoconsole the test made, and the test closes it ("Closing a
 //!   pseudoconsole will send CTRL_CLOSE_EVENT to each client application that is still connected",
 //!   ClosePseudoConsole).
+//!
+//! Every wait here is bounded and short, and the child writes its account to a file of its own, so
+//! a step that goes wrong still prints what it saw.
 
 #![cfg(windows)]
 #![allow(unsafe_code)]
@@ -14,13 +17,13 @@
 use std::io::{Read, Write};
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::signal::{Signal, SignalStream, subscribe};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, GenerateConsoleCtrlEvent, GetConsoleWindow, HPCON,
 };
@@ -28,19 +31,24 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    PROCESS_INFORMATION, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
 const ROLE: &str = "HYPER_RT_DIAG_ROLE";
 const FILE: &str = "HYPER_RT_DIAG_FILE";
+const LOG: &str = "HYPER_RT_DIAG_LOG";
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const CTRL_BREAK: u32 = 1;
 const STOPPED: i32 = 3;
 const NEVER: i32 = 4;
 const SLEPT: i32 = 5;
 const BROKE: i32 = 6;
-const ROUNDS: usize = 10;
+const ROUNDS: usize = 4;
+/// The child's patience for the close.
+const CHILD_PATIENCE_NS: u64 = 8_000_000_000;
+/// The parent's patience for a child's end.
+const PARENT_PATIENCE: Duration = Duration::from_secs(30);
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -73,11 +81,26 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hyper-rt-console-diag-{}-{name}", std::process::id()))
 }
 
+static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// The child's account: one line appended to its log file, with the ms since it began.
+fn note(line: &str) {
+    let at = ORIGIN.get_or_init(Instant::now).elapsed().as_millis();
+    if let Ok(path) = std::env::var(LOG) {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "  child +{at}ms {line}");
+            let _ = file.sync_all();
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------- child
 
 #[test]
 fn child_entry() {
     let Some(role) = role() else { return };
+    ORIGIN.get_or_init(Instant::now);
+    note(&format!("began role={role} pid={}", std::process::id()));
     match role.as_str() {
         "w-stop" | "w-never" => window_child(&role),
         "p-stop" | "p-never" => pty_child(&role),
@@ -88,35 +111,52 @@ fn child_entry() {
 
 fn window_child(role: &str) -> ! {
     let signals = subscribe(&[Signal::Close]).unwrap();
+    note("subscribed");
     let mut rt = LocalRuntime::new(&config()).unwrap();
     // SAFETY: no preconditions.
     let window = unsafe { GetConsoleWindow() };
-    println!("DIAGCHILD window={window:?}");
+    note(&format!("window={window:?}"));
     if window.is_null() {
+        note("no window: exit 98");
         std::process::exit(98);
     }
     // SAFETY: a window handle the console gave; WM_CLOSE carries no pointers.
     let posted = unsafe { PostMessageW(window, WM_CLOSE, 0, 0) };
-    println!("DIAGCHILD posted={posted}");
+    // SAFETY: no preconditions.
+    let error = unsafe { GetLastError() };
+    note(&format!("posted={posted} last_error={error}"));
     let code = rt.block_on(close_then(signals, role.to_owned())).unwrap();
-    std::process::exit(code);
+    end(code)
 }
 
 fn pty_child(role: &str) -> ! {
     let signals = subscribe(&[Signal::Close]).unwrap();
+    note("subscribed");
     let mut rt = LocalRuntime::new(&config()).unwrap();
     println!("DIAGREADY");
-    std::io::stdout().flush().unwrap();
+    let flushed = std::io::stdout().flush();
+    note(&format!("said ready: {flushed:?}"));
     let code = rt.block_on(close_then(signals, role.to_owned())).unwrap();
+    end(code)
+}
+
+fn end(code: i32) -> ! {
+    for (event, entered, left) in hyper_rt::signal::diag_entries() {
+        note(&format!(
+            "handler call event={event} entered_ms={entered} left_ms={}",
+            if left == u64::MAX { "held".to_owned() } else { left.to_string() }
+        ));
+    }
+    note(&format!("exiting with {code}"));
     std::process::exit(code);
 }
 
 async fn close_then(signals: SignalStream, role: String) -> i32 {
-    match hyper_rt::futures::within(30_000_000_000, signals.recv()).await {
+    match hyper_rt::futures::within(CHILD_PATIENCE_NS, signals.recv()).await {
         Ok(Some(Ok(seen))) if seen.contains(Signal::Close) => {
+            note("close received");
             if role.ends_with("never") {
-                println!("DIAGCHILD got close; sleeping");
-                let _ = std::io::stdout().flush();
+                note("sleeping 60 s");
                 std::thread::sleep(Duration::from_secs(60));
                 SLEPT
             } else {
@@ -124,7 +164,7 @@ async fn close_then(signals: SignalStream, role: String) -> i32 {
             }
         }
         other => {
-            println!("DIAGCHILD no close: {other:?}");
+            note(&format!("no close: {other:?}"));
             NEVER
         }
     }
@@ -135,8 +175,7 @@ fn stop() -> i32 {
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(b"stopped in order\n").unwrap();
     file.sync_all().unwrap();
-    println!("DIAGCHILD stopped");
-    let _ = std::io::stdout().flush();
+    note("stop written");
     STOPPED
 }
 
@@ -145,40 +184,53 @@ fn break_child() -> ! {
     for _ in 0..2 {
         // SAFETY: no pointers; group 0 is every process on this console (this one alone).
         let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK, 0) };
-        println!("DIAGCHILD break sent={sent}");
+        note(&format!("break sent={sent}"));
     }
     std::thread::sleep(Duration::from_secs(6));
-    for (event, entered, left) in hyper_rt::signal::diag_entries() {
-        println!("DIAGCHILD entry event={event} entered_ms={entered} left_ms={left}");
-    }
     drop(signals);
-    std::process::exit(BROKE);
+    end(BROKE)
 }
 
 // ------------------------------------------------------------------------------------------- W
 
-fn spawn_window(role: &str, file: &Path, extra: &[(&str, &str)]) -> (i32, u128, String, String) {
+fn spawn_window(role: &str, name: &str, extra: &[(&str, &str)]) -> String {
+    let file = scratch(&format!("{name}.stop"));
+    let log = scratch(&format!("{name}.log"));
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(&log);
     let started = Instant::now();
     let mut command = Command::new(me());
     command
         .args(["--exact", "child_entry", "--nocapture", "--test-threads", "1"])
         .env(ROLE, role)
-        .env(FILE, file)
+        .env(FILE, &file)
+        .env(LOG, &log)
         .creation_flags(CREATE_NEW_CONSOLE)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     for (key, value) in extra {
         command.env(key, value);
     }
-    let out = command.output().unwrap();
+    let mut child = command.spawn().unwrap();
+    let outcome = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let code = status.code().unwrap_or(i32::MIN);
+            break format!("code={code} hex={:#x}", code as u32);
+        }
+        if started.elapsed() > PARENT_PATIENCE {
+            let _ = child.kill();
+            let _ = child.wait();
+            break "TIMEOUT (killed)".to_owned();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let ms = started.elapsed().as_millis();
-    (
-        out.status.code().unwrap_or(i32::MIN),
-        ms,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    let wrote = std::fs::read_to_string(&file).unwrap_or_default();
+    let account = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(&log);
+    format!("{outcome} ended_after_ms={ms} file={:?}\n{account}", wrote.trim())
 }
 
 #[test]
@@ -188,23 +240,13 @@ fn w_rounds() {
     }
     for mode in ["hold", "nohold"] {
         for round in 0..ROUNDS {
-            let file = scratch(&format!("w-{mode}-{round}"));
             let extra: &[(&str, &str)] = if mode == "nohold" {
                 &[("HYPER_RT_DIAG_NO_HOLD", "1")]
             } else {
                 &[]
             };
-            let (code, ms, out, err) = spawn_window("w-stop", &file, extra);
-            let wrote = std::fs::read_to_string(&file).unwrap_or_default();
-            println!(
-                "DIAG w {mode} round={round} code={code} hex={:#x} elapsed_ms={ms} file={:?}",
-                code as u32,
-                wrote.trim()
-            );
-            if round == 0 {
-                println!("DIAG w {mode} stdout:\n{out}\nDIAG stderr:\n{err}");
-            }
-            let _ = std::fs::remove_file(&file);
+            let seen = spawn_window("w-stop", &format!("w-{mode}-{round}"), extra);
+            println!("DIAG w {mode} round={round} {seen}");
         }
     }
 }
@@ -214,17 +256,10 @@ fn w_never() {
     if role().is_some() {
         return;
     }
-    for round in 0..2 {
-        let file = scratch(&format!("w-never-{round}"));
-        let (code, ms, out, err) = spawn_window("w-never", &file, &[]);
-        println!("DIAG w never round={round} code={code} hex={:#x} elapsed_ms={ms}", code as u32);
-        if round == 0 {
-            println!("DIAG w never stdout:\n{out}\nDIAG stderr:\n{err}");
-        }
-    }
-    let file = scratch("w-never-60s");
-    let (code, ms, _, _) = spawn_window("w-never", &file, &[("HYPER_RT_DIAG_HOLD_MS", "60000")]);
-    println!("DIAG w never hold60s code={code} hex={:#x} elapsed_ms={ms}", code as u32);
+    let seen = spawn_window("w-never", "w-never", &[]);
+    println!("DIAG w never hold20s {seen}");
+    let seen = spawn_window("w-never", "w-never-60", &[("HYPER_RT_DIAG_HOLD_MS", "60000")]);
+    println!("DIAG w never hold60s {seen}");
 }
 
 #[test]
@@ -232,27 +267,20 @@ fn w_break() {
     if role().is_some() {
         return;
     }
-    let file = scratch("w-break");
     for hold in [true, false] {
         let extra: &[(&str, &str)] = if hold { &[("HYPER_RT_DIAG_HOLD_BREAK", "1")] } else { &[] };
-        let (code, ms, out, err) = spawn_window("w-break", &file, extra);
-        println!(
-            "DIAG w break hold={hold} code={code} hex={:#x} elapsed_ms={ms}\n{out}\nDIAG stderr:\n{err}",
-            code as u32
-        );
+        let seen = spawn_window("w-break", &format!("w-break-{hold}"), extra);
+        println!("DIAG w break hold={hold} {seen}");
     }
 }
 
 // ------------------------------------------------------------------------------------------- P
 
-struct Pty {
-    code: u32,
-    ready: bool,
-    close_to_exit_ms: u128,
-    output: String,
-}
-
-fn spawn_pty(role: &str, file: &Path, extra: &[(&str, &str)]) -> Pty {
+fn spawn_pty(role: &str, name: &str, extra: &[(&str, &str)]) -> String {
+    let file = scratch(&format!("{name}.stop"));
+    let log = scratch(&format!("{name}.log"));
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(&log);
     // SAFETY (all blocks below): the documented pseudoconsole sequence (Creating a Pseudoconsole
     // session, Microsoft Learn); every handle is one this function made and closes once.
     unsafe {
@@ -287,7 +315,8 @@ fn spawn_pty(role: &str, file: &Path, extra: &[(&str, &str)]) -> Pty {
         start.lpAttributeList = list;
 
         std::env::set_var(ROLE, role);
-        std::env::set_var(FILE, file);
+        std::env::set_var(FILE, &file);
+        std::env::set_var(LOG, &log);
         for (key, value) in extra {
             std::env::set_var(key, value);
         }
@@ -313,6 +342,7 @@ fn spawn_pty(role: &str, file: &Path, extra: &[(&str, &str)]) -> Pty {
         );
         std::env::remove_var(ROLE);
         std::env::remove_var(FILE);
+        std::env::remove_var(LOG);
         for (key, _) in extra {
             std::env::remove_var(key);
         }
@@ -339,23 +369,39 @@ fn spawn_pty(role: &str, file: &Path, extra: &[(&str, &str)]) -> Pty {
             }
             let _ = done_tx.send(all);
         });
-        let ready = ready_rx.recv_timeout(Duration::from_secs(60)).is_ok();
+        let begun = Instant::now();
+        let ready = ready_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        let ready_ms = begun.elapsed().as_millis();
         let closed = Instant::now();
         ClosePseudoConsole(pty);
-        let waited = WaitForSingleObject(info.hProcess, 90_000);
+        let close_returned_ms = closed.elapsed().as_millis();
+        let waited = WaitForSingleObject(info.hProcess, PARENT_PATIENCE.as_millis() as u32);
         let close_to_exit_ms = closed.elapsed().as_millis();
-        let mut code = 0u32;
-        GetExitCodeProcess(info.hProcess, &mut code);
-        println!("DIAG p wait={waited:#x}");
+        let outcome = if waited == 0 {
+            let mut code = 0u32;
+            GetExitCodeProcess(info.hProcess, &mut code);
+            format!("code={} hex={code:#x}", code as i32)
+        } else {
+            TerminateProcess(info.hProcess, 77);
+            format!("TIMEOUT wait={waited:#x} (terminated)")
+        };
         CloseHandle(info.hThread);
         CloseHandle(info.hProcess);
         CloseHandle(in_write);
         DeleteProcThreadAttributeList(list);
         let output = done_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(5))
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_else(|_| "(the output pipe did not close)".to_owned());
-        Pty { code, ready, close_to_exit_ms, output }
+            .unwrap_or_else(|_| "(the output pipe had not closed 5 s after)".to_owned());
+        let wrote = std::fs::read_to_string(&file).unwrap_or_default();
+        let account = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&log);
+        format!(
+            "ready={ready} ready_ms={ready_ms} close_returned_ms={close_returned_ms} {outcome} close_to_exit_ms={close_to_exit_ms} file={:?}\n{account}  output: {:?}",
+            wrote.trim(),
+            output.chars().take(600).collect::<String>()
+        )
     }
 }
 
@@ -366,26 +412,13 @@ fn p_rounds() {
     }
     for mode in ["hold", "nohold"] {
         for round in 0..ROUNDS {
-            let file = scratch(&format!("p-{mode}-{round}"));
             let extra: &[(&str, &str)] = if mode == "nohold" {
                 &[("HYPER_RT_DIAG_NO_HOLD", "1")]
             } else {
                 &[]
             };
-            let pty = spawn_pty("p-stop", &file, extra);
-            let wrote = std::fs::read_to_string(&file).unwrap_or_default();
-            println!(
-                "DIAG p {mode} round={round} ready={} code={} hex={:#x} close_to_exit_ms={} file={:?}",
-                pty.ready,
-                pty.code as i32,
-                pty.code,
-                pty.close_to_exit_ms,
-                wrote.trim()
-            );
-            if round == 0 {
-                println!("DIAG p {mode} output:\n{:?}", pty.output);
-            }
-            let _ = std::fs::remove_file(&file);
+            let seen = spawn_pty("p-stop", &format!("p-{mode}-{round}"), extra);
+            println!("DIAG p {mode} round={round} {seen}");
         }
     }
 }
@@ -395,18 +428,8 @@ fn p_never() {
     if role().is_some() {
         return;
     }
-    for round in 0..2 {
-        let file = scratch(&format!("p-never-{round}"));
-        let pty = spawn_pty("p-never", &file, &[]);
-        println!(
-            "DIAG p never round={round} ready={} code={} hex={:#x} close_to_exit_ms={}",
-            pty.ready, pty.code as i32, pty.code, pty.close_to_exit_ms
-        );
-    }
-    let file = scratch("p-never-60s");
-    let pty = spawn_pty("p-never", &file, &[("HYPER_RT_DIAG_HOLD_MS", "60000")]);
-    println!(
-        "DIAG p never hold60s ready={} code={} hex={:#x} close_to_exit_ms={}",
-        pty.ready, pty.code as i32, pty.code, pty.close_to_exit_ms
-    );
+    let seen = spawn_pty("p-never", "p-never", &[]);
+    println!("DIAG p never hold20s {seen}");
+    let seen = spawn_pty("p-never", "p-never-60", &[("HYPER_RT_DIAG_HOLD_MS", "60000")]);
+    println!("DIAG p never hold60s {seen}");
 }

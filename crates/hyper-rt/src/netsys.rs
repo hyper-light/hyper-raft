@@ -608,6 +608,60 @@ pub(crate) mod imp {
         }
     }
 
+    /// DIAG (hunt branch): the process's start, for the prints below.
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn diag_since() -> std::time::Duration {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
+    /// DIAG (hunt branch): prints a failed call's error, the socket and the address.
+    #[allow(clippy::disallowed_macros, clippy::print_stderr)]
+    fn diag_error(call: &str, socket: &Socket, addr: Option<SocketAddr>) {
+        // SAFETY: a pure query of thread-local last-error state.
+        let code = unsafe { WSAGetLastError() };
+        if code != WSAEWOULDBLOCK {
+            let local = local_addr(socket).ok();
+            eprintln!(
+                "DIAGNET {:?} {call} local {local:?} to/from {addr:?} error {code}",
+                diag_since()
+            );
+            // The error is read again by `classify`.
+            // SAFETY: restores the thread's last error, which the query above left as it was.
+            unsafe { windows_sys::Win32::Networking::WinSock::WSASetLastError(code) };
+        }
+    }
+
+    /// DIAG (hunt branch): with HYPER_RT_DIAG_REPORTS_OFF set, a new socket asks for no reports.
+    #[allow(clippy::disallowed_macros, clippy::print_stderr)]
+    fn diag_reports_off(socket: &Socket) {
+        if std::env::var_os("HYPER_RT_DIAG_REPORTS_OFF").is_none() {
+            return;
+        }
+        use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SIO_UDP_NETRESET, WSAIoctl};
+        for code in [SIO_UDP_CONNRESET, SIO_UDP_NETRESET] {
+            let off: u32 = 0;
+            let mut returned: u32 = 0;
+            // SAFETY: diag; one live u32 in, nothing out, no overlapped.
+            let rc = unsafe {
+                WSAIoctl(
+                    socket.socket,
+                    code,
+                    (&raw const off).cast(),
+                    4,
+                    core::ptr::null_mut(),
+                    0,
+                    &raw mut returned,
+                    core::ptr::null_mut(),
+                    None,
+                )
+            };
+            if rc != 0 {
+                eprintln!("DIAGNET reports off refused: {rc}");
+            }
+        }
+    }
+
     /// The `Io` the last failed non-blocking call maps to, or the refusal it is.
     fn classify<T>(call: &'static str) -> Result<Io<T>, RtError> {
         // SAFETY: a pure query of thread-local last-error state.
@@ -666,6 +720,7 @@ pub(crate) mod imp {
             )?;
         }
         set_dont_fragment(&socket)?;
+        diag_reports_off(&socket);
         Ok(socket)
     }
 
@@ -1031,6 +1086,7 @@ pub(crate) mod imp {
                     from_sockaddr(&from).unwrap_or(unspecified),
                 )));
             }
+            diag_error("recvfrom", socket, from_sockaddr(&from));
             return classify("recvfrom");
         }
         let unspecified = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
@@ -1059,6 +1115,7 @@ pub(crate) mod imp {
             )
         };
         if rc == SOCKET_ERROR {
+            diag_error("sendto", socket, Some(addr));
             return classify("sendto");
         }
         Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
@@ -1095,6 +1152,7 @@ pub(crate) mod imp {
         // SAFETY: send reads `len` bytes from `buf`.
         let rc = unsafe { ws_send(socket.socket, buf.as_ptr(), len, 0) };
         if rc == SOCKET_ERROR {
+            diag_error("send", socket, None);
             return classify("send");
         }
         Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))

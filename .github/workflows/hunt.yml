@@ -1,0 +1,34 @@
+name: hunt
+
+# hunt/console-close-red: windows-console-hold's test on the base it branches from (628111e), whose console
+# handler returns at once: ten rounds a runner, each a real close delivered through a pseudoconsole. The gates
+# are not run on this branch.
+on:
+  push:
+    branches: ["hunt/console-close-red"]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-11-arm, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test -p hyper-rt --locked --test console_close --no-run
+        shell: bash
+      - timeout-minutes: 10
+        name: the test at 628111e, 10 rounds
+        run: |
+          pass=0; fail=0
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo test -q -p hyper-rt --locked --test console_close -- --test-threads 1 > out.txt 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); grep -E "child ended|never said|had not ended|panicked" out.txt | head -3; fi
+          done
+          echo "AT 628111e pass=$pass fail=$fail"
+        shell: bash

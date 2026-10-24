@@ -256,6 +256,15 @@ is worked around.
   full goes before new 1-RTT data (`crates/hyper-quic/VENDORED.md` §37). Test:
   `tests::an_mtu_search_runs_on_a_connection_that_keeps_sending`.
 
+- **hyper-rt: whether a Windows listener stops at a UDP port-unreachable report (asked by mantle).**
+  It does not. A send to a closed port comes back on a later receive as `WSAECONNRESET`, counted
+  astray and read past: on both Windows runners the report makes the socket readable on its own,
+  holds its place among the datagrams, and the receive future and the batched drain take the
+  datagrams queued behind it with nothing more arriving (diag runs 40085130113 and 40085783959; in
+  240 of 240 rounds a drain racing a fresh report took every datagram).
+  `tests/udp_astray_reads_on.rs` keeps it so on Windows CI (`docs/runtime.md` §5.1, "Astray
+  reports"); the silence mantle saw is the entry above.
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

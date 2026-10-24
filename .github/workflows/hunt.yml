@@ -1,8 +1,8 @@
 name: hunt
 
-# hunt/console-close: a console close delivered to a child process (crates/hyper-rt/tests/console_close_diag.rs),
-# held and not, and how long the OS waits; printed. Every step is bounded so the job ends with its log.
-# The gates are not run on this branch.
+# hunt/console-close: a console close delivered through a pseudoconsole (crates/hyper-rt/tests/console_close.rs
+# and console_close_diag.rs), held and not, and how long the OS waits; printed. Every step is bounded so the
+# job ends with its log. The gates are not run on this branch.
 on:
   push:
     branches: ["hunt/console-close"]
@@ -21,35 +21,35 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
-      - timeout-minutes: 3
-        run: |
-          cmd //c ver
-          whoami
-          query session || true
-          reg query "HKCU\Control Panel\Desktop" //v HungAppTimeout || true
-          reg query "HKCU\Control Panel\Desktop" //v WaitToKillAppTimeout || true
-          reg query "HKLM\SYSTEM\CurrentControlSet\Control" //v WaitToKillServiceTimeout || true
-          reg query "HKCU\Console\%%Startup" || true
+      - run: cargo test -p hyper-rt --locked --test console_close --test console_close_diag --no-run
         shell: bash
-      - run: cargo test -p hyper-rt --locked --test console_close_diag --no-run
+      - if: always()
+        timeout-minutes: 10
+        name: the test, held (the fix), 10 rounds
+        run: |
+          pass=0; fail=0
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo test -q -p hyper-rt --locked --test console_close -- --test-threads 1 > out.txt 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); grep -E "child ended|never said|had not ended|panicked" out.txt | head -3; fi
+          done
+          echo "HELD pass=$pass fail=$fail"
+        shell: bash
+      - if: always()
+        timeout-minutes: 10
+        name: the test, not held (the handler's old return at once), 10 rounds
+        env:
+          HYPER_RT_DIAG_NO_HOLD: "1"
+        run: |
+          pass=0; fail=0
+          for round in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo test -q -p hyper-rt --locked --test console_close -- --test-threads 1 > out.txt 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); grep -E "child ended|never said|had not ended|panicked" out.txt | head -3; fi
+          done
+          echo "NOT HELD pass=$pass fail=$fail"
         shell: bash
       - if: always()
         timeout-minutes: 8
         run: cargo test -p hyper-rt --locked --test console_close_diag p_rounds -- --nocapture --test-threads 1
         shell: bash
       - if: always()
-        timeout-minutes: 8
-        run: cargo test -p hyper-rt --locked --test console_close_diag w_rounds -- --nocapture --test-threads 1
-        shell: bash
-      - if: always()
         timeout-minutes: 4
         run: cargo test -p hyper-rt --locked --test console_close_diag p_never -- --nocapture --test-threads 1
-        shell: bash
-      - if: always()
-        timeout-minutes: 4
-        run: cargo test -p hyper-rt --locked --test console_close_diag w_never -- --nocapture --test-threads 1
-        shell: bash
-      - if: always()
-        timeout-minutes: 4
-        run: cargo test -p hyper-rt --locked --test console_close_diag w_break -- --nocapture --test-threads 1
         shell: bash

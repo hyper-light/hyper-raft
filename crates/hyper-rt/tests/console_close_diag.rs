@@ -32,12 +32,14 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
     PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CreateEventW, OpenEventW, SetEvent, EVENT_MODIFY_STATE, STARTF_USESTDHANDLES,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
 const ROLE: &str = "HYPER_RT_DIAG_ROLE";
 const FILE: &str = "HYPER_RT_DIAG_FILE";
 const LOG: &str = "HYPER_RT_DIAG_LOG";
+const READY_EVENT: &str = "HYPER_RT_DIAG_READY_EVENT";
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const CTRL_BREAK: u32 = 1;
 const STOPPED: i32 = 3;
@@ -133,9 +135,12 @@ fn pty_child(role: &str) -> ! {
     let signals = subscribe(&[Signal::Close]).unwrap();
     note("subscribed");
     let mut rt = LocalRuntime::new(&config()).unwrap();
-    println!("DIAGREADY");
-    let flushed = std::io::stdout().flush();
-    note(&format!("said ready: {flushed:?}"));
+    let name: Vec<u16> = std::env::var(READY_EVENT).unwrap().encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-ended name.
+    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    // SAFETY: the handle above.
+    let set = unsafe { SetEvent(event) };
+    note(&format!("said ready: event={event:?} set={set}"));
     let code = rt.block_on(close_then(signals, role.to_owned())).unwrap();
     end(code)
 }
@@ -312,8 +317,14 @@ fn spawn_pty(role: &str, name: &str, extra: &[(&str, &str)]) -> String {
         );
         let mut start: STARTUPINFOEXW = std::mem::zeroed();
         start.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        start.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         start.lpAttributeList = list;
 
+        let event_name = format!("Local\\hyper-rt-console-diag-{}-{name}", std::process::id());
+        let event_wide: Vec<u16> = event_name.encode_utf16().chain([0]).collect();
+        let ready_event = CreateEventW(std::ptr::null(), 1, 0, event_wide.as_ptr());
+        assert!(!ready_event.is_null());
+        std::env::set_var(READY_EVENT, &event_name);
         std::env::set_var(ROLE, role);
         std::env::set_var(FILE, &file);
         std::env::set_var(LOG, &log);
@@ -340,6 +351,7 @@ fn spawn_pty(role: &str, name: &str, extra: &[(&str, &str)]) -> String {
             &start.StartupInfo,
             &mut info,
         );
+        std::env::remove_var(READY_EVENT);
         std::env::remove_var(ROLE);
         std::env::remove_var(FILE);
         std::env::remove_var(LOG);
@@ -349,28 +361,21 @@ fn spawn_pty(role: &str, name: &str, extra: &[(&str, &str)]) -> String {
         assert!(created != 0, "CreateProcessW: {}", std::io::Error::last_os_error());
 
         let mut reader = std::fs::File::from_raw_handle(out_read);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
             let mut all = Vec::new();
             let mut buf = [0u8; 4096];
-            let mut told = false;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        all.extend_from_slice(&buf[..n]);
-                        if !told && all.windows(9).any(|w| w == b"DIAGREADY") {
-                            told = true;
-                            let _ = ready_tx.send(());
-                        }
-                    }
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
                 }
             }
             let _ = done_tx.send(all);
         });
         let begun = Instant::now();
-        let ready = ready_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        let ready = WaitForSingleObject(ready_event, 20_000) == 0;
+        CloseHandle(ready_event);
         let ready_ms = begun.elapsed().as_millis();
         let closed = Instant::now();
         ClosePseudoConsole(pty);

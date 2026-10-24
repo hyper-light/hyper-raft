@@ -4,7 +4,7 @@ name: hunt
 # (crates/hyper-rt/tests/udp_reset_diag.rs), printed; the gates are not run on this branch.
 on:
   push:
-    branches: ["hunt/udp-reset-windows"]
+    branches: ["hunt/udp-reset-windows-final"]
 
 permissions:
   contents: read

@@ -150,7 +150,8 @@ macro_rules! log_config {
 
 /// A ready's update, as mantle's replica lays it out (`update_of`), for either log's types.
 macro_rules! update_of {
-    ($krate:ident, $ready:expr) => {{
+    // `held`, for a log that keeps the core's promise (core step R-8): mantle-log keeps none.
+    ($krate:ident, $ready:expr $(, $held:ident)?) => {{
         let ready: &Ready = $ready;
         let entries = match ready.entries() {
             [] => None,
@@ -169,6 +170,10 @@ macro_rules! update_of {
             term: h.term,
             vote: h.vote,
             commit: h.commit,
+            $($held: (h.held_term != 0).then_some($krate::Start {
+                index: h.held_index,
+                term: h.held_term,
+            }),)?
         });
         (entries.is_some() || hard_state.is_some()).then(|| $krate::Update {
             entries,
@@ -244,6 +249,8 @@ pub mod hyper {
                     term: h.term,
                     vote: h.vote,
                     commit: h.commit,
+                    held_index: h.held.map_or(0, |held| held.index),
+                    held_term: h.held.map_or(0, |held| held.term),
                 })
                 .unwrap_or_default();
             Ok(InitialState {
@@ -344,7 +351,7 @@ pub mod hyper {
         }
 
         fn persist(&self, ready: &Ready) -> Result<(), String> {
-            let Some(update) = update_of!(hyper_log, ready) else {
+            let Some(update) = update_of!(hyper_log, ready, held) else {
                 return Ok(());
             };
             let parts = self.log.parts(GROUP, update).map_err(|e| e.to_string())?;
@@ -417,6 +424,8 @@ pub mod mantle {
                     term: h.term,
                     vote: h.vote,
                     commit: h.commit,
+                    held_index: 0,
+                    held_term: 0,
                 })
                 .unwrap_or_default();
             Ok(InitialState {

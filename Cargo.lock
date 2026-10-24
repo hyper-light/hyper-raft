@@ -807,6 +807,7 @@ dependencies = [
  "hyper-measure",
  "hyper-seal",
  "hyper-timing",
+ "loom",
  "proptest",
  "tempfile",
  "thiserror 2.0.20",

@@ -1875,6 +1875,38 @@ fetch are the same at every row; a fetch from the file at 16 replicas carries 12
 (1090 against 969 at 128 B), the carrier box a log allocates at its first job, spread over the
 bench's fetches.
 
+### The owner's wake (2026-10-23)
+
+The owner's wake for a job back replaced the token channel and the I/O thread's watch
+(`crates/hyper-log/ORIGIN.md`, "The owner's wake for a job back"). `hyper-log-compare` on fate-commit
+`5a22c8c` (**before**) and the change (**after**), each built from its own tree in release, macOS
+arm64, 16:35–16:55 PDT, load 13–29 with other sessions building.
+
+The replica's path (`replica hyper`, nine rounds, the two in a rotated order, each run a fresh
+process; medians, with the least and the most):
+
+| | wall µs a committed entry | writes, views, terms, fetches | reads another thread answered | allocations | reallocations | context switches |
+|---|---|---|---|---|---|---|
+| before | 346.5 (152.8–683.4) | 6, 102, 15, 3 | 0 | 66.3 | 0.2 | 19.6 (18.2–21.6) |
+| **after** | **337.4** (133.2–944.8) | 6, 102, 15, 3 | 0 | 66.3 | 0.2 | **18.9** (18.2–20.9) |
+
+Appends through the I/O thread (`pairs <dir> 6 2 128 1,16,256 before=…:hyper after=…:hyper`: 128 B
+entries, six rounds of two seconds, rotated; the file's flushes on this Mac's disk set the pace):
+
+| replicas | run | appends/s, median (least–most) | p50 ms | p99 ms | appends a frame | file flushes/s | rounds after made more |
+|---|---|---|---|---|---|---|---|
+| 1 | before | 22 (19–36) | 40.71 | 94.18 | 1.0 | 44 | – |
+| 1 | after | 25 (17–31) | 38.00 | 109.37 | 1.0 | 50 | 2 of 6 |
+| 16 | before | 450 (372–531) | 32.36 | 89.83 | 15.7 | 57 | – |
+| 16 | after | 449 (412–463) | 32.40 | 93.41 | 15.5 | 57 | 2 of 6 |
+| 256 | before | 4,314 (2,253–8,993) | 52.88 | 146.46 | 247.3 | 35 | – |
+| 256 | after | 4,115 (3,172–8,675) | 46.85 | 169.63 | 231.1 | 34 | 3 of 6 |
+
+The change costs nothing these runs can see: no allocation more, a switch fewer or none, and the
+same appends a second within each point's spread. The views and terms a committed entry asks of
+the store (102 and 15, against 82 and 12 in the runs above) are the core's since then, the same in
+both.
+
 ## Many small appends
 
 mantle measured its `mantle bench log --skip-device --sizes 128,16384 --replicas 1,256` on this

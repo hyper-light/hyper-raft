@@ -197,7 +197,10 @@ spliced with another file's segments fails to open (STREAM's nonce-based OAE sec
   so it erases with it. The caller's contract is that the hash is of exactly the plaintext sealed;
   a whole file sealed by `sealed_file::seal_content` keeps it by construction, the SHA-256 of
   exactly the bytes it seals taken by the writer itself, so a store that names its chunks by
-  another hash (focal's BLAKE3) has nothing to keep paired.
+  another hash (focal's BLAKE3) has nothing to keep paired. A store that takes such a hash of every
+  file's bytes anyway gives it to `SealedWriter::content_keyed` instead, which keys the file by it
+  and costs no second pass over the bytes; the pairing is then that store's to keep, beside the
+  bytes it hashes (focal's checkpoint seeds and cold chunks).
   A stored header resumed for resealing was considered and refused: it would rest nonce uniqueness
   on the caller keeping header and plaintext paired, where a derived key rests it on the hash.
 - **Sizes follow from plaintext.** A segment of `n` bytes is `n + 16` stored bytes, so a byte's stored
@@ -237,7 +240,10 @@ the crate that writes.
 - **Durability.** `finish` is the platform's full flush. The caller writes to a name no reader
   opens and then calls `hyper_block::file::rename_durable`, which renames the file into place and
   flushes the directory (Pillai et al., OSDI 2014). A crash leaves the old file or the new one
-  whole.
+  whole. `finish_unflushed` does all `finish` does but the flush, for a caller that writes many
+  files at once and flushes them together, their flushes overlapping, then renames them and
+  flushes their directory once; until its flush such a file is of unknown durability and is not
+  renamed into place (`a_file_finished_unflushed_is_whole_and_left_for_its_caller_to_flush`).
 - **Memory.** One aligned buffer per writer or reader, the segment and its tag, the footer and two
   alignments: no allocator call after setup (counted: `cargo bench -p hyper-seal --bench files`).
   A writer makes it when it is made; a reader when it first reads a segment, so a reader that

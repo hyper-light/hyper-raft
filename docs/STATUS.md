@@ -84,6 +84,18 @@ block. A 64 KiB file's open for its length went from 16.89 to 1.52 µs and from 
 allocated bytes; opened, read whole and let go, from 25.30 to 11.50 µs (`docs/benchmarks.md`, "A
 small file's open"); focal's 64 KiB sealed read from 0.144 to 0.109 ms.
 
+Landed 2026-10-24: in hyper-seal, a sealed file keyed by a hash its writer is given
+(`SealedWriter::content_keyed`) and a finish that leaves the flush to its caller
+(`SealedWriter::finish_unflushed`; `docs/seal.md` §4, §4.1). focal seals its checkpoint seeds and
+cold chunks, which it names by the BLAKE3 hash it takes of their bytes, without a second pass over
+them for a SHA-256, and a checkpoint's batch of seeds keeps its flushes overlapping on its own
+threads, then its renames and one directory flush, where `finish` flushed each file in turn. Given the
+SHA-256 of its plaintext, the writer writes exactly the file `seal_content` does
+(`a_writer_keyed_by_a_given_hash_seals_as_seal_content_does_by_that_hash`); a file finished unflushed
+reads whole, has nothing of it durable, and once flushed is byte for byte `finish`'s
+(`a_file_finished_unflushed_is_whole_and_left_for_its_caller_to_flush`, which fails if the finish
+flushes).
+
 Landed 2026-10-23: in hyper-quic, BBR paced at its model's rate, its least round trip taken only
 from packets in order (patches Q32 and Q33, `crates/hyper-quic/VENDORED.md` §42 and §43;
 `docs/transport.md` §4ag). Held by its window of twice its product and paced at five quarters of it,

@@ -71,12 +71,17 @@ UNSAFE_ALLOWED = {
     "crates/hyper-rt/src/localsys.rs":
         "AF_UNIX stream sockets and the peer's identity: getpeereid and LOCAL_PEERPID (macOS); Winsock AF_UNIX, SIO_AF_UNIX_GETPEERPID, OpenProcessToken and GetTokenInformation(TokenUser) (Windows)",
     "crates/hyper-rt/src/signal.rs":
-        "sigaction and the async-signal-safe self-pipe write (Unix); SetConsoleCtrlHandler (Windows)",
+        "sigaction and the async-signal-safe self-pipe write (Unix); SetConsoleCtrlHandler, and Sleep "
+        "for a close's or a shutdown's hold (Windows)",
     "crates/hyper-rt/src/tcpsys.rs":
         "Winsock 2 stream calls (socket, accept, connect, recv, send, WSARecv, WSASend over IoSlice's WSABUF layout, shutdown) and the TCP options rustix lacks (TCP_NOTSENT_LOWAT, TCP_RXT_CONNDROPTIME, SO_NOSIGPIPE)",
     "crates/hyper-rt/src/udp/linux.rs":
         "sendmmsg, recvmmsg, UDP_SEGMENT, UDP_GRO and SCM_TIMESTAMPNS control messages, which rustix 1.1 lacks (batched UDP, docs/runtime.md §5.1); "
         "getsockopt(SO_MEMINFO), the kernel's account of a receive queue (docs/transport.md §4i)",
+    "crates/hyper-rt/tests/console_close.rs":
+        "CreatePipe, CreatePseudoConsole, ClosePseudoConsole, the process-thread attribute list and "
+        "CreateProcessW, WaitForSingleObject and GetExitCodeProcess through windows-sys: a child run "
+        "on a pseudoconsole the test closes, a real CTRL_CLOSE_EVENT (tests only, docs/runtime.md §6.1)",
     "crates/hyper-rt/tests/udp_batched.rs":
         "setsockopt(SO_NO_CHECK) through libc, which the runtime has no call for: a socket whose "
         "segmented sends the kernel refuses (tests only, docs/transport.md §4h)",

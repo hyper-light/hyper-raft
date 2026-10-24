@@ -335,8 +335,10 @@ fn e3_clients_each_on_a_thread_of_its_own() {
                 let exchange = asked.elapsed();
                 let stats = driver.stats();
                 let path = driver.endpoint().connection_stats(2).map(|quic| quic.path);
+                let refused = asker.asked[0].refused;
+                let events: Vec<String> = asker.events.iter().map(|e| e.chars().take(48).collect()).collect();
                 format!(
-                    "client {client} port {port} at {:?}: connected {connected} in {handshake:?}, replied {replied} in {exchange:?}; sent {} received {} astray {} send_errors {}; path {:?}",
+                    "client {client} port {port} at {:?}: connected {connected} in {handshake:?}, replied {replied} in {exchange:?} refused {refused:?} events {events:?}; sent {} received {} astray {} send_errors {}; path {:?}",
                     start.elapsed(),
                     stats.sent,
                     stats.received,

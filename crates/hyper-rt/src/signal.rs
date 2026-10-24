@@ -237,6 +237,12 @@ pub fn subscribe(kinds: &[Signal]) -> Result<SignalStream, RtError> {
     })
 }
 
+/// DIAG (hunt/console-close): each Windows handler call's event, entry and exit.
+#[cfg(windows)]
+pub fn diag_entries() -> Vec<(u64, u64, u64)> {
+    os::diag_entries()
+}
+
 /// The kinds some subscription wants now.
 #[cfg(unix)]
 fn subscribed() -> u32 {
@@ -549,15 +555,63 @@ mod os {
             CTRL_SHUTDOWN_EVENT => (Signal::Shutdown, true),
             _ => return 0,
         };
+        let slot = DIAG_COUNT.fetch_add(1, Ordering::AcqRel);
+        let entered = diag_ms();
+        if let Some(cell) = DIAG_EVENTS.get(slot) {
+            cell.store(u64::from(event), Ordering::Release);
+        }
+        if let Some(cell) = DIAG_ENTERED.get(slot) {
+            cell.store(entered, Ordering::Release);
+        }
         if deliver(kind.bit()) == 0 {
             return 0;
         }
-        if ends {
+        // DIAG (hunt/console-close): the old return at once, a hold of a Break, a hold of another length.
+        let hold = if std::env::var_os("HYPER_RT_DIAG_NO_HOLD").is_some() {
+            0
+        } else if kind == Signal::Break && std::env::var_os("HYPER_RT_DIAG_HOLD_BREAK").is_some() {
+            2_000
+        } else if ends {
+            std::env::var("HYPER_RT_DIAG_HOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(HOLD_MS)
+        } else {
+            0
+        };
+        if hold != 0 {
             // SAFETY: `Sleep` has no preconditions; it blocks only this thread, which the OS made for
             // this event.
-            unsafe { Sleep(HOLD_MS) };
+            unsafe { Sleep(hold) };
+        }
+        if let Some(cell) = DIAG_LEFT.get(slot) {
+            cell.store(diag_ms(), Ordering::Release);
         }
         1
+    }
+
+    static DIAG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DIAG_EVENTS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 16];
+    static DIAG_ENTERED: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 16];
+    static DIAG_LEFT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 16];
+    static DIAG_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    fn diag_ms() -> u64 {
+        let origin = DIAG_ORIGIN.get_or_init(std::time::Instant::now);
+        u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// DIAG: each handler call's event, and when it entered and left (ms from the first).
+    pub(super) fn diag_entries() -> Vec<(u64, u64, u64)> {
+        (0..DIAG_COUNT.load(Ordering::Acquire).min(16))
+            .map(|i| {
+                (
+                    DIAG_EVENTS.get(i).map_or(0, |c| c.load(Ordering::Acquire)),
+                    DIAG_ENTERED.get(i).map_or(0, |c| c.load(Ordering::Acquire)),
+                    DIAG_LEFT.get(i).map_or(0, |c| c.load(Ordering::Acquire)),
+                )
+            })
+            .collect()
     }
 
     pub(super) fn install(_mask: u32) -> Result<(), RtError> {

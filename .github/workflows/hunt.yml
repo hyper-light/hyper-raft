@@ -1,0 +1,40 @@
+name: hunt
+
+# hunt/console-close: a console close delivered to a child process (crates/hyper-rt/tests/console_close_diag.rs),
+# held and not, and how long the OS waits; printed. The gates are not run on this branch.
+on:
+  push:
+    branches: ["hunt/console-close"]
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-11-arm, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cmd /c ver; powershell -Command "Get-ItemProperty 'HKCU:\Control Panel\Desktop' | Select-Object HungAppTimeout,WaitToKillAppTimeout; Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' | Select-Object WaitToKillServiceTimeout; Get-ItemProperty 'HKCU:\Console\%%Startup' -ErrorAction SilentlyContinue; whoami; query session" || true
+        shell: bash
+      - run: cargo test -p hyper-rt --locked --test console_close_diag --no-run
+        shell: bash
+      - run: cargo test -p hyper-rt --locked --test console_close_diag w_rounds -- --nocapture --test-threads 1
+        shell: bash
+      - if: always()
+        run: cargo test -p hyper-rt --locked --test console_close_diag p_rounds -- --nocapture --test-threads 1
+        shell: bash
+      - if: always()
+        run: cargo test -p hyper-rt --locked --test console_close_diag w_break -- --nocapture --test-threads 1
+        shell: bash
+      - if: always()
+        run: cargo test -p hyper-rt --locked --test console_close_diag w_never -- --nocapture --test-threads 1
+        shell: bash
+      - if: always()
+        run: cargo test -p hyper-rt --locked --test console_close_diag p_never -- --nocapture --test-threads 1
+        shell: bash

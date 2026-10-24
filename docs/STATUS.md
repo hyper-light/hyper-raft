@@ -877,7 +877,9 @@ is worked around.
   another of the user's flagged sockets held, in any process, and the two split its datagrams: one to
   three of 256 clients never heard their server in four runs of five. `UdpSocket::bind_shared` binds
   first and flags after; peers' sockets join with `UdpSocket::join_shared` (`docs/transport.md` §4v).
-  Tests: `tests/udp_shared_port.rs`.
+  Tests: `tests/udp_shared_port.rs`, and hyper-rt-transport's
+  `peer_sockets::a_second_driver_on_a_held_port_is_refused` (added 2026-10-24: the driver's own
+  listener asked twice, red on the line mantle vendors at `628111e`, where the second driver bound).
 
 - **hyper-rt-transport: every park polled every peer socket's readiness wait.** With a socket for
   each connection (§4u), an exchange cost about 11 ns more for each connection the server held (the

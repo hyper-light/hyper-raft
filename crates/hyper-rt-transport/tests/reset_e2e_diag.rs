@@ -39,7 +39,7 @@ const PERIOD: Duration = Duration::from_secs(2);
 const TICK_NS: u64 = 1_000_000;
 /// A client that takes this long for one step is abandoned and the next begins.
 const STEP_BOUND: Duration = Duration::from_secs(8);
-const CLIENTS: usize = 12;
+const CLIENTS: usize = 24;
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -183,6 +183,20 @@ fn run(variant: &str, body: u64, drop_at_reply: bool) {
             };
             let exchange = asked.elapsed();
             let stats = driver.stats();
+            if !replied {
+                let a = &asker.asked[0];
+                println!(
+                    "DIAG {variant} client {client} STALLED: written {} of {} blocked {} reply {:?} read {} refused {:?}; events {:?}; quic {:?}",
+                    a.written,
+                    a.body,
+                    a.blocked,
+                    a.reply,
+                    a.read,
+                    a.refused,
+                    asker.events.iter().rev().take(6).collect::<Vec<_>>(),
+                    driver.endpoint().connection_stats(2)
+                );
+            }
             println!(
                 "DIAG {variant} client {client} port {port} at {:?}: connected {connected} in {handshake:?}, \
                  replied {replied} in {exchange:?}; client astray {} received {} sent {}",
@@ -272,13 +286,17 @@ fn e3_clients_each_on_a_thread_of_its_own() {
                 }
                 server.advance_all(driver.endpoint());
                 let stats = driver.stats();
-                if stats.astray != last.astray {
+                if stats.astray != last.astray || stats.send_errors != last.send_errors {
                     println!(
-                        "DIAG e3 server at {:?}: astray {} -> {} received {} empty {}",
+                        "DIAG e3 server at {:?}: astray {} -> {} send_errors {} sent {} send_calls {} received {} receive_calls {} empty {}",
                         start.elapsed(),
                         last.astray,
                         stats.astray,
+                        stats.send_errors,
+                        stats.sent,
+                        stats.send_calls,
                         stats.received,
+                        stats.receive_calls,
                         stats.receives_empty
                     );
                 }
@@ -315,9 +333,16 @@ fn e3_clients_each_on_a_thread_of_its_own() {
                 let asked = Instant::now();
                 let replied = until(&mut driver, &mut asker, &|asker| asker.finished()).await;
                 let exchange = asked.elapsed();
+                let stats = driver.stats();
+                let path = driver.endpoint().connection_stats(2).map(|quic| quic.path);
                 format!(
-                    "client {client} port {port} at {:?}: connected {connected} in {handshake:?}, replied {replied} in {exchange:?}",
-                    start.elapsed()
+                    "client {client} port {port} at {:?}: connected {connected} in {handshake:?}, replied {replied} in {exchange:?}; sent {} received {} astray {} send_errors {}; path {:?}",
+                    start.elapsed(),
+                    stats.sent,
+                    stats.received,
+                    stats.astray,
+                    stats.send_errors,
+                    path.map(|p| (p.rtt, p.min_rtt, p.lost_packets, p.sent_packets, p.sent_plpmtud_probes, p.lost_plpmtud_probes, p.current_mtu))
                 )
             })
             .unwrap()

@@ -208,3 +208,125 @@ fn e1_clients_dropped_after_a_whole_exchange() {
 fn e2_clients_dropped_at_the_reply_head_of_a_large_body() {
     run("e2", 4 << 20, true);
 }
+
+fn endpoint_of(
+    root: &[u8],
+    own: &(Vec<u8>, Vec<u8>),
+    other: &[u8],
+    peer: u64,
+    listen: bool,
+) -> Endpoint<Mantle, Fixed, Book> {
+    let mut book = Book::default();
+    book.add(other, peer, Role::Node);
+    let config = Config {
+        tls: hyper_transport::tls::Tls::mutual(&credentials(root, &own.0, &own.1), listen).unwrap(),
+        role: Role::Node,
+        limits: limits(),
+        congestion: Default::default(),
+    };
+    Endpoint::new(config, Fixed::new(512 << 20, 64), book, Instant::now()).unwrap()
+}
+
+/// As mantle's cell tests go: the server on a thread and runtime of its own, each client on a thread
+/// and runtime of its own that ends (its socket closed, no close sent) once its exchange is whole,
+/// the next client made only then.
+#[test]
+fn e3_clients_each_on_a_thread_of_its_own() {
+    let pki = Pki::new();
+    let one = pki.issue(&name(1));
+    let two = pki.issue(&name(2));
+    let root = pki.root.clone();
+    let start = Instant::now();
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let server_root = root.clone();
+    let (server_own, server_other) = (two.clone(), one.0.clone());
+    let server = std::thread::spawn(move || {
+        let mut rt = LocalRuntime::new(&config()).unwrap();
+        rt.block_on(async move {
+            let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let mut driver: Drv = Driver::bind(
+                endpoint_of(&server_root, &server_own, &server_other, 1, true),
+                loopback,
+                IO,
+            )
+            .unwrap();
+            addr_tx.send(driver.local_addr().unwrap()).unwrap();
+            let mut server = Server::new();
+            let mut last = driver.stats();
+            loop {
+                if let Some(event) = next(&mut driver).await {
+                    let line = format!("{event:?}");
+                    let lifecycle = line.starts_with("Connected") || line.starts_with("Closed");
+                    server.on_event(driver.endpoint(), event);
+                    if lifecycle {
+                        println!("DIAG e3 server at {:?}: {line}", start.elapsed());
+                    }
+                }
+                while let Some(event) = driver.endpoint().poll_event() {
+                    let line = format!("{event:?}");
+                    if line.starts_with("Connected") || line.starts_with("Closed") {
+                        println!("DIAG e3 server at {:?}: {line}", start.elapsed());
+                    }
+                    server.on_event(driver.endpoint(), event);
+                }
+                server.advance_all(driver.endpoint());
+                let stats = driver.stats();
+                if stats.astray != last.astray {
+                    println!(
+                        "DIAG e3 server at {:?}: astray {} -> {} received {} empty {}",
+                        start.elapsed(),
+                        last.astray,
+                        stats.astray,
+                        stats.received,
+                        stats.receives_empty
+                    );
+                }
+                last = stats;
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
+            }
+        })
+        .unwrap();
+    });
+    let server_addr: SocketAddr = addr_rx.recv().unwrap();
+    for client in 0..CLIENTS {
+        let (root, own, other) = (root.clone(), one.clone(), two.0.clone());
+        let line = std::thread::spawn(move || {
+            let mut rt = LocalRuntime::new(&config()).unwrap();
+            rt.block_on(async move {
+                let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let mut driver: Drv =
+                    Driver::bind(endpoint_of(&root, &own, &other, 2, false), loopback, IO).unwrap();
+                let port = driver.local_addr().unwrap().port();
+                let mut asker = Asker::new();
+                let began = Instant::now();
+                let now = driver.clock().unwrap();
+                driver.endpoint().connect(now, 2, server_addr).unwrap();
+                let connected =
+                    until(&mut driver, &mut asker, &|asker| !asker.connected.is_empty()).await;
+                let handshake = began.elapsed();
+                let now = driver.clock().unwrap();
+                asker
+                    .ask(driver.endpoint(), now, 2, (Kind::Put, Class::Request), 9, Some(16 << 10), PERIOD)
+                    .unwrap();
+                asker.advance_all(driver.endpoint());
+                let asked = Instant::now();
+                let replied = until(&mut driver, &mut asker, &|asker| asker.finished()).await;
+                let exchange = asked.elapsed();
+                format!(
+                    "client {client} port {port} at {:?}: connected {connected} in {handshake:?}, replied {replied} in {exchange:?}",
+                    start.elapsed()
+                )
+            })
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        println!("DIAG e3 {line}");
+    }
+    let _ = std::thread::sleep(Duration::from_millis(300));
+    stop_tx.send(()).unwrap();
+    server.join().unwrap();
+}

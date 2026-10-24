@@ -1,0 +1,26 @@
+name: hunt
+
+# hunt/udp-reset-windows: what Windows does with a UDP socket after an ICMP port unreachable
+# (crates/hyper-rt/tests/udp_reset_diag.rs), printed; the gates are not run on this branch.
+on:
+  push:
+    branches: ["hunt/udp-reset-windows"]
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test -p hyper-rt --locked --test udp_reset_diag --no-run
+        shell: bash
+      - run: for round in 1 2 3; do echo "ROUND $round"; cargo test -p hyper-rt --locked --test udp_reset_diag -- --nocapture --test-threads 1 || exit 1; done
+        shell: bash

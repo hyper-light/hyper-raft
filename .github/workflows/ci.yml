@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches-ignore: ['hunt/**']
   pull_request:
 
 jobs:

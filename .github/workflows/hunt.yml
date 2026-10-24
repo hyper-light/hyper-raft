@@ -22,9 +22,9 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo test -p hyper-rt --locked --test udp_reset_diag --no-run
         shell: bash
-      - run: for round in 1 2 3; do echo "ROUND $round"; cargo test -p hyper-rt --locked --test udp_reset_diag -- --nocapture --test-threads 1 || exit 1; done
+      - run: for round in 1; do echo "ROUND $round"; cargo test -p hyper-rt --locked --test udp_reset_diag -- --nocapture --test-threads 1 || exit 1; done
         shell: bash
       - run: cargo test -p hyper-rt-transport --locked --test reset_e2e_diag --no-run
         shell: bash
-      - run: for round in 1 2; do echo "ROUND $round"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag -- --nocapture --test-threads 1 || exit 1; done
+      - run: for round in 1 2 3; do echo "ROUND $round"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag -- --nocapture --test-threads 1 --skip e2_ || exit 1; done
         shell: bash

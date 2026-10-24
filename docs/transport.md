@@ -1552,6 +1552,10 @@ Tests: `udp_shared_port::every_shared_bind_at_port_zero_is_given_a_port_of_its_o
 port 0; flagged first, 19 ports were given twice on Linux), `a_shared_port_is_refused_to_a_second_listener`
 (flagged first, the second bind succeeded) and `a_joined_port_hands_the_joiner_its_peers_datagrams`;
 hyper-rt-transport's `connection_memory` measurement connects all 256 clients in five runs of five.
+hyper-rt-transport's `peer_sockets::a_second_driver_on_a_held_port_is_refused` asks `Driver::bind`
+itself for a port a driver holds (2026-10-24, found by mantle at its QUIC listener on the line it
+vendors, where the second driver bound: red at `628111e` on Darwin 25.4), refused `AddrInUse` on
+every target, Windows' plain listener included.
 
 ## 4w. A connection's state charged as it is held (2026-10-20)
 

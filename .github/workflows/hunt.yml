@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-2025, windows-11-arm]
+        runner: [windows-11-arm, windows-2025]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -26,9 +26,9 @@ jobs:
         shell: bash
       - run: cargo test -p hyper-rt-transport --locked --test reset_e2e_diag --no-run
         shell: bash
-      - run: for round in 1 2 3 4; do echo "ROUND $round reports on"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag e3_ -- --nocapture --test-threads 1 || exit 1; done
+      - run: for round in 1 2 3 4 5 6; do echo "ROUND $round reports on"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag e3_ -- --nocapture --test-threads 1 || exit 1; done
         shell: bash
-      - run: for round in 1 2 3 4; do echo "ROUND $round reports off"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag e3_ -- --nocapture --test-threads 1 || exit 1; done
+      - run: for round in 1 2 3 4 5 6; do echo "ROUND $round reports off"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag e3_ -- --nocapture --test-threads 1 || exit 1; done
         shell: bash
         env:
           HYPER_RT_DIAG_REPORTS_OFF: "1"

@@ -526,6 +526,27 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-24)
+
+- **hyper-quic: on the line mantle vendors, a connection on a Windows loopback went silent for a
+  probe timeout right after its handshake (found by mantle; the cause was the MTU probe Q25 holds
+  here since 2026-10-17, below).** mantle's cell tests failed on Windows only, on silences of 0.87 to
+  1.48 s. Reproduced at `2b13b15` (the line's base): 26 of 1,536 exchanges stalled on the hosted
+  Windows runners and none of 360 on Linux 6.19 and Darwin 25.4; the client's first MTU probe, 33,353
+  bytes on a Windows loopback, went past its 12,000-byte first window and its pacer, and nothing
+  followed it for about a probe timeout. With Q25 and Q26 taken to that line (`692c89f`, `a9ce7ab`),
+  0 of 576 stalled against 91 of 576 without (runs 40088388382 against 40087563225). The ICMP reports
+  mantle suspected caused none of it (the next entry).
+
+- **hyper-rt: whether a Windows listener stops at a UDP port-unreachable report (asked by mantle).**
+  It does not. A send to a closed port comes back on a later receive as `WSAECONNRESET`, counted
+  astray and read past: on both Windows runners the report makes the socket readable on its own,
+  holds its place among the datagrams, and the receive future and the batched drain take the
+  datagrams queued behind it with nothing more arriving (diag runs 40085130113 and 40085783959; in
+  240 of 240 rounds a drain racing a fresh report took every datagram).
+  `tests/udp_astray_reads_on.rs` keeps it so on Windows CI (`docs/runtime.md` §5.1, "Astray
+  reports"); the silence mantle saw is the entry above.
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

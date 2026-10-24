@@ -1,0 +1,26 @@
+name: hunt
+
+# hunt/udp-reset-windows-main: the threaded-clients exchange (crates/hyper-rt-transport/tests/reset_e2e_diag.rs)
+# on main, against the same on 2b13b15 (hunt/udp-reset-windows); the gates are not run on this branch.
+on:
+  push:
+    branches: ["hunt/udp-reset-windows-main"]
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-11-arm, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test -p hyper-rt-transport --locked --test reset_e2e_diag --no-run
+        shell: bash
+      - run: for round in 1 2 3 4 5 6; do echo "ROUND $round"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag e3_ -- --nocapture --test-threads 1 || exit 1; done
+        shell: bash

@@ -283,6 +283,20 @@ is worked around.
   schedule exactly; the answer numbered next, no slot skipped, where an answer stated as its spacing
   from the heartbeat before skipped 50).
 
+- **hyper-rt, hyper-rt-transport: a second listener could bind a node's named port and split its
+  datagrams (found by mantle; main's `0802a05` taken to this line).** `Driver::bind` binds its
+  listener with `Batched::bind_shared_lent`, which set `SO_REUSEPORT` before binding a named port, so
+  a second process of the same user bound the same port without error on Linux and macOS, and the
+  two took each other's datagrams by hash. A listener now binds first and shares after, whatever
+  the port, so a held port is refused `AddrInUse`; the sockets a driver connects to its peers join
+  the port with their flag set before their bind (`UdpSocket::join_shared`,
+  `Batched::join_shared_lent`). Windows is refused before any socket is made. Test:
+  `udp_shared::a_shared_port_is_refused_to_a_second_listener`, red at `2b13b15` on Linux 6.19.10
+  and Darwin 25.4 (the second bind succeeded), green after with hyper-rt's UDP suites and
+  hyper-rt-transport's on both; `peer_sockets::a_second_driver_on_a_held_port_is_refused`, the
+  driver's own listener asked twice, red at `628111e` on Darwin 25.4 (the second driver bound)
+  (`docs/transport.md` §4w, `docs/runtime.md` §5.1).
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

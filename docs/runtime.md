@@ -854,6 +854,15 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   (`tests/udp_shared.rs`; hyper-rt-transport's `tests/peer_sockets.rs` on Linux and macOS). TCP's search
   refuses a port any socket holds, whatever its flags (`inet_csk_find_open_port` asks
   `inet_csk_bind_conflict` with `reuseport_ok` false), so `TcpListener::bind_shared` keeps its order.
+- **A shared port is its listener's alone** (2026-10-24, main's `0802a05` taken to this line, found by
+  mantle). A named port was still shared before its bind, so a second listener of the same user asking
+  for a port a listener held bound it too, and the two split its datagrams by hash: a second
+  `bind_shared` of a held port succeeded on Linux 6.19.10 and Darwin 25.4 at `2b13b15`, a plain bind
+  failing `EADDRINUSE`. `UdpSocket::bind_shared` now binds first and shares after whatever the port,
+  so a held port is refused `AddrInUse`; the sockets a driver connects to its peers join the port with
+  their flag set before their bind (`UdpSocket::join_shared`, `Batched::join_shared_lent`), as a
+  joiner's must be. Windows is refused before any socket is made (`netsys::port_sharing`).
+  `tests/udp_shared.rs`, `a_shared_port_is_refused_to_a_second_listener`.
 - **What a socket holds, bounded and told.** `Io::held_bound` is the most a batched socket holds while it
   lives, and what its owner charges for it: its receive buffers (`batch` of `RECEIVE_BYTES` on Linux, one
   elsewhere), its outbox (`batch` slots, each one datagram or one segmented send of at most

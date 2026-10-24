@@ -1552,6 +1552,25 @@ host's wall clock (`StdSystemTime`, the server's `TimeSource`), not the world's:
 virtual time. A driver's timer granularity is never measured on the simulation (`docs/STATUS.md`, open
 defects), so every host runs a seed at RFC 9002's 1 ms.
 
+## 4w. A shared port is its listener's alone (2026-10-24, main's `0802a05` taken to this line)
+
+`Driver::bind` binds its listener with `Batched::bind_shared_lent(address, true)` and every peer's
+socket joins that port (§4u). A listener given a named port shared it before binding it, so a second
+process of the same user binding the same port, by mistake or a stale configuration, was not refused:
+on Linux and macOS the two listeners split the port's datagrams by a hash of their addresses, each
+dropping the handshakes it could not read (measured at `2b13b15`: a second `SO_REUSEPORT` bind of a held
+named UDP port succeeded on Linux 6.19.10 and Darwin 25.4; a plain one failed `EADDRINUSE`). A listener
+now binds first and shares after, as it already did for port 0, so a held port is refused `AddrInUse`
+and a second node on a node's port fails at once; the peers' sockets join with their flag set before
+their bind (`Batched::join_shared_lent`), which both kernels judge against the held socket's flag at
+that bind, so a listener's flag set after its own bind serves them (main's measurement, §4v there).
+The line `main` is on made this change on 2026-10-17 (`0802a05`); this is the same change on the line
+mantle vendors. Tests: hyper-rt's `udp_shared::a_shared_port_is_refused_to_a_second_listener`, red at
+`2b13b15` on both (the second bind succeeded), and hyper-rt-transport's
+`peer_sockets::a_second_driver_on_a_held_port_is_refused`, a second `Driver::bind` on a held port,
+red at `628111e` on Darwin 25.4 (the second driver bound) and refused `AddrInUse` after on every
+target, Windows' plain listener included.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

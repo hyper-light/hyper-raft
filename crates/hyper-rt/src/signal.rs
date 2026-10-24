@@ -38,14 +38,17 @@ pub enum Signal {
     /// Windows' Ctrl-Break.
     Break,
     /// Windows' console close. The process ends when its owner ends it or at the OS's time-out for a
-    /// close (5 s by default), whichever is first: a subscriber's orderly stop has that long.
+    /// close (`SPI_GETHUNGAPPTIMEOUT`, 5 s by default; the OS ended a process 4.99 to 5.00 s after a
+    /// close on the hosted Windows runners), whichever is first: a subscriber's orderly stop has that
+    /// long.
     Close,
     /// Windows' user logoff, delivered only to services, which run on after it.
     Logoff,
     /// Windows' system shutdown, delivered to the processes still running when the system sends it,
     /// services among them (interactive applications have ended by then). The process ends when its
-    /// owner ends it or at the OS's time-out for a shutdown (5 s by default; 20 s for a service),
-    /// whichever is first.
+    /// owner ends it or at the OS's time-out for a shutdown, whichever is first:
+    /// `SPI_GETWAITTOKILLTIMEOUT`, 5 s by default, or in a service `SPI_GETWAITTOKILLSERVICETIMEOUT`,
+    /// which Microsoft's table gives as 20 s and the hosted Windows runners' images hold at 5 s.
     Shutdown,
 }
 

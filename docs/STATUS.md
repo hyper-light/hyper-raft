@@ -537,13 +537,13 @@ is worked around.
   closed through a pseudoconsole was ended with `STATUS_CONTROL_C_EXIT` before its stop, 10 of 10 on
   windows-2025 and on windows-11-arm (hunt run 40104162470). The handler now holds its return from a
   close or a shutdown it handled for 20 s, the longest of the OS's default time-outs for them (5 s for
-  a close, 20 s for a service's shutdown), so the process ends when its owner's stop ends it, or at
-  the OS's time-out: a child that never ended was still ended 4,989 to 5,004 ms after the close, the
-  hold at 20 s or 60 s alike (hunt run 40104131817). A logoff, which reaches only services and ends
-  none, is not held (`docs/runtime.md` §6.1). Test:
-  `console_close::a_console_close_waits_for_the_subscribers_orderly_stop`, a real close delivered
-  through a pseudoconsole, red at `628111e` 10 of 10 on both Windows runners and green after 10 of 10
-  (hunt run 40104131817).
+  a close, 20 s for a service's shutdown in Microsoft's table; the runner images hold a service's at 5
+  s), so the process ends when its owner's stop ends it, or at the OS's time-out: a child that never
+  ended was still ended 4,989 to 5,004 ms after the close, the hold at 20 s or 60 s alike (hunt run
+  40104131817). A logoff, which reaches only services and ends none, is not held (`docs/runtime.md`
+  §6.1). Test: `console_close::a_console_close_waits_for_the_subscribers_orderly_stop`, a real close
+  delivered through a pseudoconsole, red at `628111e` 10 of 10 on both Windows runners and green after
+  10 of 10 (hunt run 40104131817).
 
 - **hyper-quic: on the line mantle vendors, a connection on a Windows loopback went silent for a
   probe timeout right after its handshake (found by mantle; the cause was the MTU probe Q25 holds

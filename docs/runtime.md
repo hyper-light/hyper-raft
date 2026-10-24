@@ -1043,45 +1043,6 @@ and only then publishes its mask, so a restore that hands it a signal is never u
 Both orders are loom-checked (the first from both starting states). A restore that never rechecks fails
 the first model, and a claim that publishes before resetting fails the second.
 
-**Windows' terminal console events end the process at the handler's return (open, 2026-10-24, found
-by mantle; design, not yet built).** `on_control` returns TRUE as soon as it has marked and woken the
-subscribers of a kind. For Ctrl-C and Ctrl-Break that is the whole contract: handled, the process goes
-on, and the subscriber stops when it chooses. For `CTRL_CLOSE_EVENT`, `CTRL_LOGOFF_EVENT` and
-`CTRL_SHUTDOWN_EVENT` it is not: "Return TRUE. In this case, no other handler functions are called and
-the system terminates the process" (HandlerRoutine, Remarks, Microsoft Learn, read 2026-10-24). So a
-subscriber woken by a close races the termination its own handler's return starts, and its orderly
-stop (a node's last flush, its peers told) is cut wherever it stands. What the OS allows instead, from
-the same page:
-- the handler runs on a thread the system creates for it ("When the signal is received, the system
-  creates a new thread in the process to execute the function"), so it may wait;
-- the process is ended at a time-out whether the handler returns or not: close, `SPI_GETHUNGAPPTIMEOUT`,
-  5,000 ms; logoff and shutdown, `SPI_GETWAITTOKILLTIMEOUT`, 5,000 ms, a service's shutdown
-  `SPI_GETWAITTOKILLSERVICETIMEOUT`, 20,000 ms (the Timeouts table); Ctrl-C and Ctrl-Break have none;
-- logoff and shutdown reach only services ("Interactive applications are terminated at logoff").
-
-The design: the handler holds its return for a terminal kind until every subscriber it woke says its
-stop is done, or the OS's time-out for the event is spent, whichever is first.
-- `deliver` counts the slots it marks for a terminal kind (`owed`, an atomic word) and flags each slot
-  "stop owed". Ctrl-C and Ctrl-Break are untouched: marked, woken, TRUE at once.
-- A subscriber says its stop is done with `SignalStream::stopped()`, which clears its slot's flag once,
-  takes one from `owed` and wakes the handler. Dropping a stream whose stop is owed does the same, so a
-  subscriber that ends without saying so never holds the handler.
-- The handler waits on `owed`'s address (`WaitOnAddress`, woken by `WakeByAddressAll`; synchapi.h,
-  Windows 8 and Server 2012 on): no lock and no event handle, a spurious return reading `owed` again
-  ("after WaitOnAddress returns the caller should compare the new value with the original undesired
-  value"), each wait bounded by what is left of the deadline. The deadline is the event's time-out
-  as `SystemParametersInfoW` reads it at the event, the documented default where the read fails; the
-  OS ends the process at it either way, so the bound only keeps the handler from waiting past the end.
-- Then it returns TRUE, and the system ends the process with the subscribers' stops done.
-- Cost: an atomic word per slot and one for the count; nothing on Unix, nothing for Ctrl-C or
-  Ctrl-Break; the OS's own handler thread held for at most the time-out.
-
-Not built yet: what would prove it is a real close event delivered to a process on the hosted
-runners, and `GenerateConsoleCtrlEvent` sends only Ctrl-C and Ctrl-Break (SetConsoleCtrlHandler's and
-GenerateConsoleCtrlEvent's references). The way to deliver one, a child given a console of its own
-(`CREATE_NEW_CONSOLE`) whose console window is then closed, is to be measured on windows-2025 and
-windows-11-arm first; the design adds `SignalStream::stopped`, a public call, for the owners to take.
-
 ### 6.2 Stdio
 
 Reading standard input and writing standard output without blocking a shard. Readiness works on Unix for a

@@ -8068,6 +8068,34 @@ and this run is recorded for its allocation count and its shape, not for its thr
 To be recorded: the same bench on a quiet macOS host and on Linux (ext4 and XFS, NVMe), with the
 load beside each run.
 
+### A small file's open: the reader's wipe and buffer (2026-10-23)
+
+focal's content store opens a sealed object for every read and every look at its length, and a
+profile of its 64 KiB sealed reads (focal 09, 2026-10-23) gave dropping the reader 18%: every open
+made a buffer of a whole segment and a probe besides, and the drop wiped both a byte at a time with
+volatile writes. The wipe is now a fill behind an `asm!` barrier (docs/seal.md §8) and the reader
+makes its segment buffer at its first read (§4.1). The bench's small-file rows
+(`cargo bench -p hyper-seal --features files --bench files -- --small`): a 64 KiB file sealed at
+64 KiB segments, opened 2,000 times a run through one handle, so the time is the reader's own and
+not the OS's `open`; seven runs a round, the median of each round's medians over five rounds, the
+two builds interleaved round by round (fate-commit `5a22c8c` with this bench file, against the
+change; each built in a target directory of its own). macOS 26.4.1, Apple silicon, page cache,
+load 6.7 to 6.9.
+
+| Per open | before | after | change |
+|---|---|---|---|
+| open for its length: time | 16.89 us (16.86–16.98) | 1.52 us (1.50–1.60) | −91% |
+| open for its length: allocator | 3 calls, 66,132 B | 2 calls, 146 B | no segment buffer |
+| open, read whole, let go: time | 25.30 us (25.25–25.35) | 11.50 us (11.46–11.96) | −55% |
+| open, read whole, let go: allocator | 3 calls, 66,132 B | 3 calls, 65,708 B | the probe sized to what it reads |
+
+- An open that reads no plaintext now costs its header and tail reads and its key's unwrap; the
+  64 KiB buffer and its wipe were nine-tenths of it.
+- A read whole still makes, fills and wipes the buffer, now at `memset`'s speed: AES-GCM over the
+  64 KiB is most of what is left.
+- The large-file rows' count of allocator calls after setup stays 0: setup now ends with the
+  reader's first read, which makes its buffer.
+
 ## hyper-block: a batch of reads through native AIO (2026-10-08)
 
 `cargo bench -p hyper-block --bench reads -- DIR`, the reads bench above with a third row: the

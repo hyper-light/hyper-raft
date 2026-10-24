@@ -239,11 +239,15 @@ the crate that writes.
   flushes the directory (Pillai et al., OSDI 2014). A crash leaves the old file or the new one
   whole.
 - **Memory.** One aligned buffer per writer or reader, the segment and its tag, the footer and two
-  alignments, made when the writer or reader is: no allocator call after setup (counted:
-  `cargo bench -p hyper-seal --bench files`). A segment is sealed and opened in place in it, so it
-  holds plaintext while the writer or reader works: it is wiped when let go (§8's volatile writes
-  and fence), and no file's plaintext is left in memory it gives back
-  (`a_readers_and_a_writers_buffers_are_wiped_when_let_go`).
+  alignments: no allocator call after setup (counted: `cargo bench -p hyper-seal --bench files`).
+  A writer makes it when it is made; a reader when it first reads a segment, so a reader that
+  reads no plaintext (a file's length, or whether it opens at all) makes none
+  (`a_reader_makes_its_segment_buffer_at_its_first_read`). The reader's open reads the header and
+  the tail through a probe sized to them, which holds public bytes only (the header, the last
+  ciphertext, zeros and the footer) and is not wiped. A segment is sealed and opened in place in
+  the buffer, so it holds plaintext while the writer or reader works: it is wiped when let go
+  (§8's zeroing behind an optimization barrier), and no file's plaintext is left in memory it
+  gives back (`a_readers_and_a_writers_buffers_are_wiped_when_let_go`).
 - **Tests** (`sealed_file_tests.rs`) refuse a flipped byte at every offset, a cut at and between
   segment boundaries, an extension, a segment spliced from another file under the same key, two
   segments swapped, the wrong parent, a header re-pointed at another file's key record (with and
@@ -429,7 +433,12 @@ a consumer that names by BLAKE3 hashes the plaintext with BLAKE3 and keys the na
 
 A key in memory is in `Secret32`: 32 bytes in a page that is locked against swap (`mlock` on Linux
 and macOS, `VirtualLock` on Windows), kept out of core dumps where the OS offers it (`MADV_DONTDUMP`
-on Linux), and wiped on drop (volatile writes and a compiler fence). Locked pages are still written
+on Linux), and wiped on drop: zeroed at `memset`'s speed, then held past an empty assembly block
+that takes the zeros' address and, stating neither `nomem` nor `readonly`, may read any memory it
+can reach, so the compiler keeps the zeros however soon the memory is freed after (aws-lc's
+`OPENSSL_cleanse`, `crypto/mem.c`, is the same: `memset`, then
+`__asm__ __volatile__("" : : "r"(ptr) : "memory")`; release code generation keeps the zeros of a
+buffer freed at once after, and drops them without the block). Locked pages are still written
 to a hibernation image: macOS writes them to its image (encrypted under FileVault), Windows to
 `hiberfil.sys`, Linux to its swap (R §7). So:
 

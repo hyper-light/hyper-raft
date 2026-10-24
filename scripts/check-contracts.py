@@ -124,8 +124,9 @@ UNSAFE_ALLOWED = {
     "crates/hyper-seal/src/memory.rs":
         "std::alloc::alloc_zeroed for the process's key region, mlock(2) and madvise(2) "
         "MADV_DONTDUMP through rustix (Unix), VirtualLock through windows-sys (Windows), the "
-        "region's key slots read and written by their one claimer, and std::ptr::write_volatile "
-        "for the wipe a dropped key gets",
+        "region's key slots read and written by their one claimer, and the empty asm! block "
+        "after each wipe (the optimization barrier that keeps the zeros a dropped key or a sealed "
+        "file's buffer gets)",
     "crates/hyper-seal/src/file_windows.rs":
         "GetSecurityInfo, GetAclInformation, GetAce, EqualSid, IsWellKnownSid and LocalFree through "
         "windows-sys (a key file's DACL, checked owner-only)",

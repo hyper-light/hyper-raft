@@ -16,11 +16,15 @@ jobs:
       matrix:
         runner: [windows-2025, windows-11-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo test -p hyper-rt --locked --test udp_reset_diag --no-run
         shell: bash
       - run: for round in 1 2 3; do echo "ROUND $round"; cargo test -p hyper-rt --locked --test udp_reset_diag -- --nocapture --test-threads 1 || exit 1; done
+        shell: bash
+      - run: cargo test -p hyper-rt-transport --locked --test reset_e2e_diag --no-run
+        shell: bash
+      - run: for round in 1 2; do echo "ROUND $round"; cargo test -p hyper-rt-transport --locked --test reset_e2e_diag -- --nocapture --test-threads 1 || exit 1; done
         shell: bash

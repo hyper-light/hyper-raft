@@ -431,3 +431,87 @@ fn d10_driver_pattern_rounds() {
     })
     .unwrap();
 }
+
+/// The report taken first, data already queued behind it, and only then the readable wait armed:
+/// does the wait fire at once (AFD's poll completing for what is queued)?
+#[test]
+fn d11_report_taken_then_readable_armed_with_data_queued() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let a = UdpSocket::bind(lo()).unwrap();
+        let b = UdpSocket::bind(lo()).unwrap();
+        let closed = closed_port();
+        println!("DIAG d11: send astray {:?}", a.try_send_to(b"astray", closed));
+        readable_bounded("d11 after send to closed", &a).await;
+        let to = a.local_addr().unwrap();
+        println!("DIAG d11: b send {:?}", b.try_send_to(b"data-one", to));
+        fionread_at_least("d11 data queued", &a, 8).await;
+        recv_line("d11 recv takes the report", &a);
+        readable_bounded("d11 readable armed with data queued", &a).await;
+        recv_line("d11 recv after", &a);
+    })
+    .unwrap();
+}
+
+/// The async receive (`UdpSocket::recv_from`) with a report and then data queued: does it return the
+/// data with no further datagram?
+#[test]
+fn d12_recv_from_future_report_then_data() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let a = UdpSocket::bind(lo()).unwrap();
+        let b = UdpSocket::bind(lo()).unwrap();
+        let closed = closed_port();
+        println!("DIAG d12: send astray {:?}", a.try_send_to(b"astray", closed));
+        readable_bounded("d12 after send to closed", &a).await;
+        let to = a.local_addr().unwrap();
+        println!("DIAG d12: b send {:?}", b.try_send_to(b"data-one", to));
+        fionread_at_least("d12 data queued", &a, 8).await;
+        let mut buf = [0u8; 64];
+        let start = Instant::now();
+        let got = race2(a.recv_from(&mut buf), sleep(BOUND_NS)).await;
+        println!(
+            "DIAG d12: recv_from {got:?} after {:?} astray {}",
+            start.elapsed(),
+            a.astray_reports()
+        );
+    })
+    .unwrap();
+}
+
+/// A report that comes while the receive future already waits: the future is woken by the report,
+/// takes it, waits again, and the data sent after is delivered.
+#[test]
+fn d13_recv_from_waiting_when_the_report_comes() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let a = UdpSocket::bind(lo()).unwrap();
+        let b = UdpSocket::bind(lo()).unwrap();
+        let closed = closed_port();
+        let to = a.local_addr().unwrap();
+        let mut buf = [0u8; 64];
+        let start = Instant::now();
+        let got = race2(
+            join2(a.recv_from(&mut buf), async {
+                yield_now().await;
+                let astray = a.try_send_to(b"astray", closed);
+                // Wait until the report has been taken by the waiting receive.
+                let mut spins = 0u32;
+                while a.astray_reports() == 0 && spins < 1_500 {
+                    let _ = sleep(1_000_000).await;
+                    spins += 1;
+                }
+                let data = b.try_send_to(b"data-one", to);
+                (astray, spins, data)
+            }),
+            sleep(3 * BOUND_NS),
+        )
+        .await;
+        println!(
+            "DIAG d13: {got:?} after {:?} astray {}",
+            start.elapsed(),
+            a.astray_reports()
+        );
+    })
+    .unwrap();
+}

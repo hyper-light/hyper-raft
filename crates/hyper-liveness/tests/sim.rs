@@ -2125,10 +2125,9 @@ fn a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more() {
 
 /// A node restarted where it hears no peer backs its streams off, and its peers, which hear it,
 /// expect each doubling: no suspicion of it is of a heartbeat its sender had not yet due (mantle's
-/// roll: a founder started again at a new port is sent to at its old one until its peers are told,
-/// deaf on the plane, and an election storm came with it on one CPU). Its streams state each gap
-/// and double it (`Pair::backed_off`), and a heartbeat that echoes nothing tells the peer to
-/// expect that (`unanswered_next`). Doubled from the floor, unforeseen, each doubling came a whole
+/// roll test restarts a founder so: at a new port, which its peers send to at its old one until
+/// they are told). Its streams state each gap and double it (`Pair::backed_off`), and a heartbeat
+/// that echoes nothing tells the peer to expect that (`unanswered_next`). Doubled from the floor, unforeseen, each doubling came a whole
 /// gap past the peers' freshness point: 49 to 91 suspicions of the live node a world, in 8 seeds of
 /// 8 over its 10 s deaf, where the node sending at its floor drew 0 to 2, each a late heartbeat of
 /// its own.

@@ -1128,8 +1128,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   floor read where it rose. Doubled from the floor unannounced, each doubling came a whole gap past
   the receiver's freshness point: a node restarted deaf was suspected by both live peers at every
   doubling, 49 to 91 suspicions a world in 8 seeds of 8 over 10 s, where the same node at its floor
-  drew 0 to 2, each a late heartbeat of its own; on one CPU mantle's roll test met an election storm
-  (two of five ranges at term 132) with it. The peer's first heartbeat taken ends it: the next
+  drew 0 to 2, each a late heartbeat of its own (a restart mantle's roll test makes; its own failure
+  there was its watch's, mantle `411ec501`). The peer's first heartbeat taken ends it: the next
   heartbeat is due at once, numbered next and starting the schedule anew at the floor's interval, so a
   send late on its flush is late by as much and skips no slot, and the stream sends at its floor from
   then on, since the peer judges this node from its own start (stated as its spacing from the one

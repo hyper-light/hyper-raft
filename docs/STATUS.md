@@ -283,24 +283,24 @@ is worked around.
   reports"); the silence mantle saw is the entry above.
 
 - **hyper-liveness: a node that heard no peer backed off unannounced, and the peers that heard it
-  suspected it at every doubling (found by mantle after taking `dd764a0`).** mantle's roll test, a
-  cell of three with one node stopped and started again at a time, met an election storm on one CPU
-  (two of five ranges at term 132, the other members saying every range had no leader; 1 run of 3 on
-  its linux-aarch64-1cpu job, and on fedora under `taskset`). Its restart makes the case this entry
-  closes: a founder started again at a new port is sent to at its old one until its peers are told, so
-  it hears no peer and its streams back off (the entry below), while its peers hear it and judge it by
-  those heartbeats. Each heartbeat states the gap before it and each doubling came unannounced, a
-  whole gap past the peers' freshness point: in the simulation's four worlds a node restarted deaf for
-  10 s was suspected by both live peers at every doubling, 49 to 91 times a world in 8 seeds of 8,
-  where the same node at its floor drew 0 to 2. The stream now doubles the gap it states, never below
-  its floor, and a heartbeat that echoes nothing (its sender has taken none of the receiver's) tells
-  the receiver to expect twice the gap next (`unanswered_next`): 0 to 2 a world, each a heartbeat its
-  sender sent late (macOS: 196 ms on its own flush). Test:
-  `sim::a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (red before: node 1
-  suspected the restarted node 190 ms before its next heartbeat was due). The back-off tests keep
-  their schedules; `--bench allocs` 0 allocations, reallocations, bytes and faults a heartbeat before
-  and after, 80 to 116 ns a heartbeat both (`docs/timing.md` §2.8, "A peer that has said nothing").
-  Whether this was the whole storm is mantle's trace to say.
+  suspected it at every doubling (found 2026-10-24 in the simulation, looking into mantle's roll
+  test).** A node restarted where it hears no peer backs its streams off (the entry below) while its
+  peers hear it and judge it by those heartbeats, as mantle's roll test restarts a founder at a new
+  port that its peers send to at its old one until they are told. Each heartbeat states the gap before
+  it and each doubling came unannounced, a whole gap past the peers' freshness point: in the
+  simulation's four worlds a node restarted deaf for 10 s was suspected by both live peers at every
+  doubling, 49 to 91 times a world in 8 seeds of 8, where the same node at its floor drew 0 to 2. The
+  stream now doubles the gap it states, never below its floor, and a heartbeat that echoes nothing
+  (its sender has taken none of the receiver's) tells the receiver to expect twice the gap next
+  (`unanswered_next`): 0 to 2 a world, each a heartbeat its sender sent late (macOS: 196 ms on its own
+  flush). Test: `sim::a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (red
+  before: node 1 suspected the restarted node 190 ms before its next heartbeat was due). The back-off
+  tests keep their schedules; `--bench allocs` 0 allocations, reallocations, bytes and faults a
+  heartbeat before and after, 80 to 116 ns a heartbeat both (`docs/timing.md` §2.8, "A peer that has
+  said nothing"). mantle traced its roll test's failure to the test's own watch (mantle serve-cell
+  `411ec501`), not to this; with founders started 25 s apart, the first alone 50 s, the simulation
+  shows no suspicion of a live peer the back-off adds (0 to 17 a world with none, 0 to 7 with it
+  unannounced, 0 to 6 announced).
 
 - **hyper-liveness: a node whose peers never answered heartbeated each at its floor and flushed its
   log for every heartbeat, for as long as they said nothing (found by mantle).** Before the receiver

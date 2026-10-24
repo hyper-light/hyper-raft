@@ -547,6 +547,24 @@ is worked around.
   `tests/udp_astray_reads_on.rs` keeps it so on Windows CI (`docs/runtime.md` §5.1, "Astray
   reports"); the silence mantle saw is the entry above.
 
+- **hyper-liveness: a node whose peers never answered heartbeated each at its floor and flushed its
+  log for every heartbeat, for as long as they said nothing (found by mantle).** Before the receiver
+  has chosen a stream sends at its floor, `E[flush] + G`, and a receiver that never answers never
+  chooses: a founder of mantle's three-node cell started alone flushed about ten thousand times a
+  second on fedora's NVMe at 132% of a core, and a node restarted into a cell before it learned where
+  its peers listened wrote 82 MB/s for thirty minutes. A stream to a peer from which nothing has come
+  is a sender with no return traffic, which RFC 8085 §3.1.3 (BCP 145) holds to one datagram every
+  3 s: its interval doubles from the floor at each heartbeat up to 3 s (never below the floor), its
+  liveness writes with it, and the peer's first heartbeat taken is answered at once, the stream at
+  its floor from then on (`docs/timing.md` §2.8, "A peer that has said nothing"). Tests
+  (`tests/sim.rs`): `a_node_whose_peers_never_answer_backs_off_to_a_heartbeat_every_three_seconds`
+  (red at `54d7106`: 6,879 heartbeats to a peer in a minute of macOS's world, against at most 31) and
+  `a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more` (red without the answer
+  at once: 2,354 ms against a poll's and a flush's 44 ms), and
+  `pair::tests::a_stream_never_heard_backs_off_to_three_seconds_and_answers_its_peer_at_once` (the
+  schedule exactly; the answer numbered next, no slot skipped, where an answer stated as its spacing
+  from the heartbeat before skipped 50).
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

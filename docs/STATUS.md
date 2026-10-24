@@ -547,6 +547,44 @@ is worked around.
   `tests/udp_astray_reads_on.rs` keeps it so on Windows CI (`docs/runtime.md` §5.1, "Astray
   reports"); the silence mantle saw is the entry above.
 
+- **hyper-liveness: a node that heard no peer backed off unannounced, and the peers that heard it
+  suspected it at every doubling (found 2026-10-24 in the simulation, looking into mantle's roll
+  test).** A node restarted where it hears no peer backs its streams off (the entry below) while its
+  peers hear it and judge it by those heartbeats, as mantle's roll test restarts a founder at a new
+  port that its peers send to at its old one until they are told. Each heartbeat states the gap before
+  it and each doubling came unannounced, a whole gap past the peers' freshness point: in the
+  simulation's four worlds a node restarted deaf for 10 s was suspected by both live peers at every
+  doubling, 49 to 91 times a world in 8 seeds of 8, where the same node at its floor drew 0 to 2. The
+  stream now doubles the gap it states, never below its floor, and a heartbeat that echoes nothing
+  (its sender has taken none of the receiver's) tells the receiver to expect twice the gap next
+  (`unanswered_next`): 0 to 2 a world, each a heartbeat its sender sent late (macOS: 196 ms on its own
+  flush). Test: `sim::a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (red
+  before: node 1 suspected the restarted node 190 ms before its next heartbeat was due). The back-off
+  tests keep their schedules; `--bench allocs` 0 allocations, reallocations, bytes and faults a
+  heartbeat before and after, 80 to 116 ns a heartbeat both (`docs/timing.md` §2.8, "A peer that has
+  said nothing"). mantle traced its roll test's failure to the test's own watch (mantle serve-cell
+  `411ec501`), not to this; with founders started 25 s apart, the first alone 50 s, the simulation
+  shows no suspicion of a live peer the back-off adds (0 to 17 a world with none, 0 to 7 with it
+  unannounced, 0 to 6 announced).
+
+- **hyper-liveness: a node whose peers never answered heartbeated each at its floor and flushed its
+  log for every heartbeat, for as long as they said nothing (found by mantle).** Before the receiver
+  has chosen a stream sends at its floor, `E[flush] + G`, and a receiver that never answers never
+  chooses: a founder of mantle's three-node cell started alone flushed about ten thousand times a
+  second on fedora's NVMe at 132% of a core, and a node restarted into a cell before it learned where
+  its peers listened wrote 82 MB/s for thirty minutes. A stream to a peer from which nothing has come
+  is a sender with no return traffic, which RFC 8085 §3.1.3 (BCP 145) holds to one datagram every
+  3 s: its interval doubles from the floor at each heartbeat up to 3 s (never below the floor), its
+  liveness writes with it, and the peer's first heartbeat taken is answered at once, the stream at
+  its floor from then on (`docs/timing.md` §2.8, "A peer that has said nothing"). Tests
+  (`tests/sim.rs`): `a_node_whose_peers_never_answer_backs_off_to_a_heartbeat_every_three_seconds`
+  (red at `54d7106`: 6,879 heartbeats to a peer in a minute of macOS's world, against at most 31) and
+  `a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more` (red without the answer
+  at once: 2,354 ms against a poll's and a flush's 44 ms), and
+  `pair::tests::a_stream_never_heard_backs_off_to_three_seconds_and_answers_its_peer_at_once` (the
+  schedule exactly; the answer numbered next, no slot skipped, where an answer stated as its spacing
+  from the heartbeat before skipped 50).
+
 ### Closed (2026-10-21)
 
 - **hyper-liveness: on a device the nodes share, a stall of it made every judge suspect every peer

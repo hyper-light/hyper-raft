@@ -632,6 +632,31 @@ pub(crate) mod imp {
         }
     }
 
+    /// DIAG (hunt branch): the last datagrams moved, process-wide, each a line with its time.
+    #[allow(clippy::disallowed_types)]
+    static DIAG_LOG: std::sync::Mutex<std::collections::VecDeque<String>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+
+    /// DIAG (hunt branch): logs one line, keeping the last 4,096.
+    #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+    pub(crate) fn diag_log(line: String) {
+        if let Ok(mut log) = DIAG_LOG.lock() {
+            if log.len() >= 4096 {
+                log.pop_front();
+            }
+            log.push_back(format!("{:?} {line}", diag_since()));
+        }
+    }
+
+    /// DIAG (hunt branch): takes the log.
+    #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+    pub(crate) fn diag_take() -> Vec<String> {
+        DIAG_LOG
+            .lock()
+            .map(|mut log| log.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// DIAG (hunt branch): with HYPER_RT_DIAG_REPORTS_OFF set, a new socket asks for no reports.
     #[allow(clippy::disallowed_macros, clippy::print_stderr)]
     fn diag_reports_off(socket: &Socket) {
@@ -1087,8 +1112,16 @@ pub(crate) mod imp {
                 )));
             }
             diag_error("recvfrom", socket, from_sockaddr(&from));
+            // SAFETY: a pure query of thread-local last-error state.
+            let code = unsafe { WSAGetLastError() };
+            if code != WSAEWOULDBLOCK {
+                diag_log(format!("R{} error {code} from {:?}", socket.socket, from_sockaddr(&from)));
+            }
+            // SAFETY: restores the error for `classify`.
+            unsafe { windows_sys::Win32::Networking::WinSock::WSASetLastError(code) };
             return classify("recvfrom");
         }
+        diag_log(format!("R{} from {:?} {rc}", socket.socket, from_sockaddr(&from)));
         let unspecified = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         Ok(Io::Ready((
             usize::try_from(rc).unwrap_or(0),
@@ -1116,8 +1149,10 @@ pub(crate) mod imp {
         };
         if rc == SOCKET_ERROR {
             diag_error("sendto", socket, Some(addr));
+            diag_log(format!("S{} to {addr} ERR", socket.socket));
             return classify("sendto");
         }
+        diag_log(format!("S{} to {addr} {rc}", socket.socket));
         Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
     }
 
@@ -1165,6 +1200,8 @@ pub(crate) use imp as winsock;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
+#[cfg(windows)]
+pub(crate) use imp::diag_take;
 pub(crate) use imp::{
     adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, queued_bytes,
     recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,

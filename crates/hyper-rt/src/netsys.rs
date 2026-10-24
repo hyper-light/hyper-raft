@@ -620,7 +620,7 @@ pub(crate) mod imp {
     fn diag_error(call: &str, socket: &Socket, addr: Option<SocketAddr>) {
         // SAFETY: a pure query of thread-local last-error state.
         let code = unsafe { WSAGetLastError() };
-        if code != WSAEWOULDBLOCK {
+        if code != WSAEWOULDBLOCK || call != "recvfrom" {
             let local = local_addr(socket).ok();
             eprintln!(
                 "DIAGNET {:?} {call} local {local:?} to/from {addr:?} error {code}",

@@ -107,6 +107,20 @@ end on a line of its own rather than in the cell table: 1.5 ns where other threa
 Found under load or by a fault a test injected. They are traced as far as the evidence goes; none
 is worked around.
 
+- **hyper-rt: on Windows a subscriber cannot stop in order on a console close, logoff or shutdown
+  (found 2026-10-24 by mantle; designed, not built).** The console handler returns TRUE as soon as it
+  has woken the subscribers, and for these three events the system then ends the process
+  (HandlerRoutine: "Return TRUE. In this case, no other handler functions are called and the system
+  terminates the process"), so a subscriber's orderly stop races its own handler's return. The OS
+  runs the handler on a thread of its own and waits for it up to a time-out (close
+  `SPI_GETHUNGAPPTIMEOUT`, 5,000 ms; logoff and shutdown `SPI_GETWAITTOKILLTIMEOUT`, 5,000 ms, a
+  service's shutdown 20,000 ms). The design (`docs/runtime.md` §6.1): the handler holds its return
+  for those three kinds until each subscriber it woke says its stop is done
+  (`SignalStream::stopped`, or the stream dropped), waiting on the count's address
+  (`WaitOnAddress`), bounded by the event's time-out. Not built until a close event can be delivered
+  to a process on the hosted runners, which `GenerateConsoleCtrlEvent` (Ctrl-C and Ctrl-Break only)
+  cannot do.
+
 - **hyper-liveness: a node that never heard any peer judges none (found 2026-10-20, beside the deaf
   leader below).** A node deaf from its start has no link heard, so no pool to starve and no
   interval to time a starvation by (`Liveness::starves`), and a peer never heard is judged only by

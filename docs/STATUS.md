@@ -564,6 +564,26 @@ is worked around.
   `tests/udp_astray_reads_on.rs` keeps it so on Windows CI (`docs/runtime.md` §5.1, "Astray
   reports"); the silence mantle saw is the entry above.
 
+- **hyper-liveness: a node that heard no peer backed off unannounced, and the peers that heard it
+  suspected it at every doubling (found by mantle after taking `dd764a0`).** mantle's roll test, a
+  cell of three with one node stopped and started again at a time, met an election storm on one CPU
+  (two of five ranges at term 132, the other members saying every range had no leader; 1 run of 3 on
+  its linux-aarch64-1cpu job, and on fedora under `taskset`). Its restart makes the case this entry
+  closes: a founder started again at a new port is sent to at its old one until its peers are told, so
+  it hears no peer and its streams back off (the entry below), while its peers hear it and judge it by
+  those heartbeats. Each heartbeat states the gap before it and each doubling came unannounced, a
+  whole gap past the peers' freshness point: in the simulation's four worlds a node restarted deaf for
+  10 s was suspected by both live peers at every doubling, 49 to 91 times a world in 8 seeds of 8,
+  where the same node at its floor drew 0 to 2. The stream now doubles the gap it states, never below
+  its floor, and a heartbeat that echoes nothing (its sender has taken none of the receiver's) tells
+  the receiver to expect twice the gap next (`unanswered_next`): 0 to 2 a world, each a heartbeat its
+  sender sent late (macOS: 196 ms on its own flush). Test:
+  `sim::a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (red before: node 1
+  suspected the restarted node 190 ms before its next heartbeat was due). The back-off tests keep
+  their schedules; `--bench allocs` 0 allocations, reallocations, bytes and faults a heartbeat before
+  and after, 80 to 116 ns a heartbeat both (`docs/timing.md` §2.8, "A peer that has said nothing").
+  Whether this was the whole storm is mantle's trace to say.
+
 - **hyper-liveness: a node whose peers never answered heartbeated each at its floor and flushed its
   log for every heartbeat, for as long as they said nothing (found by mantle).** Before the receiver
   has chosen a stream sends at its floor, `E[flush] + G`, and a receiver that never answers never

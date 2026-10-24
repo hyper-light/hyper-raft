@@ -1118,37 +1118,50 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   flushing is not trusted either (`Refusal::Unproven`). Idle, a node makes at most one liveness
   write per smallest interval among its pairs, shared by every pair; a node whose groups write makes
   none.
-- **A peer that has said nothing** (2026-10-24, found by mantle). Before the receiver has chosen,
-  a stream sends at its floor, and to a peer from which nothing ever came it stayed there, asking a
+- **A peer that has said nothing** (2026-10-24, found by mantle). Before the receiver has chosen, a
+  stream sends at its floor, and to a peer from which nothing ever came it stayed there, asking a
   flush for each heartbeat, for as long as the peer said nothing. A founder of mantle's three-node
-  cell started alone (`mantle init` with every port 0, so it knew no peer's address), on fedora's
-  NVMe at a floor of 80 to 115 µs, made 225,000 to 248,000 write calls every two seconds at 132% of a
-  core, and a node restarted into a cell before it learned where its peers listened wrote 82 MB/s
-  for thirty minutes. RFC 8085 §3.1.3 (BCP 145) bounds such a sender: one that "cannot maintain an
-  RTT estimate for a destination, because the destination does not send return traffic" "SHOULD NOT
-  send more than one UDP datagram every 3 seconds", and one with too few datagrams for an estimate
-  "MAY use a predetermined transmission interval that is exponentially backed off". A stream to a
-  peer from which no heartbeat has come so backs off (`Pair::backed_off`): its interval, the one the
-  floor and the peer's ask give, doubles at each heartbeat sent (RFC 6298 §5.5's back-off) up to
-  3 s, never below the floor, which a floor past 3 s keeps. The flushes follow, a liveness write
-  asked only for a heartbeat due. The peer's first heartbeat taken ends it: the next heartbeat is
-  due at once, numbered next and starting the schedule anew at the floor's interval, so a send late
-  on its flush is late by as much and skips no slot, and the stream sends at its floor from then on,
-  since the peer judges this node from its own start (stated as its spacing from the one before,
-  an answer to a peer heard 10 µs after a heartbeat went skipped 50 slots on a 500 µs flush). The stream starts at its floor, not at
-  the 1 s RFC 8085's first case recommends as an initial interval: its first heartbeats are a
-  receiver's evidence at the sender's stable rate, and the ramp passes a second within
-  `log2(1 s / floor)` heartbeats, about 2 s of the stream's time. A
-  peer heard once and then silent keeps the interval it asked, which a receiver chose; whether a
-  suspected peer's stream should back off as well is open, since a peer that is alive but unheard
-  would then see this node's heartbeats slow and suspect it in turn. Tests (`tests/sim.rs`):
+  cell started alone (`mantle init` with every port 0, so it knew no peer's address), on fedora's NVMe
+  at a floor of 80 to 115 µs, made 225,000 to 248,000 write calls every two seconds at 132% of a core,
+  and a node restarted into a cell before it learned where its peers listened wrote 82 MB/s for thirty
+  minutes. RFC 8085 §3.1.3 (BCP 145) bounds such a sender: one that "cannot maintain an RTT estimate
+  for a destination, because the destination does not send return traffic" "SHOULD NOT send more than
+  one UDP datagram every 3 seconds", and one with too few datagrams for an estimate "MAY use a
+  predetermined transmission interval that is exponentially backed off". A stream to a peer from which
+  no heartbeat has come so backs off (`Pair::backed_off`): its interval, the one the floor and the
+  peer's ask give, doubles at each heartbeat sent (RFC 6298 §5.5's back-off) up to 3 s, never below
+  the floor, which a floor past 3 s keeps. The flushes follow, a liveness write asked only for a
+  heartbeat due. Its peers may hear it while it hears them not (mantle's roll: a founder started again
+  at a new port is sent to at its old one until its peers are told), and they judge it by the
+  heartbeats whose gaps it doubles. Each heartbeat states the gap before it, and the stream doubles
+  that stated gap, never below its floor, so a heartbeat that echoes nothing, its sender having taken
+  none of the receiver's, tells the receiver to expect twice the gap next (`unanswered_next`), the
+  floor read where it rose. Doubled from the floor unannounced, each doubling came a whole gap past
+  the receiver's freshness point: a node restarted deaf was suspected by both live peers at every
+  doubling, 49 to 91 suspicions a world in 8 seeds of 8 over 10 s, where the same node at its floor
+  drew 0 to 2, each a late heartbeat of its own; on one CPU mantle's roll test met an election storm
+  (two of five ranges at term 132) with it. The peer's first heartbeat taken ends it: the next
+  heartbeat is due at once, numbered next and starting the schedule anew at the floor's interval, so a
+  send late on its flush is late by as much and skips no slot, and the stream sends at its floor from
+  then on, since the peer judges this node from its own start (stated as its spacing from the one
+  before, an answer to a peer heard 10 µs after a heartbeat went skipped 50 slots on a 500 µs flush).
+  The stream starts at its floor, not at the 1 s RFC 8085's first case recommends as an initial
+  interval: its first heartbeats are a receiver's evidence at the sender's stable rate, and the ramp
+  passes a second within `log2(1 s / floor)` heartbeats, about 2 s of the stream's time. A peer heard
+  once and then silent keeps the interval it asked, which a receiver chose; a suspected peer's stream
+  does not back off, since a peer alive but unheard would see this node's heartbeats slow with no
+  echo-less heartbeat to tell it so. Tests (`tests/sim.rs`):
   `a_node_whose_peers_never_answer_backs_off_to_a_heartbeat_every_three_seconds` (a node of three
   alone a minute in the four worlds: at `54d7106` 6,879 heartbeats to a peer in macOS's world, each at
   the floor, against at most 31 now, the stream's liveness writes no more than its heartbeats) and
   `a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more` (answered 2,354 ms after
   the peer's first heartbeat with the back-off and no answer at once, within a poll's and a flush's
-  lateness with it); `pair::tests::a_stream_never_heard_backs_off_to_three_seconds_and_answers_its_peer_at_once`
-  states the schedule exactly, the answer numbered next with no slot skipped.
+  lateness with it);
+  `pair::tests::a_stream_never_heard_backs_off_to_three_seconds_and_answers_its_peer_at_once` states
+  the schedule exactly, the answer numbered next with no slot skipped; and
+  `a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (a node of three restarted
+  deaf for 10 s in the four worlds: no suspicion of it is of a heartbeat not yet due by its schedule,
+  where with the doubling unannounced macOS's first seed had one 190 ms before it).
 - **A stream keeps its schedule without hearing its peer.** A heartbeat sent whose next slot is
   already due asks at once for the flush that proves the next (`Liveness::poll`), and its completion
   polls the stream. Its next slot is due already where the interval fell while the stream was

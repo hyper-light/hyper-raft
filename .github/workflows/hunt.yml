@@ -1,0 +1,24 @@
+name: hunt
+
+# hunt/udp-reset-guard-main: the Windows report guard (crates/hyper-rt/tests/udp_astray_reads_on.rs)
+# on main, before it is offered there; the gates are not run on this branch.
+on:
+  push:
+    branches: ["hunt/udp-reset-guard-main"]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: for round in 1 2 3 4 5; do cargo test -p hyper-rt --locked --test udp_astray_reads_on --test udp_astray -- --nocapture || exit 1; done
+        shell: bash

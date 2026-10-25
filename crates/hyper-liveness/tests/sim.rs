@@ -2312,10 +2312,11 @@ fn a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat() {
 /// A node that stops in order announces it to its peers (`Liveness::stop`), and its next run's
 /// start is no failure in their MTBF's evidence, nor is their letting go of the pair while they
 /// suspect it: the MTBF counts what a detector must catch, and an orderly stop handed over what it
-/// led first. Until its next run is heard, the announced run is sent nothing, where each heartbeat
-/// to it asked a flush of its own; that run's first heartbeat is answered at once, numbered next.
+/// led first. Until its next run is heard, the announced run is sent nothing but the one heartbeat
+/// that answers the announcement, where each heartbeat to it asked a flush of its own; that run's
+/// first heartbeat is answered at once, numbered next.
 /// Do: three nodes settled; the third announces its stop and stops; its peers suspect it at the
-/// announcement; it starts again. Expect: no heartbeat sent the stopped run after its
+/// announcement; it starts again. Expect: the stopped run sent only the answer after its
 /// announcement was taken; the restart reported and counted no failure; the first heartbeat each
 /// peer sends the new run is numbered next and sent within a poll's and a flush's lateness of taking
 /// its first; and a node that lets go of an announced, suspected peer counts no failure.
@@ -2338,7 +2339,8 @@ fn a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_n
             sim.nodes[2].alive = false;
             let stopped_at = sim.now;
             sim.run_until_suspected(2);
-            // Taken by both: each sent the stopped run nothing after it took the announcement.
+            // Taken by both: each sent the stopped run its answer after it took the announcement, and
+            // nothing else.
             let announced: Vec<u64> = (0..2)
                 .map(|node| {
                     sim.nodes[node]
@@ -2364,13 +2366,13 @@ fn a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_n
                 let after: Vec<u64> = sim.nodes[node]
                     .log
                     .iter()
-                    .filter(|(at, peer, _)| *peer == 3 && at > announced)
+                    .filter(|(at, peer, _)| *peer == 3 && at >= announced)
                     .map(|(at, _, _)| *at)
                     .collect();
                 assert!(
-                    after.is_empty(),
+                    after.len() == 1,
                     "{name} seed {seed}: node {} sent the stopped run {} heartbeats after its \
-                     announcement, the first {} ms after the stop",
+                     announcement, where it answers it once, the first {} ms after the stop",
                     node + 1,
                     after.len(),
                     after.first().map_or(0, |at| (at - stopped_at) / MS)
@@ -2656,6 +2658,121 @@ fn a_stop_announced_is_suspected_at_its_arrival_and_its_run_never_trusted_again(
                 );
             }
             sim.run_until_configured();
+        }
+    }
+}
+
+/// A stop announced is answered: each peer that takes the announcement sends the stopping run one
+/// heartbeat that echoes it, proven as any, and nothing else, and the stopping node, which runs on
+/// as an owner that announces before it hands over does, knows each peer took it
+/// (`Liveness::stop_taken`). An announcement lost on its way goes again at the stream's interval
+/// until the answer comes. Do: three nodes settled; the third announces its stop and runs on, its
+/// first announcement to the first node lost. Expect: the third knows both peers took it, the
+/// first only after an announcement sent again; each peer answered each announcement it took
+/// once, echoing one, and sent the third nothing else; the third sends no announcement after a
+/// peer's answer, and none to the second but the first.
+#[test]
+fn a_stop_announced_is_answered_once_and_the_stopping_node_knows_it_was_taken() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(26, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let logged: Vec<usize> = (0..3).map(|node| sim.nodes[node].log.len()).collect();
+            {
+                let now = sim.now;
+                let n = &mut sim.nodes[2];
+                n.liveness.stop(now, &mut n.owner);
+                assert!(!n.liveness.stop_taken(1) && !n.liveness.stop_taken(2));
+                // Lost on its way to the first node: sent, and never delivered.
+                let now = sim.now;
+                let (lost, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut n.owner.sent)
+                    .into_iter()
+                    .partition(|(peer, _)| *peer == 1);
+                n.owner.sent = kept;
+                for (peer, bytes) in lost {
+                    let beat = Heartbeat::decode(&bytes).unwrap();
+                    n.log.push((now, peer, beat));
+                    n.record.sent(peer, beat.run, beat.seq);
+                }
+            }
+            sim.drain(2);
+            // Within the time an announcement sent again and its answer take: a freshness, which
+            // holds the stream's interval, for each, and what a host's freeze or a write held back.
+            let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            let until = sim.now + 4 * freshness + 2 * behind;
+            sim.run_while(
+                |sim| !(1..=2).all(|peer| sim.nodes[2].liveness.stop_taken(peer)),
+                Some(until),
+            );
+            for peer in 1..=2 {
+                assert!(
+                    sim.nodes[2].liveness.stop_taken(peer),
+                    "{name} seed {seed}: node {peer} did not answer the announcement within {} ms",
+                    (4 * freshness + 2 * behind) / MS
+                );
+            }
+            let first_ns = sim.nodes[2].log[logged[2]..]
+                .iter()
+                .map(|(_, _, beat)| beat.sent_ns)
+                .min()
+                .expect("the announcement went");
+            // Each announcement the stopping node sent each peer, and when the answer came.
+            for (node, peer) in [(0usize, 1u64), (1, 2)] {
+                let goodbyes: Vec<(u64, Heartbeat)> = sim.nodes[2].log[logged[2]..]
+                    .iter()
+                    .filter(|(_, to, _)| *to == peer)
+                    .map(|(at, _, beat)| (*at, *beat))
+                    .collect();
+                assert!(
+                    goodbyes.iter().all(|(_, beat)| beat.stopping),
+                    "{name} seed {seed}: the stopping node sent node {peer} a heartbeat"
+                );
+                let taken = sim.nodes[node]
+                    .record
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry, record::Entry::Fed { peer: 3, beat, refused: None, .. }
+                            if beat.stopping)
+                    })
+                    .count();
+                let answers: Vec<Heartbeat> = sim.nodes[node].log[logged[node]..]
+                    .iter()
+                    .filter(|(_, to, _)| *to == 3)
+                    .map(|(_, _, beat)| *beat)
+                    .filter(|beat| beat.echo.is_some_and(|echo| echo.sent_ns >= first_ns))
+                    .collect();
+                assert!(
+                    taken >= 1 && answers.len() == taken,
+                    "{name} seed {seed}: node {peer} took {taken} announcements and answered {}",
+                    answers.len()
+                );
+                if peer == 1 {
+                    assert!(
+                        goodbyes.len() >= 2,
+                        "{name} seed {seed}: the announcement lost on its way went once"
+                    );
+                } else {
+                    assert_eq!(goodbyes.len(), 1, "{name} seed {seed}: sent node 2 again");
+                }
+            }
+            // Answered, the stopping node sends no more; the peers send it nothing more.
+            let counts: Vec<usize> = (0..3).map(|node| sim.nodes[node].log.len()).collect();
+            let until = sim.now + 4 * freshness;
+            sim.run_while(|_| true, Some(until));
+            for (node, count) in counts.iter().enumerate() {
+                let more: Vec<&(u64, PeerId, Heartbeat)> = sim.nodes[node].log[*count..]
+                    .iter()
+                    .filter(|(_, to, _)| node == 2 || *to == 3)
+                    .collect();
+                assert!(
+                    more.is_empty(),
+                    "{name} seed {seed}: node {} sent {} heartbeats after the answers",
+                    node + 1,
+                    more.len()
+                );
+            }
         }
     }
 }

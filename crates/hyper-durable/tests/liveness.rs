@@ -849,3 +849,150 @@ fn a_voters_announced_stop_leaves_no_window_for_a_wrong_suspicion() {
         world.run_until(|w| w.applied_everywhere(b"back"));
     }
 }
+
+/// mantle's orderly stop with the announcement first (`docs/timing.md` §2.9, "A voter's stop
+/// announced"): the leader's node announces its stop, its members running on; once each other node
+/// answered it (`Liveness::stop_taken`), it hands its group's lead over by a transfer, and its own
+/// member learns the new leader from the transferee's first append of its term. From the moment
+/// all three name the new leader until the stopped node is back, the two that remain name it in its
+/// term, through a wrong suspicion of it. Do: a group whose links are all judged; the leader's node
+/// announces its stop; once both answered, its replica transfers the lead to a follower, if it
+/// still leads; once all three name one new leader, the stopping node stops, and the other
+/// remaining member's core is told the new leader is suspected, wrongly, for a quiet period; the
+/// stopped node starts again. Expect: every step from then, the two name the new leader in its
+/// term; a write commits; the restart is told and counts no failure.
+#[test]
+fn an_orderly_stop_announced_first_hands_over_and_keeps_the_new_leader() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    for seed in first..first + support::count("HYPER_DURABLE_LIVENESS_SEEDS", 64) {
+        let mut world = World::new(seed);
+        world.run_until(|w| {
+            w.leader()
+                .is_some_and(|leader| (1..=3).all(|peer| peer == leader || w.judged(peer)))
+                && w.judged(w.leader().unwrap_or(0))
+        });
+        let stopping = world.leader().unwrap();
+        let others: Vec<u64> = (1..=3).filter(|id| *id != stopping).collect();
+        let at = |id: u64| (id - 1) as usize;
+        let failures: Vec<u64> = others
+            .iter()
+            .map(|id| world.nodes[at(*id)].liveness.history().failures())
+            .collect();
+        // The announcement first: the node runs on, its members leading and following as before.
+        {
+            let now = world.now;
+            let node = &mut world.nodes[at(stopping)];
+            let mut live = Live::default();
+            node.liveness.stop(now, &mut live);
+            for (peer, message) in live.heartbeats {
+                world.send(stopping, peer, Payload::Liveness(message));
+            }
+        }
+        // Answered within a quiet period, the nodes' own measure of how long a heartbeat and a
+        // flush may take (`World::quiet`).
+        let answered = |w: &World| {
+            others
+                .iter()
+                .all(|peer| w.nodes[at(stopping)].liveness.stop_taken(*peer))
+        };
+        let until = world.now + world.quiet();
+        while !answered(&world) && world.now < until {
+            world.next();
+        }
+        assert!(
+            answered(&world),
+            "seed {seed}: the announcement was not answered within a quiet period"
+        );
+        for id in &others {
+            assert!(
+                world.nodes[at(*id)].liveness.stopped(stopping),
+                "seed {seed}: node {id} answered an announcement it does not hold"
+            );
+        }
+        // Then the hand-over, as mantle's: a transfer, where the node still leads.
+        if world.replica(stopping).is_leader() {
+            let node = &mut world.nodes[at(stopping)];
+            let replica = node.owner.get_mut(node.handle).unwrap();
+            replica.transfer(others[0]).unwrap();
+            node.owner.schedule(node.handle);
+            node.alarm = Some(world.now);
+        }
+        world.run_until(|w| {
+            let leader = w.replica(others[0]).leader();
+            leader != 0 && leader != stopping && (1..=3).all(|id| w.replica(id).leader() == leader)
+        });
+        let leader = world.replica(others[0]).leader();
+        let follower = if leader == others[0] {
+            others[1]
+        } else {
+            others[0]
+        };
+        let term = world.replica(leader).term();
+        world.nodes[at(stopping)].alive = false;
+        {
+            let node = &mut world.nodes[at(follower)];
+            node.owner
+                .get_mut(node.handle)
+                .unwrap()
+                .suspect(leader)
+                .unwrap();
+            node.owner.schedule(node.handle);
+            node.alarm = Some(world.now);
+        }
+        let held = |w: &World| {
+            let (l, f) = (w.replica(leader), w.replica(follower));
+            assert!(
+                l.is_leader() && l.term() == term,
+                "seed {seed}: the new leader lost term {term} at {} ns",
+                w.now
+            );
+            assert!(
+                f.core().raft.state() == hyper_raft::StateRole::Follower
+                    && f.leader() == leader
+                    && f.term() == term,
+                "seed {seed}: the follower left the new leader at {} ns: {:?}, leader {}, term {}",
+                w.now,
+                f.core().raft.state(),
+                f.leader(),
+                f.term()
+            );
+        };
+        let until = world.now + world.quiet();
+        while world.now < until {
+            world.next();
+            held(&world);
+        }
+        assert!(world.propose(b"handed over"));
+        world.run_until(|w| {
+            held(w);
+            w.applied_everywhere(b"handed over")
+        });
+        {
+            let node = &mut world.nodes[at(follower)];
+            node.owner
+                .get_mut(node.handle)
+                .unwrap()
+                .trust(leader)
+                .unwrap();
+            node.owner.schedule(node.handle);
+            node.alarm = Some(world.now);
+        }
+        world.restarts.clear();
+        world.restart(stopping);
+        world.run_until(|w| {
+            others
+                .iter()
+                .all(|id| w.restarts.contains(&(*id, stopping)))
+        });
+        for (id, failures) in others.iter().zip(failures) {
+            assert_eq!(
+                world.nodes[at(*id)].liveness.history().failures(),
+                failures,
+                "seed {seed}: node {id} counted the restart after an announced stop a failure"
+            );
+        }
+        world.run_until(|w| w.leader().is_some());
+        assert!(world.propose(b"back"));
+        world.run_until(|w| w.applied_everywhere(b"back"));
+    }
+}

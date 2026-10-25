@@ -47,7 +47,7 @@ use hyper_timing::{Exposure, Trust};
 use hyper_tokio::{Stamped, Taken};
 
 use hyper_durable::{
-    Cause, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
+    Cause, Disk, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
 };
 use hyper_log::{Config as LogConfig, Log, Sealing, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
@@ -331,7 +331,16 @@ impl Node {
             depth: 1,
         })
         .map_err(|e| NodeError::Open(hyper_durable::OpenError::Core(e)))?;
-        let apart = judged_apart();
+        // The group's disk mode, one setting the group's every member states (Focal's condition 1):
+        // the replica takes the core's apply_unpersisted and its patience from it, the stream its
+        // judging apart.
+        let disk = if judged_apart() {
+            Disk::Apart {
+                patience: DISK_PATIENCE,
+            }
+        } else {
+            Disk::Flushed
+        };
         let shell = Shell {
             core: Config {
                 max_size_per_msg,
@@ -339,7 +348,6 @@ impl Node {
                 pre_vote: true,
                 seed: settings.id,
                 fast: settings.fast,
-                apply_unpersisted: apart,
                 ..Config::new(settings.id, limits)
             },
             // An owner woken by events has no period: the commit is written alone at the first
@@ -347,6 +355,7 @@ impl Node {
             // applied, at one write a lull (`docs/durable.md` §4.1).
             quiet: Duration::ZERO,
             elections: hyper_raft::Elections::Suspicion,
+            disk,
         };
         let store = GroupStore::claim(&log, GROUP).map_err(|e| match e {
             hyper_durable::ClaimError::Log(e) => NodeError::Log(e),
@@ -359,9 +368,7 @@ impl Node {
             ..ConfState::default()
         };
         let machine = Kv::new(configuration, settings.max_keys);
-        let mut replica =
-            Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
-        replica.set_disk_patience(apart.then_some(DISK_PATIENCE));
+        let replica = Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
         let mut liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
@@ -370,7 +377,7 @@ impl Node {
             resolution: stamped.clock().resolution(),
         })
         .map_err(NodeError::Liveness)?;
-        liveness.set_disk_apart(apart);
+        liveness.set_disk_apart(replica.disk().apart());
         Ok(Self {
             replica,
             log,

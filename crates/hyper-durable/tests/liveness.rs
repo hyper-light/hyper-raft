@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::task::Waker;
 use std::time::Duration;
 
-use hyper_durable::{Output, Owner, Replica, Unbounded};
+use hyper_durable::{Disk, Output, Owner, Replica, Unbounded};
 use hyper_liveness::{
     Change, Liveness, Output as LiveOutput, Settings as LiveSettings, Write, is_liveness,
 };
@@ -2380,4 +2380,42 @@ fn judged_apart_ten_thousand_stalls_of_the_leaders_disk_start_no_election() {
         slowest as f64 / 1e6
     );
     assert!(elections == 0 && unanswered == 0 && off_majority == 0);
+}
+
+/// Focal's condition 1: the group's disk mode is one setting. A replica opened with
+/// `Settings::disk` set to `Disk::Apart` applies ahead of its own disk (`Config::apply_unpersisted`)
+/// and states the mode, which its owner sets the node's stream to (`Replica::disk`); one opened with
+/// the default does neither, and the core's own `apply_unpersisted`, core step R-6 alone, is kept.
+#[test]
+fn the_disk_mode_is_one_setting() {
+    let configuration = ConfState {
+        voters: vec![1, 2, 3],
+        ..ConfState::default()
+    };
+    let open = |disk: Disk, ahead: bool| -> Member {
+        let mut settings = member_settings(1, 0, ahead);
+        settings.disk = disk;
+        Replica::open(
+            &settings,
+            SimStore::new(DEPTH),
+            Kv::new(configuration.clone(), false),
+            Unbounded,
+        )
+        .unwrap()
+    };
+    let patience = Duration::from_secs(5);
+    let apart = open(Disk::Apart { patience }, false);
+    assert!(apart.core().raft.config().apply_unpersisted);
+    assert_eq!(apart.disk(), Disk::Apart { patience });
+    assert!(apart.disk().apart());
+    let flushed = open(Disk::Flushed, false);
+    assert!(!flushed.core().raft.config().apply_unpersisted);
+    assert!(!flushed.disk().apart());
+    assert!(
+        open(Disk::Flushed, true)
+            .core()
+            .raft
+            .config()
+            .apply_unpersisted
+    );
 }

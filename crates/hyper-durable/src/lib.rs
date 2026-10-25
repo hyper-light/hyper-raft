@@ -51,5 +51,7 @@ pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, LogGroups, decode_ent
 pub use machine::{Fatal, StateMachine};
 pub use memory::RamStore;
 pub use owner::{Full, Handle, Owner};
-pub use replica::{Cause, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes};
+pub use replica::{
+    Cause, Disk, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes,
+};
 pub use store::{Entries, EntryRef, Fault, Health, LogStore, Point, StoreView, Write};

@@ -71,6 +71,38 @@ pub struct Settings {
     /// durable commit for this long is written then, so a member that stops reopens with what it
     /// applied (`docs/durable.md` §4.1; focal F17's period).
     pub quiet: Duration,
+    /// The group's disk mode ([`Disk`]): one setting, the same for every member of the group, from
+    /// which the replica takes the core's `apply_unpersisted` and its patience with its own disk,
+    /// and its owner the liveness stream's mode ([`Replica::disk`]).
+    pub disk: Disk,
+}
+
+/// How a group's members take their own disks (kiln's CP-T2.2, Focal's condition 1): one setting
+/// for the group, stated by every member's owner from the group's definition, so its members never
+/// differ in it, and a heartbeat says it, so a member of the other mode is refused, typed
+/// (`hyper_liveness::Refusal::OtherMode`), and never misjudged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Disk {
+    /// Today's: each peer's heartbeats wait on its flush proof, and a leader applies only what a
+    /// majority's disks hold with its own among them, as the core's settings say.
+    #[default]
+    Flushed,
+    /// Each member judges its peers' processes apart from their disks
+    /// (`hyper_liveness::Liveness::set_disk_apart`); a leader commits and applies on its followers'
+    /// disks while its own lags (`Config::apply_unpersisted`), and hands the lead on once a write
+    /// of its own has been out for `patience` with a voter there to take it
+    /// ([`Replica::set_disk_patience`]).
+    Apart {
+        /// The leader's patience with its own disk.
+        patience: Duration,
+    },
+}
+
+impl Disk {
+    /// Whether the mode judges each peer's process apart from its disk.
+    pub const fn apart(self) -> bool {
+        matches!(self, Self::Apart { .. })
+    }
 }
 
 /// Why a replica is fenced: it takes no call until its owner reopens it from what is durable.
@@ -362,6 +394,8 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// How long a leader waits on a write of its own before it hands the lead on, nanoseconds
     /// ([`Replica::set_disk_patience`]); none, never.
     disk_patience: Option<u64>,
+    /// The group's disk mode, as the replica was opened with it ([`Settings::disk`]).
+    disk: Disk,
     /// The hand-overs its patience with its disk began.
     handed_over: u64,
     /// The drives at which its patience ended with no voter to hand over to: none trusted whose disk
@@ -435,6 +469,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let depth = log.depth();
         let mut config = settings.core.clone();
         config.applied = durable.index;
+        // The group's disk mode: a leader applies on its followers' disks while its own lags.
+        if settings.disk.apart() {
+            config.apply_unpersisted = true;
+        }
         // An incarnation no other opening of this member states (core step R-8), unless the
         // owner gave one.
         if config.incarnation == 0 {
@@ -490,7 +528,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             last_durable: None,
             writes_made: Writes::default(),
             flushed: None,
-            disk_patience: None,
+            disk_patience: match settings.disk {
+                Disk::Apart { patience } => {
+                    Some(u64::try_from(patience.as_nanos()).unwrap_or(u64::MAX))
+                }
+                Disk::Flushed => None,
+            },
+            disk: settings.disk,
             handed_over: 0,
             heirless: 0,
             heir_since: None,
@@ -1237,6 +1281,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// it can no longer keep durable, its unpersisted entries growing to their bound.
     pub fn set_disk_patience(&mut self, patience: Option<Duration>) {
         self.disk_patience = patience.map(|p| u64::try_from(p.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    /// The group's disk mode the replica was opened with ([`Settings::disk`]): what its owner sets
+    /// the node's liveness stream to (`hyper_liveness::Liveness::set_disk_apart`), and what
+    /// [`crate::Owner::pairs`] holds every replica it pairs to.
+    pub fn disk(&self) -> Disk {
+        self.disk
     }
 
     /// The hand-overs the replica's patience with its disk began ([`Replica::set_disk_patience`]): one

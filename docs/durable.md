@@ -380,7 +380,10 @@ committed what it applied, and its shorter log cannot elect it; §4.3 opens it.
 apart from its disk (`hyper_liveness::Liveness::set_disk_apart`, `docs/timing.md` §2.8), a leader
 whose own disk stalls keeps its lead, its appends leaving with no write of its own (`take_light`),
 its followers' durable answers committing, and applies and answers on their disks with this
-section's rule. A disk that never comes back would then hold a lead it cannot keep durable, its
+section's rule. The group states the mode once (`Settings::disk`, `Disk::Apart { patience }`): open
+takes the core's `apply_unpersisted` and the leader's patience from it, and the owner sets the node's
+liveness stream to it (`Replica::disk`), so its members never differ in it, and a member of the
+other mode is refused by its heartbeats, typed (`hyper_liveness::Refusal::OtherMode`). A disk that never comes back would then hold a lead it cannot keep durable, its
 unpersisted entries growing to the core's bound, so the shell bounds its patience: a leader whose
 oldest write has been out past it (`Replica::set_disk_patience`, none by default, a deadline the
 owner is woken at) hands the lead to the voter that holds most of its log, of those its detectors

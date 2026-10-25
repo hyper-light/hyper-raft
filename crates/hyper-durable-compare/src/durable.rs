@@ -255,6 +255,7 @@ fn settings(id: u64, members: u64) -> Settings {
         },
         quiet: std::time::Duration::from_millis(10),
         elections: hyper_raft::Elections::Suspicion,
+        disk: hyper_durable::Disk::Flushed,
     }
 }
 
@@ -346,8 +347,7 @@ impl<F: BlockFile + 'static> Group<F> {
         if let (Some((ns, n)), Some(r)) = (before, self.owner.get(leader)) {
             let m = r.machine();
             if m.applied_entries > n {
-                self.applies
-                    .push((m.apply_ns - ns, m.applied_entries - n));
+                self.applies.push((m.apply_ns - ns, m.applied_entries - n));
             }
         }
         while let Some(m) = self.wire.pop_front() {

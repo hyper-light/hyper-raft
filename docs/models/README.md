@@ -320,13 +320,13 @@ group stays settled wherever `Stable` holds.
 
 | Name | Configuration | Bounds | Distinct states | Result |
 |---|---|---|---|---|
-| `suspicion` | `Suspicion.cfg` | 3 voters, the third stopped, 3 terms, the core's rule | 11,376 (the mirror's) | passes: `OneLeader`, `Stable`, `AskingCanWin` |
-| `susfull` | `SuspicionFull.cfg` | 3 voters, none stopped, 2 terms, the core's rule | 1,306,432 (the mirror's) | passes: `OneLeader`, `AskingCanWin` |
-| `stepdown` | `SuspicionStepDown.cfg` | `suspicion` at 2 terms, the step-down before 2026-10-24 | TLC's, first CI run | refused: `Stable` |
-| `uncond` | `SuspicionUnconditional.cfg` | `suspicion` at 2 terms, orders without the condition | TLC's, first CI run | refused: `Stable` |
-| `asking` | `SuspicionAsking.cfg` | `suspicion` at 2 terms, a pre-candidate that asks on | TLC's, first CI run | refused: `AskingCanWin` |
-| `leftnoquorum` | `SuspicionReached.cfg` | `suspicion` and the claim `NoLeaderLeftNoQuorum` | TLC's, first CI run | refused: `NoLeaderLeftNoQuorum` |
-| `handover` | `SuspicionHandOver.cfg` | `susfull` and the claim `NoHandOver` | TLC's, first CI run | refused: `NoHandOver` |
+| `suspicion` | `Suspicion.cfg` | 3 voters, the third stopped, 3 terms, the core's rule | 11,376 (the mirror's, and TLC's) | passes: `OneLeader`, `Stable`, `AskingCanWin` |
+| `susfull` | `SuspicionFull.cfg` | 3 voters, none stopped, 2 terms, the core's rule | 1,306,432 (the mirror's, and TLC's) | passes: `OneLeader`, `AskingCanWin` |
+| `stepdown` | `SuspicionStepDown.cfg` | `suspicion` at 2 terms, the step-down before 2026-10-24 | 1,087 | refused: `Stable` |
+| `uncond` | `SuspicionUnconditional.cfg` | `suspicion` at 2 terms, orders without the condition | 1,618 | refused: `Stable` |
+| `asking` | `SuspicionAsking.cfg` | `suspicion` at 2 terms, a pre-candidate that asks on | 35 | refused: `AskingCanWin` |
+| `leftnoquorum` | `SuspicionReached.cfg` | `suspicion` and the claim `NoLeaderLeftNoQuorum` | 906 | refused: `NoLeaderLeftNoQuorum` |
+| `handover` | `SuspicionHandOver.cfg` | `susfull` and the claim `NoHandOver` | 37,224 | refused: `NoHandOver` |
 
 What each shows: `suspicion` is mantle's roll at its stops, every order of every mistake between the
 two live voters within three terms, and the leader and term kept; `leftnoquorum` shows it reaches a
@@ -337,6 +337,9 @@ elected by the leader's own vote); `asking` shows a pre-candidate that asks on d
 messages where it could win only by a vote it cannot get. `handover` shows the condition still lets
 an heir that can be elected without its leader be elected, the deaf leader's hand-over (`docs/timing.md`
 §2.9). The mirror finds each refusal by the invariant named and each pass at the counts stated.
+TLC counted the passing configurations exactly at the mirror's counts (CI run 40164719210, the part
+in about a minute at four workers): the specification is the mirror state for state; the refused
+counts are TLC's own breadth-first counts at the violation, from the same run.
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

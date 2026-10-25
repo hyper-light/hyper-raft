@@ -1837,6 +1837,75 @@ spend a term and depose a leader that never left.
   campaign at a wake before it moved its term past the write it waited for, and an owner wakes a
   member after every call (`a_sole_voter_waits_for_its_own_vote_and_campaigns_once`).
 
+**A leader its detectors leave no quorum** (2026-10-24, found by mantle's roll test). Check-quorum
+is a means for clients: "a leader in Raft steps down if an election timeout elapses without a
+successful round of heartbeats to a majority of its cluster", so that the clients a cut-off leader
+holds retry their requests with another server (dissertation §6.2, "Routing requests to the
+leader"). Raft's safety does not rest on it (§3.6.3): a leader commits only what a quorum of its term
+holds, and a read is answered only once a majority acknowledged a heartbeat round of its term
+(ReadIndex, §6.4). A step-down by suspicion is worth what it lets the group gain: another voter
+leading where this one cannot. A voter elected by the stepped-down leader's own vote is never that
+voter: its request reached the leader and the leader's grant reached it, so the two exchange messages
+and it could have followed the leader as well, and the group pays an election and a gap with no
+leader for a leader no better placed. Where every quorum without the leader holds a voter that cannot
+vote, one of three stopped in a rolling restart, every voter that could be elected needs the leader's
+vote, and a step-down only costs. The leader cannot tell that case from the one the step-down is for:
+a suspicion is one-way evidence, and its detectors suspect a stopped voter and a live one it does not
+hear alike (the deaf leader above). Each heir can tell for itself, by its own detectors, whether it
+and the voters it trusts, the leader apart, are a quorum. So the leader leads on and orders its heirs
+in turn as a stepped-down leader did, timed as before, and each order tells the heir to campaign only
+where it could be elected without the leader (`proto::IF_ELECTED_WITHOUT`, `Raft::takes_order`). A
+deaf leader's followers hear one another, and the heir told is elected by them
+(`a_leader_that_suspects_every_other_voter_hands_over_all_the_same`); with the third voter stopped,
+the heir suspects it, does nothing, and the group keeps its leader and its term. The follower's side
+is the same argument: a member campaigns only while it and those it trusts are a quorum, and a
+pre-candidate that loses that quorum stops asking and follows the leader it left again.
+
+What it keeps. Election Safety ("at most one leader can be elected in a given term", Figure 3.2) and
+the rest of Raft's properties are the votes' and the logs', which the rule leaves as they were: it
+withholds a step-down and makes a forced campaign conditional, so it only refuses or delays a
+campaign, which the TLA+ models already take at any time and with no reason (`docs/models/README.md`,
+"What the model leaves out"); the model of the rule itself is below. The followers' lease, a vote
+refused while they trust their leader (thesis §4.2.3, §9.6), is unchanged, and a leader grants no
+vote but a forced one while it leads. No read is answered by a lease: the thesis's (§6.4.1) "assumes
+a bound on clock drift across servers" and rests on a majority's acknowledgment of the leader's
+heartbeats, so a leader that leads on with no trusted quorum answers a read only once a majority
+acknowledged a heartbeat round of its term, its beats reaching the voters it suspects as well
+(`Raft::active`); a lease added later must rest on such an acknowledgment, never on the role. A
+leader cut off from every voter leads on in its term, as a Raft leader does until a later term
+reaches it ("if a candidate or leader discovers that its term is out of date, it immediately reverts
+to follower state", §3.3): it commits nothing, its reads wait for answers that do not come and its
+owner's asks of it time out where they were refused as led by no one, and the voters that can be
+elected without it are. It sends one order an expected election at most while it is left no quorum,
+as a stepped-down member did. The detector's configuration still charges every mistake an election
+(§2.2), now an upper bound where a mistake can produce no leader.
+
+The evidence (mantle serve-cell `abef6120`, CI's busy shape: ubuntu-24.04, the tests on CPUs 0–1
+beside two busy loops; the roll test failed about one round in eight). At the third stop of a roll,
+leader L, restarted 4 s before, suspected F, the one other live voter, three times in 1.7 s while
+their QUIC connection stayed up; each time `Raft::suspect` found no trusted quorum and L stepped down
+with no heir it trusted, leading nothing, and was elected again at the next term 150–250 ms later
+(terms 5 to 9). At the first stop, two members had suspected each other since 250 ms after their links
+keyed, neither suspicion withdrawn; once the third voter stopped, each leader lost its trusted quorum
+the moment it suspected the stopped voter, its heir won by the stepped-down leader's vote and stepped
+down in turn within 7–20 ms, each follower campaigning at once, and terms went 3 to 8 in about
+100 ms. The detector plans such mistakes: `configure_arrivals` on that host's lateness (mean 5 ms,
+deviation 40 ms, a mature history; `G` 1 ms, floor 10 ms) recurs one per pair, at `T_E` of 100 and
+300 ms, every 2.1 and 4.8 s at an MTBF of 2 s, 7 and 16 s at 10 s, 27 and 60 s at a minute, 145 and
+318 s at ten minutes, 518 and 1,102 s at an hour, 4,237 and 8,256 s at a day; a young link (`m` about
+60) three to five times as often, and a node started on no history (`Exposure::new()`) has an MTBF of
+twice a few seconds just after a restart. With exactly a quorum of live voters each mistake between
+the two cost the group its leader. Tests (`tests/suspicion.rs`, each red on `313ada8`):
+`a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on` (the third stop: three
+mistakes, each longer than a round, a draw and two expected elections, a write taken and committed
+during each, the order given and declined; red at the first, member 1 a follower at 10 ms),
+`voters_that_suspect_each_other_for_good_keep_their_leader_once_the_third_is_stopped` (the first
+stop; red, member 1 a follower at 19.0 ms), and
+`a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`. The rules the old step-down tests
+stated are restated (`a_leader_is_left_no_quorum_when_its_detectors_suspect_a_majority_of_either_half`,
+`a_leader_left_no_quorum_hands_over_to_a_voter_elected_without_it`,
+`a_leader_that_suspects_every_voter_for_less_than_a_round_leads_on`).
+
 **Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
 (`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core
 must not read a clock, so it takes a number; a `std::time::Instant` has no value of its own a

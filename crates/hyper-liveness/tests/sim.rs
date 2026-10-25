@@ -3719,7 +3719,7 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                         && report.taken == 0
                         && !suspected
                         && sim.nodes[node].believed.get(&peer) != Some(&true)
-                        && sim.nodes[node].liveness.trust(peer) != Some(Trust::Suspected),
+                        && sim.nodes[node].liveness.trust(peer) == Some(Trust::Unconfigured),
                     "{name} seed {seed}: node {} of peer {peer} across the modes: refused for the \
                      other mode {}, taken {}, suspected {suspected}, trust {:?}",
                     node + 1,

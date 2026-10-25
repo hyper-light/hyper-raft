@@ -433,6 +433,10 @@ impl Pair {
         if self.received.stopped {
             return Trust::Suspected;
         }
+        // A peer that speaks the other disk mode is judged by nothing it says (`Refusal::OtherMode`).
+        if self.received.other_mode {
+            return Trust::Unconfigured;
+        }
         match self.received.link.as_ref() {
             Some(link) => link.estimator.trust(),
             None if self.unheard.suspected => Trust::Suspected,
@@ -605,7 +609,8 @@ impl Pair {
     /// it to; none while that waits for the node's own proof, whose completion polls the stream.
     /// Read without building the trust, since every wake asked reads it of every pair.
     pub(crate) fn deadline(&self, local: &Local, now_ns: u64) -> Option<u64> {
-        if self.received.stopped {
+        // Judged by no point: a run that announced its stop, or a peer of the other disk mode.
+        if self.received.stopped || self.received.other_mode {
             return None;
         }
         let point = self.point()?;

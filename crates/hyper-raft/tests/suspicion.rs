@@ -100,13 +100,16 @@ impl Sim {
     /// `count` members of a group whose configuration is `boot`, electing by suspicion with
     /// `timing`, each member's draws seeded from `seed`.
     fn new(count: u64, boot: &ConfState, timing: Timing, seed: u64) -> Self {
-        let settings = Settings::focal().by_suspicion();
+        Self::with(&Settings::focal().by_suspicion(), count, boot, timing, seed)
+    }
+    /// As [`Sim::new`], each member opened with `settings`.
+    fn with(settings: &Settings, count: u64, boot: &ConfState, timing: Timing, seed: u64) -> Self {
         let nodes = (1..=count)
             .map(|id| {
                 let mut node = New::open(
                     id,
                     Store::new(boot.clone()),
-                    &settings,
+                    settings,
                     seed.wrapping_mul(1_000_003).wrapping_add(id),
                     count as usize,
                 );
@@ -1148,17 +1151,20 @@ fn a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement() {
 }
 
 /// A member whose node announced its stop (`RawNode::stopped`, from hyper-liveness's
-/// `Change::Stopped`) takes no leader from its group. A stopping node may still run its members
+/// `Change::Stopped`) takes no leader from its group, on the fast track as well. A stopping node may
+/// still run its members
 /// for a while, and what it sent may arrive after its announcement: here an order its leader sent
 /// before taking the announcement reaches it, and it campaigns, forced. The members that took the
-/// announcement drop its requests for votes and what it sends of its later term, and the leader,
-/// wrongly suspecting the other member too and so left no quorum, orders it to campaign never.
+/// announcement drop its requests for votes and what it sends of its later term, a fast vote
+/// among it, and the leader, wrongly suspecting the other member too and so left no quorum,
+/// orders it to campaign never.
 /// Taken as a suspicion alone, the forced request moved the leader to the stopping member's term,
 /// leading nothing (`docs/models/SuspicionStopNoDrop.cfg`).
 #[test]
 fn a_member_whose_stop_was_announced_takes_no_leader_from_its_group() {
     let (timing, _) = timing_for(3);
-    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 43);
+    let settings = Settings::fast().by_suspicion();
+    let mut sim = Sim::with(&settings, 3, &Sim::voters(&[1, 2, 3]), timing, 43);
     sim.found(1);
     let term = sim.term(1);
     for id in [1, 2] {
@@ -1202,6 +1208,21 @@ fn a_member_whose_stop_was_announced_takes_no_leader_from_its_group() {
             .count(),
         0,
         "the leader ordered the stopping member to campaign"
+    );
+    // A fast vote of its later term, as its fast track would send one: dropped as well.
+    let later = sim.term(3);
+    sim.node(1).step(Message {
+        msg_type: MessageType::MsgFastVote,
+        from: 3,
+        to: 1,
+        term: later,
+        ..Message::default()
+    });
+    sim.settle(1);
+    assert_eq!(
+        (sim.peek(1).view().role, sim.term(1)),
+        (2, term),
+        "a fast vote of the stopping member's term deposed the leader"
     );
     sim.node(1).propose(b"while 3 stops".to_vec());
     sim.settle(1);

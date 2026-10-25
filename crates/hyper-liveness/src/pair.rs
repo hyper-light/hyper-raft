@@ -897,14 +897,7 @@ impl Pair {
             return Err(Refusal::Unproven);
         }
         self.received.flushes = beat.flushes;
-        self.received.floor_ns = beat.floor_ns;
-        self.stream.asked_ns = beat.ask_ns;
-        self.received.echo = Some((beat.sent_ns, beat.late_ns, arrival_ns));
-        if let Some(sum) = self.round_trip_sum(beat, arrival_ns) {
-            self.received
-                .offset
-                .echoed(arrival_ns, beat.sent_ns.saturating_sub(beat.late_ns), sum);
-        }
+        self.keep_said(beat, arrival_ns);
         let granularity = context.granularity.ok_or(Refusal::Unmeasured)?;
         let mapped = self
             .received
@@ -1042,6 +1035,30 @@ impl Pair {
     /// with each side's lateness past its schedule added back. The network round trip is a sample
     /// of the pair's path. `None` without an echo, or when the echo says the heartbeat arrived
     /// before this node sent the one it echoes, which no clock can make true.
+    /// What a heartbeat taken says of the peer and of this node's stream: the peer's floor, its
+    /// ask, the heartbeat to echo, and the round trip its echo closes.
+    ///
+    /// The interval the peer asks of this node's stream is its detector's choice from that
+    /// stream's heartbeats, and a run that has taken none of them (its heartbeat echoes none) chose
+    /// from nothing of it: its ask is taken once it has. A peer started again at an address its
+    /// peers did not yet know asked no interval for as long as it heard none of theirs, and each
+    /// stream to it, taking that, went to its floor, a flush a heartbeat sent where no one listened
+    /// (mantle's roll: 40 to 200 liveness writes a second against 1 to 2;
+    /// `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat`). The stream keeps the
+    /// interval it was at; a first run's stream starts from no ask, its floor, as before.
+    fn keep_said(&mut self, beat: &Heartbeat, arrival_ns: u64) {
+        self.received.floor_ns = beat.floor_ns;
+        if beat.echo.is_some() {
+            self.stream.asked_ns = beat.ask_ns;
+        }
+        self.received.echo = Some((beat.sent_ns, beat.late_ns, arrival_ns));
+        if let Some(sum) = self.round_trip_sum(beat, arrival_ns) {
+            self.received
+                .offset
+                .echoed(arrival_ns, beat.sent_ns.saturating_sub(beat.late_ns), sum);
+        }
+    }
+
     fn round_trip_sum(&mut self, beat: &Heartbeat, arrival_ns: u64) -> Option<u64> {
         let echo = beat.echo?;
         let network = arrival_ns

@@ -1501,27 +1501,38 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   transferred and shown led elsewhere), so its stop and its next start are no failure; counted one,
   as every restart was, a rolling update charged each node's peers a failure at every roll, and a
   node started with no history (`Exposure::new()`) read an MTBF of twice a few seconds from it. The
-  owner's last act on the plane (`Liveness::stop`) sends each peer the run's last heartbeat, flagged
-  `stopping` (the flags' bit 1, `codec`), which claims no life, so no flush proves it and the receiver
-  takes from it only that the run it took last has ended in order. The receiver then counts that
-  run's successor's start, or its own letting go of the pair while it suspects the peer, as no
-  failure (`Taken::after_stop`), sends the ended run nothing more, where each heartbeat to it asked a
-  flush of its own, and answers its successor's first heartbeat at once, numbered next, skipping no
-  slot of the stop (`Stream::resume`). It suspects the peer at once and until the successor's first
-  heartbeat (`Change::Stopped`, since 2026-10-25): the announcement is the peer's own word that its
-  run has ended, which the run's freshness point would say only the detector's margin later, and a
-  heartbeat of the stopped run the announcement overtook is refused as stale (§2.9, "A voter's stop
-  announced"). Lost, or taken by a build that reads only the echo's bit (which refuses it as
-  malformed, the version unchanged so every other heartbeat of a new build reads as before), it costs
-  what an unannounced stop costs. An owner
-  keeps the evidence across its runs with `Liveness::history` and `hyper_timing::Exposure::of`. Test:
+  owner's announcement (`Liveness::stop`) sends each peer the run's last heartbeat, flagged
+  `stopping` (the flags' bit 1, `codec`), which claims no life, so no flush proves it and the
+  receiver takes from it only that the run it took last has ended in order. The receiver then counts
+  that run's successor's start, or its own letting go of the pair while it suspects the peer, as no
+  failure (`Taken::after_stop`), answers the announcement once with its next heartbeat, which echoes
+  it and is proven as any (since 2026-10-25), sends the ended run nothing else, where each heartbeat
+  to it asked a flush of its own, and answers its successor's first heartbeat at once, numbered
+  next, skipping no slot of the stop (`Stream::resume`). It suspects the peer at once and until the
+  successor's first heartbeat (`Change::Stopped`, since 2026-10-25): the announcement is the peer's
+  own word that its run has ended, which the run's freshness point would say only the detector's
+  margin later, and a heartbeat of the stopped run the announcement overtook is refused as stale
+  (§2.9, "A voter's stop announced"). The stopping node learns that a peer took it from the echo of
+  the answer (`Liveness::stop_taken`), and until then sends the announcement again at the stream's
+  interval, so that a lost announcement, or a lost answer, is asked again as a heartbeat would be;
+  stamped after every heartbeat the stream sent before it, an echo of it names an announcement
+  alone. A node that announced may run on, its members leading and following, as an owner that
+  announces before it hands over does: its polls judge as before, and send the announcement and
+  nothing else. Taken by a build that reads only the echo's bit (which refuses it as malformed, the
+  version unchanged so every other heartbeat of a new build reads as before), it costs what an
+  unannounced stop costs, and is never answered. An owner keeps the evidence across its runs with
+  `Liveness::history` and `hyper_timing::Exposure::of`. Tests:
   `a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing` (the third
   node of three announces its stop and stops, in the four worlds, 8 seeds each: its peers count no
-  failure at its restart, sent it nothing after the announcement, and answered its new run at once,
-  numbered next; a peer let go while suspected after it counts none). With the rule taken out, a
-  failure was counted at the first seed; with the gate on sending taken out, 92 heartbeats went to
-  the stopped run in 10 s. `--bench allocs`: 0 allocations, reallocations, bytes and faults a
-  heartbeat in every cell, 89 to 130 ns a heartbeat.
+  failure at its restart, sent it only the answer after the announcement, and answered its new run
+  at once, numbered next; a peer let go while suspected after it counts none). With the rule taken
+  out, a failure was counted at the first seed; with the gate on sending taken out, 92 heartbeats
+  went to the stopped run in 10 s.
+  `a_stop_announced_is_answered_once_and_the_stopping_node_knows_it_was_taken` (the third announces
+  and runs on, its first announcement to the first node lost: it knows both took it, the first only
+  after an announcement sent again; each peer answered each announcement it took once and sent
+  nothing else; the third sent nothing once answered). `--bench allocs`: 0 allocations,
+  reallocations, bytes and faults a heartbeat in every cell, 89 to 130 ns a heartbeat.
 - **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α` on the
   receiver's clock, and the sender's last heartbeat was due at `σ_h` on its own; the time between
   is `τ_{h+1} − σ_h − θ`, `θ` the clocks' offset. Each echoed heartbeat `j` bounds `θ` from below:
@@ -1977,13 +1988,23 @@ trusted, and Raft's rules for a whole group stand: a follower that wrongly suspe
 for votes, and names no leader while it asks, whatever the stopping voter grants. An owner that
 announces as its stop's last act, after it handed over what it led, has the claim from the
 announcement's arrival, and the stretch from each handover to it is the whole group's. One that
-announces first, and hands over once both took the announcement, gives each range the degraded
-group's rule before its new leader is named: the stopping member's transfers are still taken (an
-order of its own term is no later term), and its followers, which suspect it, move the lead
-themselves where a transfer does not. The announcement is one datagram, and its sender cannot tell
-that a peer took it: lost, the stop is detected as a silence and that peer's window is as before,
-and an owner that would hand over once both took it, or needs the claim whatever the plane loses,
-needs the announcement answered, which hyper-liveness does not yet do (§3, item 13).
+announces first, its members still running, and hands over once each peer answered
+(`Liveness::stop_taken`, §2.8), gives each group the degraded group's rule before its new leader is
+named: the stopping member's transfers are still taken (an order of its own term is no later term),
+its followers, which suspect it, move the lead themselves where a transfer does not, and its own
+member learns the new leader from the transferee's first append of its term, which a leader sends
+every member, suspected or not (`Raft::bcast_append`); the stop drops only what the stopping member
+sends of a later term, and its answers to that append are of the same term. A leader beats on no
+suspected member's account while it trusts a quorum, so an append to the stopping member that its
+transport loses is sent again only with the leader's next round or write; an owner that would not
+rest on the transport may count a group handed once its member no longer leads in a later term than
+the one it handed over in, which an answer to any message it sends of its older term tells it, a
+transfer asked again among them. The model's `handed` configuration has the stopping voter leading,
+its announcement taken by each remaining voter at any time, and its transfer made only once both
+took it: from the moment it handed over and both follow one leader in its term, they keep it; made
+at any time, it is refused (`SuspicionStopUnwaited.cfg`). A wait the owner ends early, a peer
+suspected rather than answered, gives no such moment for that peer's groups: suspected by the
+stopping node, it may still trust it.
 
 **Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
 (`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core
@@ -2601,14 +2622,13 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   the measured mistake durations compare with the span decides whether it would move.
   `crates/hyper-raft/ORIGIN.md`, "A draw at every arming", has the first numbers, from schedules
   whose detectors are wrong one time in ten.
-- **13. An announcement answered.** A stop's announcement is one datagram (§2.8, "A stop
-  announced"): lost, its peer detects the stop as a silence, and a remaining voter that wrongly
-  suspects its leader before then asks for votes (§2.9, "A voter's stop announced"). An owner that
-  needs the group's leader kept from the moment its new leader is named, whatever the plane loses,
-  must know each peer took the announcement before it hands over: the stopping run sending it again
-  at its stream's slots until each peer's next heartbeat echoes it, the peer sending the stopped run
-  that one heartbeat, and the owner told when every peer has. Not built: it changes what an owner's
-  stop waits on, the owner's to decide.
+- **13. An announcement answered. Built (2026-10-25).** A stop's announcement was one datagram
+  (§2.8, "A stop announced"): lost, its peer detected the stop as a silence, and a remaining voter
+  that wrongly suspected its leader before then asked for votes (§2.9, "A voter's stop announced");
+  and its sender could not tell that a peer took it. A peer that takes it now answers it once with
+  its next heartbeat, which echoes it and is proven as any, the stopping node sends it again at the
+  stream's interval until the answer comes, and an owner learns which peers took it
+  (`Liveness::stop_taken`), so that it may hand over once each did.
 
 ## 4. Steps
 

@@ -93,6 +93,8 @@ stop         SuspicionStop.cfg            -                       suspicion Susp
 unannounced  SuspicionStopUnannounced.cfg Stable                  suspicion Suspicion
 nodrop       SuspicionStopNoDrop.cfg      Stable                  suspicion Suspicion
 stopreached  SuspicionStopReached.cfg     NoWrongSuspicionSettled suspicion Suspicion
+handed       SuspicionStopHanded.cfg      -                       suspicion Suspicion
+unwaited     SuspicionStopUnwaited.cfg    Stable                  suspicion Suspicion
 "
 
 if [ "${1:-}" = "--parts" ]; then

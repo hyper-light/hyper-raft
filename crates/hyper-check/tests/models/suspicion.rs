@@ -15,7 +15,8 @@ pub const MAX_SERVERS: usize = 3;
 /// A term packs in two bits: `0..=MAX_TERM`.
 pub const MAX_TERM: u8 = 3;
 const WORDS: usize = 2;
-const NOBODY: u8 = 3;
+/// No member: a place past the last.
+pub const NOBODY: u8 = 3;
 
 const FOLLOWER: u8 = 0;
 const PRECANDIDATE: u8 = 1;
@@ -44,6 +45,17 @@ pub enum Rule {
     NoDrop,
 }
 
+/// `Handover`: how the leaving voter hands over what it leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handover {
+    /// It does not: no `Transfer`.
+    None,
+    /// It transfers once every remaining voter took its announcement.
+    Waited,
+    /// It transfers at any time.
+    Unwaited,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Scope {
     pub servers: usize,
@@ -53,6 +65,10 @@ pub struct Scope {
     pub leaving: u8,
     /// Whether a leaving member's stop is announced (`Announced`).
     pub announced: bool,
+    /// How the leaving member hands over (`Handover`).
+    pub handover: Handover,
+    /// The member leading term 1 as the run begins, `NOBODY` for none (`Led`).
+    pub led: u8,
     pub max_term: u8,
     pub rule: Rule,
     /// Whether `Stable` is checked (`CheckStable`).
@@ -85,6 +101,8 @@ pub struct State {
     pub down: u8,
     /// The members whose announced stop each member took, a bit each.
     pub gone: [u8; MAX_SERVERS],
+    /// Whether the leaving member handed over (`handed`).
+    pub handed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +120,7 @@ pub enum Action {
     TakeOrder { h: u8, o: u8 },
     Announce { s: u8, x: u8 },
     Stop { x: u8 },
+    Transfer { l: u8, h: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +148,7 @@ const PATHS: &[&str] = &[
     "settled leaders left no quorum",
     "announced stops taken",
     "settled leaders a remaining voter wrongly suspects",
+    "transfers ordered by the leaving voter",
 ];
 const ELECTED: u64 = 1;
 const ORDERED: u64 = 1 << 1;
@@ -138,6 +158,7 @@ const STOPPED_ASKING: u64 = 1 << 4;
 const LEFT_NO_QUORUM: u64 = 1 << 5;
 const ANNOUNCED: u64 = 1 << 6;
 const WRONGLY_SUSPECTED: u64 = 1 << 7;
+const TRANSFERRED: u64 = 1 << 8;
 
 fn bit(s: usize) -> u8 {
     1 << s
@@ -203,7 +224,9 @@ impl Suspicion {
     fn out(&self, state: &State, s: usize) -> bool {
         let leaving = self.scope.leaving;
         state.suspects[s] & self.scope.stopped == self.scope.stopped
-            && if self.scope.announced {
+            && if self.scope.handover != Handover::None {
+                state.handed
+            } else if self.scope.announced {
                 state.gone[s] & leaving == leaving
             } else {
                 state.down & leaving == leaving
@@ -541,6 +564,37 @@ impl Suspicion {
         Some((next, paths))
     }
 
+    fn transfer(&self, state: &State, l: usize, h: usize) -> Option<(State, u64)> {
+        if self.scope.handover == Handover::None
+            || !has(self.scope.leaving, l)
+            || !self.up(state, l)
+            || state.role[l] != LEADER
+            || !self.remaining(h)
+        {
+            return None;
+        }
+        if self.scope.handover == Handover::Waited
+            && !(0..self.scope.servers)
+                .filter(|s| self.remaining(*s))
+                .all(|s| has(state.gone[s], l))
+        {
+            return None;
+        }
+        let o = Order {
+            from: l,
+            to: h,
+            term: state.term[l],
+            cond: false,
+        };
+        if state.orders & o.bit() != 0 {
+            return None;
+        }
+        let mut next = *state;
+        next.orders |= o.bit();
+        next.handed = true;
+        Some((next, TRANSFERRED))
+    }
+
     fn stop(&self, state: &State, x: usize) -> Option<(State, u64)> {
         if !has(self.scope.leaving, x) || !self.up(state, x) {
             return None;
@@ -623,6 +677,7 @@ impl Suspicion {
             put(2, u64::from(state.leader_of[t]));
         }
         put(3, u64::from(state.down));
+        put(1, u64::from(state.handed));
         p.words()
     }
 
@@ -647,6 +702,7 @@ impl Suspicion {
             state.leader_of[t] = small(take(2));
         }
         state.down = small(take(3));
+        state.handed = take(1) == 1;
         state
     }
 }
@@ -662,19 +718,27 @@ impl Model for Suspicion {
     }
 
     fn initial(&self) -> State {
+        let led = self.scope.led;
+        let mut leader_of = [NOBODY; MAX_TERM as usize];
+        let mut role = [FOLLOWER; MAX_SERVERS];
+        if led != NOBODY {
+            leader_of[0] = led;
+            role[usize::from(led)] = LEADER;
+        }
         State {
-            term: [0; MAX_SERVERS],
-            vote: [NOBODY; MAX_SERVERS],
-            role: [FOLLOWER; MAX_SERVERS],
-            leader: [NOBODY; MAX_SERVERS],
+            term: [u8::from(led != NOBODY); MAX_SERVERS],
+            vote: [led; MAX_SERVERS],
+            role,
+            leader: [led; MAX_SERVERS],
             left: [NOBODY; MAX_SERVERS],
             suspects: [0; MAX_SERVERS],
             granted: [0; MAX_SERVERS],
             kind: [ASKED; MAX_SERVERS],
             orders: 0,
-            leader_of: [NOBODY; MAX_TERM as usize],
+            leader_of,
             down: self.scope.stopped,
             gone: [0; MAX_SERVERS],
+            handed: false,
         }
     }
 
@@ -710,6 +774,10 @@ impl Model for Suspicion {
                 out.push(Action::Announce {
                     s: small(s),
                     x: small(x),
+                });
+                out.push(Action::Transfer {
+                    l: small(s),
+                    h: small(x),
                 });
             }
             out.push(Action::PreVote { s: small(s) });
@@ -748,6 +816,7 @@ impl Model for Suspicion {
             Action::TakeOrder { h, o } => self.take_order(state, u(h), u(o)),
             Action::Announce { s, x } => self.announce(state, u(s), u(x)),
             Action::Stop { x } => self.stop(state, u(x)),
+            Action::Transfer { l, h } => self.transfer(state, u(l), u(h)),
         }?;
         if next == *state {
             return None;

@@ -23,7 +23,7 @@ use std::num::NonZeroUsize;
 
 use hyper_check::explore::{Outcome, explore};
 use hyper_check::search::{Budget, MEMORY_CEILING};
-use suspicion::{Fault, Rule, Scope, Suspicion};
+use suspicion::{Fault, Handover, NOBODY, Rule, Scope, Suspicion};
 
 /// The third of three voters stopped for good.
 const THIRD: u8 = 1 << 2;
@@ -34,6 +34,8 @@ fn scope(stopped: u8, max_term: u8, rule: Rule) -> Scope {
         stopped,
         leaving: 0,
         announced: false,
+        handover: Handover::None,
+        led: NOBODY,
         max_term,
         rule,
         stable: stopped != 0,
@@ -124,6 +126,17 @@ fn each_part_of_the_rule_taken_out_is_refused() {
     );
 }
 
+/// The third voter leads term 1 and stops in order, its stop announced, handing over by a transfer
+/// `handover` allows, at three terms: `Stable` from the moment it handed over.
+fn handover(handover: Handover) -> Scope {
+    Scope {
+        handover,
+        led: 2,
+        max_term: 3,
+        ..stop(true, Rule::Core)
+    }
+}
+
 /// The third voter stops in order, its stop announced: from the moment each remaining voter took
 /// the announcement and both follow one leader, they keep it and its term, whatever the detectors
 /// then say of them and whatever the stopping voter sent, before its stop or after it took
@@ -134,6 +147,33 @@ fn with_a_voters_stop_announced_a_settled_group_keeps_its_leader() {
         ends(stop(true, Rule::Core)),
         End::Exhausted(5_454_016),
         "SuspicionStop.cfg"
+    );
+}
+
+/// The third voter, leading, announces its stop and hands over by a transfer once both remaining
+/// voters took the announcement (the owner waits on hyper-liveness's `Liveness::stop_taken`): from
+/// the moment it handed over and both follow one leader in its term, they keep it, whatever the
+/// detectors then say of them and whatever the stopping voter sent, at the states TLC counts
+/// (`SuspicionStopHanded.cfg`).
+#[test]
+#[ignore = "14.8 million classes, two minutes unoptimized: CI's explore job runs it in release"]
+fn a_handover_once_both_took_the_announcement_keeps_its_new_leader() {
+    assert_eq!(
+        ends(handover(Handover::Waited)),
+        End::Exhausted(14_791_288),
+        "SuspicionStopHanded.cfg"
+    );
+}
+
+/// Handed over without waiting for the answers, a remaining voter that has not taken the
+/// announcement still trusts the stopping voter, and a wrong suspicion of the new leader makes it
+/// ask (`SuspicionStopUnwaited.cfg`).
+#[test]
+fn a_handover_that_does_not_wait_for_the_answers_is_refused() {
+    assert_eq!(
+        ends(handover(Handover::Unwaited)),
+        End::Fault(Fault::Stable),
+        "a handover that does not wait"
     );
 }
 

@@ -225,6 +225,27 @@ is worked around.
 
 ### Closed (2026-10-25)
 
+- **hyper-liveness: a stop's announcement answered (asked by mantle; `docs/timing.md` §3, item
+  13).** For a group to keep its new leader by the rules from the moment it is named, both remaining
+  voters must have taken the stopping voter's announcement before it hands over, and the
+  announcement was one datagram its sender could not tell was taken. A peer that takes it now
+  answers it once with its next heartbeat, which echoes it and is proven as any; the stopping node
+  sends it again at the stream's interval until the answer comes, stamped after every heartbeat
+  before it so an echo names it alone, and tells its owner which peers took it
+  (`Liveness::stop_taken`). `Liveness::stop` may come before the hand-over: the node's members run
+  on, a stopping leader's transfer is taken (an order of its own term), and its member learns the
+  new leader from the transferee's first append of its term, which goes to every member
+  (`docs/timing.md` §2.9, "What the rule claims"). Tests, each red before:
+  `a_stop_announced_is_answered_once_and_the_stopping_node_knows_it_was_taken` (hyper-liveness, the
+  first announcement to one peer lost: with no answer, "node 1 did not answer the announcement
+  within 802 ms" at the macOS world's first seed),
+  `an_orderly_stop_announced_first_hands_over_and_keeps_the_new_leader` (hyper-durable: announced
+  first, the hand-over once both answered, the new leader kept through a wrong suspicion; with no
+  answer, not answered within a quiet period at seed 0). Model: `SuspicionStopHanded.cfg` (the
+  leaving voter leading, its transfer once both took the announcement: 14,791,288 states, `Stable`
+  from the hand-over), and `SuspicionStopUnwaited.cfg`, the transfer at any time, refused. A wait an
+  owner ends early, a peer suspected rather than answered, gives that peer's groups no such moment.
+
 - **hyper-liveness, hyper-raft: a voter's stop announced left its group's remaining voters a window
   in which a wrong suspicion of their leader cost them it (asked by mantle).** mantle's roll holds
   that once both remaining voters of a range name its new leader, neither says the range has no

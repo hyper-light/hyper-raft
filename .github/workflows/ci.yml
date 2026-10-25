@@ -170,6 +170,8 @@ jobs:
       - run: cargo test --release -p hyper-check --locked --test exhaustive -- --ignored --test-threads 1
       - run: cargo test --release -p hyper-check --locked --test reconfig -- --ignored --test-threads 1
       - run: cargo test --release -p hyper-check --locked --test fasttrack -- --ignored --test-threads 1
+      # Suspicion.tla's handover at three terms, 14.8 million classes (docs/models/README.md).
+      - run: cargo test --release -p hyper-check --locked --test suspicion -- --ignored --test-threads 1
       # hyper-durable's simulation past the gates' 128 seeds a shape: seed 206 of its first shape had
       # two leaders of one term until a candidate's vote for itself waited for its write
       # (docs/durable.md I9), which 128 seeds never reached; 10,000 a shape, 19.8 s in release here.

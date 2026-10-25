@@ -97,6 +97,10 @@ uncond       SuspicionUnconditional.cfg   Stable                  suspicion Susp
 asking       SuspicionAsking.cfg          AskingCanWin            suspicion Suspicion
 leftnoquorum SuspicionReached.cfg         NoLeaderLeftNoQuorum    suspicion Suspicion
 handover     SuspicionHandOver.cfg        NoHandOver              suspicion Suspicion
+stop         SuspicionStop.cfg            -                       suspicion Suspicion
+unannounced  SuspicionStopUnannounced.cfg Stable                  suspicion Suspicion
+nodrop       SuspicionStopNoDrop.cfg      Stable                  suspicion Suspicion
+stopreached  SuspicionStopReached.cfg     NoWrongSuspicionSettled suspicion Suspicion
 "
 
 if [ "${1:-}" = "--parts" ]; then

@@ -32,11 +32,25 @@ fn scope(stopped: u8, max_term: u8, rule: Rule) -> Scope {
     Scope {
         servers: 3,
         stopped,
+        leaving: 0,
+        announced: false,
         max_term,
         rule,
         stable: stopped != 0,
         reached: false,
         hand_over: false,
+        wrong: false,
+    }
+}
+
+/// Every voter up, the third stopping in order at some time, its stop announced or not, at two
+/// terms: `Stable` from the moment every remaining voter holds it out.
+fn stop(announced: bool, rule: Rule) -> Scope {
+    Scope {
+        leaving: THIRD,
+        announced,
+        stable: true,
+        ..scope(0, 2, rule)
     }
 }
 
@@ -110,10 +124,42 @@ fn each_part_of_the_rule_taken_out_is_refused() {
     );
 }
 
+/// The third voter stops in order, its stop announced: from the moment each remaining voter took
+/// the announcement and both follow one leader, they keep it and its term, whatever the detectors
+/// then say of them and whatever the stopping voter sent, before its stop or after it took
+/// effect, at the states TLC counts (`SuspicionStop.cfg`).
+#[test]
+fn with_a_voters_stop_announced_a_settled_group_keeps_its_leader() {
+    assert_eq!(
+        ends(stop(true, Rule::Core)),
+        End::Exhausted(5_454_016),
+        "SuspicionStop.cfg"
+    );
+}
+
+/// A stop detected only as a silence leaves a remaining voter trusting the stopped voter, which a
+/// wrong suspicion of the leader then makes ask for votes (`SuspicionStopUnannounced.cfg`); and an
+/// announcement that only suspects the stopping voter leaves what it sent, an order's forced
+/// campaign or a later term, to take the leader (`SuspicionStopNoDrop.cfg`).
+#[test]
+fn a_stop_unannounced_or_a_stopping_voter_heard_is_refused() {
+    assert_eq!(
+        ends(stop(false, Rule::Core)),
+        End::Fault(Fault::Stable),
+        "a stop detected as a silence"
+    );
+    assert_eq!(
+        ends(stop(true, Rule::NoDrop)),
+        End::Fault(Fault::Stable),
+        "a stopping voter heard"
+    );
+}
+
 /// The scopes reach what they are for: a settled leader its detectors leave no quorum, where one
-/// voter is stopped (`SuspicionReached.cfg`); and, with every voter up, a candidate a conditional
-/// order made granted a quorum, the hand-over a leader that hears none of its voters still makes
-/// (`SuspicionHandOver.cfg`).
+/// voter is stopped (`SuspicionReached.cfg`); with every voter up, a candidate a conditional order
+/// made granted a quorum, the hand-over a leader that hears none of its voters still makes
+/// (`SuspicionHandOver.cfg`); and, a voter's stop announced, a settled leader one of the remaining
+/// voters wrongly suspects (`SuspicionStopReached.cfg`).
 #[test]
 fn the_scopes_reach_what_they_are_for() {
     let mut left = scope(THIRD, 3, Rule::Core);
@@ -122,4 +168,7 @@ fn the_scopes_reach_what_they_are_for() {
     let mut handed = scope(0, 2, Rule::Core);
     handed.hand_over = true;
     assert_eq!(ends(handed), End::Fault(Fault::NoHandOver));
+    let mut wrong = stop(true, Rule::Core);
+    wrong.wrong = true;
+    assert_eq!(ends(wrong), End::Fault(Fault::NoWrongSuspicionSettled));
 }

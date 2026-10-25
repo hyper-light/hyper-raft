@@ -31,7 +31,7 @@ const CONDITION: u8 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
     /// A leader leads on and orders heirs only where each can be elected without it; a pre-candidate
-    /// stops asking.
+    /// stops asking; a member that took a voter's announced stop keeps that voter out (`Drops`).
     Core,
     /// A leader steps down, and having led its term orders heirs unconditionally.
     StepDown,
@@ -39,6 +39,9 @@ pub enum Rule {
     Unconditional,
     /// As `Core`, but a pre-candidate asks on.
     Asking,
+    /// As `Core`, but a member that took a voter's announced stop takes what it sends as any
+    /// other's.
+    NoDrop,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +49,10 @@ pub struct Scope {
     pub servers: usize,
     /// The members stopped for good, a bit each.
     pub stopped: u8,
+    /// The members that stop in order during the run, a bit each (`Leaving`).
+    pub leaving: u8,
+    /// Whether a leaving member's stop is announced (`Announced`).
+    pub announced: bool,
     pub max_term: u8,
     pub rule: Rule,
     /// Whether `Stable` is checked (`CheckStable`).
@@ -54,6 +61,8 @@ pub struct Scope {
     pub reached: bool,
     /// Whether `NoHandOver` is checked (the scope must reach it).
     pub hand_over: bool,
+    /// Whether `NoWrongSuspicionSettled` is checked (the scope must reach it).
+    pub wrong: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,6 +81,10 @@ pub struct State {
     pub orders: u64,
     /// The leader of terms 1 to `MAX_TERM`, `NOBODY` for none.
     pub leader_of: [u8; MAX_TERM as usize],
+    /// The members stopped, a bit each.
+    pub down: u8,
+    /// The members whose announced stop each member took, a bit each.
+    pub gone: [u8; MAX_SERVERS],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +100,8 @@ pub enum Action {
     Learn { s: u8, m: u8 },
     Order { l: u8, h: u8 },
     TakeOrder { h: u8, o: u8 },
+    Announce { s: u8, x: u8 },
+    Stop { x: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +111,7 @@ pub enum Fault {
     AskingCanWin,
     NoLeaderLeftNoQuorum,
     NoHandOver,
+    NoWrongSuspicionSettled,
 }
 
 pub type Key = [u64; WORDS];
@@ -111,6 +127,8 @@ const PATHS: &[&str] = &[
     "orders declined: the heir could not be elected without the orderer",
     "pre-candidates that stopped asking",
     "settled leaders left no quorum",
+    "announced stops taken",
+    "settled leaders a remaining voter wrongly suspects",
 ];
 const ELECTED: u64 = 1;
 const ORDERED: u64 = 1 << 1;
@@ -118,6 +136,8 @@ const TAKEN: u64 = 1 << 2;
 const DECLINED: u64 = 1 << 3;
 const STOPPED_ASKING: u64 = 1 << 4;
 const LEFT_NO_QUORUM: u64 = 1 << 5;
+const ANNOUNCED: u64 = 1 << 6;
+const WRONGLY_SUSPECTED: u64 = 1 << 7;
 
 fn bit(s: usize) -> u8 {
     1 << s
@@ -167,8 +187,27 @@ impl Suspicion {
     fn all(&self) -> u8 {
         u8::try_from((1usize << self.scope.servers) - 1).unwrap()
     }
-    fn live(&self, s: usize) -> bool {
-        s < self.scope.servers && !has(self.scope.stopped, s)
+    /// `s \in Up`: a member that acts.
+    fn up(&self, state: &State, s: usize) -> bool {
+        s < self.scope.servers && !has(state.down, s)
+    }
+    /// `s \in Remaining`.
+    fn remaining(&self, s: usize) -> bool {
+        s < self.scope.servers && !has(self.scope.stopped | self.scope.leaving, s)
+    }
+    /// `Drops(s, x)`.
+    fn drops(&self, state: &State, s: usize, x: usize) -> bool {
+        self.scope.rule != Rule::NoDrop && has(state.gone[s], x)
+    }
+    /// `Out(s)`.
+    fn out(&self, state: &State, s: usize) -> bool {
+        let leaving = self.scope.leaving;
+        state.suspects[s] & self.scope.stopped == self.scope.stopped
+            && if self.scope.announced {
+                state.gone[s] & leaving == leaving
+            } else {
+                state.down & leaving == leaving
+            }
     }
     /// `Quorum(S)`: a majority of every member.
     fn quorum(&self, set: u8) -> bool {
@@ -184,15 +223,17 @@ impl Suspicion {
         state.leader[s] != NOBODY && !has(state.suspects[s], usize::from(state.leader[s]))
     }
     fn settled(&self, state: &State, l: usize) -> bool {
-        self.live(l)
+        self.remaining(l)
             && state.role[l] == LEADER
-            && (0..self.scope.servers).filter(|s| self.live(*s)).all(|s| {
-                state.suspects[s] & self.scope.stopped == self.scope.stopped
-                    && (s == l
-                        || (state.term[s] == state.term[l]
-                            && state.role[s] == FOLLOWER
-                            && usize::from(state.leader[s]) == l))
-            })
+            && (0..self.scope.servers)
+                .filter(|s| self.remaining(*s))
+                .all(|s| {
+                    self.out(state, s)
+                        && (s == l
+                            || (state.term[s] == state.term[l]
+                                && state.role[s] == FOLLOWER
+                                && usize::from(state.leader[s]) == l))
+                })
     }
     /// `Lease(m, c, t)`.
     fn lease(state: &State, m: usize, c: usize, t: u8) -> bool {
@@ -217,14 +258,10 @@ impl Suspicion {
         next.kind[s] = ASKED;
     }
 
-    fn suspect(&self, state: &State, s: usize, x: usize) -> Option<(State, u64)> {
-        if !self.live(s) || x >= self.scope.servers || x == s || has(state.suspects[s], x) {
-            return None;
-        }
-        let mut next = *state;
+    /// `SuspectsNext(s, x)` on `next`, which `state` was before: the paths it took.
+    fn suspects_next(&self, state: &State, next: &mut State, s: usize, x: usize) -> u64 {
         next.suspects[s] |= bit(x);
-        let tq = self.tq(&next, s);
-        let mut paths = 0;
+        let tq = self.tq(next, s);
         if state.role[s] == LEADER && !tq && self.scope.rule == Rule::StepDown {
             next.role[s] = FOLLOWER;
             next.leader[s] = NOBODY;
@@ -233,13 +270,26 @@ impl Suspicion {
             next.leader[s] = state.left[s];
             next.left[s] = NOBODY;
             next.granted[s] = 0;
-            paths |= STOPPED_ASKING;
+            return STOPPED_ASKING;
         }
+        0
+    }
+
+    fn suspect(&self, state: &State, s: usize, x: usize) -> Option<(State, u64)> {
+        if !self.up(state, s) || x >= self.scope.servers || x == s || has(state.suspects[s], x) {
+            return None;
+        }
+        let mut next = *state;
+        let paths = self.suspects_next(state, &mut next, s, x);
         Some((next, paths))
     }
 
     fn trust(&self, state: &State, s: usize, x: usize) -> Option<(State, u64)> {
-        if !self.live(s) || !has(state.suspects[s], x) || !self.live(x) {
+        if !self.up(state, s)
+            || !has(state.suspects[s], x)
+            || !self.up(state, x)
+            || has(state.gone[s], x)
+        {
             return None;
         }
         let mut next = *state;
@@ -248,7 +298,7 @@ impl Suspicion {
     }
 
     fn pre_vote(&self, state: &State, s: usize) -> Option<(State, u64)> {
-        if !self.live(s)
+        if !self.up(state, s)
             || state.role[s] == LEADER
             || Self::trusts_leader(state, s)
             || !self.tq(state, s)
@@ -270,11 +320,13 @@ impl Suspicion {
     }
 
     fn grant_pre(&self, state: &State, m: usize, c: usize) -> Option<(State, u64)> {
-        if !self.live(c)
+        if c >= self.scope.servers
             || state.role[c] != PRECANDIDATE
-            || !self.live(m)
+            || !self.up(state, m)
             || m == c
             || has(state.granted[c], m)
+            || self.drops(state, m, c)
+            || self.drops(state, c, m)
         {
             return None;
         }
@@ -301,7 +353,7 @@ impl Suspicion {
     }
 
     fn elect_pre(&self, state: &State, c: usize) -> Option<(State, u64)> {
-        if !self.live(c) || state.role[c] != PRECANDIDATE || !self.quorum(state.granted[c]) {
+        if !self.up(state, c) || state.role[c] != PRECANDIDATE || !self.quorum(state.granted[c]) {
             return None;
         }
         let mut next = *state;
@@ -316,11 +368,12 @@ impl Suspicion {
     }
 
     fn grant_vote(&self, state: &State, m: usize, c: usize) -> Option<(State, u64)> {
-        if !self.live(c)
+        if c >= self.scope.servers
             || state.role[c] != CANDIDATE
-            || !self.live(m)
+            || !self.up(state, m)
             || m == c
             || has(state.granted[c], m)
+            || self.drops(state, m, c)
         {
             return None;
         }
@@ -353,7 +406,7 @@ impl Suspicion {
     }
 
     fn win(&self, state: &State, c: usize) -> Option<(State, u64)> {
-        if !self.live(c) || state.role[c] != CANDIDATE || !self.quorum(state.granted[c]) {
+        if !self.up(state, c) || state.role[c] != CANDIDATE || !self.quorum(state.granted[c]) {
             return None;
         }
         let mut next = *state;
@@ -373,10 +426,11 @@ impl Suspicion {
             return None;
         }
         let l = state.leader_of[usize::from(t) - 1];
-        if l == NOBODY || !self.live(usize::from(l)) || !self.live(m) || usize::from(l) == m {
+        if l == NOBODY || !self.up(state, m) || usize::from(l) == m {
             return None;
         }
         if t < state.term[m]
+            || (t > state.term[m] && self.drops(state, m, usize::from(l)))
             || (state.role[m] == PRECANDIDATE
                 && t == state.term[m]
                 && has(state.suspects[m], usize::from(l)))
@@ -390,11 +444,12 @@ impl Suspicion {
     }
 
     fn learn(&self, state: &State, s: usize, m: usize) -> Option<(State, u64)> {
-        if !self.live(s)
-            || !self.live(m)
+        if !self.up(state, s)
+            || m >= self.scope.servers
             || s == m
             || state.role[s] == FOLLOWER
             || state.term[m] <= state.term[s]
+            || self.drops(state, s, m)
         {
             return None;
         }
@@ -404,7 +459,12 @@ impl Suspicion {
     }
 
     fn order(&self, state: &State, l: usize, h: usize) -> Option<(State, u64)> {
-        if !self.live(l) || h >= self.scope.servers || h == l || self.tq(state, l) {
+        if !self.up(state, l)
+            || h >= self.scope.servers
+            || h == l
+            || self.drops(state, l, h)
+            || self.tq(state, l)
+        {
             return None;
         }
         let allowed = if self.scope.rule == Rule::StepDown {
@@ -421,7 +481,7 @@ impl Suspicion {
             from: l,
             to: h,
             term: state.term[l],
-            cond: matches!(self.scope.rule, Rule::Core | Rule::Asking),
+            cond: matches!(self.scope.rule, Rule::Core | Rule::Asking | Rule::NoDrop),
         };
         if state.orders & o.bit() != 0 {
             return None;
@@ -436,12 +496,12 @@ impl Suspicion {
             return None;
         }
         let o = Order::at(index);
-        if o.to != h || !self.live(h) {
+        if o.to != h || !self.up(state, h) {
             return None;
         }
         let ripe = o.term > state.term[h]
             || (o.term == state.term[h] && matches!(state.role[h], FOLLOWER | PRECANDIDATE));
-        if !ripe {
+        if !ripe || (o.term > state.term[h] && self.drops(state, h, o.from)) {
             return None;
         }
         let takes = !o.cond || self.elected_without(state, h, o.from);
@@ -461,6 +521,42 @@ impl Suspicion {
         }
         Self::follow(&mut next, h, o.term, NOBODY);
         Some((next, if takes { 0 } else { DECLINED }))
+    }
+
+    fn announce(&self, state: &State, s: usize, x: usize) -> Option<(State, u64)> {
+        if !self.scope.announced
+            || !has(self.scope.leaving, x)
+            || !self.up(state, s)
+            || s == x
+            || has(state.gone[s], x)
+        {
+            return None;
+        }
+        let mut next = *state;
+        next.gone[s] |= bit(x);
+        let mut paths = ANNOUNCED;
+        if !has(state.suspects[s], x) {
+            paths |= self.suspects_next(state, &mut next, s, x);
+        }
+        Some((next, paths))
+    }
+
+    fn stop(&self, state: &State, x: usize) -> Option<(State, u64)> {
+        if !has(self.scope.leaving, x) || !self.up(state, x) {
+            return None;
+        }
+        let mut next = *state;
+        next.down |= bit(x);
+        Some((next, 0))
+    }
+
+    /// A settled leader one of the remaining voters suspects: `NoWrongSuspicionSettled` false.
+    fn wrongly_suspected(&self, state: &State) -> bool {
+        let n = self.scope.servers;
+        (0..n).any(|l| {
+            self.settled(state, l)
+                && (0..n).any(|s| s != l && self.remaining(s) && has(state.suspects[s], l))
+        })
     }
 
     fn violation(&self, before: &State, state: &State) -> Option<Fault> {
@@ -485,7 +581,8 @@ impl Suspicion {
                 }
             }
         }
-        if (0..n).any(|s| self.live(s) && state.role[s] == PRECANDIDATE && !self.tq(state, s)) {
+        if (0..n).any(|s| self.up(state, s) && state.role[s] == PRECANDIDATE && !self.tq(state, s))
+        {
             return Some(Fault::AskingCanWin);
         }
         if self.scope.reached && (0..n).any(|l| self.settled(state, l) && !self.tq(state, l)) {
@@ -493,13 +590,16 @@ impl Suspicion {
         }
         if self.scope.hand_over
             && (0..n).any(|c| {
-                self.live(c)
+                self.up(state, c)
                     && state.role[c] == CANDIDATE
                     && state.kind[c] == CONDITION
                     && self.quorum(state.granted[c])
             })
         {
             return Some(Fault::NoHandOver);
+        }
+        if self.scope.wrong && self.wrongly_suspected(state) {
+            return Some(Fault::NoWrongSuspicionSettled);
         }
         None
     }
@@ -516,11 +616,13 @@ impl Suspicion {
             put(3, u64::from(state.suspects[s]));
             put(3, u64::from(state.granted[s]));
             put(2, u64::from(state.kind[s]));
+            put(3, u64::from(state.gone[s]));
         }
         put(ORDER_BITS, state.orders);
         for t in 0..usize::from(MAX_TERM) {
             put(2, u64::from(state.leader_of[t]));
         }
+        put(3, u64::from(state.down));
         p.words()
     }
 
@@ -538,11 +640,13 @@ impl Suspicion {
             state.suspects[s] = small(take(3));
             state.granted[s] = small(take(3));
             state.kind[s] = small(take(2));
+            state.gone[s] = small(take(3));
         }
         state.orders = take(ORDER_BITS);
         for t in 0..usize::from(MAX_TERM) {
             state.leader_of[t] = small(take(2));
         }
+        state.down = small(take(3));
         state
     }
 }
@@ -569,6 +673,8 @@ impl Model for Suspicion {
             kind: [ASKED; MAX_SERVERS],
             orders: 0,
             leader_of: [NOBODY; MAX_TERM as usize],
+            down: self.scope.stopped,
+            gone: [0; MAX_SERVERS],
         }
     }
 
@@ -601,10 +707,15 @@ impl Model for Suspicion {
                     l: small(s),
                     h: small(x),
                 });
+                out.push(Action::Announce {
+                    s: small(s),
+                    x: small(x),
+                });
             }
             out.push(Action::PreVote { s: small(s) });
             out.push(Action::ElectPre { c: small(s) });
             out.push(Action::Win { c: small(s) });
+            out.push(Action::Stop { x: small(s) });
             for t in 1..=self.scope.max_term {
                 out.push(Action::Hear { m: small(s), t });
             }
@@ -635,12 +746,17 @@ impl Model for Suspicion {
             Action::Learn { s, m } => self.learn(state, u(s), u(m)),
             Action::Order { l, h } => self.order(state, u(l), u(h)),
             Action::TakeOrder { h, o } => self.take_order(state, u(h), u(o)),
+            Action::Announce { s, x } => self.announce(state, u(s), u(x)),
+            Action::Stop { x } => self.stop(state, u(x)),
         }?;
         if next == *state {
             return None;
         }
         if (0..self.scope.servers).any(|l| self.settled(&next, l) && !self.tq(&next, l)) {
             paths |= LEFT_NO_QUORUM;
+        }
+        if self.wrongly_suspected(&next) {
+            paths |= WRONGLY_SUSPECTED;
         }
         Some(Step {
             state: next,

@@ -1671,48 +1671,61 @@ spend a term and depose a leader that never left.
   `crates/hyper-raft/ORIGIN.md`, "L-2").
 - **A member campaigns only while it and the members it trusts are a quorum** of each half of its
   configuration: a campaign that cannot win is not run, and costs nothing while a partition lasts.
-- **A leader steps down** once it and those it trusts are no quorum of either half (check-quorum
-  from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
-- **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
-  dissertation §3.10) to a voter, which campaigns at once. Its followers trust its node, which
-  lives, and on ticks their lease would have run out; nothing else would make them campaign. The
-  schedules found it twice: a leader that removed itself with no voter holding its whole log (seed 7
-  of the four settings), and one that stepped down for want of a quorum. The heir's campaign moves
-  its voters to a later term, where they know no leader, and an heir that cannot win leaves them
-  there all the same. Until its term moves or it follows another leader of it, a member that led its
-  term and cannot campaign hands over again a round and a draw after the last, as a candidate asks
-  again, for the order may be lost, but never within the election the law expects (`T_E`,
-  `Timing::election`) of its last order, nor campaigns within it (`Watch::ordered`): each order forces
-  a campaign, and a second before the first can finish makes two candidates that split the vote.
+- **A pre-candidate its detectors leave no quorum stops asking** and follows the leader it left
+  again, in its term (`Raft::stop_asking`, `Watch::left`): its campaign could win only by the vote
+  of a member it suspects, and the leader it left, which leads on, grants no vote but a forced one.
+  While it asked it dropped what that leader sent (a pre-candidate does not hear a leader it
+  suspects, below), so the leader, with no other voter up, committed nothing.
+- **A leader its detectors leave no quorum leads on** (it and those it trusts are no quorum of
+  either half: check-quorum from the detectors, dissertation §6.2) and hands over only to a voter
+  that can be elected without it: its order to campaign (next) carries `IF_ELECTED_WITHOUT`, and the
+  heir campaigns on it only where it and the voters it trusts, the leader apart, are a quorum of each
+  half of its own configuration (`Raft::takes_order`). Until 2026-10-24 it stepped down at once, the
+  detector having waited its `η + α`; "A leader its detectors leave no quorum", below, has why it no
+  longer does and what that keeps.
+- **A leader left no quorum, and a leader that stops leading in its term, hand over**: a transfer's
+  order (`MsgTimeoutNow`, dissertation §3.10) to a voter, which campaigns at once, unconditionally
+  from a member that leads nothing (its vote is free) and only where it can be elected without the
+  leader from one that leads on. Its followers trust its node, which lives, and on ticks their
+  lease would have run out; nothing else would make them campaign. The schedules found it twice: a
+  leader that removed itself with no voter holding its whole log (seed 7 of the four settings), and
+  one that stepped down for want of a quorum. The heir's campaign moves its voters to a later term,
+  where they know no leader, and an heir that cannot win leaves them there all the same. Until its
+  term moves, or it follows another leader of it, or (leading) its detectors leave it a quorum again,
+  a member hands over again a round and a draw after the last, as a candidate asks again, for the
+  order may be lost, but never within the election the law expects (`T_E`, `Timing::election`) of its
+  last order, nor, having led, campaigns within it (`Watch::ordered`): each order may force a
+  campaign, and a second before the first can finish makes two candidates that split the vote.
   Re-ordered a round and a draw after the last, about a millisecond on loopback, stepped-down members
   forced a new heir every 4 to 9 ms and two within one millisecond, and votes split (mantle's cluster
   suite pinned on Linux at `eb85154`, 776 orders in one round of it;
-  `a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last`: orders 4.12 ms apart
-  against a `T_E` of 4.40 ms without the rule). A member of a later term answers an old order (as it
-  answers an old leader's heartbeat), which moves the sender's term.
+  `no_heir_is_ordered_within_an_expected_election_of_the_last`: orders 4.12 ms apart against a `T_E`
+  of 4.40 ms without the rule). A member of a later term answers an old order (as it answers an old
+  leader's heartbeat), which moves the sender's term.
 
   *Who the heir is* (`Raft::hand_over`). The heirs are every other voter, in order: those the
   leader's detectors trust before those they suspect, then the most of its log held first, then by
   id; each hand-over names the next (`Watch::handovers`, from the first again at each term the member
-  leads), so the order at the step-down goes to the trusted voter that holds the most. At the
-  step-down it orders at once only where it still trusts a voter: trusting none, it may be the one
-  that stalled (a host that froze suspects every peer at once), while its followers trust it, so
-  the `led` path decides a round and a draw later (`wake_follower`), campaigning if it trusts a
-  quorum again, which re-elects it, and otherwise handing over. Ordered at the step-down, the heir's
-  campaign moved the group's leadership at every short stall: mantle's cluster tests on a loaded
-  Linux runner (run 39525134119, job 118977876472) cut a leader off, let the others elect, rejoined
-  it, and found the leader elected during the cut replaced around the rejoin in three tests of
-  three (`a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`, red on
-  `757740c`). A voter the leader suspects is still an heir. A spare that replaces a failed voter
+  leads and each time its detectors leave it no quorum), so the first order goes to the trusted voter
+  that holds the most. A leader left no quorum orders at once only where it still trusts a voter:
+  trusting none, it may be the one that stalled (a host that froze suspects every peer at once),
+  while its followers trust it, so it orders a round and a draw later, and not at all if it trusts a
+  quorum again first, which ends the stall with nothing lost: no term moves. Ordered at once, the
+  heir's campaign moved the group's leadership at every short stall: mantle's cluster tests on a
+  loaded Linux runner (run 39525134119, job 118977876472) cut a leader off, let the others elect,
+  rejoined it, and found the leader elected during the cut replaced around the rejoin in three
+  tests of three (`a_leader_that_suspects_every_voter_for_less_than_a_round_leads_on`, red on
+  `757740c`; until 2026-10-24 it stepped down and was elected again in a later term). A voter the
+  leader suspects is still an heir. A spare that replaces a failed voter
   is an heir the leader trusts while it has not taken the joint entry and refuses the order as a
   learner by its own configuration; the next order goes to the next heir
   (`a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over`: `{1, 2, 3}` to
   `{1, 2, 4}`, 3 dead, the leader suspecting 2 as well; orders `[4, 2]` and 2 elected, where on
   `1b85eaf` the orders were `[4, 4, 4, 4, 4]` and no term moved, the one trusted heir named for
   good). A suspicion is one-way evidence: that the leader does not hear a
-  voter says nothing of whether the voter hears the leader, and a leader steps down exactly when it
-  and those it trusts are no quorum, so it may suspect every other voter while they all hear it and
-  trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
+  voter says nothing of whether the voter hears the leader, and a leader is left no quorum exactly
+  when it and those it trusts are none, so it may suspect every other voter while they all hear it
+  and trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
   itself (it trusts no quorum), and the range stayed leaderless for as long as its suspicions lasted:
   for ever under one-way loss (mantle's node simulation, a leader whose plane went deaf, seed 1: it
   suspected both followers at 9.2 ms and sent no order, and the cell elected again at 335 ms only
@@ -1723,17 +1736,18 @@ spend a term and depose a leader that never left.
   the test's 4.63 s). The turn passes over every heir, not only those that hold the most: the first
   may be dead, or one that cannot campaign (a learner by its own configuration) or cannot win while
   its followers keep their lease on the leader (a leader that restarted marked named such a member
-  again and again, core step R-7, seed 75 of the faults at rest by suspicion). Only the order at the
-  step-down knows what each holds: a follower's progress is reset (`Raft::reset`), as a restarted
-  leader's is, so the orders after it turn through the heirs it trusts and then the rest. Tests
-  (`tests/suspicion.rs`): `a_leader_that_suspects_every_other_voter_hands_over_all_the_same`
-  (leader 1 of three suspects 2 and 3, which trust it for good; it orders a round and a draw after
-  its step-down; on `1b85eaf` no order and no leader for the quiet period) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` (leader 1 of five
-  steps down trusting only 2, which alone holds its last entry and is dead, then suspects 2 as well;
-  on `1b85eaf` no leader within the quiet period), each red before; and
+  again and again, core step R-7, seed 75 of the faults at rest by suspicion). A leader that leads on
+  knows what each holds; a member that led and leads no more does not, its followers' progress
+  reset (`Raft::reset`), as a restarted leader's is, so its orders turn through the heirs it trusts
+  and then the rest. Tests (`tests/suspicion.rs`):
+  `a_leader_that_suspects_every_other_voter_hands_over_all_the_same` (leader 1 of three suspects 2
+  and 3, which trust it for good; it orders a round and a draw later; on `1b85eaf` no order and no
+  leader for the quiet period) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over`
+  (leader 1 of five is left no quorum trusting only 2, which alone holds its last entry and is dead,
+  then suspects 2 as well; on `1b85eaf` no leader within the quiet period), each red before; and
   `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts`, red with the turn counted
-  from the member's start, which at its second step-down named a suspected voter (`[2]`, where it
-  trusted only 3).
+  from the member's start, which the second time it was left no quorum named a suspected voter
+  (`[2]`, where it trusted only 3).
 - **What ends a follower's trust in its leader**, besides its detector: a request for votes from
   that leader (a member asks only while it does not lead, and terms only rise at it); its
   incarnation's end (`restarted`); a configuration that names it no voter; and a request from a
@@ -1759,15 +1773,24 @@ spend a term and depose a leader that never left.
   retransmission timeout RFC 6298 §2 computes, mean plus four deviations over the granularity, as
   RFC 9002 §6.2.1's), which recovers what was lost. A group with nothing in flight is sent nothing
   and woken for nothing. A member the leader suspects is left out, as CockroachDB quiesces a range
-  whose behind replicas are on non-live nodes, and a leader that trusts a member again sends it a
-  heartbeat, as CockroachDB wakes such ranges when the node becomes live
-  (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`). What it sent
-  the member while suspecting it, it takes for lost, as raft takes a transport's report that a
-  member is unreachable (`MsgUnreachable`): the window is given up and the member probed from what
-  it is known to hold. A member cut off while its group committed was sent a window of what the cut
-  lost, and a full window is asked about only once a beat passes unanswered: without the rule it
-  caught up a round tail after the heal, and never at a leader whose owner had given it no timing
-  (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while suspected is taken for lost").
+  whose behind replicas are on non-live nodes, while the members it trusts leave it a quorum; left
+  none, it counts them all, for it commits only by some it suspects, and an append lost on its way
+  to one waited, unsent again, until the leader trusted it
+  (`a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`, red on `313ada8`). A leader
+  that trusts a member again sends it a heartbeat, as CockroachDB wakes such ranges when the node
+  becomes live (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`).
+  What it sent the member while suspecting it, it takes for lost, as raft takes a transport's
+  report that a member is unreachable (`MsgUnreachable`): the window is given up and the member
+  probed from what it is known to hold. A member cut off while its group committed was sent a
+  window of what the cut lost, and a full window is asked about only once a beat passes
+  unanswered: without the rule it caught up a round tail after the heal, and never at a leader whose
+  owner had given it no timing (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while
+  suspected is taken for lost"). One with nothing in flight that holds the leader's whole log lost
+  nothing and is not probed, trusted again or seen to start again (`Raft::holds_all`): probed, it
+  could answer only with nothing new, which moves no probe on (`Progress::maybe_update`), and the
+  leader beat once a round, a heartbeat to every member, until the group's next write, after every
+  mistake its detectors withdrew (`a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet`,
+  red on `313ada8`: the idle group never came to rest).
 - **A transfer** is given up `TRANSFER_ROUNDS` (two) rounds after it began, the order reaching the
   transferee and the new leader's append coming back with the transferee's vote round between
   (dissertation §3.10: given up when not finished within an election), or at once when the

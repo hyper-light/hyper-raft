@@ -92,6 +92,8 @@ struct Sim {
     leaders: BTreeMap<u64, u64>,
     /// The members' timing: how long a run may go with nothing moving.
     timing: Timing,
+    /// Every read a member answered: who, and the read's context.
+    answered: Vec<(u64, Vec<u8>)>,
 }
 
 impl Sim {
@@ -122,6 +124,7 @@ impl Sim {
             cut: Vec::new(),
             leaders: BTreeMap::new(),
             timing,
+            answered: Vec::new(),
         }
     }
     fn voters(voters: &[u64]) -> ConfState {
@@ -152,6 +155,9 @@ impl Sim {
         node.wake(now);
         let output = node.drain();
         let view = node.view();
+        for (_, context) in &output.reads {
+            self.answered.push((id, context.clone()));
+        }
         if view.role == 2 {
             let leader = *self.leaders.entry(view.term).or_insert(id);
             assert_eq!(leader, id, "two leaders of term {}", view.term);
@@ -1072,6 +1078,72 @@ fn a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects() {
             sim.peek(2).view().applied >= index
         }),
         "the write was not applied by member 2"
+    );
+}
+
+/// A leader that leads on with no quorum its detectors trust answers no read without a quorum's
+/// acknowledgement of a heartbeat round in its term (ReadIndex, thesis §6.4): it holds no lease.
+/// Cut off so that it hears no voter, as a leader whose plane went deaf, it suspects both; they hear
+/// it, and the heir it orders is elected by the other in a later term, which commits a write. The
+/// old leader leads on in its term, unaware, and the read asked of it is not answered; heard again,
+/// it follows the new leader, and the read is let go unanswered. One that answered by a lease would
+/// have answered from a term that had ended, before the write the group committed after it.
+#[test]
+fn a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 41);
+    sim.found(1);
+    let term = sim.term(1);
+    sim.cut.push(1);
+    sim.suspect(1, 2);
+    sim.suspect(1, 3);
+    sim.node(1).read(b"from a leader cut off".to_vec());
+    sim.settle(1);
+    assert_eq!(
+        sim.peek(1).raw.raft.reads_held(),
+        1,
+        "the leader left no quorum took the read"
+    );
+    assert!(
+        sim.run_until(|sim| sim.leader().is_some_and(|leader| leader != 1)),
+        "the voters that hear each other elected no one"
+    );
+    let new = sim.leader().unwrap();
+    sim.node(new).propose(b"after the old term".to_vec());
+    sim.settle(new);
+    let index = sim.peek(new).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(new).view().commit >= index));
+    assert_eq!(
+        (sim.peek(1).view().role, sim.term(1)),
+        (2, term),
+        "the old leader learned of the new term while cut off"
+    );
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 4;
+    sim.run_until_time(until, |_| false);
+    assert!(
+        sim.answered.iter().all(|(id, _)| *id != 1),
+        "the leader cut off answered a read: {:?}",
+        sim.answered
+    );
+    assert_eq!(
+        sim.peek(1).raw.raft.reads_held(),
+        1,
+        "the leader cut off let its read go"
+    );
+    sim.cut.clear();
+    assert!(
+        sim.run_until(|sim| sim.term(1) > term),
+        "the old leader never heard the new term"
+    );
+    assert!(
+        sim.answered.iter().all(|(id, _)| *id != 1),
+        "the old leader answered a read: {:?}",
+        sim.answered
+    );
+    assert_eq!(
+        sim.peek(1).raw.raft.reads_held(),
+        0,
+        "the old leader kept its read past its term"
     );
 }
 

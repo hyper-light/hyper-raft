@@ -1517,8 +1517,8 @@ impl Cluster {
     /// applies and every leader has answered the reads it took in its term: false when the entry is
     /// never applied within `rounds`, and the reads checked where they are not answered by then
     /// (`check_reads_answered`). A leader whose detectors left it no quorum leads on with the reads
-    /// it took (`docs/timing.md` §2.9), whose rounds went where its group was cut, and asks them
-    /// again at its next beat once the group is whole: the entry may be applied before then.
+    /// it took (`docs/timing.md` §2.9), and a read whose round a cut lost is asked again at its
+    /// next beat once the group is whole: the entry may be applied before then.
     pub fn settles(&mut self, rounds: usize) -> bool {
         self.net.set_path(Path::NONE);
         self.settling = true;

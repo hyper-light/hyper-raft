@@ -544,10 +544,12 @@ is worked around.
   `a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on`,
   `voters_that_suspect_each_other_for_good_keep_their_leader_once_the_third_is_stopped` and
   `a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`, each red on `313ada8`; the
-  step-down tests restated. Model: `docs/models/Suspicion.tla` and its Rust mirror (three voters, the
-  third stopped, three terms: 11,376 states, every settled group keeps its leader and term; every
-  voter up: 1,306,432 states, one leader a term; the step-down, an unconditional order and a
-  pre-candidate that asks on each refused).
+  step-down tests restated;
+  `a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement` (a leader cut off
+  while its voters elect another and commit answers no read). Model: `docs/models/Suspicion.tla` and
+  its Rust mirror (three voters, the third stopped, three terms: 11,376 states, every settled group
+  keeps its leader and term; every voter up: 1,306,432 states, one leader a term; the step-down, an
+  unconditional order and a pre-candidate that asks on each refused).
 
 - **hyper-raft: a leader that trusted again, or saw start again, a member holding its whole log
   probed it, and an idle group beat once a round for good (found on the way).** A probe moves on

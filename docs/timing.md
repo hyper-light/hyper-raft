@@ -1895,14 +1895,19 @@ vote but a forced one while it leads. No read is answered by a lease: the thesis
 a bound on clock drift across servers" and rests on a majority's acknowledgment of the leader's
 heartbeats, so a leader that leads on with no trusted quorum answers a read only once a majority
 acknowledged a heartbeat round of its term, its beats reaching the voters it suspects as well
-(`Raft::active`); a lease added later must rest on such an acknowledgment, never on the role. A
-leader cut off from every voter leads on in its term, as a Raft leader does until a later term
-reaches it ("if a candidate or leader discovers that its term is out of date, it immediately reverts
-to follower state", §3.3): it commits nothing, its reads wait for answers that do not come and its
-owner's asks of it time out where they were refused as led by no one, and the voters that can be
-elected without it are. It sends one order an expected election at most while it is left no quorum,
-as a stepped-down member did. The detector's configuration still charges every mistake an election
-(§2.2), now an upper bound where a mistake can produce no leader.
+(`Raft::active`); a lease added later must rest on such an acknowledgment, never on the role
+(`a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement`: a leader cut off while
+its voters elected another and committed a write answered no read, and followed once it heard
+them). A leader cut off from every voter leads on in its term, as a Raft leader does until a later
+term reaches it ("if a candidate or leader discovers that its term is out of date, it immediately
+reverts to follower state", §3.3): it commits nothing, its reads wait for answers that do not come,
+and its owner's asks of it time out where a step-down refused them at once, while a voter that can
+be elected without it is elected. A read whose round a cut lost is asked again at the leader's next
+beat, where a step-down let it go unanswered: hyper-durable's simulation now settles only once every
+leader has answered the reads it took, where it had settled at the first moment its write was
+applied everywhere, which can come before that beat. It sends one order an expected election at
+most while it is left no quorum, as a stepped-down member did. The detector's configuration still
+charges every mistake an election (§2.2), now an upper bound where a mistake can produce no leader.
 
 The evidence (mantle serve-cell `abef6120`, CI's busy shape: ubuntu-24.04, the tests on CPUs 0–1
 beside two busy loops; the roll test failed about one round in eight). At the third stop of a roll,

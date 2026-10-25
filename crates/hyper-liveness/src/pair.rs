@@ -1112,10 +1112,6 @@ impl Pair {
         self.received.pooled_ask_ns = ask_ns;
     }
 
-    /// The delay sum of `beat`'s echo (the `bound` module): the round trip on this node's clock,
-    /// with each side's lateness past its schedule added back. The network round trip is a sample
-    /// of the pair's path. `None` without an echo, or when the echo says the heartbeat arrived
-    /// before this node sent the one it echoes, which no clock can make true.
     /// What a heartbeat taken says of the peer and of this node's stream: the peer's floor, its
     /// ask, the heartbeat to echo, and the round trip its echo closes.
     ///
@@ -1140,6 +1136,10 @@ impl Pair {
         }
     }
 
+    /// The delay sum of `beat`'s echo (the `bound` module): the round trip on this node's clock,
+    /// with each side's lateness past its schedule added back. The network round trip is a sample
+    /// of the pair's path. `None` without an echo, or when the echo says the heartbeat arrived
+    /// before this node sent the one it echoes, which no clock can make true.
     fn round_trip_sum(&mut self, beat: &Heartbeat, arrival_ns: u64) -> Option<u64> {
         let echo = beat.echo?;
         let network = arrival_ns

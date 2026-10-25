@@ -2864,6 +2864,47 @@ fn flushes_stalled_together_as_on_a_shared_volume_are_no_ones_failure() {
     }
 }
 
+/// As every node's flushes come back from a stall they shared, for three times the longest
+/// freshness any pair holds, no node suspects another within a freshness of the stall's end: every
+/// judge's own proof returns with its peers', and each holds its peers to the margin past the end
+/// (`Local::judge`). CP-T2.2 step 1: Focal's doc 34 recorded a leader that suspected both followers
+/// over a shared disk's 0.6 s stall. Fails here in the busy world, a judge suspecting both peers as
+/// its own stall ends: what a stall every node shares leaves to CP-T2.2 step 2.
+#[test]
+#[ignore = "CP-T2.2 step 2: a judge suspects both peers as a stall every node shared ends"]
+fn flushes_stalled_together_draw_no_suspicion_as_they_end() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(16, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let until = from + 3 * freshness;
+            for node in &mut sim.nodes {
+                node.disk_held_until = until;
+            }
+            let after = until + freshness;
+            sim.run_while(|_| true, Some(after));
+            for (index, node) in sim.nodes.iter().enumerate() {
+                let late: Vec<_> = node
+                    .suspicions
+                    .iter()
+                    .filter(|s| s.noticed_ns > until && s.noticed_ns <= after)
+                    .map(|s| (s.peer, (s.noticed_ns - from) / MS))
+                    .collect();
+                assert!(
+                    late.is_empty(),
+                    "{name} seed {seed}: node {} suspected {late:?} (peer, ms from the stall's start) \
+                     within {} ms of the end of a stall of every flush for {} ms",
+                    index + 1,
+                    freshness / MS,
+                    (until - from) / MS
+                );
+            }
+        }
+    }
+}
+
 /// One node's flushes stall while the judges' own complete: it is suspected as before, within the
 /// bound each suspicion states.
 #[test]

@@ -30,7 +30,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::task::Waker;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ use hyper_liveness::{
 };
 use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Message,
+    MessageType,
 };
 use hyper_timing::Exposure;
 use support::cluster::settings;
@@ -56,6 +57,8 @@ const LATE_NS: u64 = 60_000;
 const RESOLUTION: Duration = Duration::from_nanos(1);
 /// The store's depth.
 const DEPTH: usize = 3;
+/// A millisecond.
+const MS: u64 = 1_000_000;
 
 type Member = Replica<SimStore, Kv, Unbounded>;
 
@@ -87,6 +90,10 @@ struct Node {
     flushing: Option<(u64, u64)>,
     /// When the replica's writes out are durable.
     durable_at: Option<u64>,
+    /// Where the node's device stalled, the stall's end: every write out on it at the stall's start
+    /// or given to it before the end is durable at the end and not sooner (`World::stall`); zero,
+    /// never stalled.
+    held: u64,
     /// When the node is next woken.
     alarm: Option<u64>,
     alive: bool,
@@ -110,6 +117,8 @@ struct World {
     /// Raft messages sent, all told.
     raft_sent: u64,
     suspicions: Vec<(u64, hyper_liveness::Suspicion)>,
+    /// Each suspicion with what its judge knew of its own durability as it suspected.
+    proofs: Vec<(u64, hyper_liveness::Suspicion, OwnWait)>,
     /// Restarts the streams reported: who saw whom start again.
     restarts: Vec<(u64, u64)>,
     /// Announced stops the streams reported: who saw whom stop.
@@ -117,6 +126,34 @@ struct World {
     /// Changes the streams reported, all told.
     changes: u64,
     seed: u64,
+    /// Each node's stream and replica write to one log, a frame at a time: the stream's write given
+    /// while the replica's is out waits for it and goes in the next frame, as Focal's member's
+    /// liveness update waits on the part's frame (focal-bus `member.rs`, one hyper-log).
+    one_log: bool,
+    /// A timeline of what each node did from `from`, a line an event, kept while asked for.
+    trace: Option<Trace>,
+}
+
+/// What each node did, from `from` until `until`: its writes given and made durable, the proofs
+/// its stream asked, the heartbeats it sent and took, its suspicions, its votes and its terms.
+struct Trace {
+    from: u64,
+    until: u64,
+    lines: Vec<String>,
+}
+
+impl Trace {
+    fn at(&self, now: u64) -> Option<f64> {
+        (now >= self.from && now <= self.until).then(|| (now - self.from) as f64 / 1e6)
+    }
+}
+
+/// A judge's own wait for a flush proof as it suspected: since when, and its end if it came.
+type OwnWait = Option<(u64, Option<u64>)>;
+
+/// What a judge knew of its own durability as it suspected (hyper-liveness's `own_proof`).
+fn own_wait(liveness: &Liveness) -> OwnWait {
+    liveness.own_proof().waited
 }
 
 impl World {
@@ -152,6 +189,7 @@ impl World {
                     liveness,
                     flushing: None,
                     durable_at: None,
+                    held: 0,
                     alarm: Some(0),
                     alive: true,
                     run: 1,
@@ -166,10 +204,13 @@ impl World {
             rng: Seeded(seed),
             raft_sent: 0,
             suspicions: Vec::new(),
+            proofs: Vec::new(),
             restarts: Vec::new(),
             stops: Vec::new(),
             changes: 0,
             seed,
+            one_log: false,
+            trace: None,
         }
     }
 
@@ -208,6 +249,7 @@ impl World {
             liveness,
             flushing: None,
             durable_at: None,
+            held: 0,
             alarm: Some(self.now),
             alive: true,
             run,
@@ -217,7 +259,11 @@ impl World {
     fn record(&mut self, at: u64, change: &Change) {
         self.changes += 1;
         match change {
-            Change::Suspected(suspicion) => self.suspicions.push((at, *suspicion)),
+            Change::Suspected(suspicion) => {
+                self.suspicions.push((at, *suspicion));
+                let own = own_wait(&self.nodes[(at - 1) as usize].liveness);
+                self.proofs.push((at, *suspicion, own));
+            }
             Change::Restarted { peer, .. } => self.restarts.push((at, *peer)),
             Change::Stopped { peer, .. } => self.stops.push((at, *peer)),
             Change::Trusted { .. } => {}
@@ -236,26 +282,72 @@ impl World {
         let at = (id - 1) as usize;
         let mut live = Live::default();
         let mut outgoing: Vec<(u64, u64, Payload)> = Vec::new();
+        let one_log = self.one_log;
+        let tracing = self
+            .trace
+            .as_ref()
+            .and_then(|t| t.at(now).map(|ms| (ms, t.from)));
+        let mut notes: Vec<String> = Vec::new();
         let (changes, me) = {
             let node = &mut self.nodes[at];
             if !node.alive {
                 return;
             }
+            let before = {
+                let replica = node.owner.get(node.handle).unwrap();
+                (replica.term(), replica.is_leader())
+            };
             if let Some((started, durable)) = node.flushing
                 && durable <= now
             {
                 node.flushing = None;
                 node.liveness.on_durable(Write::Liveness, started, durable);
+                if let Some((ms, from)) = tracing {
+                    let given = (started as f64 - from as f64) / 1e6;
+                    notes.push(format!(
+                        "{ms:9.3} n{id}: the stream's write durable, given at {given:.3}"
+                    ));
+                }
             }
             if node.durable_at.is_some_and(|due| due <= now) {
                 node.durable_at = None;
                 let replica = node.owner.get_mut(node.handle).unwrap();
                 while replica.log_mut().make_durable() {}
                 node.owner.schedule(node.handle);
+                if let Some((ms, _)) = tracing {
+                    notes.push(format!("{ms:9.3} n{id}: the log's writes durable"));
+                }
             }
             node.liveness.poll(now, &mut live);
+            if let Some((ms, from)) = tracing {
+                if live.flush {
+                    notes.push(format!(
+                        "{ms:9.3} n{id}: the stream asks a write, a heartbeat due unproved"
+                    ));
+                }
+                for change in &live.changes {
+                    notes.push(match change {
+                        Change::Suspected(s) => format!(
+                            "{ms:9.3} n{id}: SUSPECTS n{} (its point passed at {:.3})",
+                            s.peer,
+                            (s.at_ns as f64 - from as f64) / 1e6
+                        ),
+                        Change::Trusted { .. } => {
+                            format!("{ms:9.3} n{id}: trusts n{} again", change.peer())
+                        }
+                        Change::Restarted { .. } => {
+                            format!("{ms:9.3} n{id}: n{} restarted", change.peer())
+                        }
+                    });
+                }
+            }
+            let held = node.held;
             if std::mem::take(&mut live.flush) && node.flushing.is_none() {
-                node.flushing = Some((now, now + FLUSH_NS));
+                let frame = match node.durable_at {
+                    Some(out) if one_log => out + FLUSH_NS,
+                    _ => now + FLUSH_NS,
+                };
+                node.flushing = Some((now, frame.max(held)));
             }
             for change in &live.changes {
                 node.owner.believe(change);
@@ -287,11 +379,37 @@ impl World {
             }
             let replica = node.owner.get_mut(node.handle).unwrap();
             if replica.log_mut().pending() > 0 && node.durable_at.is_none() {
-                node.durable_at = Some(now + FLUSH_NS);
+                node.durable_at = Some((now + FLUSH_NS).max(held));
+                if let Some((ms, from)) = tracing
+                    && held > now
+                {
+                    let end = (held as f64 - from as f64) / 1e6;
+                    notes.push(format!(
+                        "{ms:9.3} n{id}: the log's writes given, held to {end:.3}"
+                    ));
+                }
+            }
+            let after = (replica.term(), replica.is_leader());
+            if let Some((ms, _)) = tracing
+                && after != before
+            {
+                notes.push(format!(
+                    "{ms:9.3} n{id}: term {} {} -> term {} {}",
+                    before.0,
+                    if before.1 { "leading" } else { "following" },
+                    after.0,
+                    if after.1 { "LEADING" } else { "following" }
+                ));
             }
             node.owner
                 .pairs(node.handle, &mut node.liveness, false)
                 .unwrap();
+            if let Some((ms, _)) = tracing
+                && !live.heartbeats.is_empty()
+            {
+                let peers: Vec<u64> = live.heartbeats.iter().map(|(peer, _)| *peer).collect();
+                notes.push(format!("{ms:9.3} n{id}: heartbeats to {peers:?}"));
+            }
             for (peer, message) in live.heartbeats.drain(..) {
                 outgoing.push((peer, id, Payload::Liveness(message)));
             }
@@ -309,6 +427,29 @@ impl World {
         };
         for change in &changes {
             self.record(me, change);
+        }
+        if let Some((ms, _)) = tracing {
+            for (to, _, payload) in &outgoing {
+                if let Payload::Raft(m) = payload
+                    && !matches!(
+                        m.msg_type,
+                        MessageType::MsgAppend
+                            | MessageType::MsgAppendResponse
+                            | MessageType::MsgHeartbeat
+                            | MessageType::MsgHeartbeatResponse
+                    )
+                {
+                    notes.push(format!(
+                        "{ms:9.3} n{id} -> n{to}: {:?} term {}{}",
+                        m.msg_type,
+                        m.term,
+                        if m.reject { " rejected" } else { "" }
+                    ));
+                }
+            }
+        }
+        if let Some(trace) = &mut self.trace {
+            trace.lines.append(&mut notes);
         }
         for (to, from, payload) in outgoing {
             if matches!(payload, Payload::Raft(_)) {
@@ -344,9 +485,28 @@ impl World {
                     Payload::Liveness(bytes) => {
                         assert!(is_liveness(&bytes));
                         let mut live = Live::default();
-                        let _ = node
+                        let taken = node
                             .liveness
                             .on_heartbeat(from, &bytes, self.now, &mut live);
+                        if let Some(trace) = &mut self.trace
+                            && let Some(ms) = trace.at(self.now)
+                        {
+                            let how = match &taken {
+                                Ok(_) => String::new(),
+                                Err(refused) => format!(" refused: {refused:?}"),
+                            };
+                            trace
+                                .lines
+                                .push(format!("{ms:9.3} n{to} <- n{from}: heartbeat{how}"));
+                            for change in &live.changes {
+                                if let Change::Suspected(s) = change {
+                                    trace.lines.push(format!(
+                                        "{ms:9.3} n{to}: SUSPECTS n{} on a heartbeat's arrival",
+                                        s.peer
+                                    ));
+                                }
+                            }
+                        }
                         for change in &live.changes {
                             node.owner.believe(change);
                         }
@@ -370,6 +530,95 @@ impl World {
             }
             (Some(_), None) => unreachable!("matched above"),
             (None, None) => panic!("nothing in flight and nothing due"),
+        }
+    }
+
+    /// Node `id`'s device stalls from now to `end`: the writes out on it, the stream's and the
+    /// replica's, and every one given to it before `end`, are durable at `end` and not sooner, as
+    /// every file's fsync on a volume waits on its journal's commit.
+    fn stall(&mut self, id: u64, end: u64) {
+        let node = &mut self.nodes[(id - 1) as usize];
+        node.held = end;
+        node.flushing = node
+            .flushing
+            .map(|(started, durable)| (started, durable.max(end)));
+        node.durable_at = node.durable_at.map(|due| due.max(end));
+    }
+
+    /// The next event, if one is due by `limit`; otherwise the clock moves to `limit`.
+    fn next_by(&mut self, limit: u64) {
+        let arrival = self.flight.keys().next().map(|(at, _)| *at);
+        let alarm = self
+            .nodes
+            .iter()
+            .filter(|n| n.alive)
+            .filter_map(|n| n.alarm)
+            .min();
+        match arrival.into_iter().chain(alarm).min() {
+            Some(at) if at <= limit => self.next(),
+            _ => self.now = self.now.max(limit),
+        }
+    }
+
+    /// Runs to `until` with a publisher offering a publish every `every_ns`, each offered again
+    /// until a leader takes it, as the bus's client follows a redirect (`Load`).
+    fn run_loaded(&mut self, until: u64, every_ns: u64, load: &mut Load) {
+        if load.next_ns == 0 {
+            load.next_ns = self.now;
+        }
+        while self.now < until {
+            while load.next_ns <= self.now {
+                load.waiting.push_back(load.offered.len() as u64);
+                load.offered.push(load.next_ns);
+                load.applied.push(None);
+                load.next_ns += every_ns;
+            }
+            while let Some(&sequence) = load.waiting.front() {
+                let mut data = LOAD.to_vec();
+                data.extend_from_slice(&sequence.to_le_bytes());
+                if !self.propose(&data) {
+                    load.refused += 1;
+                    break;
+                }
+                load.waiting.pop_front();
+            }
+            self.next_by(load.next_ns.min(until));
+            self.observe(load);
+        }
+    }
+
+    /// What the publisher sees: each publish's first application on any node, and who leads.
+    fn observe(&self, load: &mut Load) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            if !node.alive {
+                continue;
+            }
+            let entries = &self.replica(node.id).machine().now.entries;
+            for (_, _, data) in entries.iter().skip(load.read[index]) {
+                let Some(sequence) = data
+                    .strip_prefix(LOAD)
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                    .map(u64::from_le_bytes)
+                else {
+                    continue;
+                };
+                let applied = &mut load.applied[sequence as usize];
+                if applied.is_none() {
+                    *applied = Some(self.now);
+                }
+            }
+            load.read[index] = entries.len();
+        }
+        let term = self
+            .nodes
+            .iter()
+            .filter(|n| n.alive)
+            .map(|n| self.replica(n.id).term())
+            .max()
+            .unwrap_or(0);
+        let lead = (self.leader().unwrap_or(0), term);
+        if load.leads.last().is_none_or(|&(_, l, t)| (l, t) != lead) {
+            load.leads.push((self.now, lead.0, lead.1));
         }
     }
 
@@ -994,5 +1243,336 @@ fn an_orderly_stop_announced_first_hands_over_and_keeps_the_new_leader() {
         world.run_until(|w| w.leader().is_some());
         assert!(world.propose(b"back"));
         world.run_until(|w| w.applied_everywhere(b"back"));
+    }
+}
+
+/// What a publish's entry begins with: its sequence follows, eight bytes little-endian.
+const LOAD: &[u8] = b"load";
+
+/// A publisher's load on the group (Focal's comparison, doc 34: a publish every millisecond), each
+/// publish offered again until a leader takes it, as the bus's client follows a redirect: when each
+/// was offered and first applied by a node, and who led.
+#[derive(Default)]
+struct Load {
+    /// Each publish's first offer, by its sequence.
+    offered: Vec<u64>,
+    /// When a node first applied each publish, by its sequence.
+    applied: Vec<Option<u64>>,
+    /// The next publish's offer.
+    next_ns: u64,
+    /// The publishes offered that no leader took yet, oldest first.
+    waiting: VecDeque<u64>,
+    /// Offers refused: no leader, or one that took none.
+    refused: u64,
+    /// How far each node's applied entries were read.
+    read: [usize; 3],
+    /// Each change of who leads and of the highest term: when, the leader (zero, none) and the term.
+    leads: Vec<(u64, u64, u64)>,
+}
+
+/// A suspicion noticed: its judge, the peer, when from the stall's start, and its judge's own wait
+/// for a proof (since, end), from the stall's start.
+type Noticed = (u64, u64, i64, Option<(i64, Option<i64>)>);
+
+/// What a stall did, from its start: whether the leader before it lost the lead or a term was
+/// spent, the suspicions noticed with their judges' own proofs, the longest stretch without a
+/// leader, and the latencies of the publishes offered from a second before it to its end and a
+/// quiet period past.
+struct Stalled {
+    seed: u64,
+    leader: u64,
+    term: u64,
+    /// The stall's end on each node, from its start.
+    ends_ns: [u64; 3],
+    /// Terms spent from the stall's start.
+    terms: u64,
+    /// The leader before the stall lost the lead at some point.
+    lost: bool,
+    suspicions: Vec<Noticed>,
+    /// The longest stretch with no leader, from the stall's start on.
+    leaderless_ns: u64,
+    /// Offered to first applied, nanoseconds, of the publishes offered in the window, sorted.
+    latencies: Vec<u64>,
+    /// Publishes offered in the window and never applied.
+    unapplied: usize,
+    /// The freshness, `η + α`, each node held each peer to as the stall began: the widest.
+    freshness_ns: u64,
+}
+
+impl Stalled {
+    /// The latency at `permille` thousandths: the least that many of the latencies are at most.
+    fn quantile(&self, permille: usize) -> u64 {
+        let at = (self.latencies.len() * permille).div_ceil(1_000);
+        self.latencies.get(at.max(1) - 1).copied().unwrap_or(0)
+    }
+
+    fn line(&self) -> String {
+        let ms = |ns: i64| ns as f64 / 1e6;
+        let unsigned = |ns: u64| ns as f64 / 1e6;
+        let suspicions: Vec<String> = self
+            .suspicions
+            .iter()
+            .map(|(judge, peer, noticed, waited)| {
+                let own = match waited {
+                    Some((since, Some(end))) => {
+                        format!("own wait {:.0}..{:.0}", ms(*since), ms(*end))
+                    }
+                    Some((since, None)) => format!("own wait {:.0}..", ms(*since)),
+                    None => "no own wait".to_string(),
+                };
+                format!("{judge}->{peer} at {:.0} ms ({own})", ms(*noticed))
+            })
+            .collect();
+        format!(
+            "seed {}: leader {} term {}, ends {:?} ms, freshness {:.0} ms: {} terms spent, lead {}, \
+             leaderless {:.0} ms; publishes p50 {:.1} p99 {:.1} p99.9 {:.1} max {:.1} ms, {} never \
+             applied; suspicions [{}]",
+            self.seed,
+            self.leader,
+            self.term,
+            self.ends_ns.map(|e| e / MS),
+            unsigned(self.freshness_ns),
+            self.terms,
+            if self.lost { "lost" } else { "kept" },
+            unsigned(self.leaderless_ns),
+            unsigned(self.quantile(500)),
+            unsigned(self.quantile(990)),
+            unsigned(self.quantile(999)),
+            unsigned(self.latencies.last().copied().unwrap_or(0)),
+            self.unapplied,
+            suspicions.join(", ")
+        )
+    }
+}
+
+/// A group of three under the publisher's load, each pair judged by a configured detector and two
+/// seconds of the load behind it; then each node's device stalls from one instant to its own end,
+/// `ends(leader)` from it (zero, no stall), and the group runs on to a quiet period past the last.
+fn stalled(seed: u64, one_log: bool, ends: impl Fn(u64) -> [u64; 3]) -> Stalled {
+    let mut world = World::new(seed);
+    world.one_log = one_log;
+    world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+    let mut load = Load::default();
+    let settled = world.now + 2_000 * MS;
+    world.run_loaded(settled, MS, &mut load);
+    let leader = world.leader().unwrap_or(0);
+    let term = world.replica(leader.max(1)).term();
+    let from = world.now;
+    let ends_ns = ends(leader);
+    let freshness_ns = world
+        .nodes
+        .iter()
+        .flat_map(|n| (1..=3u64).filter_map(move |peer| n.liveness.report(peer)?.freshness))
+        .max()
+        .map_or(0, |f| f.as_nanos() as u64);
+    world.proofs.clear();
+    for id in 1..=3u64 {
+        let end = ends_ns[(id - 1) as usize];
+        if end > 0 {
+            world.stall(id, from + end);
+        }
+    }
+    let first = load
+        .offered
+        .partition_point(|offered| *offered < from.saturating_sub(1_000 * MS));
+    let leads_from = load.leads.len();
+    let until = from + ends_ns.into_iter().max().unwrap_or(0) + world.quiet();
+    // One seed's timeline, asked by HYPER_DURABLE_STALL_TRACE.
+    if support::count("HYPER_DURABLE_STALL_TRACE", u64::MAX) == seed {
+        world.trace = Some(Trace {
+            from,
+            until,
+            lines: Vec::new(),
+        });
+    }
+    world.run_loaded(until, MS, &mut load);
+    if let Some(trace) = world.trace.take() {
+        println!(
+            "-- seed {seed}'s timeline, ms from the stall's start (ends {:?} ms):",
+            ends_ns.map(|e| e / MS)
+        );
+        for line in &trace.lines {
+            println!("{line}");
+        }
+    }
+    // Every publish offered in the window, given the time to be applied: the load goes on a quiet
+    // period more.
+    let offered = load.offered.len();
+    let drained = world.now + world.quiet();
+    world.run_loaded(drained, MS, &mut load);
+    let rel = |ns: u64| i64::try_from(ns).unwrap() - i64::try_from(from).unwrap();
+    let suspicions = world
+        .proofs
+        .iter()
+        .map(|(judge, s, own)| {
+            (
+                *judge,
+                s.peer,
+                rel(s.noticed_ns),
+                own.map(|(since, end)| (rel(since), end.map(rel))),
+            )
+        })
+        .collect();
+    let mut leaderless_ns = 0;
+    let mut none_since: Option<u64> = None;
+    let mut lost = false;
+    let mut last_term = term;
+    for &(at, lead, t) in &load.leads[leads_from.saturating_sub(1)..] {
+        let at = at.max(from);
+        last_term = last_term.max(t);
+        if lead != leader {
+            lost = true;
+        }
+        match (lead, none_since) {
+            (0, None) => none_since = Some(at),
+            (l, Some(since)) if l != 0 => {
+                leaderless_ns = leaderless_ns.max(at - since);
+                none_since = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(since) = none_since {
+        leaderless_ns = leaderless_ns.max(world.now - since);
+    }
+    let mut latencies = Vec::new();
+    let mut unapplied = 0;
+    for (offered_ns, applied) in load.offered[first..offered]
+        .iter()
+        .zip(&load.applied[first..offered])
+    {
+        match applied {
+            Some(applied) => latencies.push(applied - offered_ns),
+            None => unapplied += 1,
+        }
+    }
+    latencies.sort_unstable();
+    Stalled {
+        seed,
+        leader,
+        term,
+        ends_ns,
+        terms: last_term - term,
+        lost,
+        suspicions,
+        leaderless_ns,
+        latencies,
+        unapplied,
+        freshness_ns,
+    }
+}
+
+/// What each shape of stall does to the group, a line a seed: doc 34's (every node's flush 584 to
+/// 587 ms in the same second), the same where each node's stream and replica share one log a frame
+/// at a time (Focal's member), a journal's (each node's flushes held to a later commit), the
+/// leader's alone, and the leader's for 2 s (CP-T2.2 step 2's example). Run with `--ignored
+/// --nocapture`; HYPER_DURABLE_STALL_SEEDS seeds from HYPER_DURABLE_LIVENESS_SEED, and
+/// HYPER_DURABLE_STALL_TRACE names a seed whose timeline each shape prints.
+#[test]
+#[ignore = "a survey of stalls for CP-T2.2's trace, not a check"]
+fn survey_of_stalls() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    type Shape = (&'static str, bool, fn(u64) -> [u64; 3]);
+    let shapes: [Shape; 5] = [
+        ("together, 584 to 587 ms (doc 34)", false, together),
+        (
+            "together, one log a frame at a time (Focal's member)",
+            true,
+            together,
+        ),
+        ("a journal's: 585, 735 and 885 ms", false, |_| {
+            [585 * MS, 735 * MS, 885 * MS]
+        }),
+        ("the leader's alone, 585 ms", false, |leader| {
+            let mut ends = [0; 3];
+            ends[(leader.max(1) - 1) as usize] = 585 * MS;
+            ends
+        }),
+        ("the leader's alone, 2 s", false, |leader| {
+            let mut ends = [0; 3];
+            ends[(leader.max(1) - 1) as usize] = 2_000 * MS;
+            ends
+        }),
+    ];
+    for (name, one_log, ends) in shapes {
+        println!("== {name}");
+        let mut lost = 0;
+        for seed in first..first + seeds {
+            let outcome = stalled(seed, one_log, ends);
+            lost += u64::from(outcome.lost || outcome.terms > 0);
+            println!("{}", outcome.line());
+        }
+        println!("-- {name}: the lead lost or a term spent in {lost} of {seeds} seeds");
+    }
+}
+
+/// The stall of doc 34: every node's flush 584 to 587 ms in the same second.
+fn together(_: u64) -> [u64; 3] {
+    [584 * MS, 585 * MS, 587 * MS]
+}
+
+/// CP-T2.2 step 1: a stall of every node's flush at once, as on the one disk of Focal's doc 34
+/// (each node's log flush 584 to 587 ms in the same second), spends no term under a publish a
+/// millisecond, where each node's stream and replica write logs of their own and where they share
+/// one a frame at a time: no judge blames a peer for a stall its own flush proof shares
+/// (`docs/timing.md` §2.8), so the leader before it leads after it, in the same term. At b5ea01ba,
+/// doc 34's run, before that rule (7959df9, 1ccd38d and 2b13b15), it failed in every seed: each
+/// judge suspected both peers within its freshness, and the leader, left no trusted quorum, stepped
+/// down (seed 0: the suspicions 63 to 81 ms into the stall, the step-down at 76 ms, no leader for
+/// 516 ms).
+#[test]
+fn a_flush_stall_every_node_shares_spends_no_term() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for one_log in [false, true] {
+        for seed in first..first + seeds {
+            let outcome = stalled(seed, one_log, together);
+            assert!(
+                !outcome.lost && outcome.terms == 0,
+                "{}{}",
+                if one_log {
+                    "one log, a frame at a time: "
+                } else {
+                    ""
+                },
+                outcome.line()
+            );
+        }
+    }
+}
+
+/// CP-T2.2 step 2's: flush stalls that end apart, as a journal's later commits hold some nodes'
+/// flushes past others' (585, 735 and 885 ms), spend no term. Fails here: a judge whose own stall
+/// ends first holds a peer still stalled to its freshness from that end, and a leader suspecting
+/// both followers steps down.
+#[test]
+#[ignore = "CP-T2.2 step 2: stalls that end apart cost the lead"]
+fn flush_stalls_that_end_apart_spend_no_term() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let outcome = stalled(seed, false, |_| [585 * MS, 735 * MS, 885 * MS]);
+        assert!(!outcome.lost && outcome.terms == 0, "{}", outcome.line());
+    }
+}
+
+/// CP-T2.2 step 2's: the leader's flush stalled alone, 585 ms and 2 s, spends no term, its process
+/// alive and its followers' disks a majority. Fails here: its heartbeats wait on its flush proof,
+/// so both followers suspect it within their freshness and elect another.
+#[test]
+#[ignore = "CP-T2.2 step 2: the leader's disk alone costs the lead"]
+fn a_stall_of_the_leaders_flush_alone_spends_no_term() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for stall in [585 * MS, 2_000 * MS] {
+        for seed in first..first + seeds {
+            let outcome = stalled(seed, false, |leader| {
+                let mut ends = [0; 3];
+                ends[(leader.max(1) - 1) as usize] = stall;
+                ends
+            });
+            assert!(!outcome.lost && outcome.terms == 0, "{}", outcome.line());
+        }
     }
 }

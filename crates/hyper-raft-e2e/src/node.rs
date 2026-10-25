@@ -427,7 +427,9 @@ impl Node {
         for peer in &now {
             if self.attached.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
-                let told = if self.liveness.trust(*peer) == Some(Trust::Suspected) {
+                let told = if self.liveness.stopped(*peer) {
+                    self.raw.stopped(*peer)
+                } else if self.liveness.trust(*peer) == Some(Trust::Suspected) {
                     self.raw.suspect(*peer)
                 } else {
                     self.raw.trust(*peer)
@@ -548,6 +550,11 @@ impl Node {
             Change::Restarted { .. } => {
                 self.restarts = self.restarts.saturating_add(1);
                 self.raw.restarted(peer)
+            }
+            Change::Stopped { at_ns, .. } => {
+                self.told.retain(|(told, _)| *told != peer);
+                self.told.push((peer, *at_ns));
+                self.raw.stopped(peer)
             }
         };
         heard(told).map(drop)

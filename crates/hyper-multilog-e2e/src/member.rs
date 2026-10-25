@@ -455,9 +455,12 @@ impl Member {
         for peer in now.clone() {
             if self.attached.binary_search(&peer).is_err() {
                 self.liveness.attach(peer).map_err(MemberError::Liveness)?;
+                let stopped = self.liveness.stopped(peer);
                 let suspected = self.liveness.trust(peer) == Some(Trust::Suspected);
                 self.each(|node| {
-                    if suspected {
+                    if stopped {
+                        node.stopped(peer)
+                    } else if suspected {
                         node.suspect(peer)
                     } else {
                         node.trust(peer)
@@ -574,6 +577,11 @@ impl Member {
             Change::Restarted { .. } => {
                 self.restarts = self.restarts.saturating_add(1);
                 self.each(|node| node.restarted(peer))
+            }
+            Change::Stopped { at_ns, .. } => {
+                self.told.retain(|(told, _)| *told != peer);
+                self.told.push((peer, *at_ns));
+                self.each(|node| node.stopped(peer))
             }
         }
     }

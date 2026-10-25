@@ -2353,6 +2353,13 @@ impl<S: Storage> Raft<S> {
             .as_ref()
             .is_some_and(|watch| watch.suspects(member))
     }
+    /// Whether `member`'s node announced its run ends and has not been heard since
+    /// ([`Raft::stopped`]); never on ticks.
+    pub fn stops(&self, member: NodeId) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(|watch| watch.stopped(member))
+    }
     /// The members the owner's detectors suspect, in order; none on ticks.
     pub fn suspected(&self) -> &[NodeId] {
         self.watch.as_ref().map_or(&[], |watch| watch.suspected())
@@ -2405,6 +2412,37 @@ impl<S: Storage> Raft<S> {
             self.left_no_quorum()?;
         }
         Ok(())
+    }
+    /// The owner's detectors took `member`'s node's announcement that its run ends, in order
+    /// (hyper-liveness `Change::Stopped`): it is suspected, as by [`Raft::suspect`], at once where
+    /// a silence is suspected only once a freshness point passes; and until its node is heard
+    /// again ([`Raft::restarted`], [`Raft::trust`]) this member orders it to campaign never, and
+    /// drops its requests for votes and whatever it sends of a later term than this member's
+    /// (`Raft::drops`). A stopping node may still run its members for a while (an owner closing
+    /// its connections, or one that announces before it hands over what it leads), and what they
+    /// sent may arrive after the announcement: a campaign of its, forced by an order it took, or a
+    /// later term it reached, would take the leader from a group whose remaining voters keep one by
+    /// the degraded group's rule (`docs/timing.md` §2.9, "A voter's stop announced";
+    /// `docs/models/SuspicionStopNoDrop.cfg`). Dropped as lost messages are, they cost Raft's
+    /// safety nothing. A member never takes itself for stopped.
+    pub fn stopped(&mut self, member: NodeId) -> Result<()> {
+        if member == self.id {
+            return Ok(());
+        }
+        self.suspect(member)?;
+        let members = self.config.limits.members;
+        self.watch_mut()?.stop(member, members)
+    }
+    /// Whether `message` comes from a member whose node announced its run ends
+    /// ([`Raft::stopped`]) and could take this group's leader: a request for votes, of any term,
+    /// forced or not, or anything of a later term than this member's.
+    fn drops(&self, message: &Message) -> bool {
+        message.from != self.id
+            && self.stops(message.from)
+            && (matches!(
+                message.msg_type,
+                MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+            ) || message.term > self.term)
     }
     /// Check-quorum, from the detectors (Raft §6.2): a leader they leave no quorum leads on, and
     /// orders its heirs in turn to campaign where each can be elected without it
@@ -2500,7 +2538,9 @@ impl<S: Storage> Raft<S> {
         let heirs = || {
             self.tracker
                 .iter()
-                .filter(|(member, _)| *member != self.id && configuration.votes(*member))
+                .filter(|(member, _)| {
+                    *member != self.id && configuration.votes(*member) && !self.stops(*member)
+                })
                 .map(|(member, progress)| {
                     (
                         self.suspects(member),
@@ -2681,7 +2721,9 @@ impl<S: Storage> Raft<S> {
     /// on dead nodes; it is told again once trusted. While the members it
     /// trusts leave it no quorum it counts them all: it commits only by some
     /// it suspects, and an append lost on its way to one waited, unsent
-    /// again, until the leader trusted it.
+    /// again, until the leader trusted it. A member whose node announced its
+    /// stop it never counts: its run is ending, and beats on its account
+    /// would go on until its next run is heard.
     fn active(&self) -> Result<bool> {
         if self.lead_transferee.is_some() || !self.read_only.is_empty() {
             return Ok(true);
@@ -2693,6 +2735,7 @@ impl<S: Storage> Raft<S> {
         let quorum = self.trusted_quorum();
         Ok(self.tracker.iter().any(|(member, progress)| {
             member != id
+                && !watch.stopped(member)
                 && (!quorum || !watch.suspects(member))
                 && (progress.matched < last
                     || progress.committed_index < committed
@@ -3222,6 +3265,9 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Violation(
                 "a term or an index beyond what is counted",
             ));
+        }
+        if self.drops(&message) {
+            return Ok(());
         }
         if self.step_term(kind, &message)? == TermChecked::Done {
             return Ok(());

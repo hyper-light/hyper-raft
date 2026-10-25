@@ -307,8 +307,9 @@ struct Received {
     /// The longest gap the peer may leave before its next heartbeat when its latest echoed nothing,
     /// nanoseconds ([`unanswered_next`]); zero once it echoes this node.
     unanswered_next_ns: u64,
-    /// The run taken last announced its stop ([`Heartbeat::stopping`]): it is sent nothing more,
-    /// and its next run's start is no failure.
+    /// The run taken last announced its stop ([`Heartbeat::stopping`]): it is suspected, judged
+    /// by no freshness point and sent nothing more, a heartbeat of it after the announcement is
+    /// refused, and its next run's start is no failure.
     stopped: bool,
 }
 
@@ -363,6 +364,9 @@ impl Pair {
     }
 
     pub(crate) fn trust(&self) -> Trust {
+        if self.received.stopped {
+            return Trust::Suspected;
+        }
         match self.received.link.as_ref() {
             Some(link) => link.estimator.trust(),
             None if self.unheard.suspected => Trust::Suspected,
@@ -521,6 +525,9 @@ impl Pair {
     /// it to; none while that waits for the node's own proof, whose completion polls the stream.
     /// Read without building the trust, since every wake asked reads it of every pair.
     pub(crate) fn deadline(&self, local: &Local, now_ns: u64) -> Option<u64> {
+        if self.received.stopped {
+            return None;
+        }
         let point = self.point()?;
         if point > now_ns {
             return Some(point);
@@ -779,6 +786,11 @@ impl Pair {
         now_ns: u64,
         local: &Local,
     ) -> (Option<Change>, bool) {
+        // A run that announced its end is suspected from the announcement until the next run is
+        // heard: nothing of it is left to judge.
+        if self.received.stopped {
+            return (None, false);
+        }
         let at = match self.point() {
             // Not passed: every poll of every pair, so nothing more is read.
             Some(point) if now_ns < point => return (None, false),
@@ -930,7 +942,7 @@ impl Pair {
     /// Takes heartbeat `beat` from `peer`, received at `arrival_ns`, after judging the peer at
     /// that arrival: a freshness point that passed before the heartbeat came is a suspicion
     /// whatever order the owner fed them in. The changes are, in order, a suspicion at the
-    /// arrival, the peer's restart, and the trust the heartbeat leaves.
+    /// arrival, the peer's restart or its announced stop, and the trust the heartbeat leaves.
     pub(crate) fn take(
         &mut self,
         peer: PeerId,
@@ -941,13 +953,8 @@ impl Pair {
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns, &context.local).0;
-        if beat.stopping {
-            // The run the peer stops, if it is the one taken: no evidence of life, which changes
-            // nothing the detector holds. An announcement of a run not taken announces nothing
-            // known: the restart after it is judged by the run that was.
-            taken.stopping = true;
-            self.received.stopped |= self.received.run == Some(beat.run);
-            return Ok(());
+        if let Some(ended) = self.take_ended(peer, beat, arrival_ns, changes, taken) {
+            return ended;
         }
         let first_heard = self.received.run.is_none();
         let after_stop = self.received.stopped;
@@ -1044,6 +1051,41 @@ impl Pair {
         taken.own = self.received.configuration.is_some();
         changes[2] = self.settle(peer, arrival_ns);
         Ok(())
+    }
+
+    /// A heartbeat that announces the end of the peer's run, or one of a run that announced its
+    /// end: what taking it comes to; `None` for any other.
+    fn take_ended(
+        &mut self,
+        peer: PeerId,
+        beat: &Heartbeat,
+        arrival_ns: u64,
+        changes: &mut [Option<Change>; 3],
+        taken: &mut Taken,
+    ) -> Option<Result<(), Refusal>> {
+        let current = self.received.run == Some(beat.run);
+        if beat.stopping {
+            // The run the peer stops, if it is the one taken: no evidence of life, which changes
+            // nothing the detector holds, and the peer's end, told at once. Suspected only as its
+            // freshness point passed, it was trusted for as long as the detector's margin after
+            // its last heartbeat, and a remaining voter that wrongly suspected its leader
+            // meanwhile counted it in a quorum it trusted and asked for votes (mantle's roll; the
+            // window `SuspicionStopUnannounced.cfg` finds). An announcement of a run not taken
+            // announces nothing known: the restart after it is judged by the run that was.
+            taken.stopping = true;
+            if current && !self.received.stopped {
+                self.received.stopped = true;
+                self.told = true;
+                changes[1] = Some(Change::Stopped {
+                    peer,
+                    at_ns: arrival_ns,
+                });
+            }
+            return Some(Ok(()));
+        }
+        // A heartbeat of a run that announced its end, overtaken by the announcement: no evidence
+        // that the run lives, which ended.
+        (current && self.received.stopped).then_some(Err(Refusal::Stale))
     }
 
     /// Whether the margin of the node's evidence is due, on the configuration's doubling schedule:

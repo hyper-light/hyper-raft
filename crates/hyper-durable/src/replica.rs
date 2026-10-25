@@ -824,6 +824,19 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         })
     }
 
+    /// The owner's detectors took `member`'s node's announcement that its run ends: suspected at
+    /// once, its held answers not counted (core step R-8), ordered to campaign never, and what it
+    /// sends that could take the group's leader dropped, until its node is heard again
+    /// (`hyper_raft::RawNode::stopped`).
+    pub fn stopped(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let held = r.node.suspect_held(member);
+            r.heard(held)?;
+            let told = r.node.stopped(member);
+            r.heard(told)
+        })
+    }
+
     /// Stops this member's held answers ahead of a planned stop (core step R-8): its promise drops
     /// in a later write once its disk holds what it answered for, and the owner stops it once
     /// [`Replica::held_settled`], so that it opens unmarked.
@@ -888,13 +901,21 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     pub fn believe_all(&mut self, liveness: &Liveness) -> Result<(), ReplicaError> {
         let peers: Vec<PeerId> = self.peers().collect();
         for peer in peers {
-            if liveness.trust(peer) == Some(Trust::Suspected) {
-                self.suspect(peer)?;
-            } else {
-                self.trust(peer)?;
-            }
+            self.believe_of(liveness, peer)?;
         }
         Ok(())
+    }
+
+    /// Tells the core what the node's liveness stream believes of `peer` now: its run's announced
+    /// stop, a suspicion, or trust.
+    pub fn believe_of(&mut self, liveness: &Liveness, peer: PeerId) -> Result<(), ReplicaError> {
+        if liveness.stopped(peer) {
+            self.stopped(peer)
+        } else if liveness.trust(peer) == Some(Trust::Suspected) {
+            self.suspect(peer)
+        } else {
+            self.trust(peer)
+        }
     }
 
     /// The group's timing by hyper-timing's law over what the node's liveness stream measured

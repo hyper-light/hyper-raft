@@ -1151,6 +1151,31 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   `a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (a node of three restarted
   deaf for 10 s in the four worlds: no suspicion of it is of a heartbeat not yet due by its schedule,
   where with the doubling unannounced macOS's first seed had one 190 ms before it).
+- **A run that has taken none of this node's heartbeats** (2026-10-24, found by mantle). The interval a
+  peer asks of this node's stream is its detector's choice from that stream's heartbeats, and a peer
+  that started again asks nothing until its new run's link has evidence: a stream taking that went
+  to its floor, a flush a heartbeat, which a restart heard at once makes a few seconds' warm-up (in
+  this simulation's macOS and Linux worlds the surviving nodes' liveness writes rise from 11–30 a
+  second to 80–240 for about five seconds, and the run configures). mantle's roll restarts a founder
+  at a new port, which its peers send to at its old one until they are told, so the new run's
+  heartbeats reached them asking nothing while it heard none of theirs, and their streams to it ran at
+  their floors, sending where no one listened, for as long as that lasted: 40 to 200 liveness writes
+  a second on its busy CI runners against 1 to 2, on the host whose lateness makes the detectors'
+  mistakes. Such a run's heartbeats echo nothing, its sender having taken none of the receiver's, and
+  its ask is taken only once one echoes (`Pair::keep_said`): until then the stream keeps the interval
+  it was at, which the run's previous ask gave. It is no back-off, whose doublings a peer that takes
+  this node's heartbeats would not expect (the echo-less heartbeat is the doubling's only notice, and
+  the back-off's own heartbeats echo the peer's), and a stream that changes no gap changes nothing
+  its peer foresees; once the run takes a heartbeat and echoes it, its ask is taken and the warm-up
+  runs as before. A first run's stream starts with no ask, at its floor, as before. Measured with
+  the simulation at `dd764a0` and `313ada8` alike, the rise is the restart's: a peer only stopped
+  leaves its peers' streams at the interval it asked, their writes as they were. Test:
+  `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat` (the third node of three restarted
+  deaf for 20 s in the four worlds, 8 seeds each: each other node's heartbeats to it keep their
+  interval and number at most the deaf time over it and two, its liveness writes at most its
+  heartbeats and one, and once heard every pair configures with no suspicion by the restarted node of
+  a heartbeat its sender did not yet have due; red at `313ada8`, macOS's first seed sending 2,159
+  heartbeats 6.97 ms apart where its stream had been at 110 ms).
 - **A stream keeps its schedule without hearing its peer.** A heartbeat sent whose next slot is
   already due asks at once for the flush that proves the next (`Liveness::poll`), and its completion
   polls the stream. Its next slot is due already where the interval fell while the stream was

@@ -2194,6 +2194,113 @@ fn a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off() {
     }
 }
 
+/// A run of a peer that has taken none of the node's heartbeats asks from no evidence of the node's
+/// stream, and its ask is not taken until it takes one: mantle's roll restarts a founder at a new
+/// port, which its peers send to at its old one until they are told, while its own heartbeats reach
+/// them asking no interval. Taken, that ask moved each peer's stream to its floor, a flush each,
+/// for as long as the founder heard nothing: in this simulation's worlds the peers' liveness writes
+/// went from 11–30 a second to 80–240 on macOS and Linux (mantle saw 40–200 against 1–2 on its busy
+/// CI runners). Do: three nodes settled; the third started again, deaf, for twenty seconds; then
+/// heard. Expect: each other node's heartbeats to it keep the interval its stream had before the
+/// restart, and number no more than the deaf time over it and two; its liveness writes no more than
+/// the heartbeats it sent and one; once heard, every pair configures, and no suspicion the restarted
+/// node makes of a live peer is of a heartbeat its sender did not yet have due.
+#[test]
+fn a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat() {
+    // Shape: long enough for a floor of a few milliseconds to send thousands of heartbeats.
+    const DEAF: u64 = 20_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(23, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let before: Vec<u64> = (0..2)
+                .map(|node| {
+                    let report = sim.nodes[node].liveness.report(3).unwrap();
+                    report.sending.unwrap().as_nanos() as u64
+                })
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.nodes[2].deaf = true;
+            let start = sim.now;
+            let logged: Vec<usize> = (0..2).map(|node| sim.nodes[node].log.len()).collect();
+            let writes: Vec<u64> = (0..2).map(|node| sim.nodes[node].liveness_writes).collect();
+            sim.poll(2);
+            sim.run_while(|_| true, Some(start + DEAF));
+            for node in 0..2 {
+                let sent = &sim.nodes[node].log[logged[node]..];
+                let to_it: Vec<u64> = sent
+                    .iter()
+                    .filter(|(_, peer, _)| *peer == 3)
+                    .map(|(_, _, beat)| beat.interval_ns)
+                    .collect();
+                let shortest = to_it.iter().copied().min().unwrap_or(0);
+                assert!(
+                    shortest >= before[node],
+                    "{name} seed {seed}: node {} sent the deaf run {} heartbeats, down to {} µs \
+                     apart, where its stream was at {} µs",
+                    node + 1,
+                    to_it.len(),
+                    shortest / US,
+                    before[node] / US
+                );
+                let most = DEAF / before[node] + 2;
+                assert!(
+                    to_it.len() as u64 <= most,
+                    "{name} seed {seed}: node {} sent the deaf run {} heartbeats in {} s, past {most}",
+                    node + 1,
+                    to_it.len(),
+                    DEAF / 1_000 / MS
+                );
+                let written = sim.nodes[node].liveness_writes - writes[node];
+                assert!(
+                    written <= sent.len() as u64 + 1,
+                    "{name} seed {seed}: node {} made {written} liveness writes for {} heartbeats",
+                    node + 1,
+                    sent.len()
+                );
+            }
+            // Heard: its peers take its ask once it has taken one of their heartbeats.
+            let heard_from = sim.now;
+            let suspected_before = sim.nodes[2].suspicions.len();
+            sim.nodes[2].deaf = false;
+            sim.run_until_configured();
+            // No suspicion the restarted node made of a live peer once it heard them is of a
+            // heartbeat its sender did not yet have due by its schedule.
+            for suspicion in &sim.nodes[2].suspicions[suspected_before..] {
+                let peer = suspicion.peer;
+                let Some(last) = suspicion.last.filter(|last| last.arrival_ns >= heard_from) else {
+                    continue;
+                };
+                let sent = &sim.nodes[peer as usize - 1].log;
+                let due = sent
+                    .iter()
+                    .find(|(_, to, beat)| *to == 3 && beat.run == 1 && beat.seq > last.seq)
+                    .map(|(_, _, beat)| {
+                        beat.sent_ns - beat.late_ns - (beat.seq - last.seq - 1) * beat.interval_ns
+                    });
+                assert!(
+                    due.is_some_and(|due| due <= suspicion.at_ns),
+                    "{name} seed {seed}: the restarted node suspected node {peer} at {} ms, its \
+                     next heartbeat due at {:?} ms",
+                    (suspicion.at_ns - heard_from) / MS,
+                    due.map(|due| due.saturating_sub(heard_from) / MS)
+                );
+            }
+        }
+    }
+}
+
 /// Runs `sim`, configured and doubled, until every live node trusts every live peer, and returns
 /// the longest freshness, `η + α`, any pair holds then.
 fn settled(sim: &mut Sim) -> u64 {

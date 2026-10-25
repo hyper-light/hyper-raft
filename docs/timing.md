@@ -1506,6 +1506,30 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
     held the peer suspected while its owner trusted it, and a peer that died in its links' first
     heartbeats was never reported (a pair's unit test; the simulation's worlds had not reached it).
   The simulation holds every node's owner to it after every step (`told_is_believed`).
+- **A stop announced** (2026-10-24, asked by mantle). The MTBF counts what a detector must catch
+  (§2.2: a crash, detected within `E(D) + α + η`, then an election), and a node its owner stops in
+  order hands over what it leads before it goes (mantle's orderly stop: each range it leads
+  transferred and shown led elsewhere), so its stop and its next start are no failure; counted one,
+  as every restart was, a rolling update charged each node's peers a failure at every roll, and a
+  node started with no history (`Exposure::new()`) read an MTBF of twice a few seconds from it. The
+  owner's last act on the plane (`Liveness::stop`) sends each peer the run's last heartbeat, flagged
+  `stopping` (the flags' bit 1, `codec`), which claims no life, so no flush proves it and the receiver
+  takes from it only that the run it took last has ended in order. The receiver then counts that
+  run's successor's start, or its own letting go of the pair while it suspects the peer, as no
+  failure (`Taken::after_stop`), sends the ended run nothing more, where each heartbeat to it asked a
+  flush of its own, and answers its successor's first heartbeat at once, numbered next, skipping no
+  slot of the stop (`Stream::resume`). It suspects the peer as before, when the peer's last
+  heartbeat's freshness point passes: the announcement is no detector's verdict. Lost, or taken by a
+  build that reads only the echo's bit (which refuses it as malformed, the version unchanged so every
+  other heartbeat of a new build reads as before), it costs what an unannounced stop costs. An owner
+  keeps the evidence across its runs with `Liveness::history` and `hyper_timing::Exposure::of`. Test:
+  `a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing` (the third
+  node of three announces its stop and stops, in the four worlds, 8 seeds each: its peers count no
+  failure at its restart, sent it nothing after the announcement, and answered its new run at once,
+  numbered next; a peer let go while suspected after it counts none). With the rule taken out, a
+  failure was counted at the first seed; with the gate on sending taken out, 92 heartbeats went to
+  the stopped run in 10 s. `--bench allocs`: 0 allocations, reallocations, bytes and faults a
+  heartbeat in every cell, 89 to 130 ns a heartbeat.
 - **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α` on the
   receiver's clock, and the sender's last heartbeat was due at `σ_h` on its own; the time between
   is `τ_{h+1} − σ_h − θ`, `θ` the clocks' offset. Each echoed heartbeat `j` bounds `θ` from below:

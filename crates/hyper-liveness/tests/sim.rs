@@ -1489,6 +1489,7 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         flushes,
         flush_age_ns: 0,
         echo: None,
+        stopping: false,
     };
     let mut out = [0u8; MAX_BYTES];
     let mut feed = |node: &mut Liveness, owner: &mut Owner, beat: Heartbeat, at: u64| {
@@ -1552,6 +1553,7 @@ fn heartbeats_without_their_proof_are_refused() {
         flushes: 4,
         flush_age_ns: 2 * MS,
         echo: None,
+        stopping: false,
     };
     let mut out = [0u8; MAX_BYTES];
     let send =
@@ -2301,6 +2303,182 @@ fn a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat() {
     }
 }
 
+/// A node that stops in order announces it to its peers (`Liveness::stop`), and its next run's
+/// start is no failure in their MTBF's evidence, nor is their letting go of the pair while they
+/// suspect it: the MTBF counts what a detector must catch, and an orderly stop handed over what it
+/// led first. Until its next run is heard, the announced run is sent nothing, where each heartbeat
+/// to it asked a flush of its own; that run's first heartbeat is answered at once, numbered next.
+/// Do: three nodes settled; the third announces its stop and stops; its peers suspect it as its
+/// heartbeats stop; it starts again. Expect: no heartbeat sent the stopped run after its
+/// announcement was taken; the restart reported and counted no failure; the first heartbeat each
+/// peer sends the new run is numbered next and sent within a poll's and a flush's lateness of taking
+/// its first; and a node that lets go of an announced, suspected peer counts no failure.
+#[test]
+fn a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(24, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let failures: Vec<u64> = (0..2)
+                .map(|node| sim.nodes[node].liveness.history().failures())
+                .collect();
+            {
+                let now = sim.now;
+                let n = &mut sim.nodes[2];
+                n.liveness.stop(now, &mut n.owner);
+            }
+            sim.drain(2);
+            sim.nodes[2].alive = false;
+            let stopped_at = sim.now;
+            sim.run_until_suspected(2);
+            // Taken by both: each sent the stopped run nothing after it took the announcement.
+            let announced: Vec<u64> = (0..2)
+                .map(|node| {
+                    sim.nodes[node]
+                        .record
+                        .entries
+                        .iter()
+                        .find_map(|entry| match entry {
+                            record::Entry::Fed {
+                                peer: 3,
+                                beat,
+                                refused: None,
+                                ..
+                            } if beat.stopping => Some(beat.stamp),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{name} seed {seed}: node {node} took no announcement")
+                        })
+                })
+                .collect();
+            sim.run_while(|_| true, Some(sim.now + 10_000 * MS));
+            for (node, announced) in announced.iter().enumerate() {
+                let after: Vec<u64> = sim.nodes[node]
+                    .log
+                    .iter()
+                    .filter(|(at, peer, _)| *peer == 3 && at > announced)
+                    .map(|(at, _, _)| *at)
+                    .collect();
+                assert!(
+                    after.is_empty(),
+                    "{name} seed {seed}: node {} sent the stopped run {} heartbeats after its \
+                     announcement, the first {} ms after the stop",
+                    node + 1,
+                    after.len(),
+                    after.first().map_or(0, |at| (at - stopped_at) / MS)
+                );
+            }
+            let last_sent: Vec<u64> = (0..2)
+                .map(|node| {
+                    sim.nodes[node]
+                        .log
+                        .iter()
+                        .filter(|(_, peer, _)| *peer == 3)
+                        .map(|(_, _, beat)| beat.seq)
+                        .max()
+                        .unwrap()
+                })
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.poll(2);
+            let logged: Vec<usize> = (0..2).map(|node| sim.nodes[node].log.len()).collect();
+            sim.run_while(
+                |sim| (0..2).any(|node| sim.nodes[node].restarts.is_empty()),
+                None,
+            );
+            sim.run_while(
+                |sim| {
+                    (0..2).any(|node| {
+                        !sim.nodes[node].log[logged[node]..]
+                            .iter()
+                            .any(|(_, peer, _)| *peer == 3)
+                    })
+                },
+                None,
+            );
+            let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            for node in 0..2 {
+                assert_eq!(
+                    sim.nodes[node].restarts,
+                    vec![3],
+                    "{name} seed {seed}: node {} saw the restart once",
+                    node + 1
+                );
+                assert_eq!(
+                    sim.nodes[node].liveness.history().failures(),
+                    failures[node],
+                    "{name} seed {seed}: node {} counted the restart after an announced stop a \
+                     failure",
+                    node + 1
+                );
+                let heard = sim.nodes[node]
+                    .record
+                    .entries
+                    .iter()
+                    .find_map(|entry| match entry {
+                        record::Entry::Fed {
+                            peer: 3,
+                            beat,
+                            refused: None,
+                            ..
+                        } if beat.run == 2 => Some(beat.stamp),
+                        _ => None,
+                    })
+                    .expect("the new run was taken");
+                let (answered, _, beat) = *sim.nodes[node].log[logged[node]..]
+                    .iter()
+                    .find(|(_, peer, _)| *peer == 3)
+                    .unwrap();
+                assert_eq!(
+                    beat.seq,
+                    last_sent[node] + 1,
+                    "{name} seed {seed}: node {} skipped the stop's slots",
+                    node + 1
+                );
+                assert!(
+                    answered.saturating_sub(heard) <= behind,
+                    "{name} seed {seed}: node {} answered the new run {} ms after taking it, past \
+                     the {} ms a poll and a flush may take",
+                    node + 1,
+                    answered.saturating_sub(heard) / MS,
+                    behind / MS
+                );
+            }
+            sim.run_until_configured();
+        }
+    }
+    // Let go while suspected after an announced stop: no failure.
+    let mut sim = Sim::new(3, MACOS, 0);
+    settled(&mut sim);
+    {
+        let now = sim.now;
+        let n = &mut sim.nodes[2];
+        n.liveness.stop(now, &mut n.owner);
+    }
+    sim.drain(2);
+    sim.nodes[2].alive = false;
+    sim.run_until_suspected(2);
+    let failures = sim.nodes[0].liveness.history().failures();
+    sim.nodes[0].liveness.detach(3).unwrap();
+    assert!(
+        sim.nodes[0].liveness.report(3).is_none(),
+        "the pair was let go"
+    );
+    assert_eq!(sim.nodes[0].liveness.history().failures(), failures);
+}
+
 /// Runs `sim`, configured and doubled, until every live node trusts every live peer, and returns
 /// the longest freshness, `η + α`, any pair holds then.
 fn settled(sim: &mut Sim) -> u64 {
@@ -2628,6 +2806,7 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
             flushes: slot + 1,
             flush_age_ns: 0,
             echo: None,
+            stopping: false,
         };
         let bytes = beat.encode(&mut out).to_vec();
         let _ = node.on_heartbeat(2, &bytes, arrival, &mut owner);
@@ -2781,6 +2960,7 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
                 flushes: seq + 1,
                 flush_age_ns: 0,
                 echo: None,
+                stopping: false,
             };
             let bytes = beat.encode(&mut out).to_vec();
             outcomes.push(node.on_heartbeat(2, &bytes, came, &mut owner));

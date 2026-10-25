@@ -141,6 +141,11 @@ struct World {
     patience: Option<Duration>,
     /// A timeline of what each node did from `from`, a line an event, kept while asked for.
     trace: Option<Trace>,
+    /// Each Raft message a node sent that carried or depended on a term or vote its disk did not
+    /// yet hold (hyper-durable's I1, `breaks_promise`): when, its sender, its kind and its term.
+    broken: Vec<(u64, u64, MessageType, u64)>,
+    /// Each vote a node gave, as it left: when, the voter, the candidate and the term.
+    votes: Vec<(u64, u64, u64, u64)>,
 }
 
 /// What each node did, from `from` until `until`: its writes given and made durable, the proofs
@@ -163,6 +168,30 @@ type OwnWait = Option<(u64, Option<u64>)>;
 /// What a judge knew of its own durability as it suspected (hyper-liveness's `own_proof`).
 fn own_wait(liveness: &Liveness) -> OwnWait {
     liveness.own_proof().waited
+}
+
+/// A Raft message held to what its sender's disk holds as it leaves (hyper-durable's I1,
+/// `docs/durable.md`): one that carries or depends on a term or vote leaves only once the disk holds
+/// that term and vote, as Raft's servers persist both before they answer (thesis §3.8). A pre-vote
+/// asks about a term its sender doesn't take. Whether `message`, from `member` whose disk holds
+/// `durable` (its term and vote), breaks it.
+fn breaks_promise(durable: (u64, u64), message: &Message, member: u64) -> bool {
+    let (term, vote) = durable;
+    if matches!(
+        message.msg_type,
+        MessageType::MsgRequestPreVote | MessageType::MsgRequestPreVoteResponse
+    ) {
+        return false;
+    }
+    if message.term > term {
+        return true;
+    }
+    let current = message.term == term;
+    match message.msg_type {
+        MessageType::MsgRequestVote if current => vote != member,
+        MessageType::MsgRequestVoteResponse if current && !message.reject => vote != message.to,
+        _ => false,
+    }
 }
 
 /// A replica's settings in the world: the cluster's, a leader applying its own entries before its
@@ -239,6 +268,8 @@ impl World {
             ahead: how.apply_ahead,
             patience: how.patience,
             trace: None,
+            broken: Vec::new(),
+            votes: Vec::new(),
         }
     }
 
@@ -318,7 +349,7 @@ impl World {
             .as_ref()
             .and_then(|t| t.at(now).map(|ms| (ms, t.from)));
         let mut notes: Vec<String> = Vec::new();
-        let (changes, me) = {
+        let (changes, me, durable) = {
             let node = &mut self.nodes[at];
             if !node.alive {
                 return;
@@ -408,6 +439,10 @@ impl World {
                 node.liveness.on_durable(Write::Log, started, durable);
             }
             let replica = node.owner.get_mut(node.handle).unwrap();
+            // The term and vote the node's disk holds as this turn's messages leave: nothing
+            // becomes durable within a turn (`make_durable` above, at its start).
+            let hard = &replica.log().disk.hard;
+            let durable = (hard.term, hard.vote);
             if replica.log_mut().pending() > 0 && node.durable_at.is_none() {
                 node.durable_at = Some((now + FLUSH_NS).max(held));
                 if let Some((ms, from)) = tracing
@@ -453,7 +488,7 @@ impl World {
             .flatten()
             .filter(|at| *at > now)
             .min();
-            (changes, me)
+            (changes, me, durable)
         };
         for change in &changes {
             self.record(me, change);
@@ -480,6 +515,15 @@ impl World {
         }
         if let Some(trace) = &mut self.trace {
             trace.lines.append(&mut notes);
+        }
+        for (to, _, payload) in &outgoing {
+            let Payload::Raft(m) = payload else { continue };
+            if breaks_promise(durable, m, id) {
+                self.broken.push((now, id, m.msg_type, m.term));
+            }
+            if m.msg_type == MessageType::MsgRequestVoteResponse && !m.reject {
+                self.votes.push((now, id, *to, m.term));
+            }
         }
         for (to, from, payload) in outgoing {
             if matches!(payload, Payload::Raft(_)) {
@@ -1887,6 +1931,126 @@ fn judged_apart_a_stall_of_each_node_in_turn_spends_no_term() {
             world.leader(),
             slowest as f64 / 1e6,
             load.off_majority
+        );
+    }
+}
+
+/// CP-T2.2 step 2, Focal's condition 4: a member whose disk is stalled gives no vote its disk doesn't
+/// hold, in the step's group, and the group elects only once it can. A follower's disk stalls for
+/// 2 s and the leader is killed 100 ms in: the other follower campaigns and needs the stalled
+/// member's vote, which waits on its disk, so no member leads until the stall ends, and one leads
+/// once it has. No message any member sends carries a term or vote its disk doesn't hold
+/// (`breaks_promise`), and a vote answered from memory is caught: the check refuses one planted.
+#[test]
+fn judged_apart_a_stalled_disk_gives_no_vote_until_it_is_durable() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let mut world = World::with(seed, APART);
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let leader = world.leader().unwrap();
+        let stalled = (1..=3u64).find(|id| *id != leader).unwrap();
+        let other = 6 - leader - stalled;
+        let end = world.now + 2_000 * MS;
+        world.stall(stalled, end);
+        let killed = world.now + 100 * MS;
+        while world.now < killed {
+            world.next_by(killed);
+        }
+        world.nodes[(leader - 1) as usize].alive = false;
+        let term = world.replica(other).term();
+        while world.now < end {
+            world.next_by(end);
+            assert!(
+                world.leader().is_none(),
+                "seed {seed}: n{} led at {} ms into the stall, before n{stalled}'s disk answered",
+                world.leader().unwrap_or(0),
+                (world.now + 2_000 * MS - end) / MS
+            );
+        }
+        world.run_until(|w| w.leader().is_some());
+        let early: Vec<_> = world
+            .votes
+            .iter()
+            .filter(|(at, voter, _, t)| *voter == stalled && *at < end && *t > term)
+            .collect();
+        assert!(
+            world.broken.is_empty() && early.is_empty(),
+            "seed {seed}: messages past their senders' disks {:?}; n{stalled}'s votes before its \
+             disk answered {early:?}",
+            world.broken
+        );
+        assert!(
+            world.replica(world.leader().unwrap()).term() > term,
+            "seed {seed}: no new term led after the stall"
+        );
+    }
+    // Planted: a vote answered from memory, its term or its vote not on the disk, is caught.
+    let vote = Message {
+        msg_type: MessageType::MsgRequestVoteResponse,
+        to: 1,
+        from: 2,
+        term: 3,
+        ..Message::default()
+    };
+    assert!(
+        breaks_promise((2, 0), &vote, 2),
+        "a vote of a term not durable"
+    );
+    assert!(breaks_promise((3, 0), &vote, 2), "a vote not durable");
+    assert!(!breaks_promise((3, 1), &vote, 2), "a vote durable");
+}
+
+/// CP-T2.2 step 2, Focal's condition 4: liveness comes from a hand-over, not from a stalled disk's
+/// vote. A follower's disk stalls for 2 s and the leader hands the lead to the other follower
+/// (`Replica::transfer`): the heir leads on the old leader's vote while the stall lasts, and the
+/// stalled member gives no vote its disk doesn't hold.
+#[test]
+fn judged_apart_a_hand_over_needs_no_vote_from_a_stalled_disk() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let mut world = World::with(seed, APART);
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let leader = world.leader().unwrap();
+        let stalled = (1..=3u64).find(|id| *id != leader).unwrap();
+        let heir = 6 - leader - stalled;
+        let term = world.replica(leader).term();
+        let end = world.now + 2_000 * MS;
+        world.stall(stalled, end);
+        {
+            let node = &mut world.nodes[(leader - 1) as usize];
+            node.owner
+                .get_mut(node.handle)
+                .unwrap()
+                .transfer(heir)
+                .unwrap();
+            node.owner.schedule(node.handle);
+            node.alarm = Some(world.now);
+        }
+        while world.now < end && world.leader() != Some(heir) {
+            world.next_by(end);
+        }
+        let led = world.now;
+        assert!(
+            world.leader() == Some(heir) && world.replica(heir).term() > term && led < end,
+            "seed {seed}: n{heir} did not lead before n{stalled}'s disk answered: leader {:?}",
+            world.leader()
+        );
+        let after = end + world.quiet();
+        while world.now < after {
+            world.next_by(after);
+        }
+        let early: Vec<_> = world
+            .votes
+            .iter()
+            .filter(|(at, voter, _, t)| *voter == stalled && *at < end && *t > term)
+            .collect();
+        assert!(
+            world.broken.is_empty() && early.is_empty(),
+            "seed {seed}: messages past their senders' disks {:?}; n{stalled}'s votes before its \
+             disk answered {early:?}",
+            world.broken
         );
     }
 }

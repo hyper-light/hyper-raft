@@ -611,6 +611,8 @@ impl Node {
                     self.told.push((peer, *at_ns));
                     heard(self.replica.stopped(peer))?
                 }
+                Change::DiskSlow { .. } => heard(self.replica.disk_slow(peer))?,
+                Change::DiskCaughtUp { .. } => heard(self.replica.disk_caught_up(peer))?,
             };
         }
         self.asked.changes = changes;

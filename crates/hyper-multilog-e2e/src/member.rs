@@ -583,6 +583,9 @@ impl Member {
                 self.told.push((peer, *at_ns));
                 self.each(|node| node.stopped(peer))
             }
+            // Each log's core judges processes alone: a disk's verdict is the shell's
+            // (`hyper_durable::Replica::disk_slow`), and these members have none.
+            Change::DiskSlow { .. } | Change::DiskCaughtUp { .. } => Ok(()),
         }
     }
 

@@ -325,6 +325,9 @@ struct Node {
     restarts: Vec<PeerId>,
     /// The peers whose announced stop the node's stream reported, and when.
     stops: Vec<(PeerId, u64)>,
+    /// Each disk verdict its stream gave (`Change::DiskSlow`, `DiskCaughtUp`): the peer, whether
+    /// slow, and the heartbeat's arrival.
+    disks: Vec<(PeerId, bool, u64)>,
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
     /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
     believed: BTreeMap<PeerId, bool>,
@@ -416,6 +419,7 @@ impl Sim {
                     },
                     restarts: Vec::new(),
                     stops: Vec::new(),
+                    disks: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
                     frozen_until: 0,
@@ -600,15 +604,26 @@ impl Sim {
         let changes = std::mem::take(&mut self.nodes[node].owner.changes);
         for change in changes {
             let n = &mut self.nodes[node];
-            n.believed.insert(
-                change.peer(),
-                matches!(change, Change::Suspected(_) | Change::Stopped { .. }),
-            );
             match change {
-                Change::Suspected(suspicion) => n.suspicions.push(suspicion),
-                Change::Restarted { peer, .. } => n.restarts.push(peer),
-                Change::Stopped { peer, at_ns } => n.stops.push((peer, at_ns)),
-                Change::Trusted { .. } => {}
+                Change::Suspected(suspicion) => {
+                    n.believed.insert(suspicion.peer, true);
+                    n.suspicions.push(suspicion);
+                }
+                Change::Restarted { peer, .. } => {
+                    n.believed.insert(peer, false);
+                    n.restarts.push(peer);
+                }
+                Change::Trusted { peer, .. } => {
+                    n.believed.insert(peer, false);
+                }
+                // A disk's verdict leaves what the owner believes of the peer's process as it was.
+                Change::DiskSlow { peer, at_ns } => n.disks.push((peer, true, at_ns)),
+                Change::DiskCaughtUp { peer, at_ns } => n.disks.push((peer, false, at_ns)),
+                // An announced stop: the peer held out as suspected until its next run (Mantle's).
+                Change::Stopped { peer, at_ns } => {
+                    n.believed.insert(peer, true);
+                    n.stops.push((peer, at_ns));
+                }
             }
         }
     }
@@ -1540,6 +1555,8 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         late_ns: 0,
         flushes,
         flush_age_ns: 0,
+        apart: false,
+        disk_slow: false,
         echo: None,
         stopping: false,
     };
@@ -1604,6 +1621,8 @@ fn heartbeats_without_their_proof_are_refused() {
         late_ns: MS,
         flushes: 4,
         flush_age_ns: 2 * MS,
+        apart: false,
+        disk_slow: false,
         echo: None,
         stopping: false,
     };
@@ -1628,6 +1647,8 @@ fn heartbeats_without_their_proof_are_refused() {
         seq: 1,
         flushes: 5,
         flush_age_ns: 12 * MS,
+        apart: false,
+        disk_slow: false,
         ..beat
     };
     assert_eq!(
@@ -3062,6 +3083,188 @@ fn judged_apart_a_stalled_disk_is_not_suspected() {
     }
 }
 
+/// CP-T2.2 step 2, Focal's condition 5: judged apart from its disk, a node whose disk is held for
+/// three freshnesses is judged slow by each peer while the hold lasts, its heartbeats saying so
+/// (`Change::DiskSlow`), and caught up (`Change::DiskCaughtUp`) within a freshness of its end; what
+/// the peers trust of its process is what the stream believes throughout (the sim's own check, every
+/// step), and the others' disks are judged as healthy ones are
+/// (`judged_apart_healthy_disks_draw_no_lasting_verdict`). In each world: idle (macOS's, Linux's: the
+/// stream's probes alone) and loaded (the busy one's log writes).
+#[test]
+fn judged_apart_a_held_disk_is_judged_slow_and_then_caught_up() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(43, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let held = 2usize;
+            let peer = held as u64 + 1;
+            let end = from + 3 * freshness;
+            sim.nodes[held].disk_held_until = end;
+            sim.run_while(|_| true, Some(end + 2 * freshness));
+            for judge in (0..3).filter(|j| *j != held) {
+                let verdicts: Vec<(PeerId, bool, u64)> = sim.nodes[judge]
+                    .disks
+                    .iter()
+                    .filter(|(_, _, at)| *at > from)
+                    .copied()
+                    .collect();
+                let slow = verdicts.iter().find(|(p, slow, _)| *p == peer && *slow);
+                let caught = verdicts
+                    .iter()
+                    .find(|(p, slow, at)| *p == peer && !*slow && *at >= end);
+                let others: Vec<(PeerId, bool, u64)> =
+                    verdicts.iter().filter(|v| v.0 != peer).copied().collect();
+                assert!(
+                    slow.is_some_and(|(_, _, at)| *at < end)
+                        && caught.is_some_and(|(_, _, at)| *at <= end + freshness)
+                        && caught_up_within(&others, freshness),
+                    "{name} seed {seed}: node {}'s verdicts on the disks (peer, slow, ms from the \
+                     hold's start) {:?}, the hold {} ms, the freshness {} ms",
+                    judge + 1,
+                    verdicts
+                        .iter()
+                        .map(|(p, s, at)| (*p, *s, (at - from) / MS))
+                        .collect::<Vec<_>>(),
+                    (end - from) / MS,
+                    freshness / MS
+                );
+            }
+        }
+    }
+}
+
+/// CP-T2.2 step 2, Focal's condition 5: judged apart from their disks, healthy nodes, idle or
+/// loaded, over twenty freshnesses once the group has settled. A node's disk is slow only past its
+/// flushes' tail and its detectors' freshness, so the flushes macOS's traces hold (to 205 ms, under
+/// its freshness) are no verdict, idle or busy, host freezes and all; Linux's VM disk stalls past
+/// its freshness at times (its trace to 3.7 s), which is a verdict, and each is caught up within a
+/// freshness, the stall's end: no flap, no verdict that lingers past what caused it
+/// (`survey_of_disk_verdicts` has each world's).
+#[test]
+fn judged_apart_healthy_disks_draw_no_lasting_verdict() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(44, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            sim.run_while(|_| true, Some(from + 20 * freshness));
+            for (judge, node) in sim.nodes.iter().enumerate() {
+                let verdicts: Vec<(PeerId, bool, u64)> = node
+                    .disks
+                    .iter()
+                    .filter(|(_, _, at)| *at > from)
+                    .copied()
+                    .collect();
+                let none_where_none_stalls = world.name == LINUX.name || verdicts.is_empty();
+                assert!(
+                    none_where_none_stalls && caught_up_within(&verdicts, freshness),
+                    "{name} seed {seed}: node {} judged healthy disks (peer, slow, ms from the \
+                     group settling) {:?}, the freshness {} ms",
+                    judge + 1,
+                    verdicts
+                        .iter()
+                        .map(|(p, s, at)| (*p, *s, (at - from) / MS))
+                        .collect::<Vec<_>>(),
+                    freshness / MS
+                );
+            }
+        }
+    }
+}
+
+/// Whether every slow verdict in `verdicts` (a judge's, in order: peer, slow, arrival) is caught up
+/// within `within` of it.
+fn caught_up_within(verdicts: &[(PeerId, bool, u64)], within: u64) -> bool {
+    verdicts.iter().enumerate().all(|(i, (peer, slow, at))| {
+        !*slow
+            || verdicts[i + 1..]
+                .iter()
+                .find(|(p, ..)| p == peer)
+                .is_some_and(|(_, again, back)| !*again && *back <= at + within)
+    })
+}
+
+/// What healthy disks' verdicts are in each world, judged apart: per node, the slow verdicts its
+/// peers gave, how long the longest lasted, against the world's longest flush (its trace's maximum)
+/// and the node's own flush tail at the end. A survey, not a check: run with `--ignored
+/// --nocapture`.
+#[test]
+#[ignore = "a survey of disk verdicts, not a check"]
+fn survey_of_disk_verdicts() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        let longest = world.flush[world.flush.len() - 1];
+        for seed in seeds(44, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let span = 20 * freshness;
+            sim.run_while(|_| true, Some(from + span));
+            let mut line = Vec::new();
+            for peer in 1..=3u64 {
+                let mut slow = 0;
+                let mut longest_verdict = 0u64;
+                for judge in sim.nodes.iter().filter(|n| n.owner.id != peer) {
+                    let mut since = None;
+                    for &(p, is_slow, at) in
+                        judge.disks.iter().filter(|d| d.0 == peer && d.2 > from)
+                    {
+                        let _ = p;
+                        if is_slow {
+                            slow += 1;
+                            since = Some(at);
+                        } else if let Some(began) = since.take() {
+                            longest_verdict = longest_verdict.max(at - began);
+                        }
+                    }
+                }
+                let tail = sim.nodes[(peer - 1) as usize]
+                    .liveness
+                    .flush_tail()
+                    .map_or(0, |t| t.as_nanos() as u64 / 1_000);
+                line.push(format!(
+                    "n{peer}: {slow} slow verdicts, the longest {} ms, tail {} us",
+                    longest_verdict / MS,
+                    tail
+                ));
+            }
+            println!(
+                "{name} seed {seed}: {} ms span, longest trace flush {} ms, freshness {} ms; {}",
+                span / MS,
+                longest / MS,
+                freshness / MS,
+                line.join("; ")
+            );
+        }
+    }
+}
+
+/// Today's group judges by the flush proof and no disk apart from it: a held disk gives no
+/// `Change::DiskSlow`.
+#[test]
+fn todays_group_gives_no_disk_verdict() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(45, 4) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            sim.nodes[2].disk_held_until = from + 3 * freshness;
+            sim.run_while(|_| true, Some(from + 6 * freshness));
+            assert!(
+                sim.nodes.iter().all(|node| node.disks.is_empty()),
+                "{name} seed {seed}: a disk verdict in today's group"
+            );
+        }
+    }
+}
+
 /// One node's flushes stall while the judges' own complete: it is suspected as before, within the
 /// bound each suspicion states.
 #[test]
@@ -3301,6 +3504,8 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
             late_ns: 0,
             flushes: slot + 1,
             flush_age_ns: 0,
+            apart: false,
+            disk_slow: false,
             echo: None,
             stopping: false,
         };
@@ -3455,6 +3660,8 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
                 late_ns: 0,
                 flushes: seq + 1,
                 flush_age_ns: 0,
+                apart: false,
+                disk_slow: false,
                 echo: None,
                 stopping: false,
             };

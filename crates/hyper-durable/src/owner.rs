@@ -270,6 +270,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
                 Change::Trusted { .. } => replica.trust(peer),
                 Change::Restarted { .. } => replica.restarted(peer),
                 Change::Stopped { .. } => replica.stopped(peer),
+                Change::DiskSlow { .. } => replica.disk_slow(peer),
+                Change::DiskCaughtUp { .. } => replica.disk_caught_up(peer),
             };
             if let Ok(slot) = u32::try_from(at) {
                 self.queue_slot(slot);

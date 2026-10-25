@@ -263,6 +263,26 @@ pub enum Change {
         /// The announcement's arrival.
         at_ns: u64,
     },
+    /// Judged apart from its disk ([`Liveness::set_disk_apart`], kiln's CP-T2.2): the peer's
+    /// process is alive and its disk is slow. Its heartbeat says its own stream has waited on its
+    /// disk longer than its flushes' tail, RFC 6298's bound over its own measured flushes, and its
+    /// detectors' widest freshness, a stall the flush proof would have been suspected for
+    /// ([`Heartbeat::disk_slow`], [`Liveness::own_disk_slow`]). What the owner trusts of the peer is
+    /// unchanged: a leader names no heir whose disk is slow.
+    DiskSlow {
+        /// The peer.
+        peer: PeerId,
+        /// The heartbeat's arrival.
+        at_ns: u64,
+    },
+    /// Judged apart from its disk, the peer's disk is no longer slow: a completion ended its wait,
+    /// and its heartbeat says so.
+    DiskCaughtUp {
+        /// The peer.
+        peer: PeerId,
+        /// The heartbeat's arrival.
+        at_ns: u64,
+    },
 }
 
 impl Change {
@@ -272,7 +292,9 @@ impl Change {
             Self::Suspected(suspicion) => suspicion.peer,
             Self::Trusted { peer, .. }
             | Self::Restarted { peer, .. }
-            | Self::Stopped { peer, .. } => *peer,
+            | Self::Stopped { peer, .. }
+            | Self::DiskSlow { peer, .. }
+            | Self::DiskCaughtUp { peer, .. } => *peer,
         }
     }
 }
@@ -357,9 +379,15 @@ pub struct Liveness {
     asked: Option<u64>,
     late_most: u64,
     flushes: Flushes,
-    /// The same flushes' tail, RFC 6298's bound over them: what the node's own writes, and in the
-    /// disk mode its peers' flush ages, are judged against (kiln's CP-T2.2).
+    /// The same flushes' tail, RFC 6298's bound over them: what the node's own wait on its disk is
+    /// judged against in the disk mode (kiln's CP-T2.2).
     flush_tail: FlushTail,
+    /// In the disk mode, this node's own disk is slow: it has waited on it past both `flush_tail`
+    /// and `widest_freshness`.
+    own_disk_slow: bool,
+    /// The widest freshness its pairs held at the last poll: how long its detectors trust a peer
+    /// past its latest heartbeat, what a stall of the disk's would have been suspected after.
+    widest_freshness: Option<Duration>,
     durable: Durable,
     /// Whether a liveness write is out.
     flushing: bool,
@@ -498,7 +526,7 @@ fn send(
         return false;
     }
     match pair.send(sender, now_ns, message) {
-        pair::Sent::Message(length, lateness) => {
+        pair::Sent::Message(length, lateness, probe) => {
             if let Some(message) = message.get(..length) {
                 out.heartbeat(peer, message);
             }
@@ -510,8 +538,9 @@ fn send(
             // Its next slot already due (the interval fell while the stream was behind): the
             // flush that proves it is asked now, and its completion polls the stream. Left to a
             // wake, it asked none, and only a peer's heartbeat polled it again: a node that heard
-            // none sent nothing more.
-            pair.next_due().is_some_and(|due| due <= now_ns)
+            // none sent nothing more. In the disk mode a probe is asked where nothing became
+            // durable in the heartbeat's slot, so the next is fresh on a disk that answers.
+            probe || pair.next_due().is_some_and(|due| due <= now_ns)
         }
         pair::Sent::NeedsFlush => true,
         pair::Sent::Nothing => false,
@@ -562,6 +591,8 @@ impl Liveness {
             late_most: 0,
             flushes: Flushes::new(),
             flush_tail: FlushTail::new(),
+            own_disk_slow: false,
+            widest_freshness: None,
             durable: Durable::default(),
             flushing: false,
             stall: None,
@@ -807,6 +838,19 @@ impl Liveness {
         for change in changes.into_iter().flatten() {
             out.change(change);
         }
+        if context.apart && outcome.is_ok() {
+            match pair.judge_disk(&beat) {
+                Some(true) => out.change(Change::DiskSlow {
+                    peer: from,
+                    at_ns: arrival_ns,
+                }),
+                Some(false) => out.change(Change::DiskCaughtUp {
+                    peer: from,
+                    at_ns: arrival_ns,
+                }),
+                None => {}
+            }
+        }
         // The heartbeat moved this pair's freshness point; the others are as the last poll left
         // them. The earliest of the last poll's wake and this pair's is never past the earliest of
         // them all, so an owner that asks before it polls is woken in time, if early.
@@ -887,6 +931,20 @@ impl Liveness {
         let mut wants_flush = false;
         let granularity = self.granularity();
         let floor = self.floor_at(granularity);
+        // Judged apart from its disk, this node's own disk is slow once it has waited on it longer
+        // than its flushes' tail (RFC 6298's bound over them, `FlushTail`) and the widest freshness
+        // its detectors hold, a stall the flush proof would have been suspected for, and caught up
+        // once a completion ends the wait: its heartbeats say so (`Heartbeat::disk_slow`). Its
+        // flushes' own spikes are shorter than its peers' patience with it, and are no verdict.
+        let tail = self.flush_tail.tail(granularity.unwrap_or(Duration::ZERO));
+        self.own_disk_slow = self.apart
+            && match (self.stall, tail, self.widest_freshness) {
+                (Some((since, None)), Some(tail), Some(freshness)) => {
+                    self.own_disk_slow
+                        || Duration::from_nanos(now_ns.saturating_sub(since)) > tail.max(freshness)
+                }
+                _ => false,
+            };
         let sender = pair::Sender {
             local_run: self.run,
             floor,
@@ -895,6 +953,7 @@ impl Liveness {
             durable_ns: self.durable.latest_ns,
             stopped: self.stopped,
             apart: self.apart,
+            disk_slow: self.own_disk_slow,
         };
         // The MTBF only for a pair that waits for a margin from the node's evidence, which a
         // configured node has none of: read at every poll, it was a float division and a
@@ -905,8 +964,10 @@ impl Liveness {
         let evidence = self.evidence_at(now_ns);
         let local = self.local();
         let mut wake: Option<u64> = None;
+        let mut widest_freshness: Option<Duration> = None;
         for (&peer, pair) in &mut self.pairs {
             pair.attached(now_ns);
+            widest_freshness = widest_freshness.max(pair.freshness());
             if let (Some((evidence, measured)), Some(granularity)) = (evidence, granularity) {
                 pool_margins(
                     pair,
@@ -931,6 +992,7 @@ impl Liveness {
             wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
             wake = earliest(wake, pair, &local, now_ns);
         }
+        self.widest_freshness = widest_freshness;
         // The stream wants a proof it lacks: from now, unless it has waited since earlier.
         if wants_flush && !matches!(self.stall, Some((_, None))) {
             self.stall = Some((now_ns, None));
@@ -997,6 +1059,21 @@ impl Liveness {
     /// the vote round's flush in the election law's ballot (`hyper_timing::Ballot::measure`).
     pub fn flush_mean(&self) -> Option<Duration> {
         self.flushes.mean()
+    }
+
+    /// Judged apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), whether this node's own
+    /// disk is slow: its stream has waited on it longer than its flushes' tail
+    /// ([`flush_tail`](Self::flush_tail)) and the widest freshness its detectors hold (a stall the
+    /// flush proof would have been suspected for), and no completion has ended the wait. Its
+    /// heartbeats say so, and its peers report it ([`Change::DiskSlow`]).
+    pub fn own_disk_slow(&self) -> bool {
+        self.own_disk_slow
+    }
+
+    /// Judged apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), whether `peer`'s disk
+    /// is slow by what its heartbeats say ([`Change::DiskSlow`]); `None` for a peer not attached.
+    pub fn disk_slow(&self, peer: PeerId) -> Option<bool> {
+        self.pairs.get(&peer).map(Pair::disk_slow)
     }
 
     /// The smoothed flush, RFC 6298's `SRTT` over this node's log writes, once one is reported.

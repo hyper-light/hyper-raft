@@ -364,6 +364,9 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     disk_patience: Option<u64>,
     /// The hand-overs its patience with its disk began.
     handed_over: u64,
+    /// The voters whose disks the owner's detectors judge slow, apart from their processes
+    /// (`hyper_liveness::Change::DiskSlow`): at most the group's voters.
+    slow_disks: Vec<u64>,
 }
 
 /// A value no other opening of a member states, with overwhelming likelihood: the keys std's
@@ -483,6 +486,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             flushed: None,
             disk_patience: None,
             handed_over: 0,
+            slow_disks: Vec::new(),
         };
         // A log compacted before the restart serves a lagging member only by snapshot, and its
         // image is what the compaction rule weighs the log against; a log never compacted is
@@ -823,6 +827,28 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             let told = r.node.trust(member);
             r.heard(told)
         })
+    }
+
+    /// Judged apart from its disk, `member`'s disk is slow by its heartbeats' flush ages
+    /// (`hyper_liveness::Change::DiskSlow`, kiln's CP-T2.2): what the replica trusts of its process
+    /// is unchanged, and while it is slow it is named heir to no hand-over of the leader's patience
+    /// with its own disk ([`Replica::set_disk_patience`]).
+    pub fn disk_slow(&mut self, member: u64) -> Result<(), ReplicaError> {
+        if !self.slow_disks.contains(&member) {
+            self.slow_disks.push(member);
+        }
+        Ok(())
+    }
+
+    /// `member`'s disk is no longer slow (`hyper_liveness::Change::DiskCaughtUp`).
+    pub fn disk_caught_up(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.slow_disks.retain(|slow| *slow != member);
+        Ok(())
+    }
+
+    /// Whether the owner's detectors judge `member`'s disk slow ([`Replica::disk_slow`]).
+    pub fn disk_is_slow(&self, member: u64) -> bool {
+        self.slow_disks.contains(&member)
     }
 
     /// The owner's detectors saw `member`'s node start again, a new incarnation: trusted, and

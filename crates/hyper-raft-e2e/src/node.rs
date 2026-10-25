@@ -556,6 +556,9 @@ impl Node {
                 self.told.push((peer, *at_ns));
                 self.raw.stopped(peer)
             }
+            // The core judges processes alone: a disk's verdict is the shell's
+            // (`hyper_durable::Replica::disk_slow`), and this member has none.
+            Change::DiskSlow { .. } | Change::DiskCaughtUp { .. } => return Ok(()),
         };
         heard(told).map(drop)
     }

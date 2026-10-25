@@ -146,6 +146,9 @@ struct World {
     broken: Vec<(u64, u64, MessageType, u64)>,
     /// Each vote a node gave, as it left: when, the voter, the candidate and the term.
     votes: Vec<(u64, u64, u64, u64)>,
+    /// Each disk verdict a node's stream gave (`Change::DiskSlow`, `DiskCaughtUp`): when, the
+    /// judge, the peer, and whether slow.
+    disks: Vec<(u64, u64, u64, bool)>,
 }
 
 /// What each node did, from `from` until `until`: its writes given and made durable, the proofs
@@ -270,6 +273,7 @@ impl World {
             trace: None,
             broken: Vec::new(),
             votes: Vec::new(),
+            disks: Vec::new(),
         }
     }
 
@@ -327,6 +331,8 @@ impl World {
             }
             Change::Restarted { peer, .. } => self.restarts.push((at, *peer)),
             Change::Stopped { peer, .. } => self.stops.push((at, *peer)),
+            Change::DiskSlow { peer, at_ns } => self.disks.push((*at_ns, at, *peer, true)),
+            Change::DiskCaughtUp { peer, at_ns } => self.disks.push((*at_ns, at, *peer, false)),
             Change::Trusted { .. } => {}
         }
     }
@@ -398,6 +404,12 @@ impl World {
                         }
                         Change::Restarted { .. } => {
                             format!("{ms:9.3} n{id}: n{} restarted", change.peer())
+                        }
+                        Change::DiskSlow { .. } => {
+                            format!("{ms:9.3} n{id}: n{}'s disk SLOW", change.peer())
+                        }
+                        Change::DiskCaughtUp { .. } => {
+                            format!("{ms:9.3} n{id}: n{}'s disk caught up", change.peer())
                         }
                     });
                 }

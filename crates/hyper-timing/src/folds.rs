@@ -232,7 +232,13 @@ impl FlushTail {
     /// A flush that started at `started_ns` and was durable at `durable_ns`, on one monotonic clock.
     pub fn on_flush(&mut self, started_ns: u64, durable_ns: u64) {
         // Saturating: a clock read out of order is a flush of no measurable length.
-        self.fold.on_sample(durable_ns.saturating_sub(started_ns));
+        self.on_sample(durable_ns.saturating_sub(started_ns));
+    }
+
+    /// One flush's time, or another duration the fold bounds the same way, nanoseconds: a peer's
+    /// flush age as its heartbeats carry it (kiln's CP-T2.2, hyper-liveness's disk verdicts).
+    pub fn on_sample(&mut self, sample_ns: u64) {
+        self.fold.on_sample(sample_ns);
     }
 
     /// The flushes folded in.

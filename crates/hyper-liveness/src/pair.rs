@@ -48,6 +48,8 @@ pub(crate) struct Sender {
     /// The node judges each peer's process apart from its disk (`Liveness::set_disk_apart`): a
     /// heartbeat due leaves whatever a flush is doing.
     pub(crate) apart: bool,
+    /// In that mode, its own disk is slow (`Liveness::own_disk_slow`): its heartbeats say so.
+    pub(crate) disk_slow: bool,
 }
 
 /// What a judge knows of its own durability (`docs/timing.md` §2.8, "A judge whose own proof
@@ -149,6 +151,25 @@ pub(crate) struct Taken {
     pub(crate) stopping: bool,
 }
 
+/// A peer's disk as its heartbeats say it is, judged apart from its process (kiln's CP-T2.2): slow
+/// while they carry its own verdict (`Heartbeat::disk_slow`), from its own measured flushes, and
+/// caught up once one doesn't.
+#[derive(Debug, Default)]
+struct Disk {
+    slow: bool,
+}
+
+impl Disk {
+    /// The verdict `beat` moves the peer's disk to, if it moves it: `Some(true)` slow, `Some(false)`
+    /// caught up.
+    fn judge(&mut self, beat: &Heartbeat) -> Option<bool> {
+        (beat.disk_slow != self.slow).then(|| {
+            self.slow = beat.disk_slow;
+            self.slow
+        })
+    }
+}
+
 /// The wider of two behaviours, each measure the larger: an upper bound on both. The bound on a
 /// lateness past a margin, `u + (1 − u)·V/(V + (α − μ)²)`, grows with the unseen share `u`, with
 /// the variance `V` and with the mean `μ` at every margin (its derivatives are
@@ -186,8 +207,10 @@ pub(crate) fn scaled(pool: &Arrivals, window: u64) -> Arrivals {
 pub(crate) enum Sent {
     /// A heartbeat of this many bytes is in the node's buffer, and its lateness past the slot after
     /// the previous heartbeat sent the peer, nanoseconds: what the peer will take it as, but the
-    /// path's delay (`Stream::expected_ns`); `None` for the first.
-    Message(usize, Option<i64>),
+    /// path's delay (`Stream::expected_ns`); `None` for the first. Third, in the disk mode, whether
+    /// a probe flush is wanted: nothing became durable in this heartbeat's slot, so the next is
+    /// fresh only if a write is made and answered before it.
+    Message(usize, Option<i64>, bool),
     /// A heartbeat is due and no flush proves it.
     NeedsFlush,
     /// Nothing due.
@@ -382,6 +405,8 @@ pub(crate) struct Pair {
     counts: Counts,
     /// This node's run announced its end to the peer, if it did.
     announced: Option<Announced>,
+    /// In the disk mode, the peer's disk as its heartbeats' flush ages show it.
+    disk: Disk,
 }
 
 impl Pair {
@@ -396,6 +421,7 @@ impl Pair {
             held: None,
             counts: Counts::default(),
             announced: None,
+            disk: Disk::default(),
         }
     }
 
@@ -765,6 +791,8 @@ impl Pair {
             late_ns: sent_ns.saturating_sub(due),
             flushes: sender.durable_count,
             flush_age_ns: sent_ns.saturating_sub(durable_ns),
+            apart: sender.apart,
+            disk_slow: sender.apart && sender.disk_slow,
             echo,
             stopping: false,
         };
@@ -795,7 +823,11 @@ impl Pair {
         self.stream.next = Some((seq.saturating_add(1), due.saturating_add(interval)));
         self.stream.expected_ns = Some(due.saturating_add(interval));
         self.counts.sent = self.counts.sent.saturating_add(1);
-        Sent::Message(length, own)
+        // Judged apart from its disk the heartbeat left whatever this node's flushes are doing. A
+        // probe is asked where nothing became durable in this heartbeat's slot, never holding one:
+        // the node's own wait on its disk is measured from it (`Liveness::own_disk_slow`), and the
+        // next heartbeat is fresh on a disk that answers.
+        Sent::Message(length, own, sender.apart && durable_ns <= due)
     }
 
     /// The heartbeat that ends this node's run, in order ([`Heartbeat::stopping`]), written into
@@ -1168,6 +1200,28 @@ impl Pair {
         (current && self.received.stopped).then_some(Err(Refusal::Stale))
     }
 
+    /// In the disk mode, the verdict `beat`, taken, moves the peer's disk to (`Disk::judge`):
+    /// `Some(true)` slow, `Some(false)` caught up.
+    pub(crate) fn judge_disk(&mut self, beat: &Heartbeat) -> Option<bool> {
+        self.disk.judge(beat)
+    }
+
+    /// In the disk mode, whether the peer's disk is judged slow by what its heartbeats say.
+    pub(crate) fn disk_slow(&self) -> bool {
+        self.disk.slow
+    }
+
+    /// How long past the peer's latest heartbeat this pair trusts it, `η + α`, once its detector
+    /// has a margin: what a stall of the peer's would have been suspected after.
+    pub(crate) fn freshness(&self) -> Option<Duration> {
+        let link = self.received.link.as_ref()?;
+        Some(
+            link.estimator
+                .next_interval()
+                .saturating_add(link.estimator.margin()?),
+        )
+    }
+
     /// Whether the margin of the node's evidence is due, on the configuration's doubling schedule:
     /// never imposed, or the heartbeats taken have doubled since it was; or at once, where it was
     /// imposed from evidence that was not measured and the node's now is.
@@ -1486,6 +1540,8 @@ mod tests {
             late_ns: 0,
             flushes: seq + 1,
             flush_age_ns: 0,
+            apart: false,
+            disk_slow: false,
             echo: None,
             stopping: false,
         }
@@ -1621,9 +1677,10 @@ mod tests {
             durable_ns: Some(now),
             stopped: false,
             apart: false,
+            disk_slow: false,
         };
         let mut out = [0; MAX_BYTES];
-        let Sent::Message(length, _) = node.send(&sender, now, &mut out) else {
+        let Sent::Message(length, ..) = node.send(&sender, now, &mut out) else {
             panic!("due, and a flush proves it");
         };
         let ours = Heartbeat::decode(out.get(..length).unwrap()).unwrap();
@@ -1673,10 +1730,11 @@ mod tests {
                 durable_ns: Some(now),
                 stopped: false,
                 apart: false,
+                disk_slow: false,
             };
             let mut out = [0; MAX_BYTES];
             match node.send(&sender, now, &mut out) {
-                Sent::Message(length, _) => Heartbeat::decode(&out[..length]).unwrap(),
+                Sent::Message(length, ..) => Heartbeat::decode(&out[..length]).unwrap(),
                 _ => panic!("due and proven at {now}"),
             }
         };
@@ -1747,6 +1805,7 @@ mod tests {
                 durable_ns: Some(now),
                 stopped: false,
                 apart: false,
+                disk_slow: false,
             };
             let mut out = [0; MAX_BYTES];
             assert!(

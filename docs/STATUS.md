@@ -543,8 +543,8 @@ is worked around.
   its detectors leave no quorum"). Tests: `tests/suspicion.rs`,
   `a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on`,
   `voters_that_suspect_each_other_for_good_keep_their_leader_once_the_third_is_stopped` and
-  `a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`, each red on `313ada8`; the
-  step-down tests restated;
+  `a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`, each red on `313ada8` and on
+  `af01c51`; the step-down tests restated;
   `a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement` (a leader cut off
   while its voters elect another and commit answers no read). Model: `docs/models/Suspicion.tla` and
   its Rust mirror (three voters, the third stopped, three terms: 11,376 states, every settled group
@@ -557,8 +557,8 @@ is worked around.
   member stayed probed until the group's next write and the leader, which beats while a member is
   probed, sent a heartbeat round every round tail after every mistake its detectors withdrew. A
   member with nothing in flight that holds the leader's whole log is not probed (`Raft::holds_all`).
-  Test: `a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet` (red on `313ada8`: the
-  idle group never came to rest).
+  Test: `a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet` (red on `313ada8` and
+  `af01c51`: the idle group never came to rest).
 
 - **hyper-liveness: a peer restarted where it heard nothing was sent heartbeats at its peers'
   floors, a flush each (found by mantle's roll).** A new run asks no interval until its link has
@@ -568,8 +568,8 @@ is worked around.
   once one of its heartbeats echoes one of this node's (`docs/timing.md` §2.8, "A run that has taken
   none of this node's heartbeats"); measured at `dd764a0` and `313ada8` alike, the rise is the
   restart's, a stop alone leaving its peers' writes as they were. Test:
-  `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat` (red on `313ada8`: 2,159 heartbeats
-  6.97 ms apart where the stream had been at 110 ms).
+  `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat` (red on `313ada8`, whose
+  hyper-liveness is `af01c51`'s: 2,159 heartbeats 6.97 ms apart where the stream had been at 110 ms).
 
 - **hyper-liveness: every restart counted a failure in the MTBF's evidence, a node's orderly stop and
   start among them (asked by mantle).** The owner's last act on the plane, `Liveness::stop`, now

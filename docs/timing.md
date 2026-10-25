@@ -1185,8 +1185,8 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   deaf for 20 s in the four worlds, 8 seeds each: each other node's heartbeats to it keep their
   interval and number at most the deaf time over it and two, its liveness writes at most its
   heartbeats and one, and once heard every pair configures with no suspicion by the restarted node of
-  a heartbeat its sender did not yet have due; red at `313ada8`, macOS's first seed sending 2,159
-  heartbeats 6.97 ms apart where its stream had been at 110 ms).
+  a heartbeat its sender did not yet have due; red at `313ada8`, whose hyper-liveness is `af01c51`'s,
+  macOS's first seed sending 2,159 heartbeats 6.97 ms apart where its stream had been at 110 ms).
 - **A stream keeps its schedule without hearing its peer.** A heartbeat sent whose next slot is
   already due asks at once for the flush that proves the next (`Liveness::poll`), and its completion
   polls the stream. Its next slot is due already where the interval fell while the stream was
@@ -1850,7 +1850,7 @@ spend a term and depose a leader that never left.
   could answer only with nothing new, which moves no probe on (`Progress::maybe_update`), and the
   leader beat once a round, a heartbeat to every member, until the group's next write, after every
   mistake its detectors withdrew (`a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet`,
-  red on `313ada8`: the idle group never came to rest).
+  red on `313ada8` and `af01c51`: the idle group never came to rest).
 - **A transfer** is given up `TRANSFER_ROUNDS` (two) rounds after it began, the order reaching the
   transferee and the new leader's append coming back with the transferee's vote round between
   (dissertation §3.10: given up when not finished within an election), or at once when the
@@ -1924,7 +1924,8 @@ deviation 40 ms, a mature history; `G` 1 ms, floor 10 ms) recurs one per pair, a
 318 s at ten minutes, 518 and 1,102 s at an hour, 4,237 and 8,256 s at a day; a young link (`m` about
 60) three to five times as often, and a node started on no history (`Exposure::new()`) has an MTBF of
 twice a few seconds just after a restart. With exactly a quorum of live voters each mistake between
-the two cost the group its leader. Tests (`tests/suspicion.rs`, each red on `313ada8`):
+the two cost the group its leader. Tests (`tests/suspicion.rs`, each red on `313ada8` and on
+`af01c51`):
 `a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on` (the third stop: three
 mistakes, each longer than a round, a draw and two expected elections, a write taken and committed
 during each, the order given and declined; red at the first, member 1 a follower at 10 ms),

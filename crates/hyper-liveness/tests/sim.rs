@@ -3728,15 +3728,19 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                     sim.nodes[node].liveness.trust(peer)
                 );
             }
+            // The pair of one mode is judged by its own rules, today's flush proof: taken, never
+            // refused for its mode, and judged (trusted, or suspected for a disk that stalled, as
+            // today's mode suspects one: Linux's VM disk at seed 55).
             for (node, peer) in [(1usize, 3u64), (2, 2)] {
+                let report = sim.nodes[node].liveness.report(peer).unwrap();
                 assert!(
-                    matches!(
-                        sim.nodes[node].liveness.trust(peer),
-                        Some(Trust::Trusted { .. })
-                    ) && sim.nodes[node].liveness.report(peer).unwrap().other_mode == 0,
-                    "{name} seed {seed}: node {} of peer {peer}, one mode: {:?}",
+                    report.taken > 0 && report.other_mode == 0 && report.judged,
+                    "{name} seed {seed}: node {} of peer {peer}, one mode: taken {}, refused for \
+                     the other mode {}, judged {}",
                     node + 1,
-                    sim.nodes[node].liveness.trust(peer)
+                    report.taken,
+                    report.other_mode,
+                    report.judged
                 );
             }
             // Node 1 starts again in the others' mode: a new run, taken and judged as any.

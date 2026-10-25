@@ -96,6 +96,17 @@ reads whole, has nothing of it durable, and once flushed is byte for byte `finis
 (`a_file_finished_unflushed_is_whole_and_left_for_its_caller_to_flush`, which fails if the finish
 flushes).
 
+Landed 2026-10-25: in hyper-transport, a restarted endpoint resets what its last run held
+(`RestartKey`, `Endpoint::new_restartable`; `docs/transport.md` §4ah). The stateless reset key and the
+key connection IDs are hashed under were drawn afresh at each start, so a peer of a restarted
+endpoint held its connection to the last run until its idle timeout (two minutes at focal's bus,
+where a group of three restarted one node at a time lost its leader). An owner now gives the endpoint
+32 bytes it keeps for it alone; HKDF-SHA256 expands them into both keys, and the restarted endpoint
+answers a packet on an old connection with a reset the peer verifies (RFC 9000 §10.3.2), as a
+restarted host's TCP answers with an RST. Test: a peer is told `Closed` within a keep-alive of the
+restart, and only at its idle timeout (12 s) when the restarted endpoint has another key
+(`exchange::a_restarted_endpoint_resets_what_its_last_run_held`).
+
 Landed 2026-10-23: in hyper-quic, BBR paced at its model's rate, its least round trip taken only
 from packets in order (patches Q32 and Q33, `crates/hyper-quic/VENDORED.md` §42 and §43;
 `docs/transport.md` §4ag). Held by its window of twice its product and paced at five quarters of it,

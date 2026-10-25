@@ -2048,6 +2048,42 @@ Tests: `congestion::bbr_at_a_queue_of_one_product_loses_no_more_than_newreno`,
 `congestion::a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order`,
 `congestion::bbr::tests::a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`.
 
+## 4ah. A restarted endpoint resets what its last run held (2026-10-25, found by focal)
+
+An endpoint's stateless reset key and the key its connection IDs are hashed under were drawn afresh at
+every start (hyper-quic's `EndpointConfig::default`, quinn's), so a restarted endpoint could tell no
+peer that the connection its last run held was gone: a packet on it carried a connection ID the new
+key did not know, and was dropped (`validate`), and a reset it did send would have carried a token the
+peer could not verify. The peer held the connection, sending into it, until its idle timeout: focal's
+bus waits two minutes (RFC 4787 REQ-5's least NAT mapping), and a group of three restarted one node at
+a time lost every pair whose holder had not restarted since, the group without a leader. A TCP peer
+of a restarted host learns at its next send, from the host's RST (RFC 9293 §3.5.2): Kafka's and NATS's
+brokers have that from the kernel. QUIC gives it to an endpoint that keeps a static key across its
+restarts (RFC 9000 §10.3.2: the token a pseudorandom function of a static key and the connection ID,
+so "an endpoint that loses state can use the same method to generate a valid stateless reset
+token"), and quinn's API says the same of its connection IDs (`HashedConnectionIdGenerator::from_key`,
+"a consistent set of connection IDs across restarts").
+
+`Endpoint::new_restartable` takes the key an endpoint keeps across its restarts (`RestartKey`), made
+from 32 bytes the owner keeps for that endpoint alone: HKDF-SHA256 (RFC 5869) expands them into the
+reset key, an HMAC-SHA256 key whose output's first 16 bytes are a connection ID's token, and the key
+connection IDs are hashed under, each under a context of its own. Restarted at its address with the
+same key, the endpoint knows a packet on an old connection for one of its own, finds no connection
+for it, and answers with a reset the peer verifies, at most one each `min_reset_interval` and always
+smaller than the packet it answers (§10.3's amplification rule, upstream's); the peer's connection
+ends and its owner is told `Closed`, and an owner that dials on `Closed` connects to the new run. A
+keep-alive is long enough to draw one (a short header, a connection ID, a packet number and a tag
+past the 21 bytes a reset needs). Two endpoints must not share a key: a packet reaching the one
+without its connection's state is answered with a reset that ends a live connection (RFC 9000
+§21.11), and so the key is as secret as the endpoint's private key. Without a key an endpoint is as
+before, and `new` and `new_seeded` are unchanged.
+
+Test (`tests/exchange.rs`): `a_restarted_endpoint_resets_what_its_last_run_held`: node 1, connected
+to node 2 and sending it only keep-alives, is told `Closed` within a keep-alive (2 s) of node 2's
+restart with its key, and its next dial connects; restarted with another key node 2 drops what comes,
+and node 1 is told only as the connection idles out (12 s, the idle timeout's three probe timeouts
+included). With the key not applied the first assertion fails, `reset 12s after the restart`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

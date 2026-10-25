@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use hyper_transport::{
-    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, Unprompted, probes_within,
+    Event, ExchangeId, LEAST_PROGRESS, Limits, Progress, Refusal, RestartKey, Unprompted,
+    probes_within,
 };
 
 const PERIOD: Duration = Duration::from_secs(2);
@@ -2721,6 +2722,103 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
         ),
         "{told:?}"
     );
+}
+
+/// An endpoint restarted at its address with the key it keeps across restarts resets each connection
+/// its last run held as a packet on it arrives (RFC 9000 §10.3), as a restarted host's TCP answers
+/// with an RST: node 1, connected to node 2 and sending it only keep-alives, is told the connection
+/// closed within a keep-alive of node 2's restart, and its next dial connects. Restarted with a key
+/// of its own, as an endpoint without one is at every start, node 2 drops what comes on the old
+/// connection, its ID one the new key does not know, and node 1 is told only as the connection idles
+/// out (docs/transport.md §4ah).
+#[test]
+fn a_restarted_endpoint_resets_what_its_last_run_held() {
+    let pair = Pair::new();
+    let kept = RestartKey::from_secret(&[1; 32]).unwrap();
+    let fresh = RestartKey::from_secret(&[2; 32]).unwrap();
+    let limits = limits();
+    let keep_alive = limits.keep_alive.unwrap();
+    for (restarted_with, reset) in [(&kept, true), (&fresh, false)] {
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let node_2 = |restart: &RestartKey, now| {
+            pair.restartable::<Mantle>(
+                2,
+                Role::Node,
+                pair.book(Role::Node, Role::Node),
+                limits,
+                256 << 20,
+                now,
+                restart,
+            )
+        };
+        let node_1 = pair.node::<Mantle>(
+            1,
+            Role::Node,
+            pair.book(Role::Node, Role::Node),
+            limits,
+            256 << 20,
+            now,
+        );
+        let mut net = Net::new(now, node_1, node_2(&kept, now));
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }
+                )
+            })
+        });
+        // Node 2's run ends with nothing said, as a process's does when it stops, and the next
+        // starts at its address.
+        net.b = node_2(restarted_with, net.now);
+        let restarted = net.now;
+        let mut told = Vec::new();
+        net.until(TURNS, |net| {
+            told.extend(events(&mut net.a));
+            !told.is_empty()
+        });
+        assert!(
+            matches!(
+                told[..],
+                [Event::Closed {
+                    peer: 2,
+                    epoch: 1,
+                    ..
+                }]
+            ),
+            "{told:?}"
+        );
+        let took = net.now - restarted;
+        if reset {
+            assert!(took <= keep_alive, "reset {took:?} after the restart");
+        } else {
+            assert!(
+                took >= limits.idle_timeout - keep_alive,
+                "closed {took:?} after a restart that could not reset it"
+            );
+        }
+        net.a.connect(net.now, 2, address).unwrap();
+        net.until(TURNS, |net| {
+            events(&mut net.b);
+            events(&mut net.a).iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Connected {
+                        peer: 2,
+                        epoch: 2,
+                        ..
+                    }
+                )
+            })
+        });
+    }
 }
 
 /// A dial that ends after its peer connected in, and went, while the owner polled nothing is told:

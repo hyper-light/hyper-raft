@@ -293,23 +293,24 @@ is worked around.
   before its answer under the old rule).
 
 - **hyper-transport: a stream its peer read in steps was refused as unread while it moved (main's
-  `1912194`, taken to this line: the cause of mantle's busy-job objects failures, where on 4 of 4 busy
-  runners a gateway judged its reader unread and refused the exchange `Stalled`, the reader having
-  taken bytes 7 to 22 ms before the verdict and consumed everything sent).** mantle's trace (run
-  40161296995, ubuntu-24.04, the tests on CPUs 0–1 beside two busy loops): the gateway judged its
-  client unread across a window of 3,072 ms in which it took 312 `MAX_DATA` and 312 `MAX_STREAM_DATA`
-  frames from it; at the verdict its write limit was 2,268 bytes, its class's reserve at its rank, its
-  stream not blocked and all it had sent acknowledged, while the client read 280–315 KB every 250 ms
-  throughout, giving credit 25–28 times every 250 ms, its connection window at its first 12,000 bytes
-  with no debt: a reader keeping pace, judged each time just after the sender spent its credit. F38's unread rule judged a
-  stream by its state at each judgement, once a period: out of credit with everything it sent
-  acknowledged at two judgements a window apart, it was refused `Stalled`, whatever it wrote between
-  them. A stream held to its peer's pace is in that state at nearly every instant: hyper-rt-transport's
-  `exchanges` test refused its 8 MiB request in 12 runs of 14 under two dozen busy loops (and on the
-  macOS gate twice in three runs), the server reading every byte as it came. The wait now starts again
-  whenever the stream has written more than when it was found unread (`docs/transport.md` §4a). Test:
-  `exchange::a_stream_its_peer_reads_at_its_own_pace_is_never_refused` (refused at 4.6 MB under the old
-  rule); 0 of 14 under the same load.
+  `1912194`, taken to this line: the cause of mantle's busy-job objects failures, where on 4 of 4
+  busy runners a gateway judged its reader unread and refused the exchange `Stalled`, the reader
+  having taken bytes 7 to 22 ms before the verdict and consumed everything sent).** mantle's trace
+  (run 40161296995, ubuntu-24.04, the tests on CPUs 0–1 beside two busy loops): the gateway judged
+  its client unread across a window of 3,072 ms in which it took 312 `MAX_DATA` and 312
+  `MAX_STREAM_DATA` frames from it; at the verdict its write limit was 2,268 bytes, its class's
+  reserve at its rank, its stream not blocked and all it had sent acknowledged, while the client
+  read 280–315 KB every 250 ms throughout, giving credit 25–28 times every 250 ms, its connection
+  window at its first 12,000 bytes with no debt: a reader keeping pace, judged each time just after
+  the sender spent its credit. F38's unread rule judged a stream by its state at each judgement,
+  once a period: out of credit with everything it sent acknowledged at two judgements a window
+  apart, it was refused `Stalled`, whatever it wrote between them. A stream held to its peer's pace
+  is in that state at nearly every instant: hyper-rt-transport's `exchanges` test refused its 8 MiB
+  request in 12 runs of 14 under two dozen busy loops (and on the macOS gate twice in three runs),
+  the server reading every byte as it came. The wait now starts again whenever the stream has
+  written more than when it was found unread (`docs/transport.md` §4a). Test:
+  `exchange::a_stream_its_peer_reads_at_its_own_pace_is_never_refused` (refused at 4.6 MB under the
+  old rule); 0 of 14 under the same load.
 
 - **hyper-rt: on Windows a console close or a shutdown ended the process as the handler returned, before
   a subscriber's orderly stop (found by mantle).** The console handler returned TRUE as soon as it had

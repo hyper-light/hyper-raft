@@ -372,6 +372,7 @@ group stays settled wherever `Stable` holds.
 | `Suspect(s, x)`, `Trust(s, x)` | `Raft::suspect`, `Raft::trust` (`Watch::suspect`, `trust`); a pre-candidate left no quorum, `Raft::stop_asking`; under `"stepdown"`, the step-down before 2026-10-24. |
 | `Announce(s, x)` | hyper-liveness's `Change::Stopped` at the stopping heartbeat's arrival, taken as `Raft::stopped` (`Watch::stop`): suspected until the voter's next run, and `Drops(s, x)`: its requests for votes and what it sends of a later term dropped (`Raft::drops`), no order to it (`Raft::hand_over`). Under `"nodrop"`, the suspicion alone. |
 | `Stop(x)` | The leaving voter's node stops: what it sent may still arrive (`GrantPre`, `GrantVote`, `Hear`, `Learn` and `TakeOrder` take a stopped member's requests, heartbeats, answers and orders). |
+| `Transfer(l, h)` | The owner's hand-over of what the leaving voter leads: `Raft::transfer_leader`, a `MsgTimeoutNow` of its term to the heir, taken as a forced campaign (`TakeOrder`); under `"waited"` only once every remaining voter took its announcement, as hyper-liveness's `Liveness::stop_taken` tells the owner. `Led` starts the run with the leaving voter leading term 1. |
 | `PreVote(s)` | `Raft::wake_follower` → `Raft::hup(false)` (`trusts_leader`, `trusted_quorum`; `Watch::left`, `become_pre_candidate`). |
 | `GrantPre(m, c)`, `GrantVote(m, c)` | `Raft::step_newer_term`'s lease (`Lease`: a leader, or a member that trusts a leader other than the asker, the asker's term not past its next; a request from its own leader ends its trust) and `Raft::step_vote`; a forced request (`CAMPAIGN_TRANSFER`) is refused by no lease. |
 | `ElectPre(c)`, `Win(c)` | `Raft::poll` → `Raft::campaign(Campaign::Election)`, `Raft::become_leader`. |
@@ -393,6 +394,8 @@ group stays settled wherever `Stable` holds.
 | `unannounced` | `SuspicionStopUnannounced.cfg` | `stop`, its stop detected as a silence, `Stable` from the stop | 25,976 | refused: `Stable` |
 | `nodrop` | `SuspicionStopNoDrop.cfg` | `stop`, the announcement only suspecting | 347,255 | refused: `Stable` |
 | `stopreached` | `SuspicionStopReached.cfg` | `stop` and the claim `NoWrongSuspicionSettled` | 41,988 | refused: `NoWrongSuspicionSettled` |
+| `handed` | `SuspicionStopHanded.cfg` | 3 voters, the third leading term 1 and leaving, announced, its transfer once both took the announcement, 3 terms, `Stable` from the hand-over | 14,791,288 (the mirror's, and TLC's) | passes: `OneLeader`, `Stable`, `AskingCanWin` |
+| `unwaited` | `SuspicionStopUnwaited.cfg` | `handed`, the transfer at any time | 10,185 | refused: `Stable` |
 
 What each shows: `suspicion` is mantle's roll at its stops, every order of every mistake between the
 two live voters within three terms, and the leader and term kept; `leftnoquorum` shows it reaches a
@@ -419,6 +422,15 @@ the announcement taken as a suspicion alone: refused where the leader, left no q
 stopping voter, still running, to campaign, and its forced request takes the remaining voter to its
 term. TLC counted all four on a Linux runner (tla2tools v1.7.4, one worker; `stop` in 3 min 43 s),
 `stop` at the mirror's count.
+
+`handed` (2026-10-25, asked by mantle) is the stop as mantle makes it with the announcement first:
+the leaving voter leads term 1, announces, runs on, and hands over by a transfer once both remaining
+voters took the announcement, which the announcement's answer tells its owner; the claim starts at
+the hand-over, once both follow one leader in its term, and holds through every mistake of the
+detectors to the third term. `unwaited` is the same hand-over made at any time: refused where the
+transfer elects a new leader before one remaining voter took the announcement, and that voter,
+still trusting the stopping one, asks at a wrong suspicion of the new leader. The mirror's `handed`
+search, 14.8 million classes, runs in release in CI's explore job (16 s here), not in the gates.
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

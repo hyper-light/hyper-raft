@@ -52,6 +52,12 @@
 (* it sends of a later term than its own (Drops).  Without Announced     *)
 (* its stop is detected as any silence is, by Suspect at some later time *)
 (* (refused, SuspicionStopUnannounced).                                  *)
+(* Handover, the owner's: "none"; "waited", the leaving voter, leading,  *)
+(* orders an heir to campaign, unconditionally (a transfer, Transfer),   *)
+(* once every remaining voter took its announcement, as the answer to it *)
+(* tells (hyper-liveness's Liveness::stop_taken); "unwaited", at any time *)
+(* (refused, SuspicionStopUnwaited).  Led, if a voter: the run begins    *)
+(* with it leading term 1, every member following it.                   *)
 (*                                                                         *)
 (* Stable: where the voters out leave no quorum without the leader, a    *)
 (* group whose remaining voters follow one leader in its term keeps that *)
@@ -60,15 +66,16 @@
 (* leader and term, CheckStable).  The voters out, at each remaining     *)
 (* voter: those stopped for good, which it suspects, and the leaving     *)
 (* one, whose announcement it took (Announced), or which stopped (not    *)
-(* Announced).                                                           *)
+(* Announced); with a Handover, the leaving voter once it handed over    *)
+(* (the history variable handed).                                        *)
 (*                                                                         *)
 (* Nothing grows without a bound: terms to MaxTerm, and StateBudget, as  *)
 (* in FastTrack.tla.                                                     *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
-CONSTANTS Servers, Nobody, MaxTerm, Stopped, Leaving, Announced, Rule,
-          CheckStable, StateBudget
+CONSTANTS Servers, Nobody, MaxTerm, Stopped, Leaving, Announced, Handover, Led,
+          Rule, CheckStable, StateBudget
 
 Terms == 1..MaxTerm
 Quorum(S) == 2 * Cardinality(S \cap Servers) > Cardinality(Servers)
@@ -83,9 +90,9 @@ Orders == [from : Servers, to : Servers, term : Terms, cond : BOOLEAN]
 NotSettled == [l |-> Nobody, t |-> 0]
 
 VARIABLES term, vote, role, leader, left, suspects, granted, kind, orders,
-          leaderOf, down, gone, settled
+          leaderOf, down, gone, handed, settled
 vars == <<term, vote, role, leader, left, suspects, granted, kind, orders,
-          leaderOf, down, gone, settled>>
+          leaderOf, down, gone, handed, settled>>
 
 \* The members that act: all but those stopped.
 Up == Servers \ down
@@ -102,10 +109,14 @@ Drops(s, x) == Rule # "nodrop" /\ x \in gone[s]
 \* not announced, the leaving one stopped.
 Out(s) ==
   /\ Stopped \subseteq suspects[s]
-  /\ IF Announced THEN Leaving \subseteq gone[s] ELSE Leaving \subseteq down
+  /\ CASE Handover # "none" -> handed
+       [] Announced -> Leaving \subseteq gone[s]
+       [] OTHER -> Leaving \subseteq down
 OutNext(s) ==
   /\ Stopped \subseteq suspects'[s]
-  /\ IF Announced THEN Leaving \subseteq gone'[s] ELSE Leaving \subseteq down'
+  /\ CASE Handover # "none" -> handed'
+       [] Announced -> Leaving \subseteq gone'[s]
+       [] OTHER -> Leaving \subseteq down'
 
 \* l leads, and every remaining voter follows it in its term, holding the
 \* voters out as out.
@@ -136,20 +147,22 @@ TypeOK ==
   /\ leaderOf \in [Terms -> Servers \cup {Nobody}]
   /\ down \subseteq Servers
   /\ gone \in [Servers -> SUBSET Servers]
+  /\ handed \in BOOLEAN
 
 Init ==
-  /\ term = [s \in Servers |-> 0]
-  /\ vote = [s \in Servers |-> Nobody]
-  /\ role = [s \in Servers |-> "follower"]
-  /\ leader = [s \in Servers |-> Nobody]
+  /\ term = [s \in Servers |-> IF Led = Nobody THEN 0 ELSE 1]
+  /\ vote = [s \in Servers |-> Led]
+  /\ role = [s \in Servers |-> IF s = Led THEN "leader" ELSE "follower"]
+  /\ leader = [s \in Servers |-> Led]
   /\ left = [s \in Servers |-> Nobody]
   /\ suspects = [s \in Servers |-> {}]
   /\ granted = [s \in Servers |-> {}]
   /\ kind = [s \in Servers |-> "asked"]
   /\ orders = {}
-  /\ leaderOf = [t \in Terms |-> Nobody]
+  /\ leaderOf = [t \in Terms |-> IF t = 1 THEN Led ELSE Nobody]
   /\ down = Stopped
   /\ gone = [s \in Servers |-> {}]
+  /\ handed = FALSE
   /\ settled = NotSettled
 
 \* s becomes a follower of l (Nobody for none) in term t: what it asked or
@@ -187,7 +200,7 @@ Suspect(s, x) ==
   /\ s \in Up
   /\ x \in Servers \ ({s} \cup suspects[s])
   /\ SuspectsNext(s, x)
-  /\ UNCHANGED <<term, vote, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<term, vote, orders, leaderOf, down, gone, handed>>
 
 \* The detectors of s trust x again.  A stopped voter's heartbeats never
 \* come, nor those of a run whose stop s took.
@@ -196,7 +209,7 @@ Trust(s, x) ==
   /\ x \in (suspects[s] \cap Up) \ gone[s]
   /\ suspects' = [suspects EXCEPT ![s] = @ \ {x}]
   /\ UNCHANGED <<term, vote, role, leader, left, granted, kind, orders, leaderOf,
-                 down, gone>>
+                 down, gone, handed>>
 
 \* s, trusting no leader and with a quorum it trusts, asks for pre-votes for
 \* its next term, anew if it asked before.
@@ -213,7 +226,7 @@ PreVote(s) ==
   /\ leader' = [leader EXCEPT ![s] = Nobody]
   /\ granted' = [granted EXCEPT ![s] = {s}]
   /\ kind' = [kind EXCEPT ![s] = "asked"]
-  /\ UNCHANGED <<term, vote, suspects, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<term, vote, suspects, orders, leaderOf, down, gone, handed>>
 
 \* The lease of m against a request of c for term t (Raft::step_newer_term):
 \* m leads, or trusts a leader other than c and c's term is not past m's
@@ -239,7 +252,7 @@ GrantPre(m, c) ==
         /\ UNCHANGED leader
   /\ granted' = [granted EXCEPT ![c] = @ \cup {m}]
   /\ UNCHANGED <<term, vote, role, left, suspects, kind, orders, leaderOf, down,
-                 gone>>
+                 gone, handed>>
 
 \* A pre-candidate granted by a quorum campaigns in its next term.
 ElectPre(c) ==
@@ -252,7 +265,7 @@ ElectPre(c) ==
   /\ left' = [left EXCEPT ![c] = Nobody]
   /\ granted' = [granted EXCEPT ![c] = {c}]
   /\ kind' = [kind EXCEPT ![c] = "asked"]
-  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone, handed>>
 
 \* m votes for candidate c in c's term: a later term moves m there as a
 \* follower knowing no leader, unless the lease refuses an unforced request.
@@ -275,7 +288,7 @@ GrantVote(m, c) ==
         /\ vote' = [vote EXCEPT ![m] = c]
         /\ granted' = [granted EXCEPT ![c] = @ \cup {m}]
         /\ UNCHANGED <<term, role, leader, left, kind>>
-  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone, handed>>
 
 \* A candidate a quorum voted for leads its term.
 Win(c) ==
@@ -287,7 +300,7 @@ Win(c) ==
   /\ kind' = [kind EXCEPT ![c] = "asked"]
   /\ leaderOf' = IF leaderOf[term[c]] = Nobody
                  THEN [leaderOf EXCEPT ![term[c]] = c] ELSE leaderOf
-  /\ UNCHANGED <<term, vote, left, suspects, orders, down, gone>>
+  /\ UNCHANGED <<term, vote, left, suspects, orders, down, gone, handed>>
 
 \* A heartbeat or an append of term t's leader reaches m: m follows it in t,
 \* unless m asks in t and suspects it, when the message is dropped.
@@ -299,7 +312,7 @@ Hear(m, t) ==
   /\ ~(role[m] = "precandidate" /\ t = term[m] /\ leaderOf[t] \in suspects[m])
   /\ ~(role[m] = "follower" /\ t = term[m] /\ leader[m] = leaderOf[t])
   /\ Follow(m, t, leaderOf[t])
-  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone, handed>>
 
 \* s, which sends (a leader, or a member that asks), hears an answer of a
 \* later term from m.
@@ -309,7 +322,7 @@ Learn(s, m) ==
   /\ term[m] > term[s]
   /\ ~Drops(s, m)
   /\ Follow(s, term[m], Nobody)
-  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone, handed>>
 
 \* l orders heir h to campaign: under "core" and "unconditional" a leader
 \* its detectors leave no quorum; under "stepdown" a member that led its
@@ -328,7 +341,7 @@ Order(l, h) ==
      IN /\ o \notin orders
         /\ orders' = orders \cup {o}
   /\ UNCHANGED <<term, vote, role, leader, left, suspects, granted, kind, leaderOf,
-                 down, gone>>
+                 down, gone, handed>>
 
 \* h takes order o: a later term moves it there as a follower knowing no
 \* leader first, whatever it was; it campaigns, forced, unless the order
@@ -350,7 +363,7 @@ TakeOrder(h, o) ==
              /\ kind' = [kind EXCEPT ![h] = IF o.cond THEN "condition" ELSE "order"]
         ELSE /\ o.term > term[h]
              /\ Follow(h, o.term, Nobody)
-  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone>>
+  /\ UNCHANGED <<suspects, orders, leaderOf, down, gone, handed>>
 
 \* s takes the leaving voter x's announced stop: it suspects x, if it did
 \* not, and from now on keeps it out (Trust, Drops).
@@ -363,7 +376,7 @@ Announce(s, x) ==
   /\ IF x \in suspects[s]
      THEN UNCHANGED <<suspects, role, leader, left, granted, kind>>
      ELSE SuspectsNext(s, x)
-  /\ UNCHANGED <<term, vote, orders, leaderOf, down>>
+  /\ UNCHANGED <<term, vote, orders, leaderOf, down, handed>>
 
 \* The leaving voter x stops: it acts no more, and what it sent may still
 \* arrive.
@@ -371,7 +384,22 @@ Stop(x) ==
   /\ x \in Leaving \cap Up
   /\ down' = down \cup {x}
   /\ UNCHANGED <<term, vote, role, leader, left, suspects, granted, kind, orders,
-                 leaderOf, gone>>
+                 leaderOf, gone, handed>>
+
+\* The leaving voter l, leading, orders heir h to campaign, unconditionally,
+\* in its term: the owner's transfer (Raft §3.10), under "waited" only once
+\* every remaining voter took its announcement.
+Transfer(l, h) ==
+  /\ Handover # "none"
+  /\ l \in Leaving \cap Up /\ role[l] = "leader"
+  /\ h \in Remaining
+  /\ Handover = "waited" => \A s \in Remaining : l \in gone[s]
+  /\ LET o == [from |-> l, to |-> h, term |-> term[l], cond |-> FALSE]
+     IN /\ o \notin orders
+        /\ orders' = orders \cup {o}
+  /\ handed' = TRUE
+  /\ UNCHANGED <<term, vote, role, leader, left, suspects, granted, kind, leaderOf,
+                 down, gone>>
 
 Step ==
   \/ \E s, x \in Servers : Suspect(s, x) \/ Trust(s, x)
@@ -383,6 +411,7 @@ Step ==
   \/ \E h \in Servers, o \in orders : TakeOrder(h, o)
   \/ \E s, x \in Servers : Announce(s, x)
   \/ \E x \in Servers : Stop(x)
+  \/ \E l, h \in Servers : Transfer(l, h)
 
 \* The history: the first leader and term the group settled on.
 Next ==

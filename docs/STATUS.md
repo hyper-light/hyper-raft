@@ -36,7 +36,7 @@ Timing (`docs/timing.md`, sources in `docs/research/timing.md`): elections and f
 move from picked constants to measurement — one NFD-E detector per node pair configured to
 minimize unavailability, the election span from Ongaro's split-vote probability, the timer
 granularity measured. hyper-swim's probes are already such detectors, one per pair, with the
-period, the time-outs, the suspicion and the dissemination budget derived (§2.7). Steps L-1 (`hyper-timing`) to L-5 (the consumers); L-1 done (`qos.rs`: the bound, the configurator, the span; `link.rs` and `folds.rs`: the per-link NFD-E estimator, its window `min(n_G, n_A)` under a derived drift bound, the unseen-delay term for the first variance, and the folds for `G`, the sender's flush and the MTBF, path estimates fresh and of one endpoint (each sample stamped with its time and its endpoint's generation, a new generation starting the window again, a sample past the window's span dropped, the age reported: focal's audit F44), `G` never below the resolution of the owner's clock, so an owner whose waits all read on time still configures, where a mean of zero had floored nothing, configured no detector and suspected no one; `election.rs`: the election law from the detector and the span, the priority's window from `T_c`, the measured `G` under every tail, with `ELECTION_MARGIN`, `PATH_WINDOW` and `GRANULARITY_NS` gone). L-2 done (`docs/timing.md` §2.9): the core elects by its owner's detectors' suspicion after the law's draw over the measured span, steps down on a suspected majority, beats only while its group has work in flight, and takes no ticks; item 10 is closed (the first election needs only the handshake's round trip; a link younger than its evidence is judged by what its node measured, built in hyper-liveness). L-3 done (`crates/hyper-liveness`, §2.8): the node-pair stream with its flush proof, kernel receive stamps from hyper-tokio's plane socket (Linux `SO_TIMESTAMPNS`, macOS `SO_TIMESTAMP_MONOTONIC`; Windows stamps at the read, item 5), each suspicion with its stated bound; the core takes its `Suspected`, `Trusted` and `Restarted` changes as `suspect`/`trust`/`restarted` (L-2). Its follow-ups done (§2.9): every link configures or is judged by what its node measured, the widest of its pool's and its configured links' (item 10's detector half), the interval a link's evidence needs measured online, restarts reported. Its review done (§2.8): runs ordered and kept durably by the owner, the owner told every trust that differs from what it was told, the node's evidence kept and read only where a pair has no configuration of its own, the doubling renewal derived, the simulation on measured worlds. The detector model at its causes (§2.2, §2.8, §3 item 11): mistakes bounded per heartbeat taken, a sender's skipped slots its lateness, no margin cap, no configuration whose `U` is one or more (the node's evidence's margin for a young link held to the same rule), the evidence interval held only until a link configures, the `β` rule gone and the history kept against a sliding window as measured, `G` from every wait its owner began before a wake and that reached it (counted only where the timer ended them, members asked for reports back to back on Linux's 1 ms tick never measured it and refused every heartbeat, §2.9); every test exact, every suspicion traced from the nodes' records and every reported count held to them, the allowance reported; the account end to end against main on macOS and in Linux at one, two and four CPUs (`docs/benchmarks.md`). L-4 done: hyper-durable-e2e's and hyper-raft-e2e's members run on their own detectors, and neither test computes a tick, a tolerance bound or a count of elections (§2.9, "On real detectors").
+period, the time-outs, the suspicion and the dissemination budget derived (§2.7). Steps L-1 (`hyper-timing`) to L-5 (the consumers); L-1 done (`qos.rs`: the bound, the configurator, the span; `link.rs` and `folds.rs`: the per-link NFD-E estimator, its window `min(n_G, n_A)` under a derived drift bound, the unseen-delay term for the first variance, and the folds for `G`, the sender's flush and the MTBF, path estimates fresh and of one endpoint (each sample stamped with its time and its endpoint's generation, a new generation starting the window again, a sample past the window's span dropped, the age reported: focal's audit F44), `G` never below the resolution of the owner's clock, so an owner whose waits all read on time still configures, where a mean of zero had floored nothing, configured no detector and suspected no one; `election.rs`: the election law from the detector and the span, the priority's window from `T_c`, the measured `G` under every tail, with `ELECTION_MARGIN`, `PATH_WINDOW` and `GRANULARITY_NS` gone). L-2 done (`docs/timing.md` §2.9): the core elects by its owner's detectors' suspicion after the law's draw over the measured span, leads on when they leave it no quorum and hands over only to a voter that can be elected without it (since 2026-10-24; it stepped down before), beats only while its group has work in flight, and takes no ticks; item 10 is closed (the first election needs only the handshake's round trip; a link younger than its evidence is judged by what its node measured, built in hyper-liveness). L-3 done (`crates/hyper-liveness`, §2.8): the node-pair stream with its flush proof, kernel receive stamps from hyper-tokio's plane socket (Linux `SO_TIMESTAMPNS`, macOS `SO_TIMESTAMP_MONOTONIC`; Windows stamps at the read, item 5), each suspicion with its stated bound; the core takes its `Suspected`, `Trusted` and `Restarted` changes as `suspect`/`trust`/`restarted` (L-2). Its follow-ups done (§2.9): every link configures or is judged by what its node measured, the widest of its pool's and its configured links' (item 10's detector half), the interval a link's evidence needs measured online, restarts reported. Its review done (§2.8): runs ordered and kept durably by the owner, the owner told every trust that differs from what it was told, the node's evidence kept and read only where a pair has no configuration of its own, the doubling renewal derived, the simulation on measured worlds. The detector model at its causes (§2.2, §2.8, §3 item 11): mistakes bounded per heartbeat taken, a sender's skipped slots its lateness, no margin cap, no configuration whose `U` is one or more (the node's evidence's margin for a young link held to the same rule), the evidence interval held only until a link configures, the `β` rule gone and the history kept against a sliding window as measured, `G` from every wait its owner began before a wake and that reached it (counted only where the timer ended them, members asked for reports back to back on Linux's 1 ms tick never measured it and refused every heartbeat, §2.9); every test exact, every suspicion traced from the nodes' records and every reported count held to them, the allowance reported; the account end to end against main on macOS and in Linux at one, two and four CPUs (`docs/benchmarks.md`). L-4 done: hyper-durable-e2e's and hyper-raft-e2e's members run on their own detectors, and neither test computes a tick, a tolerance bound or a count of elections (§2.9, "On real detectors").
 
 The core's TLA+ model (`docs/models/`, from focal `7ea6f63`): the classic track, a change of
 configuration by one entry or through a joint configuration, the fast track with both of its
@@ -527,6 +527,57 @@ is worked around.
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
 ### Closed (2026-10-24)
+
+- **hyper-raft: with exactly a quorum of live voters, a wrong suspicion between the two live voters
+  of three cost the group its leader (found by mantle's roll, serve-cell `abef6120`).** A leader its
+  detectors left no quorum stepped down, though with the third voter stopped no voter could be
+  elected without its vote: at the roll's third stop a leader suspected its one live voter three
+  times in 1.7 s, their QUIC connection up, stepped down each time and was elected again 150–250 ms
+  later (terms 5 to 9); at its first stop two voters suspecting each other for good handed the
+  leadership back and forth, terms 3 to 8 in about 100 ms. A leader left no quorum now leads on and
+  orders its heirs to campaign only where each and those it trusts, the leader apart, are a quorum
+  (`proto::IF_ELECTED_WITHOUT`); a pre-candidate left no quorum stops asking and follows the leader
+  it left; and a leader left no quorum beats the voters it suspects too. Safety is the votes' and
+  the logs', unchanged; reads stay ReadIndex, with no lease; a leader cut off from every voter leads
+  on in its term until a later term reaches it, as any Raft leader (`docs/timing.md` §2.9, "A leader
+  its detectors leave no quorum"). Tests: `tests/suspicion.rs`,
+  `a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on`,
+  `voters_that_suspect_each_other_for_good_keep_their_leader_once_the_third_is_stopped` and
+  `a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`, each red on `313ada8`; the
+  step-down tests restated. Model: `docs/models/Suspicion.tla` and its Rust mirror (three voters, the
+  third stopped, three terms: 11,376 states, every settled group keeps its leader and term; every
+  voter up: 1,306,432 states, one leader a term; the step-down, an unconditional order and a
+  pre-candidate that asks on each refused).
+
+- **hyper-raft: a leader that trusted again, or saw start again, a member holding its whole log
+  probed it, and an idle group beat once a round for good (found on the way).** A probe moves on
+  only with news (`Progress::maybe_update`), and a member that holds everything has none, so the
+  member stayed probed until the group's next write and the leader, which beats while a member is
+  probed, sent a heartbeat round every round tail after every mistake its detectors withdrew. A
+  member with nothing in flight that holds the leader's whole log is not probed (`Raft::holds_all`).
+  Test: `a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet` (red on `313ada8`: the
+  idle group never came to rest).
+
+- **hyper-liveness: a peer restarted where it heard nothing was sent heartbeats at its peers'
+  floors, a flush each (found by mantle's roll).** A new run asks no interval until its link has
+  evidence; its peers, taking that, went to their floors. mantle's roll restarts a founder at a new
+  port its peers do not yet know, and their streams to it ran at their floors where no one listened,
+  40 to 200 liveness writes a second against 1 to 2 on its busy CI runners. A run's ask is now taken
+  once one of its heartbeats echoes one of this node's (`docs/timing.md` §2.8, "A run that has taken
+  none of this node's heartbeats"); measured at `dd764a0` and `313ada8` alike, the rise is the
+  restart's, a stop alone leaving its peers' writes as they were. Test:
+  `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat` (red on `313ada8`: 2,159 heartbeats
+  6.97 ms apart where the stream had been at 110 ms).
+
+- **hyper-liveness: every restart counted a failure in the MTBF's evidence, a node's orderly stop and
+  start among them (asked by mantle).** The owner's last act on the plane, `Liveness::stop`, now
+  announces the run's end (a heartbeat flagged `stopping`, the flags' bit 1); a peer that takes it
+  counts the next run's start, or its letting go of the suspected pair, as no failure, and sends the
+  ended run nothing more (`docs/timing.md` §2.8, "A stop announced"). `Liveness::history` and
+  `hyper_timing::Exposure::of` let an owner keep the evidence across its runs, given whole where it
+  was rebuilt one failure a call. Tests: `a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing`,
+  `codec::tests::a_flag_past_the_two_bits_is_malformed`,
+  `folds::tests::stored_totals_are_the_evidence_they_were_taken_from`.
 
 - **hyper-rt: on Windows a console close or a shutdown ended the process as the handler returned,
   before a subscriber's orderly stop (found by mantle).** The console handler returned TRUE as soon as

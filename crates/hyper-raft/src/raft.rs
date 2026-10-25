@@ -3074,6 +3074,11 @@ impl<S: Storage> Raft<S> {
         if self.msgs.len() >= self.config.limits.pending_messages {
             return Err(Error::Capacity("messages that wait to be taken"));
         }
+        // Before the fast track's too: a fast vote of a later term deposes a leader as any
+        // message of one does.
+        if self.drops(&message) {
+            return Ok(());
+        }
         if message.msg_type == fast::FAST_PROPOSE {
             return self.hear_proposal(message);
         }
@@ -3085,9 +3090,6 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Violation(
                 "a term or an index beyond what is counted",
             ));
-        }
-        if self.drops(&message) {
-            return Ok(());
         }
         if self.step_term(kind, &message)? == TermChecked::Done {
             return Ok(());

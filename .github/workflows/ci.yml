@@ -120,7 +120,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [fast, change, small, reconfig, scenario]
+        part: [fast, change, small, reconfig, scenario, suspicion]
     runs-on: ubuntu-24.04
     # The state bound is what bounds the work; this catches a checker that stopped making
     # progress: twice the whole suite's measured time at one worker (docs/models/README.md),
@@ -150,7 +150,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - run: diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast reconfig scenario small)
+      - run: diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast reconfig scenario small suspicion)
   explore:
     # hyper-check's exhaustive searches at full scope (docs/sim.md §15.1): slates' models at the
     # class counts slates recorded, every rejected variant refused by its shortest history, and

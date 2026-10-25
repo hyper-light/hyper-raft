@@ -40,7 +40,8 @@ workers="${TLC_WORKERS:-1}"
 # one that passes; the part of CI's model job it runs in (.github/workflows/ci.yml, where the parts
 # run side by side); the module checked, FastTrack unless named (a scenario, FastTrackScenario, is
 # FastTrack held to an order of leaders and proposals; Reconfig, the configuration a member counts
-# by across two changes, docs/research/reconfiguration.md §5).
+# by across two changes, docs/research/reconfiguration.md §5; Suspicion, the rules that decide when
+# a member that elects by suspicion acts on its detectors' word, docs/timing.md §2.9).
 configurations="
 one          FastTrack.cfg                -                       fast
 round        FastTrackRound.cfg           -                       fast
@@ -81,6 +82,13 @@ designb      FastTrackScenarioB.cfg       -                       scenario FastT
 designblog   FastTrackScenarioBLog.cfg    -                       scenario FastTrackScenario
 roundballot  FastTrackRoundBallot.cfg     -                       fast
 oneb         FastTrackB.cfg               -                       fast
+suspicion    Suspicion.cfg                -                       suspicion Suspicion
+susfull      SuspicionFull.cfg            -                       suspicion Suspicion
+stepdown     SuspicionStepDown.cfg        Stable                  suspicion Suspicion
+uncond       SuspicionUnconditional.cfg   Stable                  suspicion Suspicion
+asking       SuspicionAsking.cfg          AskingCanWin            suspicion Suspicion
+leftnoquorum SuspicionReached.cfg         NoLeaderLeftNoQuorum    suspicion Suspicion
+handover     SuspicionHandOver.cfg        NoHandOver              suspicion Suspicion
 "
 
 if [ "${1:-}" = "--parts" ]; then

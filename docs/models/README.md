@@ -79,11 +79,13 @@ What the model leaves out, and why it is sound to:
 - **Pre-vote, check-quorum, priority and leader transfer** only refuse or bring forward a
   campaign, which the model may take at any time. So do **elections by suspicion** (timing step
   L-2, `docs/timing.md` §2.9): a campaign started by a detector's suspicion after a drawn delay,
-  refused while a member and those it trusts are no quorum, brought forward by a hand-over's order;
-  a leader stepping down when its detectors suspect a majority, which is a leader that stops acting;
+  refused while a member and those it trusts are no quorum, brought forward by a hand-over's order
+  (one a leader that leads on with no quorum its detectors trust gives only to an heir that can be
+  elected without it); a pre-candidate that stops asking, which is a member that stops campaigning;
   a lease that refuses votes while the leader is trusted rather than while it is heard; a follower
   forgetting its leader, which no action reads. None grants a vote the log comparison would refuse,
-  so `Elect` is unchanged and so is every configuration's state count. **Learners** do not vote and are not counted.
+  so `Elect` is unchanged and so is every configuration's state count. When the rules make a
+  campaign is `Suspicion.tla`'s question (below). **Learners** do not vote and are not counted.
   **ReadIndex** commits nothing. **A snapshot** stands for a committed prefix of a log.
 - **A member's word that it lost entries** (R-5's refusal flagged lost, `Raft::take_lost`) lowers
   what its leader counts it holding; the model's leader keeps counting what it was told (`acks`)
@@ -288,6 +290,53 @@ hyper-check's swarm, group seed 9,657, which no model checked before, as none ha
 liveness property (`docs/raft.md` §3.3). CI's TLC counted both (run 37387647725: `rremove` at the
 mirror's 667,123, `rlength` refused at 848). The mirror finds the same
 (`by_the_logs_precedence_a_group_with_every_member_up_can_always_elect`).
+
+**Elections by suspicion (`Suspicion.tla`, 2026-10-24).** The modules above take a campaign at
+any time and a leader that stops acting, which is every run the suspicion rules allow; whether the
+rules themselves make the runs they are for is this module's question. It models the rules alone
+(`docs/timing.md` §2.9): no log, one configuration, messages as the members' states (a request is
+out while its asker asks in its term; a leader's heartbeats of a term it led may arrive at any later
+time), detectors that suspect and trust any member at any time and never trust a stopped one again,
+and `Rule`, what a member does when its detectors leave it no quorum. `Stable` is the property the
+core's rule is for: where the stopped voters leave no quorum without the leader and every live voter
+suspects them, a group whose live voters follow one leader in its term keeps that leader and that
+term whatever the detectors say of the live voters (a history variable holds the first such leader
+and term; `CheckStable` is off where it is not claimed, so the variable adds no state). The Rust
+mirror (`crates/hyper-check/tests/models/suspicion.rs`, `tests/suspicion.rs`) has the same
+variables and actions with no symmetry, and counts the states the passing configurations state; it
+checks `Stable` on each step from a settled state, which counts the same states, since a settled
+group stays settled wherever `Stable` holds.
+
+| Action | What it is in `crates/hyper-raft` |
+|---|---|
+| `Suspect(s, x)`, `Trust(s, x)` | `Raft::suspect`, `Raft::trust` (`Watch::suspect`, `trust`); a pre-candidate left no quorum, `Raft::stop_asking`; under `"stepdown"`, the step-down before 2026-10-24. |
+| `PreVote(s)` | `Raft::wake_follower` → `Raft::hup(false)` (`trusts_leader`, `trusted_quorum`; `Watch::left`, `become_pre_candidate`). |
+| `GrantPre(m, c)`, `GrantVote(m, c)` | `Raft::step_newer_term`'s lease (`Lease`: a leader, or a member that trusts a leader other than the asker, the asker's term not past its next; a request from its own leader ends its trust) and `Raft::step_vote`; a forced request (`CAMPAIGN_TRANSFER`) is refused by no lease. |
+| `ElectPre(c)`, `Win(c)` | `Raft::poll` → `Raft::campaign(Campaign::Election)`, `Raft::become_leader`. |
+| `Hear(m, t)` | A leader's append or heartbeat, `Raft::step_follower`; dropped by a pre-candidate that suspects its sender (`Raft::step_candidate`). |
+| `Learn(s, m)` | An answer of a later term, `Raft::step_term` → `become_follower`. |
+| `Order(l, h)` | `Raft::left_no_quorum` and `Raft::wake_order` → `Raft::hand_over(true)` (`proto::IF_ELECTED_WITHOUT`); under `"stepdown"`, the `led` path of `Raft::wake_follower`, unconditional. |
+| `TakeOrder(h, o)` | `MsgTimeoutNow` in `Raft::step_follower` and `Raft::step_candidate`, `Raft::takes_order` (`elected_without`) → `Raft::hup(true)`. |
+
+| Name | Configuration | Bounds | Distinct states | Result |
+|---|---|---|---|---|
+| `suspicion` | `Suspicion.cfg` | 3 voters, the third stopped, 3 terms, the core's rule | 11,376 (the mirror's) | passes: `OneLeader`, `Stable`, `AskingCanWin` |
+| `susfull` | `SuspicionFull.cfg` | 3 voters, none stopped, 2 terms, the core's rule | 1,306,432 (the mirror's) | passes: `OneLeader`, `AskingCanWin` |
+| `stepdown` | `SuspicionStepDown.cfg` | `suspicion` at 2 terms, the step-down before 2026-10-24 | TLC's, first CI run | refused: `Stable` |
+| `uncond` | `SuspicionUnconditional.cfg` | `suspicion` at 2 terms, orders without the condition | TLC's, first CI run | refused: `Stable` |
+| `asking` | `SuspicionAsking.cfg` | `suspicion` at 2 terms, a pre-candidate that asks on | TLC's, first CI run | refused: `AskingCanWin` |
+| `leftnoquorum` | `SuspicionReached.cfg` | `suspicion` and the claim `NoLeaderLeftNoQuorum` | TLC's, first CI run | refused: `NoLeaderLeftNoQuorum` |
+| `handover` | `SuspicionHandOver.cfg` | `susfull` and the claim `NoHandOver` | TLC's, first CI run | refused: `NoHandOver` |
+
+What each shows: `suspicion` is mantle's roll at its stops, every order of every mistake between the
+two live voters within three terms, and the leader and term kept; `leftnoquorum` shows it reaches a
+settled leader its detectors leave no quorum (the state the rule is for), and `susfull`, with every
+voter up, keeps one leader a term under the same rules. `stepdown` is the core before the change,
+refused at the step-down; `uncond` shows the order's condition is what keeps the leader (an heir
+elected by the leader's own vote); `asking` shows a pre-candidate that asks on drops its leader's
+messages where it could win only by a vote it cannot get. `handover` shows the condition still lets
+an heir that can be elected without its leader be elected, the deaf leader's hand-over (`docs/timing.md`
+§2.9). The mirror finds each refusal by the invariant named and each pass at the counts stated.
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

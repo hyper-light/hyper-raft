@@ -1919,6 +1919,17 @@ stated are restated (`a_leader_is_left_no_quorum_when_its_detectors_suspect_a_ma
 `a_leader_left_no_quorum_hands_over_to_a_voter_elected_without_it`,
 `a_leader_that_suspects_every_voter_for_less_than_a_round_leads_on`).
 
+The model (`docs/models/Suspicion.tla`, its Rust mirror `crates/hyper-check/tests/suspicion.rs`,
+`docs/models/README.md`). The rules alone, with detectors wrong at any time: three voters, the third
+stopped, three terms, 11,376 states, and every group settled on a leader keeps it and its term
+(`Stable`) with one leader a term and no pre-candidate asking where it could not be elected without
+those it suspects; every voter up, two terms, 1,306,432 states, one leader a term. Each part of the
+rule taken out is refused: the step-down before it and an unconditional order lose a settled
+leader, and a pre-candidate that asks on asks with no quorum to win by. Two claims are refused, so
+the scopes reach what they are for: a settled leader its detectors leave no quorum, and, with every
+voter up, a candidate a conditional order made granted a quorum, the hand-over of a leader that
+hears none of its voters. TLC checks the same configurations in CI's model job, part `suspicion`.
+
 **Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
 (`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core
 must not read a clock, so it takes a number; a `std::time::Instant` has no value of its own a

@@ -907,7 +907,14 @@ is worked around.
   head-only request answered nine tenths of a period after the peer has it, over 60 ms each way:
   refused 20 ms before its answer under the old rule).
 
-- **hyper-transport: a stream its peer read in steps was refused as unread while it moved.** F38's
+- **hyper-transport: a stream its peer read in steps was refused as unread while it moved.** The cause
+  of mantle's busy-job objects failures (2026-10-24, on a line that lacked it): on 4 of 4 busy runners
+  a gateway judged its reader unread and refused the exchange `Stalled`, the reader having taken bytes
+  7 to 22 ms before the verdict and consumed everything sent; in run 40161296995 (ubuntu-24.04, the
+  tests on CPUs 0–1 beside two busy loops) the gateway judged its client unread across 3,072 ms in
+  which it took 312 `MAX_DATA` and 312 `MAX_STREAM_DATA` frames from it, its write limit at its
+  class's reserve, its stream unblocked and all it had sent acknowledged, while the client read
+  280–315 KB every 250 ms and gave credit 25–28 times every 250 ms. F38's
   unread rule judged a stream by its state at each judgement, once a period: out of credit with
   everything it sent acknowledged at two judgements a window apart, it was refused `Stalled`, whatever
   it wrote between them. A stream held to its peer's pace is in that state at nearly every instant:

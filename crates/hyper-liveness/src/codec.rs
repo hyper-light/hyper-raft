@@ -79,8 +79,9 @@ pub struct Heartbeat {
     pub stopping: bool,
 }
 
-/// The flags' bits: an echo follows; the run stops here.
+/// Format: the flags' bit 0, an echo follows.
 const ECHO: u8 = 1;
+/// Format: the flags' bit 1, the run stops here ([`Heartbeat::stopping`]).
 const STOPPING: u8 = 2;
 
 fn put(out: &mut [u8; MAX_BYTES], at: &mut usize, value: u64) {

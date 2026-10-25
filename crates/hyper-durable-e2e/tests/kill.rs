@@ -1185,8 +1185,10 @@ fn stalled_disk(leader: bool) -> String {
 ///
 /// In a group judged apart from its disks (`HYPER_DURABLE_E2E_DISK_APART`, kiln's CP-T2.2) the
 /// stalled leader is trusted still: it takes the writes, which wait on its survivors' held devices
-/// and commit on their disks once they go on, and once a write of its own has been out its patience
-/// it hands the lead to a survivor, whose campaign waits on its own held write.
+/// and commit on their disks once they go on. Its survivors' disks judged slow while held, it names
+/// no heir through the hold, and once a write of its own has been out its patience and a survivor's
+/// disk has answered as long, it hands the lead to that survivor (12.2 s in on adas-mac-studio-3, a
+/// hold of 7 s and a patience of 5 s).
 fn stalled_devices() -> String {
     let name = "stalled-devices";
     let mut cluster = Cluster::start(name, 3);

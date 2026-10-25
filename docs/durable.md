@@ -384,12 +384,24 @@ section's rule. A disk that never comes back would then hold a lead it cannot ke
 unpersisted entries growing to the core's bound, so the shell bounds its patience: a leader whose
 oldest write has been out past it (`Replica::set_disk_patience`, none by default, a deadline the
 owner is woken at) hands the lead to the voter that holds most of its log, of those its detectors
-trust (`TimeoutNow`, which leaves without a write of its own), and begins again a hand-over the core
-gives up while the write is still out (`Replica::handed_over` counts them). A stall shorter than the
-patience costs nothing: in the liveness harness, a 2 s stall of the leader's disk with a patience of
-5 s started no election over 10,000 seeds, and one that never ends, with a patience of 1 s, hands
-the lead on at its patience, its heir's campaign taking one term or two (the second where the heir's
-ballot round ended before a vote that waited on the voter's flush came).
+trust whose disks they don't judge slow (`Replica::disk_slow`, from each peer's own heartbeats,
+`hyper_liveness::Change::DiskSlow`), once such a voter has been there as long (`TimeoutNow`, which
+leaves without a write of its own), and begins again a hand-over the core gives up while the write
+is still out (`Replica::handed_over` counts them). With no such voter it names none
+(`Replica::heirless` counts the drives): an heir whose disk is slow could neither keep the lead's
+writes nor win its campaign, whose vote waits on its disk. The patience is with its disk lagging a
+voter's that could lead, so while every other disk is slow too, as when the members share one, the
+leader waits on its own as long as on theirs, and a voter's disk that answers a moment before its
+own is no cause to hand over. A stall shorter than the patience costs nothing: in the liveness
+harness, a 2 s stall of the leader's disk with a patience of 5 s started no election over 10,000
+seeds, and one that never ends, with a patience of 1 s, hands the lead on at its patience, its
+heir's campaign taking one term or two (the second where the heir's ballot round ended before a vote
+that waited on the voter's flush came). Every member's disk held a second past a patience of 5 s
+spent no term and began no hand-over over 200 seeds of each shape (let go together, 1 and 3 ms
+apart the leader's first or last, 150 and 300 ms apart the leader's first; a publish a millisecond,
+or one every 100 ms), and answered nothing off a majority's disks; counted from the leader's write
+alone, the patience began a hand-over in 19 of 200 seeds with the leader's disk let go 3 ms after
+its followers', and spent one to three terms in 20 of 200 at one publish every 100 ms.
 
 ### 4.3 What a member opens with
 

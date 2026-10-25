@@ -2166,6 +2166,151 @@ fn judged_apart_no_hand_over_while_every_other_disk_is_slow() {
     }
 }
 
+/// Focal's condition 6 on the disk mode: with every member's disk slow, no term is spent. Every
+/// member's disk stalls from one instant to a second past the leader's patience in the step's group
+/// (`APART`), under a publish a millisecond and under one every 100 ms, as on one disk the members
+/// share (Focal's doc 34): let go together, at doc 34's spread (1 and 3 ms apart, the leader's first
+/// and last) and at a journal's (150 and 300 ms apart, the leader's first). The leader's patience ends with both
+/// followers' disks judged slow, so it names no heir (`Replica::heirless`) and begins no hand-over,
+/// and no member's term moves; no message leaves past its sender's disk, no publish offered in the
+/// stall is answered before a majority's disks hold it, its second disk let go, and every one is
+/// answered after, the backlog at the group's pace (each quiet period answering some of it). A
+/// leader whose disk lets go a heartbeat or more after its followers' is condition 5's: its disk
+/// alone slow past its patience, it may begin a hand-over to a follower heard caught up.
+#[test]
+fn judged_apart_every_disk_slow_past_the_patience_spends_no_term() {
+    let patience = APART.patience.unwrap().as_nanos() as u64;
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    // Each shape's ends past the stall's own, the leader's and then its followers', and its load: a
+    // publish a millisecond, or one every 100 ms, whose backlog an heir catches up at once.
+    let shapes: [(&str, [u64; 3], u64); 6] = [
+        ("together", [0, 0, 0], MS),
+        ("doc 34's spread, the leader's first", [0, MS, 3 * MS], MS),
+        ("doc 34's spread, the leader's last", [3 * MS, 0, MS], MS),
+        (
+            "a journal's, the leader's first",
+            [0, 150 * MS, 300 * MS],
+            MS,
+        ),
+        ("together, lightly loaded", [0, 0, 0], 100 * MS),
+        (
+            "doc 34's spread, the leader's last, lightly loaded",
+            [3 * MS, 0, MS],
+            100 * MS,
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (shape, spread, every_ns) in shapes {
+        for seed in first..first + seeds {
+            let mut world = World::with(seed, APART);
+            world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+            let mut load = Load::default();
+            let settled = world.now + 2_000 * MS;
+            world.run_loaded(settled, every_ns, &mut load);
+            let leader = world.leader().unwrap();
+            let term = world.replica(leader).term();
+            let (heirless_before, handed_before) = (
+                world.replica(leader).heirless(),
+                world.replica(leader).handed_over(),
+            );
+            load.watch = leader;
+            let from = world.now;
+            let end = from + patience + 1_000 * MS;
+            let members = [leader, leader % 3 + 1, (leader + 1) % 3 + 1];
+            let mut ends = [0; 3];
+            for (member, after) in members.iter().zip(spread) {
+                ends[(member - 1) as usize] = end + after;
+                world.stall(*member, end + after);
+            }
+            let mut sorted = ends;
+            sorted.sort_unstable();
+            let (majority, last) = (sorted[1], sorted[2]);
+            world.run_loaded(last, every_ns, &mut load);
+            // The backlog the stall held, answered at the group's pace: the load runs on a quiet
+            // period at a time while each answers some of it.
+            let unanswered = |load: &Load| {
+                load.offered
+                    .iter()
+                    .zip(&load.by_leader)
+                    .filter(|(offered, answered)| {
+                        (from..last).contains(*offered) && answered.is_none()
+                    })
+                    .count()
+            };
+            let mut left = unanswered(&load);
+            while left > 0 {
+                let next = world.now + world.quiet();
+                world.run_loaded(next, every_ns, &mut load);
+                let now_left = unanswered(&load);
+                if now_left == left {
+                    break;
+                }
+                left = now_left;
+            }
+            let drained = world.now + world.quiet();
+            world.run_loaded(drained, every_ns, &mut load);
+            let terms = (1..=3u64).map(|id| world.replica(id).term()).max().unwrap() - term;
+            let lost = load
+                .leads
+                .iter()
+                .any(|(at, lead, _)| *at >= from && *lead != leader);
+            let timeouts: Vec<(u64, u64)> = world
+                .timeouts
+                .iter()
+                .filter(|(at, ..)| *at >= from)
+                .map(|(at, _, to)| ((at - from) / MS, *to))
+                .collect();
+            let handed_over = world.replica(leader).handed_over() - handed_before;
+            let heirless = world.replica(leader).heirless() - heirless_before;
+            let judged = members[1..].iter().all(|follower| {
+                world.disks.iter().any(|(at, judge, peer, slow)| {
+                    *judge == leader
+                        && peer == follower
+                        && *slow
+                        && (from..from + patience).contains(at)
+                })
+            });
+            let (mut early, mut caught_up) = (0, 0);
+            for (offered, answered) in load.offered.iter().zip(&load.by_leader) {
+                if let (true, Some(at)) = ((from..last).contains(offered), answered) {
+                    early += usize::from(*at < majority);
+                    caught_up = caught_up.max(at.saturating_sub(majority));
+                }
+            }
+            let line = format!(
+                "{shape}, seed {seed}: leader n{leader}, the disks let go {:?} ms in (the leader's, \
+                 then its followers'); {terms} terms, lead {}, hand-overs begun {handed_over} \
+                 (orders to campaign, ms and heir, {timeouts:?}), the patience heirless {heirless} \
+                 times, both followers judged slow within it {judged}; messages past their senders' \
+                 disks {}; publishes offered in the stall answered before a majority's disks held \
+                 them {early}, never {left}, the last {:.0} ms after a majority's disks answered, \
+                 answered off a majority's disks {}",
+                members.map(|m| (ends[(m - 1) as usize] - from) / MS),
+                if lost { "lost" } else { "kept" },
+                world.broken.len(),
+                caught_up as f64 / 1e6,
+                load.off_majority
+            );
+            println!("{line}");
+            if terms > 0
+                || lost
+                || handed_over > 0
+                || !timeouts.is_empty()
+                || heirless == 0
+                || !judged
+                || !world.broken.is_empty()
+                || early > 0
+                || left > 0
+                || load.off_majority > 0
+            {
+                failed.push(line);
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// CP-T2.2 step 2: a leader whose disk stops for good, in a group whose patience is 1 s, hands the
 /// lead to a follower, and every publish is applied: a disk that stops costs a planned hand-over,
 /// not a leader that holds a lead it cannot keep durable. A hand-over the core gives up is begun

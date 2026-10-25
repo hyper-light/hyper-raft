@@ -1507,10 +1507,13 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   run's successor's start, or its own letting go of the pair while it suspects the peer, as no
   failure (`Taken::after_stop`), sends the ended run nothing more, where each heartbeat to it asked a
   flush of its own, and answers its successor's first heartbeat at once, numbered next, skipping no
-  slot of the stop (`Stream::resume`). It suspects the peer as before, when the peer's last
-  heartbeat's freshness point passes: the announcement is no detector's verdict. Lost, or taken by a
-  build that reads only the echo's bit (which refuses it as malformed, the version unchanged so every
-  other heartbeat of a new build reads as before), it costs what an unannounced stop costs. An owner
+  slot of the stop (`Stream::resume`). It suspects the peer at once and until the successor's first
+  heartbeat (`Change::Stopped`, since 2026-10-25): the announcement is the peer's own word that its
+  run has ended, which the run's freshness point would say only the detector's margin later, and a
+  heartbeat of the stopped run the announcement overtook is refused as stale (§2.9, "A voter's stop
+  announced"). Lost, or taken by a build that reads only the echo's bit (which refuses it as
+  malformed, the version unchanged so every other heartbeat of a new build reads as before), it costs
+  what an unannounced stop costs. An owner
   keeps the evidence across its runs with `Liveness::history` and `hyper_timing::Exposure::of`. Test:
   `a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing` (the third
   node of three announces its stop and stops, in the four worlds, 8 seeds each: its peers count no
@@ -1934,6 +1937,53 @@ leader, and a pre-candidate that asks on asks with no quorum to win by. Two clai
 the scopes reach what they are for: a settled leader its detectors leave no quorum, and, with every
 voter up, a candidate a conditional order made granted a quorum, the hand-over of a leader that
 hears none of its voters. TLC checks the same configurations in CI's model job, part `suspicion`.
+
+**A voter's stop announced** (2026-10-25, asked by mantle). mantle's roll holds that once both
+remaining voters of a range name its new leader, neither says the range has no leader until the
+stopped node is back, and holds it by the rules, not by the odds. A stop was detected as any silence
+is: the stopped run was trusted until its freshness point passed, the detector's margin after its
+last heartbeat, and a remaining voter that wrongly suspected its leader meanwhile counted the
+stopped voter in a quorum it trusted, asked for pre-votes and dropped its leader's messages, naming
+no leader. Each step is what the rules allow with every voter up, so only taking the stopped voter
+out closes it. A peer that takes the stopping heartbeat (§2.8, "A stop announced") now suspects the
+run at once and until its successor's first heartbeat, and its owner tells each core it shares a
+group with that the member stopped (`Change::Stopped`, `RawNode::stopped`), from which the degraded
+group's rule above applies. The stopping node may still run its members while it closes (mantle's
+announcement goes a turn before its connections close), and what it sent before may arrive after: an
+order its leader sent it before taking the announcement makes it campaign, forced, and its request,
+which no lease refuses, would take the leader to its term. So a member that took the announcement
+drops the stopping member's requests for votes, of any term, forced or not, and whatever it sends of
+a later term than its own, orders it to campaign never, and beats on no account of it, until its
+node is heard again (`Raft::drops`, `Raft::hand_over`, `Raft::active`). Dropped as lost messages
+are, they cost Raft's safety nothing; its run is ending, so they cost the group no election it could
+win. Tests: `a_stop_announced_is_suspected_at_its_arrival_and_its_run_never_trusted_again`
+(hyper-liveness; on the code before, node 1 held node 3 trusted to 8,585,804,112 ns, past the
+announcement's arrival at 8,342,860,603 ns: the macOS world's first seed),
+`a_voters_announced_stop_leaves_no_window_for_a_wrong_suspicion` (hyper-durable, liveness and
+replicas on one clock, 64 seeds: before, the follower told its leader is suspected left it, a
+pre-candidate naming no leader, at the first seed) and
+`a_member_whose_stop_was_announced_takes_no_leader_from_its_group` (hyper-raft: without the drops
+and the heir rule, the leader ended a follower in term 3, from term 1). The model's `stop`
+configuration (`docs/models/README.md`) has every voter up and the third leaving at any time, what
+it sent arriving after it stops, each remaining voter taking the announcement at any time, and the
+detectors wrong at any time: from the moment both took the announcement and follow one leader in its
+term, they keep it (5,454,016 states, TLC's count the mirror's). Detected as a silence and claimed
+from the stop, it is refused at the window (`SuspicionStopUnannounced.cfg`); with the announcement
+taken as a suspicion alone, at the stopping voter's forced campaign (`SuspicionStopNoDrop.cfg`).
+
+What the rule claims, and what it leaves to the owner. It holds from the moment both remaining
+voters have taken the announcement. Before that the group is whole, or its stopped voter dead but
+trusted, and Raft's rules for a whole group stand: a follower that wrongly suspects its leader asks
+for votes, and names no leader while it asks, whatever the stopping voter grants. An owner that
+announces as its stop's last act, after it handed over what it led, has the claim from the
+announcement's arrival, and the stretch from each handover to it is the whole group's. One that
+announces first, and hands over once both took the announcement, gives each range the degraded
+group's rule before its new leader is named: the stopping member's transfers are still taken (an
+order of its own term is no later term), and its followers, which suspect it, move the lead
+themselves where a transfer does not. The announcement is one datagram, and its sender cannot tell
+that a peer took it: lost, the stop is detected as a silence and that peer's window is as before,
+and an owner that would hand over once both took it, or needs the claim whatever the plane loses,
+needs the announcement answered, which hyper-liveness does not yet do (§3, item 13).
 
 **Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
 (`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core
@@ -2551,6 +2601,14 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   the measured mistake durations compare with the span decides whether it would move.
   `crates/hyper-raft/ORIGIN.md`, "A draw at every arming", has the first numbers, from schedules
   whose detectors are wrong one time in ten.
+- **13. An announcement answered.** A stop's announcement is one datagram (§2.8, "A stop
+  announced"): lost, its peer detects the stop as a silence, and a remaining voter that wrongly
+  suspects its leader before then asks for votes (§2.9, "A voter's stop announced"). An owner that
+  needs the group's leader kept from the moment its new leader is named, whatever the plane loses,
+  must know each peer took the announcement before it hands over: the stopping run sending it again
+  at its stream's slots until each peer's next heartbeat echoes it, the peer sending the stopped run
+  that one heartbeat, and the owner told when every peer has. Not built: it changes what an owner's
+  stop waits on, the owner's to decide.
 
 ## 4. Steps
 

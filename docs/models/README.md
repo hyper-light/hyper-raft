@@ -296,12 +296,16 @@ any time and a leader that stops acting, which is every run the suspicion rules 
 rules themselves make the runs they are for is this module's question. It models the rules alone
 (`docs/timing.md` §2.9): no log, one configuration, messages as the members' states (a request is
 out while its asker asks in its term; a leader's heartbeats of a term it led may arrive at any later
-time), detectors that suspect and trust any member at any time and never trust a stopped one again,
-and `Rule`, what a member does when its detectors leave it no quorum. `Stable` is the property the
-core's rule is for: where the stopped voters leave no quorum without the leader and every live voter
-suspects them, a group whose live voters follow one leader in its term keeps that leader and that
-term whatever the detectors say of the live voters (a history variable holds the first such leader
-and term; `CheckStable` is off where it is not claimed, so the variable adds no state). The Rust
+time, a stopped leader's too), detectors that suspect and trust any member at any time and never
+trust a stopped one again, voters stopped for good (`Stopped`) or one that stops in order during the
+run (`Leaving`), acting until it stops, its stop announced or not (`Announced`), and `Rule`, what a
+member does when its detectors leave it no quorum. `Stable` is the property the core's rule is for:
+where the voters out leave no quorum without the leader, a group whose remaining voters follow one
+leader in its term keeps that leader and that term whatever the detectors say of the remaining
+voters (a history variable holds the first such leader and term; `CheckStable` is off where it is
+not claimed, so the variable adds no state). The voters out, at each remaining voter: those
+stopped for good, which it suspects, and the leaving one, whose announcement it took, or, not
+announced, which has stopped. The Rust
 mirror (`crates/hyper-check/tests/models/suspicion.rs`, `tests/suspicion.rs`) has the same
 variables and actions with no symmetry, and counts the states the passing configurations state; it
 checks `Stable` on each step from a settled state, which counts the same states, since a settled
@@ -310,6 +314,8 @@ group stays settled wherever `Stable` holds.
 | Action | What it is in `crates/hyper-raft` |
 |---|---|
 | `Suspect(s, x)`, `Trust(s, x)` | `Raft::suspect`, `Raft::trust` (`Watch::suspect`, `trust`); a pre-candidate left no quorum, `Raft::stop_asking`; under `"stepdown"`, the step-down before 2026-10-24. |
+| `Announce(s, x)` | hyper-liveness's `Change::Stopped` at the stopping heartbeat's arrival, taken as `Raft::stopped` (`Watch::stop`): suspected until the voter's next run, and `Drops(s, x)`: its requests for votes and what it sends of a later term dropped (`Raft::drops`), no order to it (`Raft::hand_over`). Under `"nodrop"`, the suspicion alone. |
+| `Stop(x)` | The leaving voter's node stops: what it sent may still arrive (`GrantPre`, `GrantVote`, `Hear`, `Learn` and `TakeOrder` take a stopped member's requests, heartbeats, answers and orders). |
 | `PreVote(s)` | `Raft::wake_follower` → `Raft::hup(false)` (`trusts_leader`, `trusted_quorum`; `Watch::left`, `become_pre_candidate`). |
 | `GrantPre(m, c)`, `GrantVote(m, c)` | `Raft::step_newer_term`'s lease (`Lease`: a leader, or a member that trusts a leader other than the asker, the asker's term not past its next; a request from its own leader ends its trust) and `Raft::step_vote`; a forced request (`CAMPAIGN_TRANSFER`) is refused by no lease. |
 | `ElectPre(c)`, `Win(c)` | `Raft::poll` → `Raft::campaign(Campaign::Election)`, `Raft::become_leader`. |
@@ -327,6 +333,10 @@ group stays settled wherever `Stable` holds.
 | `asking` | `SuspicionAsking.cfg` | `suspicion` at 2 terms, a pre-candidate that asks on | 35 | refused: `AskingCanWin` |
 | `leftnoquorum` | `SuspicionReached.cfg` | `suspicion` and the claim `NoLeaderLeftNoQuorum` | 906 | refused: `NoLeaderLeftNoQuorum` |
 | `handover` | `SuspicionHandOver.cfg` | `susfull` and the claim `NoHandOver` | 37,224 | refused: `NoHandOver` |
+| `stop` | `SuspicionStop.cfg` | 3 voters up, the third leaving, announced, 2 terms, the core's rule | 5,454,016 (the mirror's, and TLC's) | passes: `OneLeader`, `Stable`, `AskingCanWin` |
+| `unannounced` | `SuspicionStopUnannounced.cfg` | `stop`, its stop detected as a silence, `Stable` from the stop | 25,976 | refused: `Stable` |
+| `nodrop` | `SuspicionStopNoDrop.cfg` | `stop`, the announcement only suspecting | 347,255 | refused: `Stable` |
+| `stopreached` | `SuspicionStopReached.cfg` | `stop` and the claim `NoWrongSuspicionSettled` | 41,988 | refused: `NoWrongSuspicionSettled` |
 
 What each shows: `suspicion` is mantle's roll at its stops, every order of every mistake between the
 two live voters within three terms, and the leader and term kept; `leftnoquorum` shows it reaches a
@@ -340,6 +350,19 @@ an heir that can be elected without its leader be elected, the deaf leader's han
 TLC counted the passing configurations exactly at the mirror's counts (CI run 40164719210, the part
 in about a minute at four workers): the specification is the mirror state for state; the refused
 counts are TLC's own breadth-first counts at the violation, from the same run.
+
+`stop` (2026-10-25, asked by mantle) is mantle's roll at a stop made in order: every voter up, the
+leaving one acting until it stops and what it sent arriving after, each remaining voter taking the
+announcement at any time, and every mistake of the detectors within two terms; from the moment both
+remaining voters took it and follow one leader in its term, they keep it. `stopreached` shows the
+scope reaches such a group with a remaining voter that wrongly suspects its leader, the case the
+claim is for. `unannounced` is the stop as before, a silence its detectors suspect at some time
+after: claimed from the stop on, it is refused at a remaining voter that wrongly suspects its leader
+while it still trusts the stopped voter, and asks (the window the announcement closes). `nodrop` is
+the announcement taken as a suspicion alone: refused where the leader, left no quorum, orders the
+stopping voter, still running, to campaign, and its forced request takes the remaining voter to its
+term. TLC counted all four on a Linux runner (tla2tools v1.7.4, one worker; `stop` in 3 min 43 s),
+`stop` at the mirror's count.
 
 **To change the model.** A change that makes a configuration larger or smaller fails the check
 until its states are counted again and stated; a new configuration is first run with a

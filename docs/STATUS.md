@@ -223,6 +223,34 @@ is worked around.
   tail: doubling holds the interval up to twice its floor, and latest takes a young log's noisy last
   flush as the floor (Linux's most 2.2 s against 0.28 s). Neither dominates the rule as built.
 
+### Closed (2026-10-25)
+
+- **hyper-liveness, hyper-raft: a voter's stop announced left its group's remaining voters a window
+  in which a wrong suspicion of their leader cost them it (asked by mantle).** mantle's roll holds
+  that once both remaining voters of a range name its new leader, neither says the range has no
+  leader until the stopped node is back, by the rules. A stop was detected as a silence: the stopped
+  run was trusted until its freshness point passed, and a remaining voter that wrongly suspected its
+  leader meanwhile counted it in a quorum it trusted, asked for pre-votes and named no leader. A
+  peer that takes the stopping heartbeat now suspects the run at once and until its next run is
+  heard (`Change::Stopped`; a heartbeat of the stopped run the announcement overtook is refused),
+  and the core told so (`RawNode::stopped`, `Replica::stopped`) drops the stopping member's requests
+  for votes and whatever it sends of a later term, orders it to campaign never and beats on no
+  account of it, so that what it still sends while it closes, or sent before, cannot take the
+  leader: an order it took makes it campaign, forced, and no lease refuses that (`docs/timing.md`
+  §2.9, "A voter's stop announced"). Tests, each red before:
+  `a_stop_announced_is_suspected_at_its_arrival_and_its_run_never_trusted_again` (hyper-liveness:
+  the stopped node trusted 243 ms past the announcement),
+  `a_voters_announced_stop_leaves_no_window_for_a_wrong_suspicion` (hyper-durable: the follower a
+  pre-candidate naming no leader at the first seed),
+  `a_member_whose_stop_was_announced_takes_no_leader_from_its_group` (hyper-raft: the leader moved
+  from term 1 to a follower in term 3). Model: `docs/models/Suspicion.tla` with a voter leaving in
+  order (`SuspicionStop.cfg`, 5,454,016 states, TLC's count the mirror's: from the moment both
+  remaining voters took the announcement, they keep their leader and its term); detected as a
+  silence it is refused at the window, and with the announcement only suspecting, at the stopping
+  voter's forced campaign. The claim starts when both took the announcement: an owner that announces
+  after handing over leaves the stretch from each handover to it to Raft's rules for a whole group,
+  and a lost announcement to the silence's (`docs/timing.md` §3, item 13).
+
 ### Closed (2026-10-24)
 
 - **hyper-raft: with exactly a quorum of live voters, a wrong suspicion between the two live voters

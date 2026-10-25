@@ -2314,8 +2314,8 @@ fn a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat() {
 /// suspect it: the MTBF counts what a detector must catch, and an orderly stop handed over what it
 /// led first. Until its next run is heard, the announced run is sent nothing, where each heartbeat
 /// to it asked a flush of its own; that run's first heartbeat is answered at once, numbered next.
-/// Do: three nodes settled; the third announces its stop and stops; its peers suspect it as its
-/// heartbeats stop; it starts again. Expect: no heartbeat sent the stopped run after its
+/// Do: three nodes settled; the third announces its stop and stops; its peers suspect it at the
+/// announcement; it starts again. Expect: no heartbeat sent the stopped run after its
 /// announcement was taken; the restart reported and counted no failure; the first heartbeat each
 /// peer sends the new run is numbered next and sent within a poll's and a flush's lateness of taking
 /// its first; and a node that lets go of an announced, suspected peer counts no failure.

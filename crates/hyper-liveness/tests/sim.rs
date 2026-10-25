@@ -1203,6 +1203,38 @@ fn a_killed_peer_is_suspected_within_the_stated_bound() {
     killed_peer_is_suspected_within_its_bound(false);
 }
 
+/// CP-T2.2 step 2, Focal's condition 5: the stream bounds its own flushes' tail once one is reported
+/// (`Liveness::flush_tail`), RFC 6298's bound over them (`hyper_timing::FlushTail`), what its own
+/// writes and, in the disk mode, its peers' flush ages are judged against.
+#[test]
+fn the_stream_bounds_its_own_flushes_tail_once_it_has_one() {
+    let mut liveness = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 3,
+        history: Exposure::new(),
+        resolution: RESOLUTION,
+    })
+    .unwrap();
+    assert_eq!(
+        (liveness.flush_tail(), liveness.flush_smoothed()),
+        (None, None)
+    );
+    let mut tail = hyper_timing::FlushTail::new();
+    for (started, durable) in [
+        (0, 1_000_000),
+        (5_000_000, 6_200_000),
+        (9_000_000, 9_900_000),
+    ] {
+        liveness.on_durable(Write::Log, started, durable);
+        tail.on_flush(started, durable);
+    }
+    // No wait reported: the granularity is not measured, and the tail is the four deviations'.
+    assert_eq!(liveness.flush_smoothed(), tail.smoothed());
+    assert_eq!(liveness.flush_tail(), tail.tail(Duration::ZERO));
+    assert!(liveness.flush_tail() > liveness.flush_smoothed());
+}
+
 /// The same, every node judging each peer's process apart from its disk (kiln's CP-T2.2): a crash
 /// is suspected within its bound as before.
 #[test]

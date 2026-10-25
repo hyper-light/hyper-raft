@@ -93,8 +93,8 @@ use std::time::Duration;
 
 pub use codec::{Echo, Heartbeat, KIND, MAX_BYTES, VERSION, is_liveness};
 use hyper_timing::{
-    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, Flushes, Lateness, LinkEstimator,
-    Trust,
+    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, FlushTail, Flushes, Lateness,
+    LinkEstimator, Trust,
 };
 use pair::Pair;
 
@@ -357,6 +357,9 @@ pub struct Liveness {
     asked: Option<u64>,
     late_most: u64,
     flushes: Flushes,
+    /// The same flushes' tail, RFC 6298's bound over them: what the node's own writes, and in the
+    /// disk mode its peers' flush ages, are judged against (kiln's CP-T2.2).
+    flush_tail: FlushTail,
     durable: Durable,
     /// Whether a liveness write is out.
     flushing: bool,
@@ -558,6 +561,7 @@ impl Liveness {
             asked: None,
             late_most: 0,
             flushes: Flushes::new(),
+            flush_tail: FlushTail::new(),
             durable: Durable::default(),
             flushing: false,
             stall: None,
@@ -757,6 +761,7 @@ impl Liveness {
         );
         // A full fold keeps its mean.
         let _ = self.flushes.on_flush(started_ns, durable_ns);
+        self.flush_tail.on_flush(started_ns, durable_ns);
         if write == Write::Liveness {
             self.flushing = false;
         }
@@ -992,6 +997,19 @@ impl Liveness {
     /// the vote round's flush in the election law's ballot (`hyper_timing::Ballot::measure`).
     pub fn flush_mean(&self) -> Option<Duration> {
         self.flushes.mean()
+    }
+
+    /// The smoothed flush, RFC 6298's `SRTT` over this node's log writes, once one is reported.
+    pub fn flush_smoothed(&self) -> Option<Duration> {
+        self.flush_tail.smoothed()
+    }
+
+    /// The bound on this node's flushes' tail, `smoothed + max(4 · deviation, G)` (RFC 6298 §2.3,
+    /// `hyper_timing::FlushTail`) with `G` the granularity measured so far, once a flush is reported:
+    /// a write of the node's own out past it is one its device's measured flushes don't explain.
+    pub fn flush_tail(&self) -> Option<Duration> {
+        self.flush_tail
+            .tail(self.granularity().unwrap_or(Duration::ZERO))
     }
 
     /// A wait the owner began before `deadline_ns`, the stream's [`wake`](Self::wake), that ended

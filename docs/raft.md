@@ -44,9 +44,11 @@ clock, no disk and no network:
   kept for the differential); one that elects by suspicion (timing step L-2, `docs/timing.md` §2.9)
   is told what its owner's detectors believe of the other members (`suspect`, `trust`,
   `restarted`), given its group's measured `Timing`, and woken at its owner's clock (`wake`,
-  `deadline`): an idle group is woken for nothing. A leader those detectors leave no quorum steps
-  down and hands its term to a voter, trusted ones first and suspected ones after, since a voter it
-  does not hear may hear it (`docs/timing.md` §2.9, "Who the heir is");
+  `deadline`): an idle group is woken for nothing. A leader those detectors leave no quorum leads
+  on and hands its group to a voter that can be elected without it, trusted ones first and
+  suspected ones after, since a voter it does not hear may hear it: each heir told to campaign does
+  so only where it and those it trusts, the leader apart, are a quorum (`docs/timing.md` §2.9, "A
+  leader its detectors leave no quorum", "Who the heir is");
 - `RawNode::step` gives it what arrived;
 - a `Ready` says what to persist, send and apply; one is taken at a time, and once its write is
   issued (`advance_issued`) the member takes operations again and the next may be taken, up to
@@ -75,9 +77,10 @@ A leader's proposals and a follower's appends move into the log uncopied (`Log::
 
 It is Raft as Ongaro's thesis states it, with these extensions:
 - pre-vote and check-quorum; and, by suspicion, campaigns started by the owner's failure detectors
-  after the election law's draw, check-quorum from the detectors, a leader that beats only while
+  after the election law's draw, check-quorum from the detectors (a leader left no quorum leads on
+  and hands over only to a voter that can be elected without it), a leader that beats only while
   its group has work in flight, and a lead that ends in its term handed over (`docs/timing.md`
-  §2.9);
+  §2.9; the rules model-checked in `docs/models/Suspicion.tla`);
 - election priority, a voter of higher priority granting a candidate whose log is more current;
 - learners and joint consensus (`ConfChangeV2`);
 - leader transfer;
@@ -889,8 +892,9 @@ followers answer late, and lets one that is cut off take requests a little longe
   the election timeout, so they may elect another while a patient old leader still believes it
   leads: ordinary Raft, the old leader committing nothing without a quorum and stepping down at its
   check or at the first newer term it hears.
-- **Under elections by suspicion** it is kept and changes nothing: those take no ticks, and the
-  owner's detectors depose.
+- **Under elections by suspicion** it is kept and changes nothing: those take no ticks, and a leader
+  the owner's detectors leave no quorum hands over to a voter that can be elected without it
+  (`docs/timing.md` §2.9).
 - **Bounds.** A patience whose sum with the election timeout passes what a tick counts is refused,
   typed (`Error::Settings`), never clamped; the owner bounds it by its tick ceiling, as it bounds
   patience.

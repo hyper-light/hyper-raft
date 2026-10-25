@@ -242,7 +242,13 @@ is worked around.
 - **hyper-transport: a stream its peer read in steps was refused as unread while it moved (main's
   `1912194`, taken to this line: the cause of mantle's busy-job objects failures, where on 4 of 4 busy
   runners a gateway judged its reader unread and refused the exchange `Stalled`, the reader having
-  taken bytes 7 to 22 ms before the verdict and consumed everything sent).** F38's unread rule judged a
+  taken bytes 7 to 22 ms before the verdict and consumed everything sent).** mantle's trace (run
+  40161296995, ubuntu-24.04, the tests on CPUs 0–1 beside two busy loops): the gateway judged its
+  client unread across a window of 3,072 ms in which it took 312 `MAX_DATA` and 312 `MAX_STREAM_DATA`
+  frames from it; at the verdict its write limit was 2,268 bytes, its class's reserve at its rank, its
+  stream not blocked and all it had sent acknowledged, while the client read 280–315 KB every 250 ms
+  throughout, giving credit 25–28 times every 250 ms, its connection window at its first 12,000 bytes
+  with no debt: a reader keeping pace, judged each time just after the sender spent its credit. F38's unread rule judged a
   stream by its state at each judgement, once a period: out of credit with everything it sent
   acknowledged at two judgements a window apart, it was refused `Stalled`, whatever it wrote between
   them. A stream held to its peer's pace is in that state at nearly every instant: hyper-rt-transport's

@@ -364,6 +364,9 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     disk_patience: Option<u64>,
     /// The hand-overs its patience with its disk began.
     handed_over: u64,
+    /// The drives at which its patience ended with no voter to hand over to: none trusted whose disk
+    /// isn't slow.
+    heirless: u64,
     /// The voters whose disks the owner's detectors judge slow, apart from their processes
     /// (`hyper_liveness::Change::DiskSlow`): at most the group's voters.
     slow_disks: Vec<u64>,
@@ -486,6 +489,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             flushed: None,
             disk_patience: None,
             handed_over: 0,
+            heirless: 0,
             slow_disks: Vec::new(),
         };
         // A log compacted before the restart serves a lagging member only by snapshot, and its
@@ -1237,6 +1241,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.handed_over
     }
 
+    /// The drives at which the replica's patience with its disk ended and no voter was there to
+    /// hand over to: every other voter suspected, or its disk judged slow
+    /// ([`Replica::disk_slow`]). The leader leads on, its writes committing where they can.
+    pub fn heirless(&self) -> u64 {
+        self.heirless
+    }
+
     /// When a leader's patience with its oldest write out ends, if it has one and a write is out.
     fn disk_patience_point(&self) -> Option<u64> {
         let patience = self.disk_patience?;
@@ -1246,9 +1257,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// A leader whose oldest write has been out past its patience hands the lead to the voter that
-    /// holds most of its log, of those its detectors trust, unless a hand-over is under way
-    /// ([`Replica::set_disk_patience`]). The heir campaigns on the core's word (`TimeoutNow`),
-    /// which leaves without a write of this member's (`RawNode::light_now`).
+    /// holds most of its log, of those its detectors trust whose disks aren't judged slow
+    /// ([`Replica::disk_slow`]), unless a hand-over is under way ([`Replica::set_disk_patience`]).
+    /// The heir campaigns on the core's word (`TimeoutNow`), which leaves without a write of this
+    /// member's (`RawNode::light_now`) once the core has brought the heir's log up to the leader's
+    /// (Raft's precondition, thesis §3.10). With no such voter, none is named: an heir whose disk is
+    /// slow could neither hold the lead's writes nor win its campaign, whose vote waits on a disk.
     fn keep_disk_patience(&mut self, now: u64) -> Result<(), ReplicaError> {
         if self.disk_patience_point().is_none_or(|point| now < point)
             || self.node.raft.lead_transferee().is_some()
@@ -1262,11 +1276,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             .voters
             .iter()
             .copied()
-            .filter(|&voter| voter != id && !self.node.raft.suspects(voter))
+            .filter(|&voter| {
+                voter != id && !self.node.raft.suspects(voter) && !self.disk_is_slow(voter)
+            })
             .filter_map(|voter| tracker.get(voter).map(|p| (p.matched, voter)))
             .max()
             .map(|(_, voter)| voter);
         let Some(heir) = heir else {
+            self.heirless = self.heirless.saturating_add(1);
             return Ok(());
         };
         let told = self.node.transfer_leader(heir);

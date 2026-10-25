@@ -149,6 +149,8 @@ struct World {
     /// Each disk verdict a node's stream gave (`Change::DiskSlow`, `DiskCaughtUp`): when, the
     /// judge, the peer, and whether slow.
     disks: Vec<(u64, u64, u64, bool)>,
+    /// Each hand-over's order as it left (`MsgTimeoutNow`): when, the leader, and the heir it named.
+    timeouts: Vec<(u64, u64, u64)>,
 }
 
 /// What each node did, from `from` until `until`: its writes given and made durable, the proofs
@@ -274,6 +276,7 @@ impl World {
             broken: Vec::new(),
             votes: Vec::new(),
             disks: Vec::new(),
+            timeouts: Vec::new(),
         }
     }
 
@@ -535,6 +538,9 @@ impl World {
             }
             if m.msg_type == MessageType::MsgRequestVoteResponse && !m.reject {
                 self.votes.push((now, id, *to, m.term));
+            }
+            if m.msg_type == MessageType::MsgTimeoutNow {
+                self.timeouts.push((now, id, *to));
             }
         }
         for (to, from, payload) in outgoing {
@@ -2063,6 +2069,99 @@ fn judged_apart_a_hand_over_needs_no_vote_from_a_stalled_disk() {
             "seed {seed}: messages past their senders' disks {:?}; n{stalled}'s votes before its \
              disk answered {early:?}",
             world.broken
+        );
+    }
+}
+
+/// CP-T2.2 step 2, Focal's condition 5: a leader whose disk stops hands the lead only to a voter
+/// whose disk isn't slow. The leader's disk stops for good and one follower's is held for 4 s, the
+/// leader's patience 1 s, under a publish a millisecond: the follower's own heartbeats say its disk
+/// is slow (`Change::DiskSlow`) before the patience ends, every hand-over the leader begins names
+/// the other follower, and that one leads once a second disk answers its campaign.
+#[test]
+fn judged_apart_a_hand_over_names_no_heir_whose_disk_is_slow() {
+    let how = How {
+        patience: Some(Duration::from_secs(1)),
+        ..APART
+    };
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let mut world = World::with(seed, how);
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let mut load = Load::default();
+        let settled = world.now + 2_000 * MS;
+        world.run_loaded(settled, MS, &mut load);
+        let leader = world.leader().unwrap();
+        let slow = (1..=3u64).find(|id| *id != leader).unwrap();
+        let heir = 6 - leader - slow;
+        let from = world.now;
+        world.stall(slow, from + 4_000 * MS);
+        world.stall(leader, from + 60_000 * MS);
+        world.run_loaded(from + 6_000 * MS, MS, &mut load);
+        let named: Vec<(u64, u64)> = world
+            .timeouts
+            .iter()
+            .filter(|(at, by, _)| *at >= from && *by == leader)
+            .map(|(at, _, to)| ((at - from) / MS, *to))
+            .collect();
+        let judged_slow = world.disks.iter().any(|(at, judge, peer, is_slow)| {
+            *judge == leader && *peer == slow && *is_slow && *at < from + 1_000 * MS
+        });
+        assert!(
+            judged_slow
+                && !named.is_empty()
+                && named.iter().all(|(_, to)| *to == heir)
+                && world.leader() == Some(heir),
+            "seed {seed}: n{leader}'s disk stopped and n{slow}'s held; judged slow in time \
+             {judged_slow}; hand-overs named (ms from the stop, heir) {named:?}; leader then {:?}",
+            world.leader()
+        );
+    }
+}
+
+/// CP-T2.2 step 2, Focal's condition 5: with every other voter's disk slow, no hand-over begins
+/// and no term is spent. The leader's disk stops for good and both followers' are held for 4 s, the
+/// leader's patience 1 s, under a publish a millisecond: while both are held the leader names no
+/// heir (its patience finds none, `Replica::heirless`) and no member's term moves; once they
+/// answer, it hands the lead to one of them.
+#[test]
+fn judged_apart_no_hand_over_while_every_other_disk_is_slow() {
+    let how = How {
+        patience: Some(Duration::from_secs(1)),
+        ..APART
+    };
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let mut world = World::with(seed, how);
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let mut load = Load::default();
+        let settled = world.now + 2_000 * MS;
+        world.run_loaded(settled, MS, &mut load);
+        let leader = world.leader().unwrap();
+        let term = world.replica(leader).term();
+        let from = world.now;
+        let end = from + 4_000 * MS;
+        for id in (1..=3u64).filter(|id| *id != leader) {
+            world.stall(id, end);
+        }
+        world.stall(leader, from + 60_000 * MS);
+        world.run_loaded(end - 100 * MS, MS, &mut load);
+        let named = |w: &World| {
+            w.timeouts
+                .iter()
+                .filter(|(at, by, _)| *at >= from && *by == leader)
+                .count()
+        };
+        let terms = (1..=3u64).map(|id| world.replica(id).term()).max().unwrap() - term;
+        let (during, heirless) = (named(&world), world.replica(leader).heirless());
+        world.run_loaded(end + 6_000 * MS, MS, &mut load);
+        assert!(
+            during == 0 && terms == 0 && heirless > 0 && named(&world) > 0,
+            "seed {seed}: while every other disk was held, {during} hand-overs and {terms} terms, \
+             the patience heirless {heirless} times; after, {} hand-overs",
+            named(&world)
         );
     }
 }

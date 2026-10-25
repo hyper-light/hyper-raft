@@ -2659,17 +2659,21 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
     let pair = Pair::new();
     let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
     let address = net.b_address;
-    // The path is cut: node 2 hears nothing more, and the connection idles out.
+    // The path is cut: node 2 hears nothing more, node 1's keep-alive goes unacknowledged and its
+    // path is degrading (§4ai), and the connection idles out.
     net.b_dead = true;
     let told = told_until_a_holds(&mut net, 0);
     assert!(
         matches!(
             told[..],
-            [Event::Closed {
-                peer: 2,
-                epoch: 1,
-                refusal: None
-            }]
+            [
+                Event::Degrading { peer: 2, epoch: 1 },
+                Event::Closed {
+                    peer: 2,
+                    epoch: 1,
+                    refusal: None
+                }
+            ]
         ),
         "{told:?}"
     );
@@ -2718,6 +2722,70 @@ fn a_dial_failing_as_the_last_one_did_is_told_all_the_same() {
                 peer: 2,
                 epoch: 2,
                 ..
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+/// A dialer is told its peer's path is degrading once nothing it sent has been acknowledged for four
+/// probe timeouts (hyper-quic's `PathDegrading`, quiche's rule; docs/transport.md §4ai), long before
+/// its idle timeout ends the connection, and progressing once the peer answers again; a path event
+/// the owner has not polled is taken away by the connection's close, which says more. Before it, an
+/// owner heard nothing of a peer that went until the idle timeout: focal's bus client kept sending
+/// to a leader killed with kill -9 for two minutes, while the group had elected another in a second
+/// (found by focal).
+#[test]
+fn a_dialer_is_told_its_peers_path_degrading_long_before_its_idle_timeout() {
+    let pair = Pair::new();
+    let limits = limits();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits, 256 << 20);
+    let mut server = Server::new();
+    events(&mut net.a);
+    // Node 2 goes, saying nothing, as a killed process does; node 1 sends it a frame.
+    net.b_dead = true;
+    let gone = net.now;
+    net.a.send_frame(2, 0, Kind::Append, b"one").unwrap();
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        told.extend(events(&mut net.a));
+        !told.is_empty()
+    });
+    assert!(
+        matches!(told[..], [Event::Degrading { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    let took = net.now - gone;
+    assert!(
+        took < limits.keep_alive.unwrap(),
+        "told {took:?} after the peer went"
+    );
+    assert_eq!(net.a.stats().connections, 1, "the connection stays open");
+    // Node 2 answers again: node 1 is told its path makes progress, and the frame arrives.
+    net.b_dead = false;
+    let mut told = Vec::new();
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        told.extend(events(&mut net.a));
+        !told.is_empty() && server.frames.len() == 1
+    });
+    assert!(
+        matches!(told[..], [Event::Progressing { peer: 2, epoch: 1 }]),
+        "{told:?}"
+    );
+    // Node 2 goes again, and node 1 polls nothing until the connection idles out: the path event
+    // that waited is taken away by the close.
+    net.b_dead = true;
+    net.a.send_frame(2, 0, Kind::Append, b"two").unwrap();
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    let told = events(&mut net.a);
+    assert!(
+        matches!(
+            told[..],
+            [Event::Closed {
+                peer: 2,
+                epoch: 1,
+                refusal: None
             }]
         ),
         "{told:?}"
@@ -2780,25 +2848,53 @@ fn a_restarted_endpoint_resets_what_its_last_run_held() {
         net.b = node_2(restarted_with, net.now);
         let restarted = net.now;
         let mut told = Vec::new();
+        let mut degraded = None;
         net.until(TURNS, |net| {
-            told.extend(events(&mut net.a));
-            !told.is_empty()
+            for event in events(&mut net.a) {
+                if matches!(event, Event::Degrading { .. }) {
+                    degraded = Some(net.now);
+                }
+                told.push(event);
+            }
+            told.iter()
+                .any(|event| matches!(event, Event::Closed { .. }))
         });
-        assert!(
-            matches!(
-                told[..],
-                [Event::Closed {
-                    peer: 2,
-                    epoch: 1,
-                    ..
-                }]
-            ),
-            "{told:?}"
-        );
         let took = net.now - restarted;
         if reset {
+            assert!(
+                matches!(
+                    told[..],
+                    [Event::Closed {
+                        peer: 2,
+                        epoch: 1,
+                        ..
+                    }]
+                ),
+                "{told:?}"
+            );
             assert!(took <= keep_alive, "reset {took:?} after the restart");
         } else {
+            // Its keep-alive unacknowledged, node 1 is told its path is degrading (§4ai) within a
+            // keep-alive and the zero path's four probe timeouts, long before the close.
+            assert!(
+                matches!(
+                    told[..],
+                    [
+                        Event::Degrading { peer: 2, epoch: 1 },
+                        Event::Closed {
+                            peer: 2,
+                            epoch: 1,
+                            ..
+                        }
+                    ]
+                ),
+                "{told:?}"
+            );
+            let degraded = degraded.unwrap() - restarted;
+            assert!(
+                degraded <= keep_alive * 2,
+                "degrading told {degraded:?} after the restart"
+            );
             assert!(
                 took >= limits.idle_timeout - keep_alive,
                 "closed {took:?} after a restart that could not reset it"

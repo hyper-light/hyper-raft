@@ -2084,6 +2084,53 @@ restart with its key, and its next dial connects; restarted with another key nod
 and node 1 is told only as the connection idles out (12 s, the idle timeout's three probe timeouts
 included). With the key not applied the first assertion fails, `reset 12s after the restart`.
 
+## 4ai. A dialer told its peer's path is degrading (2026-10-25, found by focal)
+
+An owner heard nothing of a peer that went without a word (its process killed, its host down, the
+path cut) until the connection's idle timeout, the transport's only judgement of a silent peer:
+nothing authenticated comes back from a host whose endpoint is gone (a datagram to its port finds no
+socket, and hyper-rt reads on past the host's port-unreachable report, 3220638). focal's bus waits
+two minutes (RFC 4787 REQ-5's least NAT mapping, `limits::IDLE_TIMEOUT`): in Quiver's run on fedora
+(three `focal start bus` units, a client publishing 1,000 a second, kill -9 of its leader at 25 s)
+the two survivors elected another leader within about 110 ms of suspecting the first, and the client
+kept publishing into the dead connection to the end of its run, 4,096 publishes unacknowledged. A
+Kafka client has the dead broker's kernel's RST at its next send; one whose broker's host died waits
+its request timeout (`request.timeout.ms`, 30 s) and asks another broker for metadata.
+
+RFC 1122 §4.2.3.5 gives TCP two steps: past R1, at least three retransmissions at the current RTO,
+"TCP SHOULD inform the application of the delivery problem ... when R1 is reached and before R2",
+and past R2, at least 100 s, the close. Chromium's QUIC has the first step for its clients (quiche,
+`QuicNetworkBlackholeDetector`): a path is degrading once nothing the client sent has been
+acknowledged for four probe timeouts (`kNumProbeTimeoutsForPathDegradingDelay`, "kPDE4 is the
+default. We have the experiments with kPDE4."), armed when a packet with retransmittable data goes
+and no detection runs, restarted by any packet newly acknowledged while packets are in flight,
+stopped in quiescence; its session is told (`OnPathDegrading`) and may move to another path, and is
+told again when the path makes progress (`OnForwardProgressMadeAfterPathDegrading`). The connection
+stays open: a busy peer's scheduler can hold its acknowledgements past four probe timeouts, and the
+idle timeout remains the judgement that the peer is gone.
+
+hyper-quic now runs quiche's detection (VENDORED.md §45) and tells `PathDegrading`, once, and
+`ForwardProgress` when the peer acknowledges again. The endpoint tells the owner of a peer's newest
+connection, the one its exchanges and lanes are on: `Event::Degrading { peer, epoch }` and
+`Event::Progressing { peer, epoch }`. They wait in one seat of the peer's entry, as its lifecycle
+does: a change while one waits replaces it and moves it to the back, a change back to what the owner
+was told takes it away, and the connection's close, which says more, takes it away. The event bound
+(`Limits::event_bound`) counts one more event a peer. Only the side that dialed is told, the one that
+can go elsewhere, as only quiche's client is: focal's bus client asks another node of its group
+which node leads, as a Kafka producer asks another broker (focal doc 34). An owner whose match on
+`Event` names every variant names the two new ones.
+
+Tests (`tests/exchange.rs`): `a_dialer_is_told_its_peers_path_degrading_long_before_its_idle_timeout`:
+node 1 sends a frame after node 2 went silently and is told `Degrading` within a keep-alive (2 s; the
+idle timeout is 10 s), the connection still open; told `Progressing` once node 2 answers again, the
+frame delivered; and, polling nothing until the connection idles out on a second silence, told only
+`Closed`. With the event not mapped, the first assertion fails (told only `Closed`, at the idle
+timeout). `a_dial_failing_as_the_last_one_did_is_told_all_the_same` is told `Degrading` before
+`Closed` (its keep-alive unacknowledged), and so is `a_restarted_endpoint_resets_what_its_last_run_held`
+where the restarted endpoint has another key (within two keep-alives of the restart; the reset with
+the same key still closes the connection within one, before any degrading). hyper-quic's own tests
+are in VENDORED.md §45.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

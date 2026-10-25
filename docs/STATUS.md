@@ -96,6 +96,21 @@ reads whole, has nothing of it durable, and once flushed is byte for byte `finis
 (`a_file_finished_unflushed_is_whole_and_left_for_its_caller_to_flush`, which fails if the finish
 flushes).
 
+Landed 2026-10-25: in hyper-quic and hyper-transport, a dialer is told its peer's path is degrading
+(`Event::Degrading`, `Event::Progressing`; hyper-quic patch, `crates/hyper-quic/VENDORED.md` §45;
+`docs/transport.md` §4ai). An owner heard nothing of a peer that went without a word until the idle
+timeout: focal's bus client kept publishing for two minutes into a leader killed with kill -9 while
+the group had elected another. hyper-quic now runs quiche's path-degrading detection on a client:
+nothing it sent acknowledged for four probe timeouts (`kNumProbeTimeoutsForPathDegradingDelay`) tells
+the application once, the connection staying open, and the peer's next acknowledgement tells it the
+path makes progress (RFC 1122 §4.2.3.5: inform the application at R1, close at R2). The endpoint
+tells the owner of the peer's newest connection, in one seat of the peer's entry. An owner whose
+match on `Event` names every variant names the two new ones. Tests: a dialer is told within a
+keep-alive of its peer going (the idle timeout 10 s), and progress when it answers
+(`exchange::a_dialer_is_told_its_peers_path_degrading_long_before_its_idle_timeout`); hyper-quic's
+`tests::path_degrading` (exactly four probe timeouts, once, never on a server, never on a path that
+answers, nothing after a loss by time left nothing in flight).
+
 Landed 2026-10-25: in hyper-transport, a restarted endpoint resets what its last run held
 (`RestartKey`, `Endpoint::new_restartable`; `docs/transport.md` §4ah). The stateless reset key and the
 key connection IDs are hashed under were drawn afresh at each start, so a peer of a restarted

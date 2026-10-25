@@ -1147,6 +1147,68 @@ fn a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement() {
     );
 }
 
+/// A member whose node announced its stop (`RawNode::stopped`, from hyper-liveness's
+/// `Change::Stopped`) takes no leader from its group. A stopping node may still run its members
+/// for a while, and what it sent may arrive after its announcement: here an order its leader sent
+/// before taking the announcement reaches it, and it campaigns, forced. The members that took the
+/// announcement drop its requests for votes and what it sends of its later term, and the leader,
+/// wrongly suspecting the other member too and so left no quorum, orders it to campaign never.
+/// Taken as a suspicion alone, the forced request moved the leader to the stopping member's term,
+/// leading nothing (`docs/models/SuspicionStopNoDrop.cfg`).
+#[test]
+fn a_member_whose_stop_was_announced_takes_no_leader_from_its_group() {
+    let (timing, _) = timing_for(3);
+    let mut sim = Sim::new(3, &Sim::voters(&[1, 2, 3]), timing, 43);
+    sim.found(1);
+    let term = sim.term(1);
+    for id in [1, 2] {
+        sim.node(id).raw.stopped(3).unwrap();
+        sim.settle(id);
+        assert!(sim.peek(id).raw.raft.stops(3) && sim.peek(id).raw.raft.suspects(3));
+    }
+    let from = sim.sent.len();
+    sim.node(3).step(Message {
+        msg_type: MessageType::MsgTimeoutNow,
+        from: 1,
+        to: 3,
+        term,
+        ..Message::default()
+    });
+    sim.settle(3);
+    assert_eq!(
+        sim.term(3),
+        term + 1,
+        "the stopping member campaigned, forced"
+    );
+    sim.suspect(1, 2);
+    assert!(!trusts_a_quorum(&sim, 1));
+    let until = sim.now + (timing.round + timing.span + timing.election).as_nanos() as u64 * 4;
+    sim.run_until_time(until, |_| false);
+    assert_eq!(
+        (sim.peek(1).view().role, sim.term(1)),
+        (2, term),
+        "the leader lost its term to the stopping member"
+    );
+    let view = sim.peek(2).view();
+    assert_eq!(
+        (view.role, view.leader, view.term),
+        (0, 1, term),
+        "the other member left the leader"
+    );
+    assert_eq!(
+        sim.sent[from..]
+            .iter()
+            .filter(|m| m.msg_type == MessageType::MsgTimeoutNow && m.from == 1 && m.to == 3)
+            .count(),
+        0,
+        "the leader ordered the stopping member to campaign"
+    );
+    sim.node(1).propose(b"while 3 stops".to_vec());
+    sim.settle(1);
+    let index = sim.peek(1).view().last_index;
+    assert!(sim.run_until(|sim| sim.peek(1).view().commit >= index));
+}
+
 /// A leader that removes itself counts its commits by the configuration it wrote, which needs both
 /// of the voters it leaves: with one cut off, the removal waits, and the leader leads on (Ongaro's
 /// thesis §4.2.2). Once the removal is committed and applied, the leader hands the group to a

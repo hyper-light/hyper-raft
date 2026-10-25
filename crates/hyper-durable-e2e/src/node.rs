@@ -487,12 +487,7 @@ impl Node {
             if self.attached.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
                 // What the stream believes of it now (hyper-durable's `Owner::pairs`).
-                let suspected = self.liveness.trust(*peer) == Some(Trust::Suspected);
-                heard(if suspected {
-                    self.replica.suspect(*peer)
-                } else {
-                    self.replica.trust(*peer)
-                })?;
+                heard(self.replica.believe_of(&self.liveness, *peer))?;
             }
         }
         for peer in &self.attached {
@@ -588,6 +583,11 @@ impl Node {
                 Change::Restarted { .. } => {
                     self.restarts = self.restarts.saturating_add(1);
                     heard(self.replica.restarted(peer))?
+                }
+                Change::Stopped { at_ns, .. } => {
+                    self.told.retain(|(told, _)| *told != peer);
+                    self.told.push((peer, *at_ns));
+                    heard(self.replica.stopped(peer))?
                 }
             };
         }

@@ -112,6 +112,8 @@ struct World {
     suspicions: Vec<(u64, hyper_liveness::Suspicion)>,
     /// Restarts the streams reported: who saw whom start again.
     restarts: Vec<(u64, u64)>,
+    /// Announced stops the streams reported: who saw whom stop.
+    stops: Vec<(u64, u64)>,
     /// Changes the streams reported, all told.
     changes: u64,
     seed: u64,
@@ -165,6 +167,7 @@ impl World {
             raft_sent: 0,
             suspicions: Vec::new(),
             restarts: Vec::new(),
+            stops: Vec::new(),
             changes: 0,
             seed,
         }
@@ -216,6 +219,7 @@ impl World {
         match change {
             Change::Suspected(suspicion) => self.suspicions.push((at, *suspicion)),
             Change::Restarted { peer, .. } => self.restarts.push((at, *peer)),
+            Change::Stopped { peer, .. } => self.stops.push((at, *peer)),
             Change::Trusted { .. } => {}
         }
     }
@@ -701,5 +705,147 @@ fn a_node_removed_while_suspected_and_added_again_counts_in_the_quorum() {
         world.run_until(|w| w.leader().is_some());
         assert!(world.propose(b"after"));
         world.run_until(|w| w.applied_everywhere(b"after"));
+    }
+}
+
+/// A voter's stop announced (`Liveness::stop`), its group's other members hold it out from the
+/// announcement's arrival (`Change::Stopped`, `Replica::stopped`): a follower that then wrongly
+/// suspects its leader is left no quorum it trusts and asks for no votes, and the leader leads on.
+/// Before, the stopped voter was trusted until its freshness point passed, the detector's margin
+/// after its last heartbeat, and such a follower counted it in a quorum it trusted, asked for
+/// votes and named no leader meanwhile (mantle's roll; the window
+/// `docs/models/SuspicionStopUnannounced.cfg` finds). Do: a group whose links are all judged; once
+/// the follower took a heartbeat of the stopping node, that node announces its stop and stops; once
+/// both others took the announcement, the follower's core is told its leader is suspected, wrongly,
+/// for a quiet period; the stopped node starts again. Expect: the window was open (the follower
+/// would have trusted the stopped node past the wrong suspicion); every step the two name the
+/// leader in its term, neither asks for votes, and a write commits; the restart is told, counted no
+/// failure, and the group writes again.
+#[test]
+fn a_voters_announced_stop_leaves_no_window_for_a_wrong_suspicion() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    for seed in first..first + support::count("HYPER_DURABLE_LIVENESS_SEEDS", 64) {
+        let mut world = World::new(seed);
+        world.run_until(|w| {
+            w.leader()
+                .is_some_and(|leader| (1..=3).all(|peer| peer == leader || w.judged(peer)))
+                && w.judged(w.leader().unwrap_or(0))
+        });
+        let leader = world.leader().unwrap();
+        let stopping = if leader == 3 { 2 } else { 3 };
+        let follower = 6 - leader - stopping;
+        let at = |id: u64| (id - 1) as usize;
+        // The follower takes a heartbeat of the stopping node: it holds it trusted a freshness on.
+        let taken = world.nodes[at(follower)]
+            .liveness
+            .report(stopping)
+            .map_or(0, |report| report.taken);
+        world.run_until(|w| {
+            w.nodes[at(follower)]
+                .liveness
+                .report(stopping)
+                .is_some_and(|report| report.taken > taken)
+        });
+        let Some(hyper_timing::Trust::Trusted {
+            until_ns: trusted_to,
+        }) = world.nodes[at(follower)].liveness.trust(stopping)
+        else {
+            panic!("seed {seed}: the follower does not trust the stopping node");
+        };
+        let failures: Vec<u64> = [leader, follower]
+            .iter()
+            .map(|id| world.nodes[at(*id)].liveness.history().failures())
+            .collect();
+        // The stop, announced: the stream's last act, then nothing more of the node.
+        {
+            let now = world.now;
+            let node = &mut world.nodes[at(stopping)];
+            let mut live = Live::default();
+            node.liveness.stop(now, &mut live);
+            node.alive = false;
+            for (peer, message) in live.heartbeats {
+                world.send(stopping, peer, Payload::Liveness(message));
+            }
+        }
+        world.run_until(|w| {
+            [leader, follower]
+                .iter()
+                .all(|id| w.nodes[at(*id)].liveness.stopped(stopping))
+        });
+        let term = world.replica(leader).term();
+        assert!(
+            world.now < trusted_to,
+            "seed {seed}: the announcement came at {} ns, past the point {trusted_to} ns the \
+             follower trusted the stopped node to: no window to close",
+            world.now
+        );
+        // The wrong suspicion, for a quiet period.
+        {
+            let node = &mut world.nodes[at(follower)];
+            node.owner
+                .get_mut(node.handle)
+                .unwrap()
+                .suspect(leader)
+                .unwrap();
+            node.owner.schedule(node.handle);
+            node.alarm = Some(world.now);
+        }
+        let held = |w: &World| {
+            let (l, f) = (w.replica(leader), w.replica(follower));
+            assert!(
+                l.is_leader() && l.term() == term,
+                "seed {seed}: the leader lost term {term} at {} ns",
+                w.now
+            );
+            assert!(
+                f.core().raft.state() == hyper_raft::StateRole::Follower
+                    && f.leader() == leader
+                    && f.term() == term,
+                "seed {seed}: the follower left its leader at {} ns: {:?}, leader {}, term {}",
+                w.now,
+                f.core().raft.state(),
+                f.leader(),
+                f.term()
+            );
+        };
+        let until = world.now + world.quiet();
+        while world.now < until {
+            world.next();
+            held(&world);
+        }
+        assert!(world.propose(b"while one is stopped"));
+        world.run_until(|w| {
+            held(w);
+            w.applied_everywhere(b"while one is stopped")
+        });
+        // The suspicion withdrawn, the stopped node starts again: told, no failure, trusted.
+        {
+            let node = &mut world.nodes[at(follower)];
+            node.owner
+                .get_mut(node.handle)
+                .unwrap()
+                .trust(leader)
+                .unwrap();
+            node.owner.schedule(node.handle);
+            node.alarm = Some(world.now);
+        }
+        world.restarts.clear();
+        world.restart(stopping);
+        world.run_until(|w| {
+            [leader, follower]
+                .iter()
+                .all(|id| w.restarts.contains(&(*id, stopping)))
+        });
+        for (id, failures) in [leader, follower].iter().zip(failures) {
+            assert_eq!(
+                world.nodes[at(*id)].liveness.history().failures(),
+                failures,
+                "seed {seed}: node {id} counted the restart after an announced stop a failure"
+            );
+            assert!(!world.nodes[at(*id)].liveness.stopped(stopping));
+        }
+        world.run_until(|w| w.leader().is_some());
+        assert!(world.propose(b"back"));
+        world.run_until(|w| w.applied_everywhere(b"back"));
     }
 }

@@ -54,8 +54,8 @@
 //! attach. A node whose pool starves before it has measured anything, its links silent, judges by
 //! its pool's latenesses at the most correlation they can carry and by its own stream's, which it
 //! keeps sending (`docs/timing.md` §2.8, "Judged with no evidence of its own"). A receiver expects
-//! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
-//! ([`Change::Restarted`]).
+//! the interval it asked (`LinkEstimator::expect_interval`), a peer's new run is reported
+//! ([`Change::Restarted`]), and its announced stop at once ([`Change::Stopped`]).
 //!
 //! **The bound.** Each suspicion states when the sender's last heartbeat was due on the sender's
 //! clock and the bound past it within which NFD-E suspected: the difference of the two clocks'
@@ -251,6 +251,16 @@ pub enum Change {
         /// The new run's first heartbeat's arrival.
         at_ns: u64,
     },
+    /// The peer announced that its run ends, in order ([`Heartbeat::stopping`]): suspected at once,
+    /// and until a heartbeat of its next run comes ([`Change::Restarted`]). The owner's core takes
+    /// it as `RawNode::stopped`: it orders the stopping run to campaign never, and drops what the
+    /// run still sends that could take a group's leader from it.
+    Stopped {
+        /// The peer.
+        peer: PeerId,
+        /// The announcement's arrival.
+        at_ns: u64,
+    },
 }
 
 impl Change {
@@ -258,7 +268,9 @@ impl Change {
     pub fn peer(&self) -> PeerId {
         match self {
             Self::Suspected(suspicion) => suspicion.peer,
-            Self::Trusted { peer, .. } | Self::Restarted { peer, .. } => *peer,
+            Self::Trusted { peer, .. }
+            | Self::Restarted { peer, .. }
+            | Self::Stopped { peer, .. } => *peer,
         }
     }
 }
@@ -706,8 +718,9 @@ impl Liveness {
     /// stamp where the owner has one). The peer is judged at the arrival first, so a freshness
     /// point that passed before the message came is a suspicion in whatever order messages and
     /// polls are fed; trust changes go to `out`. A heartbeat from a later run of the peer counts
-    /// as a failure in the MTBF's evidence, the peer having restarted, and one from an earlier
-    /// run than the latest taken is refused as stale.
+    /// as a failure in the MTBF's evidence, the peer having restarted, unless the run before
+    /// announced its stop; one from an earlier run than the latest taken, or from a run after its
+    /// announced stop, is refused as stale.
     pub fn on_heartbeat(
         &mut self,
         from: PeerId,
@@ -763,14 +776,17 @@ impl Liveness {
         outcome
     }
 
-    /// This node's run ends in order, at `now_ns` (its owner stops, having handed over what it
-    /// led): each peer it shares a group with is sent a heartbeat that says so
-    /// ([`Heartbeat::stopping`]), and the node sends nothing after it. A peer that takes it counts
-    /// the node's next run, or its letting go of the pair while it suspects the node, as no failure
-    /// in the MTBF's evidence, and sends the run nothing more. Lost, or taken by a build that does
-    /// not read it, it costs what an unannounced stop costs: the peer suspects the node as its
-    /// heartbeats stop, and counts its restart a failure. Call it once, as the stop's last act on
-    /// the plane; a poll after it judges and sends nothing.
+    /// This node's run ends in order, at `now_ns`: each peer it shares a group with is sent a
+    /// heartbeat that says so ([`Heartbeat::stopping`]), and the node sends nothing after it. A
+    /// peer that takes it suspects the node at once and until its next run is heard
+    /// ([`Change::Stopped`]), counts that run, or its letting go of the pair while it suspects the
+    /// node, as no failure in the MTBF's evidence, and sends the run nothing more. Lost, or taken
+    /// by a build that does not read it, it costs what an unannounced stop costs: the peer
+    /// suspects the node once its freshness point passes, and counts its restart a failure. A
+    /// group's remaining voters hold the stopping voter out from the moment both took it
+    /// (`docs/timing.md` §2.9, "A voter's stop announced"), so an owner that announces before it
+    /// hands over the groups it leads gives each the degraded group's rule before its new leader
+    /// is named. Call it once; a poll after it judges and sends nothing.
     pub fn stop(&mut self, now_ns: u64, out: &mut impl Output) {
         if std::mem::replace(&mut self.stopped, true) {
             return;
@@ -961,6 +977,13 @@ impl Liveness {
         self.pairs
             .get(&peer)
             .map(|pair| pair.trust_at(&local, self.judged_ns))
+    }
+
+    /// Whether `peer`'s run announced its stop and no heartbeat of its next run has come
+    /// ([`Change::Stopped`]): what an owner tells a core it gives the peer anew
+    /// (`RawNode::stopped`).
+    pub fn stopped(&self, peer: PeerId) -> bool {
+        self.pairs.get(&peer).is_some_and(Pair::stopped)
     }
 
     /// The peers this node suspects.

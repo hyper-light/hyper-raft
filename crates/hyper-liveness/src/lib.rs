@@ -134,6 +134,12 @@ pub enum Refusal {
     /// A heartbeat too far from its run's schedule for the estimator to sum: a sender that
     /// restarted its schedule.
     OutOfRange,
+    /// A heartbeat of the other disk mode ([`Heartbeat::apart`] against
+    /// [`Liveness::set_disk_apart`]): every member of a group runs one mode (kiln's CP-T2.2,
+    /// Focal's condition 1), and this one is evidence of another kind than this node judges by. The
+    /// pair takes nothing from it and judges its sender by no freshness point until a heartbeat of
+    /// this node's mode comes: a mismatch is this refusal, never a suspicion or a trust.
+    OtherMode,
 }
 
 impl std::fmt::Display for Refusal {
@@ -313,6 +319,9 @@ pub struct PairReport {
     pub taken: u64,
     /// Heartbeats refused for their flush proof.
     pub unproven: u64,
+    /// Heartbeats refused for their disk mode, the other one than this node's
+    /// ([`Refusal::OtherMode`]).
+    pub other_mode: u64,
     /// Whether a configured detector of the pair's own judges the peer.
     pub configured: bool,
     /// Whether a margin judges the peer: its own configuration's, or, while it has none, the one
@@ -622,9 +631,10 @@ impl Liveness {
     /// failure, so an owner that keeps its group's writes going on the others' disks (a leader's
     /// commit on a majority without its own, `Config::apply_unpersisted`) loses nothing to the
     /// stall. What its disk owes is the owner's to bound (a leader that hands over once its own
-    /// writes stay out too long). Every node of a group runs so, or none: a node that does not
-    /// refuses the others' heartbeats that no flush proves ([`Refusal::Unproven`]) and suspects
-    /// them. Set before the first poll; off by default, the flush proof as above.
+    /// writes stay out too long). Every node of a group runs so, or none: a heartbeat of the other
+    /// mode is refused ([`Refusal::OtherMode`]) and its sender judged by no freshness point while
+    /// it speaks it, so a mixed group is told, never misjudged. Set before the first poll; off by
+    /// default, the flush proof as above.
     pub fn set_disk_apart(&mut self, apart: bool) {
         self.apart = apart;
     }

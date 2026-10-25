@@ -359,6 +359,9 @@ struct Received {
     /// The announcement taken last is owed its answer: the next heartbeat sent the stopped run,
     /// which echoes it.
     answer: bool,
+    /// The latest heartbeat of the peer spoke the other disk mode ([`Refusal::OtherMode`]): the
+    /// pair judges it by no freshness point until one of this node's mode comes.
+    other_mode: bool,
 }
 
 /// This node's run announced its end to the peer ([`Pair::goodbye`]): when the first announcement
@@ -379,6 +382,7 @@ struct Counts {
     skipped: u64,
     taken: u64,
     unproven: u64,
+    other_mode: u64,
     configurations: u64,
     suspicions: u64,
     allowance: f64,
@@ -519,6 +523,7 @@ impl Pair {
             skipped: counts.skipped,
             taken: counts.taken,
             unproven: counts.unproven,
+            other_mode: counts.other_mode,
             configured: self.received.configuration.is_some(),
             judged: !matches!(self.trust(), Trust::Unconfigured),
             interval: self
@@ -889,8 +894,9 @@ impl Pair {
         local: &Local,
     ) -> (Option<Change>, bool) {
         // A run that announced its end is suspected from the announcement until the next run is
-        // heard: nothing of it is left to judge.
-        if self.received.stopped {
+        // heard: nothing of it is left to judge. One that speaks the other disk mode is judged by
+        // nothing it says, so by no point either, until it speaks this node's (`Refusal::OtherMode`).
+        if self.received.stopped || self.received.other_mode {
             return (None, false);
         }
         let at = match self.point() {
@@ -1056,6 +1062,14 @@ impl Pair {
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns, &context.local).0;
+        // A heartbeat of the other disk mode (kiln's CP-T2.2, Focal's condition 1): refused, typed,
+        // nothing taken from it, and the peer judged by no point while it speaks that mode.
+        if beat.apart != context.apart {
+            self.counts.other_mode = self.counts.other_mode.saturating_add(1);
+            self.received.other_mode = true;
+            return Err(Refusal::OtherMode);
+        }
+        self.received.other_mode = false;
         if let Some(ended) = self.take_ended(peer, beat, arrival_ns, changes, taken) {
             return ended;
         }

@@ -1270,8 +1270,11 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   leader whose own write stays out past its patience hands the lead on (hyper-durable's
   `Replica::set_disk_patience`, `docs/durable.md` §4.2), and one that leads on its followers'
   disks meanwhile answers on them (`Config::apply_unpersisted`). Every node of a group runs so, or
-  none: one that does not refuses the others' heartbeats that no flush proves (`Unproven`) and
-  suspects them. In the harness, in such a group, a 2 s stall of the leader's disk alone started no
+  none, and the heartbeat says which (flags bit 2): a heartbeat of the other mode is refused
+  (`Refusal::OtherMode`), nothing is taken from it, and its sender is judged by no freshness point
+  while it speaks that mode, so a mixed group is a typed refusal and never a misjudgment (Focal's
+  condition 1; before it, a node not in the mode refused its peers' unproven heartbeats as
+  `Unproven` and suspected them). In the harness, in such a group, a 2 s stall of the leader's disk alone started no
   election over 10,000 seeds, every publish offered in it answered by the leader within 5.2 ms on a
   majority's disks (`judged_apart_ten_thousand_stalls_...`); a stall of every node's disk at once
   and of each in turn spends no term; and a killed node is suspected within its stated bound as

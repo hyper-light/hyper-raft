@@ -3681,3 +3681,117 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
         }
     }
 }
+
+/// Focal's condition 1 on the disk mode (kiln's CP-T2.2): a heartbeat of the other mode is refused,
+/// typed, and its sender never misjudged. Node 1 judges its peers apart from their disks, nodes 2
+/// and 3 do not. Through ten of the same-mode pair's freshnesses every heartbeat node 1 takes from
+/// the others, and they from it, is refused (`Refusal::OtherMode`, counted in each pair's report),
+/// none is taken, and no node suspects or trusts a peer of the other mode; nodes 2 and 3 judge each
+/// other as ever. Started again in their mode, node 1 is taken, and killed after, it is suspected as
+/// any peer is.
+#[test]
+fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(46, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.nodes[0].liveness.set_disk_apart(true);
+            // The pair of one mode is judged; the pairs across the modes take nothing.
+            let judged = |sim: &Sim, node: usize, peer: PeerId| {
+                sim.nodes[node]
+                    .liveness
+                    .report(peer)
+                    .is_some_and(|r| r.judged)
+            };
+            sim.run_while(|sim| !(judged(sim, 1, 3) && judged(sim, 2, 2)), None);
+            let freshness = [(1usize, 3u64), (2, 2)]
+                .iter()
+                .filter_map(|&(node, peer)| sim.nodes[node].liveness.report(peer)?.freshness)
+                .max()
+                .map_or(0, |f| f.as_nanos() as u64);
+            let from = sim.now;
+            sim.run_while(|_| true, Some(from + 10 * freshness));
+            for (node, peer) in [(0usize, 2u64), (0, 3), (1, 1), (2, 1)] {
+                let report = sim.nodes[node].liveness.report(peer).unwrap();
+                let suspected = sim.nodes[node].suspicions.iter().any(|s| s.peer == peer);
+                assert!(
+                    report.other_mode > 0
+                        && report.taken == 0
+                        && !suspected
+                        && sim.nodes[node].believed.get(&peer) != Some(&true)
+                        && sim.nodes[node].liveness.trust(peer) != Some(Trust::Suspected),
+                    "{name} seed {seed}: node {} of peer {peer} across the modes: refused for the \
+                     other mode {}, taken {}, suspected {suspected}, trust {:?}",
+                    node + 1,
+                    report.other_mode,
+                    report.taken,
+                    sim.nodes[node].liveness.trust(peer)
+                );
+            }
+            for (node, peer) in [(1usize, 3u64), (2, 2)] {
+                assert!(
+                    matches!(
+                        sim.nodes[node].liveness.trust(peer),
+                        Some(Trust::Trusted { .. })
+                    ) && sim.nodes[node].liveness.report(peer).unwrap().other_mode == 0,
+                    "{name} seed {seed}: node {} of peer {peer}, one mode: {:?}",
+                    node + 1,
+                    sim.nodes[node].liveness.trust(peer)
+                );
+            }
+            // Node 1 starts again in the others' mode: a new run, taken and judged as any.
+            let mut liveness = Liveness::new(Settings {
+                local: 1,
+                run: 2,
+                max_peers: 3,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(2).unwrap();
+            liveness.attach(3).unwrap();
+            sim.restart(0, liveness);
+            sim.poll(0);
+            let back = sim.now;
+            sim.run_while(
+                |sim| !(judged(sim, 1, 1) && judged(sim, 2, 1)),
+                Some(back + 20 * freshness),
+            );
+            assert!(
+                judged(&sim, 1, 1) && judged(&sim, 2, 1),
+                "{name} seed {seed}: node 1, started again in the others' mode, was not judged \
+                 within twenty freshnesses"
+            );
+            let trusted = |sim: &Sim| {
+                (1..3).all(|node| {
+                    matches!(
+                        sim.nodes[node].liveness.trust(1),
+                        Some(Trust::Trusted { until_ns }) if until_ns > sim.now
+                    )
+                })
+            };
+            sim.run_while(|sim| !trusted(sim), Some(sim.now + 20 * freshness));
+            let killed = sim.now;
+            sim.nodes[0].alive = false;
+            sim.run_while(
+                |sim| {
+                    (1..3).any(|node| sim.nodes[node].liveness.trust(1) != Some(Trust::Suspected))
+                },
+                Some(killed + 20 * freshness),
+            );
+            for node in 1..3 {
+                let found = sim.nodes[node]
+                    .suspicions
+                    .iter()
+                    .rfind(|s| s.peer == 1 && s.at_ns >= killed)
+                    .copied();
+                assert!(
+                    found.is_some(),
+                    "{name} seed {seed}: node {} never suspected node 1, killed after it started \
+                     again in its mode",
+                    node + 1
+                );
+            }
+        }
+    }
+}

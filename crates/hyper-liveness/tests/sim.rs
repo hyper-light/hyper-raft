@@ -1200,8 +1200,22 @@ fn no_heartbeat_leaves_without_a_newer_flush() {
 /// last heartbeat's schedule (one clock in the simulation, so the peer's schedule is on it).
 #[test]
 fn a_killed_peer_is_suspected_within_the_stated_bound() {
+    killed_peer_is_suspected_within_its_bound(false);
+}
+
+/// The same, every node judging each peer's process apart from its disk (kiln's CP-T2.2): a crash
+/// is suspected within its bound as before.
+#[test]
+fn judged_apart_a_killed_peer_is_suspected_within_the_stated_bound() {
+    killed_peer_is_suspected_within_its_bound(true);
+}
+
+fn killed_peer_is_suspected_within_its_bound(apart: bool) {
     for seed in seeds(3, 16) {
         let mut sim = Sim::new(4, MACOS, seed);
+        if apart {
+            sim.judge_apart();
+        }
         sim.run_until_configured();
         sim.run_until_doubled();
         let victim = 3usize;
@@ -2779,6 +2793,16 @@ fn a_stop_announced_is_answered_once_and_the_stopping_node_knows_it_was_taken() 
 
 /// Runs `sim`, configured and doubled, until every live node trusts every live peer, and returns
 /// the longest freshness, `η + α`, any pair holds then.
+impl Sim {
+    /// Every node judges each peer's process apart from its disk (`Liveness::set_disk_apart`,
+    /// kiln's CP-T2.2), set before the first poll.
+    fn judge_apart(&mut self) {
+        for node in &mut self.nodes {
+            node.liveness.set_disk_apart(true);
+        }
+    }
+}
+
 fn settled(sim: &mut Sim) -> u64 {
     sim.run_until_configured();
     sim.run_until_doubled();
@@ -2899,6 +2923,107 @@ fn flushes_stalled_together_draw_no_suspicion_as_they_end() {
                     index + 1,
                     freshness / MS,
                     (until - from) / MS
+                );
+            }
+        }
+    }
+}
+
+/// What each node suspected from the moment a run of `world` and `seed`, every node judging each
+/// peer's process apart from its disk (kiln's CP-T2.2), settled, to `spans` freshnesses past it,
+/// with `hold` done to the run at that moment, given it and the freshness: each suspicion's node,
+/// peer and time from the moment, in order. A world's sources are drawn apart (`Streams`), so a
+/// run with and one without the hold see the same host freezes and the same network.
+fn judged_apart(
+    world: World,
+    seed: u64,
+    spans: u64,
+    hold: impl Fn(&mut Sim, u64, u64),
+) -> Vec<(usize, u64, u64)> {
+    let mut sim = Sim::new(3, world, seed);
+    sim.judge_apart();
+    let freshness = settled(&mut sim);
+    let from = sim.now;
+    hold(&mut sim, from, freshness);
+    sim.run_while(|_| true, Some(from + spans * freshness));
+    let mut seen: Vec<(usize, u64, u64)> = sim
+        .nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, node)| {
+            node.suspicions
+                .iter()
+                .filter(|s| s.noticed_ns > from)
+                .map(move |s| (index + 1, s.peer, (s.noticed_ns - from) / MS))
+        })
+        .collect();
+    seen.sort_unstable();
+    seen
+}
+
+/// Judged apart from their disks (kiln's CP-T2.2), nodes whose flushes stall together, as on a
+/// volume they share, for three times the longest freshness any pair holds, suspect no one for the
+/// stall: what they suspect through it is what the same run without it suspects, a host's freeze
+/// among them, since no stream waits on a flush.
+#[test]
+fn judged_apart_flushes_stalled_together_draw_no_suspicion() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(41, 8) {
+            let held = judged_apart(world, seed, 3, |sim, from, freshness| {
+                for node in &mut sim.nodes {
+                    node.disk_held_until = from + 3 * freshness;
+                }
+            });
+            let unheld = judged_apart(world, seed, 3, |_, _, _| {});
+            let added: Vec<_> = held.iter().filter(|s| !unheld.contains(s)).collect();
+            assert!(
+                added.is_empty(),
+                "{name} seed {seed}: a stall of every flush for three freshnesses added the \
+                 suspicions {added:?} (node, peer, ms from its start) to the run without it, {unheld:?}"
+            );
+        }
+    }
+}
+
+/// Judged apart from its disk (kiln's CP-T2.2), a node whose disk stops completing flushes goes on
+/// heartbeating, and for three times the longest freshness any pair holds no peer suspects it for
+/// the stall: what its peers suspect of it is what the same run without the stall shows, and they
+/// take its heartbeats throughout.
+#[test]
+fn judged_apart_a_stalled_disk_is_not_suspected() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(42, 8) {
+            let stalled = 2usize;
+            let peer = stalled as u64 + 1;
+            let of_it = |seen: Vec<(usize, u64, u64)>| -> Vec<(usize, u64, u64)> {
+                seen.into_iter().filter(|s| s.1 == peer).collect()
+            };
+            let held = of_it(judged_apart(world, seed, 3, |sim, _, _| {
+                sim.nodes[stalled].disk_stalled = true;
+            }));
+            let unheld = of_it(judged_apart(world, seed, 3, |_, _, _| {}));
+            let added: Vec<_> = held.iter().filter(|s| !unheld.contains(s)).collect();
+            assert!(
+                added.is_empty(),
+                "{name} seed {seed}: a disk that stopped added the suspicions {added:?} (node, peer, \
+                 ms from its stop) of its node to the run without it, {unheld:?}"
+            );
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let taken: Vec<u64> = (0..2)
+                .map(|node| sim.nodes[node].liveness.report(peer).unwrap().taken)
+                .collect();
+            sim.nodes[stalled].disk_stalled = true;
+            sim.run_while(|_| true, Some(from + 3 * freshness));
+            for (node, before) in taken.iter().enumerate() {
+                assert!(
+                    sim.nodes[node].liveness.report(peer).unwrap().taken > *before,
+                    "{name} seed {seed}: node {} took no heartbeat of the node whose disk stopped",
+                    node + 1
                 );
             }
         }

@@ -376,6 +376,21 @@ A member that restarts with its state machine past its log is the case TiKV argu
 acknowledged nothing it had not made durable (I2), so it was not counted in the quorum that
 committed what it applied, and its shorter log cannot elect it; §4.3 opens it.
 
+**A leader whose disk stalls** (kiln's CP-T2.2). Where the group's nodes judge each peer's process
+apart from its disk (`hyper_liveness::Liveness::set_disk_apart`, `docs/timing.md` §2.8), a leader
+whose own disk stalls keeps its lead, its appends leaving with no write of its own (`take_light`),
+its followers' durable answers committing, and applies and answers on their disks with this
+section's rule. A disk that never comes back would then hold a lead it cannot keep durable, its
+unpersisted entries growing to the core's bound, so the shell bounds its patience: a leader whose
+oldest write has been out past it (`Replica::set_disk_patience`, none by default, a deadline the
+owner is woken at) hands the lead to the voter that holds most of its log, of those its detectors
+trust (`TimeoutNow`, which leaves without a write of its own), and begins again a hand-over the core
+gives up while the write is still out (`Replica::handed_over` counts them). A stall shorter than the
+patience costs nothing: in the liveness harness, a 2 s stall of the leader's disk with a patience of
+5 s started no election over 10,000 seeds, and one that never ends, with a patience of 1 s, hands
+the lead on at its patience, its heir's campaign taking one term or two (the second where the heir's
+ballot round ended before a vote that waited on the voter's flush came).
+
 ### 4.3 What a member opens with
 
 At open, from the log's view and the state machine's durable point `(index, term)`:
@@ -1389,7 +1404,8 @@ directory once, at create.
   derives it); what the owner reads to admit and account, `reads_held` (reads confirmed that wait
   for their apply, which an owner bounding reads counts beside the core's) and `budget_mut` (an
   owner whose budget charges by lane says which before a call); and on ticks (§8), `tick`, `beat`,
-  `set_randomized_election_timeout`, `set_patience`.
+  `set_randomized_election_timeout`, `set_patience`; and a leader's patience with its own disk,
+  `set_disk_patience`, and the hand-overs it began, `handed_over` (§4.2).
   `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, one page at most (§2.2), takes at most one `Ready`
   (§7's quantum), and writes the

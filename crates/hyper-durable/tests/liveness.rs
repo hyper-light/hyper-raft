@@ -130,6 +130,15 @@ struct World {
     /// while the replica's is out waits for it and goes in the next frame, as Focal's member's
     /// liveness update waits on the part's frame (focal-bus `member.rs`, one hyper-log).
     one_log: bool,
+    /// Each node judges its peers' processes apart from their disks (`Liveness::set_disk_apart`,
+    /// CP-T2.2 step 2): a heartbeat leaves whatever the node's flushes are doing.
+    apart: bool,
+    /// Its leaders apply their own entries before their writes of them are durable
+    /// (`Config::apply_unpersisted`).
+    ahead: bool,
+    /// How long a leader waits on a write of its own before it hands the lead on
+    /// (`Replica::set_disk_patience`).
+    patience: Option<Duration>,
     /// A timeline of what each node did from `from`, a line an event, kept while asked for.
     trace: Option<Trace>,
 }
@@ -156,21 +165,36 @@ fn own_wait(liveness: &Liveness) -> OwnWait {
     liveness.own_proof().waited
 }
 
+/// A replica's settings in the world: the cluster's, a leader applying its own entries before its
+/// write of them is durable where `ahead` (`Config::apply_unpersisted`, core step R-6).
+fn member_settings(id: u64, seed: u64, ahead: bool) -> hyper_durable::Settings {
+    let mut s = settings(id, seed);
+    s.core.apply_unpersisted = ahead;
+    s
+}
+
 impl World {
     fn new(seed: u64) -> Self {
+        Self::with(seed, How::default())
+    }
+
+    /// A world made as `how` says: its leaders applying their own entries before their writes of
+    /// them are durable, its nodes judging their peers apart from their disks.
+    fn with(seed: u64, how: How) -> Self {
         let configuration = ConfState {
             voters: vec![1, 2, 3],
             ..ConfState::default()
         };
         let nodes = (1..=3)
             .map(|id| {
-                let replica: Member = Replica::open(
-                    &settings(id, seed),
+                let mut replica: Member = Replica::open(
+                    &member_settings(id, seed, how.apply_ahead),
                     SimStore::new(DEPTH),
                     Kv::new(configuration.clone(), false),
                     Unbounded,
                 )
                 .unwrap();
+                replica.set_disk_patience(how.patience);
                 let mut owner = Owner::new(vec![Waker::noop().clone()]);
                 let handle = owner.insert(replica).map_err(|_| ()).unwrap();
                 let mut liveness = Liveness::new(LiveSettings {
@@ -181,6 +205,7 @@ impl World {
                     resolution: RESOLUTION,
                 })
                 .unwrap();
+                liveness.set_disk_apart(how.disk_apart);
                 owner.pairs(handle, &mut liveness, false).unwrap();
                 Node {
                     id,
@@ -210,6 +235,9 @@ impl World {
             changes: 0,
             seed,
             one_log: false,
+            apart: how.disk_apart,
+            ahead: how.apply_ahead,
+            patience: how.patience,
             trace: None,
         }
     }
@@ -223,13 +251,14 @@ impl World {
         let disk = old.log_mut().disk.clone();
         let machine = old.machine().crashed();
         drop(old);
-        let replica: Member = Replica::open(
-            &settings(id, self.seed),
+        let mut replica: Member = Replica::open(
+            &member_settings(id, self.seed, self.ahead),
             SimStore::from_disk(disk, DEPTH),
             machine,
             Unbounded,
         )
         .unwrap();
+        replica.set_disk_patience(self.patience);
         let mut owner = Owner::new(vec![Waker::noop().clone()]);
         let handle = owner.insert(replica).map_err(|_| ()).unwrap();
         let run = node.run + 1;
@@ -241,6 +270,7 @@ impl World {
             resolution: RESOLUTION,
         })
         .unwrap();
+        liveness.set_disk_apart(self.apart);
         owner.pairs(handle, &mut liveness, false).unwrap();
         *node = Node {
             id,
@@ -571,6 +601,8 @@ impl World {
                 load.waiting.push_back(load.offered.len() as u64);
                 load.offered.push(load.next_ns);
                 load.applied.push(None);
+                load.by_leader.push(None);
+                load.durable_on.push(0);
                 load.next_ns += every_ns;
             }
             while let Some(&sequence) = load.waiting.front() {
@@ -587,8 +619,30 @@ impl World {
         }
     }
 
-    /// What the publisher sees: each publish's first application on any node, and who leads.
+    /// What the publisher sees: each publish's first application on any node, and who leads; and
+    /// what each node's disk holds of the load, so that an answer the watched node gives is known
+    /// to stand on a majority's disks or not.
     fn observe(&self, load: &mut Load) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            let disk = &self.replica(node.id).log().disk;
+            if disk.entries.len() < load.durable_read[index] {
+                load.durable_read[index] = 0;
+            }
+            for entry in disk.entries.iter().skip(load.durable_read[index]) {
+                let Some(sequence) = entry
+                    .data
+                    .strip_prefix(LOAD)
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                    .map(u64::from_le_bytes)
+                else {
+                    continue;
+                };
+                if let Some(on) = load.durable_on.get_mut(sequence as usize) {
+                    *on |= 1 << index;
+                }
+            }
+            load.durable_read[index] = disk.entries.len();
+        }
         for (index, node) in self.nodes.iter().enumerate() {
             if !node.alive {
                 continue;
@@ -605,6 +659,15 @@ impl World {
                 let applied = &mut load.applied[sequence as usize];
                 if applied.is_none() {
                     *applied = Some(self.now);
+                }
+                if node.id == load.watch {
+                    let by_leader = &mut load.by_leader[sequence as usize];
+                    if by_leader.is_none() {
+                        *by_leader = Some(self.now);
+                        if load.durable_on[sequence as usize].count_ones() < 2 {
+                            load.off_majority += 1;
+                        }
+                    }
                 }
             }
             load.read[index] = entries.len();
@@ -780,10 +843,21 @@ impl World {
 
 #[test]
 fn the_shell_elects_sleeps_and_fails_over_on_the_liveness_stream() {
+    elects_sleeps_and_fails_over(How::default());
+}
+
+/// CP-T2.2 step 2: the same in the step's group (`APART`): a real failure, the leader's node
+/// killed, is suspected within the bound each suspicion states, and the survivors elect.
+#[test]
+fn judged_apart_the_shell_elects_sleeps_and_fails_over_on_the_liveness_stream() {
+    elects_sleeps_and_fails_over(APART);
+}
+
+fn elects_sleeps_and_fails_over(how: How) {
     let mut idle = (0u64, 0u64);
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
     for seed in first..first + support::count("HYPER_DURABLE_LIVENESS_SEEDS", 64) {
-        let mut world = World::new(seed);
+        let mut world = World::with(seed, how);
         // Elected from nothing: the members know no leader and draw over the span the law chose
         // from the stream's first echoed round trips.
         world.run_until(|w| w.leader().is_some());
@@ -1268,6 +1342,16 @@ struct Load {
     read: [usize; 3],
     /// Each change of who leads and of the highest term: when, the leader (zero, none) and the term.
     leads: Vec<(u64, u64, u64)>,
+    /// The node whose applications are watched (`by_leader`): the stall's leader; zero, none.
+    watch: u64,
+    /// When the watched node applied each publish, by its sequence: what its client was answered.
+    by_leader: Vec<Option<u64>>,
+    /// The nodes whose disks hold each publish, a bit a node, by its sequence.
+    durable_on: Vec<u8>,
+    /// How far each node's disk was read.
+    durable_read: [usize; 3],
+    /// Answers the watched node gave for a publish fewer than two disks held.
+    off_majority: usize,
 }
 
 /// A suspicion noticed: its judge, the peer, when from the stall's start, and its judge's own wait
@@ -1297,6 +1381,19 @@ struct Stalled {
     unapplied: usize,
     /// The freshness, `η + α`, each node held each peer to as the stall began: the widest.
     freshness_ns: u64,
+    /// Publishes offered while the longest stall lasted, those of them the stall's leader applied
+    /// (answered) before it ended, and the slowest of those, offered to applied.
+    in_stall: usize,
+    acked_in_stall: usize,
+    ack_most_ns: u64,
+    /// Of the publishes offered in the stall, those the stall's leader never answered, and the
+    /// slowest it did, offered to answered, whenever it answered.
+    unanswered: usize,
+    answer_most_ns: u64,
+    /// Answers the stall's leader gave for a publish fewer than two disks held.
+    off_majority: usize,
+    /// The hand-overs the stall's leader's patience began.
+    handed_over: u64,
 }
 
 impl Stalled {
@@ -1326,7 +1423,9 @@ impl Stalled {
         format!(
             "seed {}: leader {} term {}, ends {:?} ms, freshness {:.0} ms: {} terms spent, lead {}, \
              leaderless {:.0} ms; publishes p50 {:.1} p99 {:.1} p99.9 {:.1} max {:.1} ms, {} never \
-             applied; suspicions [{}]",
+             applied; offered in the stall {}, answered by its leader in it {}, the slowest {:.1} ms, \
+             never {}, the slowest ever {:.1} ms, off a majority's disks {}, hand-overs {}; \
+             suspicions [{}]",
             self.seed,
             self.leader,
             self.term,
@@ -1340,6 +1439,13 @@ impl Stalled {
             unsigned(self.quantile(999)),
             unsigned(self.latencies.last().copied().unwrap_or(0)),
             self.unapplied,
+            self.in_stall,
+            self.acked_in_stall,
+            unsigned(self.ack_most_ns),
+            self.unanswered,
+            unsigned(self.answer_most_ns),
+            self.off_majority,
+            self.handed_over,
             suspicions.join(", ")
         )
     }
@@ -1348,9 +1454,9 @@ impl Stalled {
 /// A group of three under the publisher's load, each pair judged by a configured detector and two
 /// seconds of the load behind it; then each node's device stalls from one instant to its own end,
 /// `ends(leader)` from it (zero, no stall), and the group runs on to a quiet period past the last.
-fn stalled(seed: u64, one_log: bool, ends: impl Fn(u64) -> [u64; 3]) -> Stalled {
-    let mut world = World::new(seed);
-    world.one_log = one_log;
+fn stalled(seed: u64, how: How, ends: impl Fn(u64) -> [u64; 3]) -> Stalled {
+    let mut world = World::with(seed, how);
+    world.one_log = how.one_log;
     world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
     let mut load = Load::default();
     let settled = world.now + 2_000 * MS;
@@ -1358,6 +1464,7 @@ fn stalled(seed: u64, one_log: bool, ends: impl Fn(u64) -> [u64; 3]) -> Stalled 
     let leader = world.leader().unwrap_or(0);
     let term = world.replica(leader.max(1)).term();
     let from = world.now;
+    load.watch = leader;
     let ends_ns = ends(leader);
     let freshness_ns = world
         .nodes
@@ -1447,6 +1554,26 @@ fn stalled(seed: u64, one_log: bool, ends: impl Fn(u64) -> [u64; 3]) -> Stalled 
         }
     }
     latencies.sort_unstable();
+    let stall_end = from + ends_ns.into_iter().max().unwrap_or(0);
+    let (mut in_stall, mut acked_in_stall, mut ack_most_ns) = (0, 0, 0);
+    let (mut unanswered, mut answer_most_ns) = (0, 0);
+    for (offered_ns, answered) in load.offered.iter().zip(&load.by_leader) {
+        if *offered_ns < from || *offered_ns >= stall_end {
+            continue;
+        }
+        in_stall += 1;
+        match *answered {
+            Some(at) => {
+                answer_most_ns = answer_most_ns.max(at - offered_ns);
+                if at < stall_end {
+                    acked_in_stall += 1;
+                    ack_most_ns = ack_most_ns.max(at - offered_ns);
+                }
+            }
+            None => unanswered += 1,
+        }
+    }
+    let handed_over = world.replica(leader.max(1)).handed_over();
     Stalled {
         seed,
         leader,
@@ -1459,8 +1586,45 @@ fn stalled(seed: u64, one_log: bool, ends: impl Fn(u64) -> [u64; 3]) -> Stalled 
         latencies,
         unapplied,
         freshness_ns,
+        in_stall,
+        acked_in_stall,
+        ack_most_ns,
+        unanswered,
+        answer_most_ns,
+        off_majority: load.off_majority,
+        handed_over,
     }
 }
+
+/// How a stall's world is made: each node's stream and replica on one log a frame at a time
+/// (`one_log`, Focal's member), each node judging its peers' processes apart from their disks
+/// (`disk_apart`, CP-T2.2 step 2), and its leaders applying ahead of their own durability
+/// (`apply_ahead`).
+#[derive(Clone, Copy, Default)]
+struct How {
+    one_log: bool,
+    disk_apart: bool,
+    /// The leader applies its own entries before its write of them is durable
+    /// (`Config::apply_unpersisted`).
+    apply_ahead: bool,
+    /// How long a leader waits on a write of its own before it hands the lead on
+    /// (`Replica::set_disk_patience`).
+    patience: Option<Duration>,
+}
+
+/// CP-T2.2 step 2's group: each node judging its peers' processes apart from their disks, its
+/// leader applying on its followers' disks while its own lags, and handing the lead on after 5 s
+/// of a write of its own out, past the 2 s stall the step's bar is.
+const APART: How = How {
+    one_log: false,
+    disk_apart: true,
+    apply_ahead: true,
+    patience: Some(Duration::from_secs(5)),
+};
+
+/// The slowest answer a publish may take through a stall the group rides out: about twice the
+/// slowest the survey shows of a publish through one (5.3 ms, the leader judged apart).
+const ANSWER_MOST_NS: u64 = 10 * MS;
 
 /// What each shape of stall does to the group, a line a seed: doc 34's (every node's flush 584 to
 /// 587 ms in the same second), the same where each node's stream and replica share one log a frame
@@ -1473,33 +1637,53 @@ fn stalled(seed: u64, one_log: bool, ends: impl Fn(u64) -> [u64; 3]) -> Stalled 
 fn survey_of_stalls() {
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
-    type Shape = (&'static str, bool, fn(u64) -> [u64; 3]);
-    let shapes: [Shape; 5] = [
-        ("together, 584 to 587 ms (doc 34)", false, together),
+    type Shape = (&'static str, How, fn(u64) -> [u64; 3]);
+    let own_logs = How::default();
+    let one_log = How {
+        one_log: true,
+        ..How::default()
+    };
+    let apart = How {
+        disk_apart: true,
+        ..How::default()
+    };
+    let apart_ahead = How {
+        disk_apart: true,
+        apply_ahead: true,
+        ..How::default()
+    };
+    let shapes: [Shape; 7] = [
+        ("together, 584 to 587 ms (doc 34)", own_logs, together),
         (
             "together, one log a frame at a time (Focal's member)",
-            true,
+            one_log,
             together,
         ),
-        ("a journal's: 585, 735 and 885 ms", false, |_| {
+        ("a journal's: 585, 735 and 885 ms", own_logs, |_| {
             [585 * MS, 735 * MS, 885 * MS]
         }),
-        ("the leader's alone, 585 ms", false, |leader| {
+        ("the leader's alone, 585 ms", own_logs, |leader| {
             let mut ends = [0; 3];
             ends[(leader.max(1) - 1) as usize] = 585 * MS;
             ends
         }),
-        ("the leader's alone, 2 s", false, |leader| {
-            let mut ends = [0; 3];
-            ends[(leader.max(1) - 1) as usize] = 2_000 * MS;
-            ends
-        }),
+        ("the leader's alone, 2 s", own_logs, leaders_two_seconds),
+        (
+            "the leader's alone, 2 s, judged apart from its disk (CP-T2.2 step 2)",
+            apart,
+            leaders_two_seconds,
+        ),
+        (
+            "the leader's alone, 2 s, judged apart, applying ahead of its own durability",
+            apart_ahead,
+            leaders_two_seconds,
+        ),
     ];
-    for (name, one_log, ends) in shapes {
+    for (name, how, ends) in shapes {
         println!("== {name}");
         let mut lost = 0;
         for seed in first..first + seeds {
-            let outcome = stalled(seed, one_log, ends);
+            let outcome = stalled(seed, how, ends);
             lost += u64::from(outcome.lost || outcome.terms > 0);
             println!("{}", outcome.line());
         }
@@ -1510,6 +1694,13 @@ fn survey_of_stalls() {
 /// The stall of doc 34: every node's flush 584 to 587 ms in the same second.
 fn together(_: u64) -> [u64; 3] {
     [584 * MS, 585 * MS, 587 * MS]
+}
+
+/// The leader's device alone, for 2 s (CP-T2.2 step 2's example).
+fn leaders_two_seconds(leader: u64) -> [u64; 3] {
+    let mut ends = [0; 3];
+    ends[(leader.max(1) - 1) as usize] = 2_000 * MS;
+    ends
 }
 
 /// CP-T2.2 step 1: a stall of every node's flush at once, as on the one disk of Focal's doc 34
@@ -1527,7 +1718,11 @@ fn a_flush_stall_every_node_shares_spends_no_term() {
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
     for one_log in [false, true] {
         for seed in first..first + seeds {
-            let outcome = stalled(seed, one_log, together);
+            let how = How {
+                one_log,
+                ..How::default()
+            };
+            let outcome = stalled(seed, how, together);
             assert!(
                 !outcome.lost && outcome.terms == 0,
                 "{}{}",
@@ -1543,31 +1738,34 @@ fn a_flush_stall_every_node_shares_spends_no_term() {
 }
 
 /// CP-T2.2 step 2's: flush stalls that end apart, as a journal's later commits hold some nodes'
-/// flushes past others' (585, 735 and 885 ms), spend no term. Fails here: a judge whose own stall
-/// ends first holds a peer still stalled to its freshness from that end, and a leader suspecting
-/// both followers steps down.
+/// flushes past others' (585, 735 and 885 ms), spend no term. Fails in today's group, judged by the
+/// flush proof: a judge whose own stall ends first holds a peer still stalled to its freshness from
+/// that end, and a leader suspecting both followers steps down. The step's group, which judges each
+/// process apart from its disk, passes it (`judged_apart_flush_stalls_that_end_apart_spend_no_term`).
 #[test]
-#[ignore = "CP-T2.2 step 2: stalls that end apart cost the lead"]
+#[ignore = "today's group, judged by the flush proof, loses the lead; the step's group does not"]
 fn flush_stalls_that_end_apart_spend_no_term() {
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
     for seed in first..first + seeds {
-        let outcome = stalled(seed, false, |_| [585 * MS, 735 * MS, 885 * MS]);
+        let outcome = stalled(seed, How::default(), |_| [585 * MS, 735 * MS, 885 * MS]);
         assert!(!outcome.lost && outcome.terms == 0, "{}", outcome.line());
     }
 }
 
 /// CP-T2.2 step 2's: the leader's flush stalled alone, 585 ms and 2 s, spends no term, its process
-/// alive and its followers' disks a majority. Fails here: its heartbeats wait on its flush proof,
-/// so both followers suspect it within their freshness and elect another.
+/// alive and its followers' disks a majority. Fails in today's group, judged by the flush proof: its
+/// heartbeats wait on its flush proof, so both followers suspect it within their freshness and elect
+/// another. The step's group passes it
+/// (`judged_apart_a_2_s_stall_of_the_leaders_disk_spends_no_term_and_answers_every_publish`).
 #[test]
-#[ignore = "CP-T2.2 step 2: the leader's disk alone costs the lead"]
+#[ignore = "today's group, judged by the flush proof, loses the lead; the step's group does not"]
 fn a_stall_of_the_leaders_flush_alone_spends_no_term() {
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
     for stall in [585 * MS, 2_000 * MS] {
         for seed in first..first + seeds {
-            let outcome = stalled(seed, false, |leader| {
+            let outcome = stalled(seed, How::default(), |leader| {
                 let mut ends = [0; 3];
                 ends[(leader.max(1) - 1) as usize] = stall;
                 ends
@@ -1575,4 +1773,188 @@ fn a_stall_of_the_leaders_flush_alone_spends_no_term() {
             assert!(!outcome.lost && outcome.terms == 0, "{}", outcome.line());
         }
     }
+}
+
+/// CP-T2.2 step 2: the leader's disk alone stalls for 2 s, in the step's group (`APART`): no
+/// election and no term spent, and every publish offered in the stall is answered by the leader,
+/// within `ANSWER_MOST_NS`, each on a majority's disks as it is answered. Today's group, judged by
+/// the flush proof, spends a term in every seed (`a_stall_of_the_leaders_flush_alone_...`).
+#[test]
+fn judged_apart_a_2_s_stall_of_the_leaders_disk_spends_no_term_and_answers_every_publish() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let outcome = stalled(seed, APART, leaders_two_seconds);
+        assert!(
+            !outcome.lost
+                && outcome.terms == 0
+                && outcome.unanswered == 0
+                && outcome.answer_most_ns <= ANSWER_MOST_NS
+                && outcome.off_majority == 0
+                && outcome.handed_over == 0,
+            "{}",
+            outcome.line()
+        );
+    }
+}
+
+/// CP-T2.2 step 2, step 1's stall test in the step's group: every node's flush stalled at once,
+/// as on doc 34's one disk, spends no term, and every publish offered in it is answered, each on a
+/// majority's disks as it is answered (once two disks answer, 585 ms in).
+#[test]
+fn judged_apart_a_flush_stall_every_node_shares_spends_no_term() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let outcome = stalled(seed, APART, together);
+        assert!(
+            !outcome.lost
+                && outcome.terms == 0
+                && outcome.unanswered == 0
+                && outcome.off_majority == 0,
+            "{}",
+            outcome.line()
+        );
+    }
+}
+
+/// CP-T2.2 step 2, step 1's stalls that end apart in the step's group: every node's flush stalled
+/// at once and let go 585, 735 and 885 ms in, as a journal's later commits hold some nodes' flushes
+/// past others', spends no term, and every publish offered in it is answered, each on a majority's
+/// disks as it is answered (from 735 ms, when a second disk answers).
+#[test]
+fn judged_apart_flush_stalls_that_end_apart_spend_no_term() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let outcome = stalled(seed, APART, |_| [585 * MS, 735 * MS, 885 * MS]);
+        assert!(
+            !outcome.lost
+                && outcome.terms == 0
+                && outcome.unanswered == 0
+                && outcome.off_majority == 0,
+            "{}",
+            outcome.line()
+        );
+    }
+}
+
+/// CP-T2.2 step 2: a 2 s stall of each node's disk in turn, the leader's among them, 500 ms apart,
+/// in the step's group: no term spent, and every publish offered from the first stall to the last
+/// one's end answered by the leader within `ANSWER_MOST_NS`, each on a majority's disks as it is
+/// answered.
+#[test]
+fn judged_apart_a_stall_of_each_node_in_turn_spends_no_term() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    for seed in first..first + seeds {
+        let mut world = World::with(seed, APART);
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let mut load = Load::default();
+        let settled = world.now + 2_000 * MS;
+        world.run_loaded(settled, MS, &mut load);
+        let leader = world.leader().unwrap();
+        let term = world.replica(leader).term();
+        load.watch = leader;
+        let from = world.now;
+        for id in 1..=3u64 {
+            let end = world.now + 2_000 * MS;
+            world.stall(id, end);
+            world.run_loaded(end + 500 * MS, MS, &mut load);
+        }
+        let until = world.now;
+        let drained = until + world.quiet();
+        world.run_loaded(drained, MS, &mut load);
+        let terms = (1..=3u64).map(|id| world.replica(id).term()).max().unwrap() - term;
+        let (mut unanswered, mut slowest) = (0, 0);
+        for (offered, answered) in load.offered.iter().zip(&load.by_leader) {
+            if *offered < from || *offered >= until {
+                continue;
+            }
+            match answered {
+                Some(at) => slowest = slowest.max(at - offered),
+                None => unanswered += 1,
+            }
+        }
+        assert!(
+            world.leader() == Some(leader)
+                && terms == 0
+                && unanswered == 0
+                && slowest <= ANSWER_MOST_NS
+                && load.off_majority == 0,
+            "seed {seed}: leader {leader} then {:?}, {terms} terms spent; {unanswered} publishes \
+             never answered, the slowest {:.1} ms, {} answered off a majority's disks",
+            world.leader(),
+            slowest as f64 / 1e6,
+            load.off_majority
+        );
+    }
+}
+
+/// CP-T2.2 step 2: a leader whose disk stops for good, in a group whose patience is 1 s, hands the
+/// lead to a follower, and every publish is applied: a disk that stops costs a planned hand-over,
+/// not a leader that holds a lead it cannot keep durable. A hand-over the core gives up is begun
+/// again (seeds 3 and 6 begin two). The heir's campaign may take a second term: it skips pre-vote
+/// on the core's word, and its ballot's round (the quorum's round trip and one flush,
+/// `hyper_timing::Ballot`) can end before a vote that waited on the voter's flush comes (seed 1:
+/// 0.2 ms after it), so the test allows two terms and no more.
+#[test]
+fn judged_apart_a_leaders_disk_that_stops_costs_one_hand_over() {
+    let how = How {
+        patience: Some(Duration::from_secs(1)),
+        ..APART
+    };
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    let outcomes: Vec<Stalled> = (first..first + seeds)
+        .map(|seed| {
+            stalled(seed, how, |leader| {
+                let mut ends = [0; 3];
+                ends[(leader.max(1) - 1) as usize] = 6_000 * MS;
+                ends
+            })
+        })
+        .collect();
+    for outcome in &outcomes {
+        println!("{}", outcome.line());
+    }
+    for outcome in &outcomes {
+        assert!(
+            outcome.lost
+                && (1..=2).contains(&outcome.terms)
+                && (1..=2).contains(&outcome.handed_over)
+                && outcome.unapplied == 0,
+            "{}",
+            outcome.line()
+        );
+    }
+}
+
+/// CP-T2.2 step 2's bar: a 2 s stall of the leader's disk alone over 10,000 seeds in the step's
+/// group starts no election, by the simulator's term count, and every publish offered in it is
+/// answered. Run with `--ignored --nocapture`; HYPER_DURABLE_STALL_SEEDS seeds (10,000 by default)
+/// from HYPER_DURABLE_LIVENESS_SEED.
+#[test]
+#[ignore = "CP-T2.2 step 2's 10,000 seeds, minutes long"]
+fn judged_apart_ten_thousand_stalls_of_the_leaders_disk_start_no_election() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 10_000);
+    let (mut elections, mut unanswered, mut off_majority, mut slowest) = (0, 0, 0, 0);
+    for seed in first..first + seeds {
+        let outcome = stalled(seed, APART, leaders_two_seconds);
+        elections += outcome.terms;
+        unanswered += outcome.unanswered;
+        off_majority += outcome.off_majority;
+        slowest = slowest.max(outcome.answer_most_ns);
+        if outcome.terms > 0 || outcome.lost || outcome.unanswered > 0 || outcome.off_majority > 0 {
+            println!("{}", outcome.line());
+        }
+    }
+    println!(
+        "seeds {first}..{}: {elections} elections, {unanswered} publishes unanswered, \
+         {off_majority} answered off a majority's disks, the slowest answer {:.1} ms",
+        first + seeds,
+        slowest as f64 / 1e6
+    );
+    assert!(elections == 0 && unanswered == 0 && off_majority == 0);
 }

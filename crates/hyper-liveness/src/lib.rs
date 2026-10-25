@@ -23,7 +23,9 @@
 //! proof is outstanding judges no peer by it until it comes, and one with nothing durable since a
 //! point waits for its next completion: on a device nodes share, a stall stops every stream at once
 //! (Lifeguard's local health, applied to the device: `docs/timing.md` §2.8, "A judge whose own
-//! proof stalls").
+//! proof stalls"). An owner may judge each peer's process apart from its disk instead
+//! ([`Liveness::set_disk_apart`], kiln's CP-T2.2): a heartbeat then leaves when due whatever a
+//! flush is doing, and only a node's silence is a failure.
 //!
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
@@ -362,6 +364,9 @@ pub struct Liveness {
     /// one to the durable completion that ended it, if one has (`pair::Local`, `docs/timing.md` §2.8,
     /// "A judge whose own proof stalls").
     stall: Option<(u64, Option<u64>)>,
+    /// Whether each peer's process is judged apart from its disk
+    /// ([`set_disk_apart`](Self::set_disk_apart)).
+    apart: bool,
     /// The latest time the stream judged its peers at, a poll's or a heartbeat's arrival: what the
     /// trust it shows is stated at.
     judged_ns: u64,
@@ -556,6 +561,7 @@ impl Liveness {
             durable: Durable::default(),
             flushing: false,
             stall: None,
+            apart: false,
             judged_ns: 0,
             exposure: settings.history,
             last_poll_ns: None,
@@ -571,6 +577,27 @@ impl Liveness {
             evidence: None,
             stopped: false,
         })
+    }
+
+    /// Judges each peer's process apart from its disk (kiln's CP-T2.2): a heartbeat leaves when it is
+    /// due whatever a flush is doing, carrying the durable count and the age of the latest as ever;
+    /// a heartbeat is taken whether or not the sender's count moved; and a freshness point that
+    /// passed is judged at the point, whatever this node's own durability. A node whose disk stalls
+    /// is then not suspected for it: its process goes on heartbeating, and only its silence is a
+    /// failure, so an owner that keeps its group's writes going on the others' disks (a leader's
+    /// commit on a majority without its own, `Config::apply_unpersisted`) loses nothing to the
+    /// stall. What its disk owes is the owner's to bound (a leader that hands over once its own
+    /// writes stay out too long). Every node of a group runs so, or none: a node that does not
+    /// refuses the others' heartbeats that no flush proves ([`Refusal::Unproven`]) and suspects
+    /// them. Set before the first poll; off by default, the flush proof as above.
+    pub fn set_disk_apart(&mut self, apart: bool) {
+        self.apart = apart;
+    }
+
+    /// Whether each peer's process is judged apart from its disk
+    /// ([`set_disk_apart`](Self::set_disk_apart)).
+    pub fn disk_apart(&self) -> bool {
+        self.apart
     }
 
     /// What the node has measured of its links, which judges a link with no configuration of its
@@ -627,8 +654,12 @@ impl Liveness {
         Some(arrival_ns.saturating_add(wait))
     }
 
-    /// What the node knows of its own durability, which a point that passed is judged with.
+    /// What the node knows of its own durability, which a point that passed is judged with: nothing
+    /// that holds a point where the node judges its peers apart from its disk.
     fn local(&self) -> pair::Local {
+        if self.apart {
+            return pair::Local::apart();
+        }
         pair::Local {
             durable_ns: self.durable.latest_ns,
             stall: self.stall,
@@ -763,6 +794,7 @@ impl Liveness {
             exposure: &self.exposure,
             evidence: self.evidence.as_ref(),
             local,
+            apart: self.apart,
         };
         let mut changes = [None, None, None];
         let mut taken = pair::Taken::default();
@@ -857,6 +889,7 @@ impl Liveness {
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
             stopped: self.stopped,
+            apart: self.apart,
         };
         // The MTBF only for a pair that waits for a margin from the node's evidence, which a
         // configured node has none of: read at every poll, it was a float division and a

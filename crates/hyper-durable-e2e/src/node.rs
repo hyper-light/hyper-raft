@@ -66,6 +66,23 @@ use crate::control::{self, Order, Point, Report};
 use crate::file::{self, FaultFile};
 use crate::machine::{Applied, Kv};
 
+/// Whether the members judge each peer's process apart from its disk, their leader committing on
+/// its followers' disks while its own lags and handing the lead on after [`DISK_PATIENCE`] of a
+/// write of its own out (kiln's CP-T2.2, `hyper_liveness::Liveness::set_disk_apart`,
+/// `Config::apply_unpersisted`, `Replica::set_disk_patience`): where
+/// `HYPER_DURABLE_E2E_DISK_APART` is set, so that the scenarios run in such a group too.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a run of the scenarios says the group's shape in the environment its members inherit"
+)]
+fn judged_apart() -> bool {
+    std::env::var_os("HYPER_DURABLE_E2E_DISK_APART").is_some()
+}
+
+/// A leader's patience with a write of its own, in a group judged apart from its disks: past the
+/// 2 s stall kiln's CP-T2.2 asks a group to ride out.
+const DISK_PATIENCE: Duration = Duration::from_secs(5);
+
 /// The group every member's log holds: one group a log.
 pub const GROUP: u128 = 1;
 /// The group the node-pair stream's own writes go to, on the same log and device as the replica's,
@@ -314,6 +331,7 @@ impl Node {
             depth: 1,
         })
         .map_err(|e| NodeError::Open(hyper_durable::OpenError::Core(e)))?;
+        let apart = judged_apart();
         let shell = Shell {
             core: Config {
                 max_size_per_msg,
@@ -321,6 +339,7 @@ impl Node {
                 pre_vote: true,
                 seed: settings.id,
                 fast: settings.fast,
+                apply_unpersisted: apart,
                 ..Config::new(settings.id, limits)
             },
             // An owner woken by events has no period: the commit is written alone at the first
@@ -340,8 +359,10 @@ impl Node {
             ..ConfState::default()
         };
         let machine = Kv::new(configuration, settings.max_keys);
-        let replica = Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
-        let liveness = Liveness::new(LiveSettings {
+        let mut replica =
+            Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
+        replica.set_disk_patience(apart.then_some(DISK_PATIENCE));
+        let mut liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
             max_peers: settings.voters.len(),
@@ -349,6 +370,7 @@ impl Node {
             resolution: stamped.clock().resolution(),
         })
         .map_err(NodeError::Liveness)?;
+        liveness.set_disk_apart(apart);
         Ok(Self {
             replica,
             log,

@@ -1257,6 +1257,27 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   with the node's own proof recorded at each call: a point may pass untold, or be told later, only
   where the call shows that proof outstanding or ended since the peer was heard, or nothing durable
   since the point.
+- **Judged apart from the disk** (kiln's CP-T2.2, `Liveness::set_disk_apart`, off by default). The
+  flush proof makes a node whose disk stalls look crashed, and so a leader whose disk alone stalls
+  loses its lead though its process runs and its followers' disks are a majority: in hyper-durable's
+  liveness harness (`tests/liveness.rs`, `survey_of_stalls`) a 2 s stall of the leader's disk alone
+  spends a term in 8 of 8 seeds, both followers suspecting it within their freshness (59 to 88 ms).
+  An owner may judge each peer's process apart from its disk instead: a heartbeat leaves when it is
+  due whatever a flush is doing, carrying the durable count and the age of the latest as ever; a
+  receiver takes one whether or not the count moved; and a freshness point that passed is judged
+  at the point, whatever the judge's own durability, so the own-proof rule above has nothing to
+  hold. Only a node's silence is then a failure. What its disk owes is the owner's to bound: a
+  leader whose own write stays out past its patience hands the lead on (hyper-durable's
+  `Replica::set_disk_patience`, `docs/durable.md` §4.2), and one that leads on its followers'
+  disks meanwhile answers on them (`Config::apply_unpersisted`). Every node of a group runs so, or
+  none: one that does not refuses the others' heartbeats that no flush proves (`Unproven`) and
+  suspects them. In the harness, in such a group, a 2 s stall of the leader's disk alone started no
+  election over 10,000 seeds, every publish offered in it answered by the leader within 5.2 ms on a
+  majority's disks (`judged_apart_ten_thousand_stalls_...`); a stall of every node's disk at once
+  and of each in turn spends no term; and a killed node is suspected within its stated bound as
+  before (`judged_apart_a_killed_peer_...`, `judged_apart_the_shell_..._fails_over_...`). The cost
+  is the flush proof's: a node whose disk stops for good is not suspected for it, only handed
+  around by its own patience.
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at

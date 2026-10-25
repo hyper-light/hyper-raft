@@ -45,6 +45,9 @@ pub(crate) struct Sender {
     /// This node's run announced its end (`Liveness::stop`): a pair is sent the announcement again
     /// where it is due, and nothing else.
     pub(crate) stopped: bool,
+    /// The node judges each peer's process apart from its disk (`Liveness::set_disk_apart`): a
+    /// heartbeat due leaves whatever a flush is doing.
+    pub(crate) apart: bool,
 }
 
 /// What a judge knows of its own durability (`docs/timing.md` §2.8, "A judge whose own proof
@@ -66,6 +69,15 @@ pub(crate) enum Held {
 }
 
 impl Local {
+    /// What a node that judges its peers apart from its disk judges with (`Liveness::set_disk_apart`):
+    /// nothing of its own holds a point, and it waits for no completion of its own.
+    pub(crate) fn apart() -> Self {
+        Self {
+            durable_ns: Some(u64::MAX),
+            stall: None,
+        }
+    }
+
     /// When a point that has passed, a peer's expected arrival plus `margin_ns`, is judged. A judge
     /// whose own proof is outstanding waits for it: its peers' proofs may be stalled with it, as on
     /// a volume they share, and a judge whose own stream stopped judges by a proof it cannot
@@ -113,6 +125,9 @@ pub(crate) struct Context<'a> {
     pub(crate) evidence: Option<&'a Arrivals>,
     /// The node's own durability, which a point that passed is judged with.
     pub(crate) local: Local,
+    /// The node judges each peer's process apart from its disk (`Liveness::set_disk_apart`): a
+    /// heartbeat is taken whether or not a flush proves it.
+    pub(crate) apart: bool,
 }
 
 /// What a heartbeat taken did, for the node.
@@ -654,7 +669,9 @@ impl Pair {
     }
 
     /// Sends the heartbeat due, if a flush proves it: one made durable after the previous
-    /// heartbeat was due, and newer than the one the previous heartbeat carried. A sender behind
+    /// heartbeat was due, and newer than the one the previous heartbeat carried; or, where the node
+    /// judges each peer's process apart from its disk, whatever a flush is doing, carrying its
+    /// latest durable completion's age as ever (`Liveness::set_disk_apart`). A sender behind
     /// its schedule sends the latest heartbeat due; the ones it skipped are never sent, and the
     /// peer takes them as that heartbeat's lateness, the stall's delay (`docs/timing.md` §2.2).
     pub(crate) fn send(&mut self, sender: &Sender, now_ns: u64, out: &mut [u8; MAX_BYTES]) -> Sent {
@@ -692,10 +709,11 @@ impl Pair {
             self.stream.interval_ns
         };
         let previous_due = due.saturating_sub(spacing);
-        let proven = sender.durable_count > self.stream.proof
-            && sender
-                .durable_ns
-                .is_some_and(|at| at > previous_due && at <= now_ns);
+        let proven = sender.apart
+            || (sender.durable_count > self.stream.proof
+                && sender
+                    .durable_ns
+                    .is_some_and(|at| at > previous_due && at <= now_ns));
         let Some(durable_ns) = sender.durable_ns.filter(|_| proven) else {
             self.stream.next = Some((seq, due));
             if self.stream.interval_ns == 0 {
@@ -1033,11 +1051,11 @@ impl Pair {
             return Err(Refusal::Stale);
         }
         let fresh_flush = beat.flush_age_ns <= beat.late_ns.saturating_add(beat.interval_ns);
-        if beat.flushes <= self.received.flushes || !fresh_flush {
+        if !context.apart && (beat.flushes <= self.received.flushes || !fresh_flush) {
             self.counts.unproven = self.counts.unproven.saturating_add(1);
             return Err(Refusal::Unproven);
         }
-        self.received.flushes = beat.flushes;
+        self.received.flushes = self.received.flushes.max(beat.flushes);
         self.keep_said(beat, arrival_ns);
         let granularity = context.granularity.ok_or(Refusal::Unmeasured)?;
         let mapped = self
@@ -1499,6 +1517,7 @@ mod tests {
             exposure: &exposure,
             evidence: None,
             local: steady(),
+            apart: false,
         };
         let (mut changes, mut taken) = ([None, None, None], Taken::default());
         let arrival = until + MS;
@@ -1534,6 +1553,7 @@ mod tests {
             exposure: &exposure,
             evidence: None,
             local: steady(),
+            apart: false,
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -1582,6 +1602,7 @@ mod tests {
             exposure: &exposure,
             evidence: None,
             local: steady(),
+            apart: false,
         };
         let us = 1_000;
         let now = 10 * MS;
@@ -1599,6 +1620,7 @@ mod tests {
             durable_count: 1,
             durable_ns: Some(now),
             stopped: false,
+            apart: false,
         };
         let mut out = [0; MAX_BYTES];
         let Sent::Message(length, _) = node.send(&sender, now, &mut out) else {
@@ -1650,6 +1672,7 @@ mod tests {
                 durable_count: *durable,
                 durable_ns: Some(now),
                 stopped: false,
+                apart: false,
             };
             let mut out = [0; MAX_BYTES];
             match node.send(&sender, now, &mut out) {
@@ -1682,6 +1705,7 @@ mod tests {
             exposure: &exposure,
             evidence: None,
             local: steady(),
+            apart: false,
         };
         let (mut changes, mut taken) = ([None, None, None], Taken::default());
         let heard = last_due + 10_000;
@@ -1722,6 +1746,7 @@ mod tests {
                 durable_count: n,
                 durable_ns: Some(now),
                 stopped: false,
+                apart: false,
             };
             let mut out = [0; MAX_BYTES];
             assert!(
@@ -1758,6 +1783,7 @@ mod tests {
             exposure: &exposure,
             evidence: None,
             local: steady(),
+            apart: false,
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -1814,6 +1840,7 @@ mod tests {
             exposure: &exposure,
             evidence: None,
             local: steady(),
+            apart: false,
         };
         let mut pair = pair();
         pair.election = Some(Duration::from_secs(1));

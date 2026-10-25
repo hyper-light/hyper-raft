@@ -1084,9 +1084,22 @@ fn kill_at(point: Point, leader: bool, count: u64, name: &str, fast: bool) -> St
     format!("{}{fast_track}", cluster.looks())
 }
 
+/// Whether this run's members judge each peer's process apart from its disk (kiln's CP-T2.2):
+/// `HYPER_DURABLE_E2E_DISK_APART`, which the members inherit (`hyper_durable_e2e::node`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a run of the scenarios says the group's shape in the environment its members inherit"
+)]
+fn judged_apart() -> bool {
+    std::env::var_os("HYPER_DURABLE_E2E_DISK_APART").is_some()
+}
+
 /// A member's disk stops completing flushes: its heartbeats stop with it (each needs a flush made
 /// after the previous was due), every other member's detector suspects it, and they elect without
-/// it if it led and take writes. Then it is killed and started again on its log.
+/// it if it led and take writes. Then it is killed and started again on its log. In a group judged
+/// apart from its disks (`HYPER_DURABLE_E2E_DISK_APART`, kiln's CP-T2.2) its heartbeats go on and no
+/// member suspects it: it takes writes as before, which commit on the others' disks if it leads,
+/// and a leader hands the lead on once a write of its own has been out its patience.
 fn stalled_disk(leader: bool) -> String {
     let name = if leader {
         "stall-leader"
@@ -1105,28 +1118,50 @@ fn stalled_disk(leader: bool) -> String {
         cluster.order(target, Order::StallFlush),
         Some(Outcome::Done)
     );
-    // The stalled member is asked nothing more: its answers would say what it holds, not what the
-    // group does. Every other member must say it suspects it: one that did not answer a look says
-    // nothing of it.
-    cluster.stopped.push(target);
     let others: Vec<u64> = cluster
         .up()
         .into_iter()
         .filter(|&id| id != target)
         .collect();
-    let suspected = cluster.until(|reports| {
-        others.iter().all(|id| {
+    if judged_apart() {
+        // Trusted still, the stalled member is asked as any other: what it answers is what the
+        // group does. Then another leads, the stalled member's patience ended if it led, and none
+        // suspects it.
+        cluster.write_some("while-stalled", WRITES);
+        let moved = cluster.until(|reports| {
             reports
-                .get(id)
-                .is_some_and(|r| r.suspected.contains(&target))
-        })
-    });
-    assert!(
-        suspected,
-        "{name}: the stalled member was not suspected by every other; {}",
-        cluster.state()
-    );
-    cluster.write_some("while-stalled", WRITES);
+                .iter()
+                .any(|(&id, r)| id != target && r.status.leads)
+                && others.iter().all(|id| {
+                    reports
+                        .get(id)
+                        .is_some_and(|r| !r.suspected.contains(&target))
+                })
+        });
+        assert!(
+            moved,
+            "{name}: judged apart, no other member led, or one suspected the stalled member; {}",
+            cluster.state()
+        );
+    } else {
+        // The stalled member is asked nothing more: its answers would say what it holds, not what
+        // the group does. Every other member must say it suspects it: one that did not answer a
+        // look says nothing of it.
+        cluster.stopped.push(target);
+        let suspected = cluster.until(|reports| {
+            others.iter().all(|id| {
+                reports
+                    .get(id)
+                    .is_some_and(|r| r.suspected.contains(&target))
+            })
+        });
+        assert!(
+            suspected,
+            "{name}: the stalled member was not suspected by every other; {}",
+            cluster.state()
+        );
+        cluster.write_some("while-stalled", WRITES);
+    }
     cluster.kill(target);
     cluster.restart(target, true);
     cluster.write_some("after", WRITES);
@@ -1147,6 +1182,11 @@ fn stalled_disk(leader: bool) -> String {
 /// than its evidence, its heartbeats stopped by the hold, is judged only once its node's links have
 /// evidence again (`docs/timing.md` §2.8), which on this machine kept the survivors trusting the
 /// stalled leader 44 s.
+///
+/// In a group judged apart from its disks (`HYPER_DURABLE_E2E_DISK_APART`, kiln's CP-T2.2) the
+/// stalled leader is trusted still: it takes the writes, which wait on its survivors' held devices
+/// and commit on their disks once they go on, and once a write of its own has been out its patience
+/// it hands the lead to a survivor, whose campaign waits on its own held write.
 fn stalled_devices() -> String {
     let name = "stalled-devices";
     let mut cluster = Cluster::start(name, 3);
@@ -1166,10 +1206,21 @@ fn stalled_devices() -> String {
         cluster.hold_flushes(*id, hold);
     }
     assert_eq!(cluster.order(lead, Order::StallFlush), Some(Outcome::Done));
-    // The stalled leader is asked nothing more: its answers would say what it holds, not what the
-    // group does.
-    cluster.stopped.push(lead);
-    cluster.write_some("while-held", WRITES);
+    if judged_apart() {
+        cluster.write_some("while-held", WRITES);
+        let handed =
+            cluster.until(|reports| reports.iter().any(|(&id, r)| id != lead && r.status.leads));
+        assert!(
+            handed,
+            "{name}: judged apart, the stalled leader never handed the lead on; {}",
+            cluster.state()
+        );
+    } else {
+        // The stalled leader is asked nothing more: its answers would say what it holds, not what
+        // the group does.
+        cluster.stopped.push(lead);
+        cluster.write_some("while-held", WRITES);
+    }
     assert!(
         cluster.quiet.seen().extended_ns > 0,
         "{name}: no wait was extended for the members' writes through a hold of {hold:?}; {}",

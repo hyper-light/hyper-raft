@@ -359,6 +359,11 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     writes_made: Writes,
     /// The latest write made durable since the last drive ended ([`Driven::flushed`]).
     flushed: Option<(u64, u64)>,
+    /// How long a leader waits on a write of its own before it hands the lead on, nanoseconds
+    /// ([`Replica::set_disk_patience`]); none, never.
+    disk_patience: Option<u64>,
+    /// The hand-overs its patience with its disk began.
+    handed_over: u64,
 }
 
 /// A value no other opening of a member states, with overwhelming likelihood: the keys std's
@@ -476,6 +481,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             last_durable: None,
             writes_made: Writes::default(),
             flushed: None,
+            disk_patience: None,
+            handed_over: 0,
         };
         // A log compacted before the restart serves a lagging member only by snapshot, and its
         // image is what the compaction rule weighs the log against; a log never compacted is
@@ -593,6 +600,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// orders or answers.
     pub fn log_mut(&mut self) -> &mut L {
         &mut self.node.store_mut().log
+    }
+
+    /// The group's log, read: its counts, or what a test's device holds.
+    pub fn log(&self) -> &L {
+        &self.node.store().log
     }
 
     /// The state machine, for its owner's own use of it, between drives.
@@ -963,10 +975,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let quiet = self.quiet_since.filter(|_| self.has_slot()).map(|since| {
             since.saturating_add(u64::try_from(self.quiet.as_nanos()).unwrap_or(u64::MAX))
         });
-        match (self.node.deadline(), quiet) {
-            (Some(core), Some(quiet)) => Some(core.min(quiet)),
-            (core, quiet) => core.or(quiet),
-        }
+        [self.node.deadline(), quiet, self.disk_patience_point()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Wakes the core at the owner's clock (timing step L-2): what it armed since the last
@@ -1182,6 +1194,61 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.reads.len()
     }
 
+    /// How long, leading, the replica waits on a write of its own before it hands the lead to the
+    /// follower that holds most of its log, of those its detectors trust (kiln's CP-T2.2); none,
+    /// never, the default. For a group whose nodes judge each peer's process apart from its disk
+    /// (`hyper_liveness::Liveness::set_disk_apart`), whose leader commits on its followers' disks
+    /// while its own lags (`Config::apply_unpersisted`): a disk that stalls for less costs
+    /// nothing, and one that stops costs one planned hand-over, not a leader that holds the lead
+    /// it can no longer keep durable, its unpersisted entries growing to their bound.
+    pub fn set_disk_patience(&mut self, patience: Option<Duration>) {
+        self.disk_patience = patience.map(|p| u64::try_from(p.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    /// The hand-overs the replica's patience with its disk began ([`Replica::set_disk_patience`]): one
+    /// the core gives up (its transfer's timeout) is begun again while the write is still out.
+    pub fn handed_over(&self) -> u64 {
+        self.handed_over
+    }
+
+    /// When a leader's patience with its oldest write out ends, if it has one and a write is out.
+    fn disk_patience_point(&self) -> Option<u64> {
+        let patience = self.disk_patience?;
+        let oldest = self.writes.front()?;
+        self.is_leader()
+            .then(|| oldest.submitted.saturating_add(patience))
+    }
+
+    /// A leader whose oldest write has been out past its patience hands the lead to the voter that
+    /// holds most of its log, of those its detectors trust, unless a hand-over is under way
+    /// ([`Replica::set_disk_patience`]). The heir campaigns on the core's word (`TimeoutNow`),
+    /// which leaves without a write of this member's (`RawNode::light_now`).
+    fn keep_disk_patience(&mut self, now: u64) -> Result<(), ReplicaError> {
+        if self.disk_patience_point().is_none_or(|point| now < point)
+            || self.node.raft.lead_transferee().is_some()
+        {
+            return Ok(());
+        }
+        let id = self.id();
+        let tracker = self.node.raft.tracker();
+        let heir = self
+            .configuration()
+            .voters
+            .iter()
+            .copied()
+            .filter(|&voter| voter != id && !self.node.raft.suspects(voter))
+            .filter_map(|voter| tracker.get(voter).map(|p| (p.matched, voter)))
+            .max()
+            .map(|(_, voter)| voter);
+        let Some(heir) = heir else {
+            return Ok(());
+        };
+        let told = self.node.transfer_leader(heir);
+        self.heard(told)?;
+        self.handed_over = self.handed_over.saturating_add(1);
+        Ok(())
+    }
+
     /// Hands the lead to `to`.
     pub fn transfer(&mut self, to: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
@@ -1250,6 +1317,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_reports()?;
                 r.release_fence(out)?;
                 r.take_ready(now, waker, out)?;
+                r.keep_disk_patience(now)?;
                 r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
             }

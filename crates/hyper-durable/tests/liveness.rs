@@ -414,6 +414,9 @@ impl World {
                         Change::DiskCaughtUp { .. } => {
                             format!("{ms:9.3} n{id}: n{}'s disk caught up", change.peer())
                         }
+                        Change::Stopped { .. } => {
+                            format!("{ms:9.3} n{id}: n{} announced its stop", change.peer())
+                        }
                     });
                 }
             }

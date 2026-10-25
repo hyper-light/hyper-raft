@@ -29,12 +29,6 @@ pub const KIND: u8 = 0x4c;
 pub const VERSION: u8 = 2;
 /// The bytes before the echo: kind, version, nine eight-byte fields and the flags.
 const HEAD_BYTES: usize = 2 + 9 * 8 + 1;
-/// Format: the flags' bit 0, an echo follows.
-const ECHO: u8 = 1;
-/// Format: the flags' bit 2, the sender judges its peers apart from their disks.
-const APART: u8 = 1 << 2;
-/// Format: the flags' bit 3, the sender's own disk is slow, in that mode.
-const DISK_SLOW: u8 = 1 << 3;
 /// The echo's three eight-byte fields.
 const ECHO_BYTES: usize = 3 * 8;
 /// The longest message: a heartbeat with its echo.
@@ -99,6 +93,11 @@ pub struct Heartbeat {
 const ECHO: u8 = 1;
 /// Format: the flags' bit 1, the run stops here ([`Heartbeat::stopping`]).
 const STOPPING: u8 = 2;
+/// Format: the flags' bit 2, the sender judges its peers apart from their disks
+/// ([`Heartbeat::apart`]).
+const APART: u8 = 1 << 2;
+/// Format: the flags' bit 3, the sender's own disk is slow, in that mode ([`Heartbeat::disk_slow`]).
+const DISK_SLOW: u8 = 1 << 3;
 
 fn put(out: &mut [u8; MAX_BYTES], at: &mut usize, value: u64) {
     if let Some(slot) = at.checked_add(8).and_then(|end| out.get_mut(*at..end)) {

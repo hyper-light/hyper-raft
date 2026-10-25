@@ -865,6 +865,8 @@ impl Pair {
             flush_age_ns: sender
                 .durable_ns
                 .map_or(0, |durable| sent_ns.saturating_sub(durable)),
+            apart: sender.apart,
+            disk_slow: sender.disk_slow,
             echo: None,
             stopping: true,
         };

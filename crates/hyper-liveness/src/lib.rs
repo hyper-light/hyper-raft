@@ -915,6 +915,8 @@ impl Liveness {
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
             stopped: true,
+            apart: self.apart,
+            disk_slow: self.own_disk_slow,
         };
         for (&peer, pair) in &mut self.pairs {
             announce(pair, peer, &sender, now_ns, &mut self.message, out);

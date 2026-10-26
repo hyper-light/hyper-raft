@@ -3769,8 +3769,8 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
     }
 }
 
-/// Focal's condition 1 on the disk mode (kiln's CP-T2.2): a heartbeat of the other mode is refused,
-/// typed, and its sender never misjudged. Node 1 judges its peers apart from their disks, nodes 2
+/// Focal's condition 1 on the disk mode (kiln's CP-T2.2): a heartbeat of the other mode is refused
+/// for its disk, typed, and its sender judged by its arrivals. Node 1 judges its peers apart from their disks, nodes 2
 /// and 3 do not. Through ten of the same-mode pair's freshnesses every heartbeat node 1 takes from
 /// the others, and they from it, is refused for its disk (`Refusal::OtherMode`, counted in each
 /// pair's report) and taken for its sender's process, and each pair across the modes judges its
@@ -3786,7 +3786,7 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
 /// taken, its peers told once that its mode agrees again (`Change::ModeAgrees`), and killed after,
 /// it is suspected as any peer is.
 #[test]
-fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
+fn a_heartbeat_of_the_other_mode_is_refused_for_its_disk_and_its_sender_judged_by_its_arrivals() {
     for world in [MACOS, BUSY, LINUX] {
         let name = world.name;
         for seed in seeds(46, 8) {

@@ -2649,17 +2649,21 @@ fn judged_apart_ten_thousand_stalls_of_the_leaders_disk_start_no_election() {
 /// in the disk mode, its followers in today's; and one follower alone in it, judging every peer by
 /// the other mode's heartbeats from its own measure of them. In each, every pair comes to judge its
 /// peer again with no suspicion and no term spent in two seconds of the mixed group; then the
-/// leader's node dies, and a new leader is elected no later than twice the slowest the same group
-/// takes in one mode.
+/// leader's node dies, and a new leader is elected no later than the protocol gives: the same
+/// seed's failover in one mode, plus the detection deadline the surviving judges report for the
+/// dead leader at the kill (each pair's freshness, the interval its heartbeats come at and the
+/// margin in force). A peer judged by its arrivals alone is suspected within that deadline, and
+/// the election after is the law's, as in one mode.
 #[test]
 fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
-    // The time from the leader's kill to a new leader, ms, and the suspicions and terms the mixed
+    // The time from the leader's kill to a new leader, ms; the detection deadline the surviving
+    // judges report for the dead leader at the kill, ms; and the suspicions and terms the mixed
     // group cost before the kill, the nodes `apart` names judging apart from their disks.
     // The nodes judging apart from their disks, of the leader's id.
     type Apart = fn(u64) -> Vec<u64>;
-    let failover = |seed: u64, apart: Apart| -> (u64, usize, u64) {
+    let failover = |seed: u64, apart: Apart| -> (u64, u64, usize, u64) {
         let mut world = World::with(seed, How::default());
         world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
         let leader = world.leader().unwrap();
@@ -2674,15 +2678,24 @@ fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
         world.run_until(|w| w.now >= settled);
         let mixed = (world.suspicions.len() - suspected, max_term(&world) - term);
         let leader = world.leader().unwrap();
+        let deadline = (1..=3u64)
+            .filter(|id| *id != leader)
+            .filter_map(|id| {
+                world.nodes[(id - 1) as usize]
+                    .liveness
+                    .report(leader)?
+                    .freshness
+            })
+            .max()
+            .map_or(0, |d| d.as_millis() as u64);
         let killed_at = world.now;
         world.nodes[(leader - 1) as usize].alive = false;
         world.run_until(|w| w.leader().is_some_and(|l| l != leader));
-        ((world.now - killed_at) / MS, mixed.0, mixed.1)
+        ((world.now - killed_at) / MS, deadline, mixed.0, mixed.1)
     };
     let one_mode: Vec<u64> = (first..first + seeds)
         .map(|seed| failover(seed, |_| Vec::new()).0)
         .collect();
-    let bound = 2 * one_mode.iter().copied().max().unwrap();
     let shapes: [(&str, Apart); 2] = [
         ("the leader alone in the disk mode", |leader| vec![leader]),
         ("a follower alone in the disk mode", |leader| {
@@ -2692,12 +2705,13 @@ fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
     let mut failed = Vec::new();
     for (shape, apart) in shapes {
         for seed in first..first + seeds {
-            let (ms, suspicions, terms) = failover(seed, apart);
+            let (ms, deadline, suspicions, terms) = failover(seed, apart);
+            let one = one_mode[(seed - first) as usize];
+            let bound = one + deadline;
             let line = format!(
-                "{shape}, seed {seed}: a new leader {ms} ms after the kill (one mode, this seed: \
-                 {} ms; the bound {bound} ms); in the mixed group before it, {suspicions} \
-                 suspicions and {terms} terms",
-                one_mode[(seed - first) as usize]
+                "{shape}, seed {seed}: a new leader {ms} ms after the kill (the bound {bound} ms: \
+                 {one} ms in one mode, this seed, and the judges' deadline {deadline} ms); in the \
+                 mixed group before it, {suspicions} suspicions and {terms} terms"
             );
             println!("{line}");
             if ms > bound || suspicions > 0 || terms > 0 {

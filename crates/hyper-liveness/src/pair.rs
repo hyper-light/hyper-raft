@@ -867,7 +867,7 @@ impl Pair {
                 .durable_ns
                 .map_or(0, |durable| sent_ns.saturating_sub(durable)),
             apart: sender.apart,
-            disk_slow: sender.disk_slow,
+            disk_slow: sender.apart && sender.disk_slow,
             echo: None,
             stopping: true,
         };
@@ -1894,6 +1894,35 @@ mod tests {
             u64::BITS - flushes.leading_zeros(),
             "one move a doubling, from the first flush"
         );
+    }
+
+    /// A stop announced outside the disk mode says no disk verdict, as a heartbeat doesn't: a node
+    /// whose disk was slow while it was judged apart, then set to today's mode, stops before a poll
+    /// renews its verdict. A verdict outside the disk mode is malformed, and every peer refused the
+    /// announcement as one (Focal's condition 1, the switch).
+    #[test]
+    fn a_stop_announced_outside_the_disk_mode_says_no_disk_verdict() {
+        for apart in [false, true] {
+            let mut node = pair();
+            let sender = Sender {
+                local_run: 1,
+                floor: None,
+                granularity: None,
+                durable_count: 1,
+                durable_ns: Some(0),
+                stopped: true,
+                apart,
+                disk_slow: true,
+            };
+            let mut out = [0; MAX_BYTES];
+            let length = node.goodbye(&sender, 10 * MS, &mut out);
+            let beat = Heartbeat::decode(&out[..length]);
+            assert_eq!(
+                beat.map(|beat| (beat.stopping, beat.apart, beat.disk_slow)),
+                Ok((true, apart, apart)),
+                "judged apart: {apart}"
+            );
+        }
     }
 
     /// A young link whose latest heartbeat came later than the freshness point of the one after it,

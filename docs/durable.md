@@ -410,7 +410,17 @@ its followers', and spent one to three terms in 20 of 200 at one publish every 1
 member's owner stating it from the group's one definition, as fates are stated (`Settings::disk`).
 A running group switches by a rolling restart, each member restarted in turn with the new setting.
 As in any rolling restart, its leader goes last, once the others run the new setting, so the group
-changes its leader once. While its members' modes differ:
+changes its leader once.
+
+The build goes first. A build that doesn't know the mode's heartbeat bits (2 and 3) refuses a
+heartbeat that sets them as malformed (`Refusal::Malformed`), as a build without Mantle's stopping
+bit refuses a stopping heartbeat (`a_flag_past_the_known_bits_is_malformed`). A member switched
+among such peers would be heard by none of them: suspected by each, and replaced were it to lead.
+Today's mode sets neither bit, so a member on a build that knows them is heard as before. The switch
+so takes two rolling restarts: every member onto a build that reads the bits, in the mode it had,
+and only then the mode.
+
+While its members' modes differ:
 
 - **Safety holds.** Raft's safety rests on no liveness verdict, and each leader's commit rule is its
   own. A leader in the disk mode answers what a majority's disks hold (condition 2's model,

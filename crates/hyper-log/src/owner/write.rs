@@ -161,7 +161,9 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             self.drain();
             let told = self.p.config.waits == Waits::Told;
-            if told && !self.told() {
+            // A restore of a lost frame at open is the log's own, written as it opens (the open
+            // waits for it), before any caller could cut.
+            if told && !self.told() && !self.schedule.restoring {
                 // Nothing is written until told: what is held and queued waits for a cut.
                 if !self.idle() {
                     return;

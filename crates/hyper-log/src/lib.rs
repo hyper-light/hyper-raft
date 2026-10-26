@@ -109,7 +109,8 @@ pub enum Waits {
     /// simulation that decides when each write reaches the device: what one frame holds and when
     /// it is answered are then the caller's, not the log's threads'. A frame is confirmed on its
     /// own unless a cut already asks for the next, its confirmation made durable one way rather
-    /// than the way the device measured cheaper, and nothing is filled ahead.
+    /// than the way the device measured cheaper, and nothing is filled ahead. The restore of a
+    /// frame lost at open is the log's own, written as the log opens, which waits for it.
     Told,
 }
 

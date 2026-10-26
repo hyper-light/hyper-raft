@@ -34,6 +34,20 @@ use crate::task::SpawnRequest;
 /// Format: the "no deadline requested" sentinel.
 const NO_DEADLINE: u64 = u64::MAX;
 
+/// The instant every simulated shard's clock reads zero at: one for the process, taken the first time
+/// it is asked for. An adapter that speaks `std::time::Instant` anchors to it on a simulated shard
+/// (hyper-rt-transport's `Driver`), so every endpoint of a simulation reads one clock however much real
+/// time passed between their making; an endpoint anchored when it was made would read the virtual clock
+/// offset by the real time before it, a different offset for each.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a simulation's Instant anchor, its one read of the host's clock (docs/sim.md §3.2)"
+)]
+pub fn anchor() -> std::time::Instant {
+    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *ANCHOR.get_or_init(std::time::Instant::now)
+}
+
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::mem::Encoded;

@@ -581,6 +581,11 @@ impl ShardContext {
 
     // ------------------------------------------------------------------ what tasks read
 
+    /// Whether the shard runs on the simulation runtime's virtual clock (`crate::sim::SimRuntime`).
+    pub fn simulated(&self) -> bool {
+        matches!(self.clock, crate::driver::Clock::Sim(_))
+    }
+
     /// The shard's clock in nanoseconds, read live: from the counter carrying the loop's last reading of
     /// its driver's clock forward where the shard reads one (`machine::clock::counter_ticks`), else from the
     /// driver's clock (the time the loop last published where the driver has none). Never earlier than a

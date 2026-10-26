@@ -71,9 +71,10 @@ fn shard_now() -> Result<u64, RtError> {
     reason = "the runtime adapter's clock: the host's off a simulated shard, as the driver's anchor is"
 )]
 pub fn shard_instant() -> Instant {
-    let simulated =
-        hyper_rt::registry::with_current(|context| context.simulated().then(|| context.now_ns()))
-            .flatten();
+    let simulated = hyper_rt::registry::with_current(|context| {
+        context.driver_is_sim().then(|| context.now_ns())
+    })
+    .flatten();
     match simulated {
         Some(ns) => {
             let anchor = hyper_rt::sim::anchor();
@@ -320,7 +321,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         endpoint.set_receive_capacity(unmeasured, 0);
         // On a simulated shard every driver anchors to the process's one instant for the virtual
         // clock's zero, so all of a simulation's endpoints read one clock (`hyper_rt::sim::anchor`).
-        let simulated = hyper_rt::registry::with_current(ShardContext::simulated).unwrap_or(false);
+        let simulated =
+            hyper_rt::registry::with_current(ShardContext::driver_is_sim).unwrap_or(false);
         let anchor = if simulated {
             (0, hyper_rt::sim::anchor())
         } else {

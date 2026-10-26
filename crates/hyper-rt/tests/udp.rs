@@ -435,6 +435,41 @@ fn a_simulated_udp_datagram_is_received() {
     }
 }
 
+/// On the simulation fabric a port of the shard's own range asked for by number is the port bound, a
+/// second bind of it is refused while the first holds it, and it is bound again once the first has
+/// closed, as a node started again on its shard binds where its peers dial it; port 0 takes the next
+/// free port, the one asked for passed over.
+#[test]
+fn a_simulated_bind_takes_the_port_asked_for_in_its_shard() {
+    use hyper_rt::sim::SimRuntime;
+
+    let mut sim = SimRuntime::new(&config(), 1).unwrap();
+    let id = sim.shard_ids()[0];
+    let (tx, rx) = channel();
+    sim.spawn_on(id, async move {
+        let at = |port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let port_of = |socket: &UdpSocket| socket.local_addr().unwrap().port();
+        let any = UdpSocket::bind(at(0)).unwrap();
+        let first = port_of(&any);
+        let asked = first + 5;
+        let held = UdpSocket::bind(at(asked)).unwrap();
+        let bound = port_of(&held);
+        let refused = UdpSocket::bind(at(asked)).is_err();
+        drop(held);
+        let again = UdpSocket::bind(at(asked)).unwrap();
+        let rebound = port_of(&again);
+        let next = port_of(&UdpSocket::bind(at(0)).unwrap());
+        let _ = tx.send((first, asked, bound, refused, rebound, next));
+    })
+    .unwrap();
+    sim.run_until_idle();
+    let (first, asked, bound, refused, rebound, next) = rx.try_recv().unwrap();
+    assert_eq!(bound, asked);
+    assert!(refused, "a bound port is refused");
+    assert_eq!(rebound, asked);
+    assert_eq!(next, first + 1);
+}
+
 // ── The fabric's latency model (§4.8 A-9: "independently delayed … messages") ────────────────────────
 
 /// Shape: the one-way delay of the modelled inter-region path — 80 ms, half the 162 ms P50 round trip

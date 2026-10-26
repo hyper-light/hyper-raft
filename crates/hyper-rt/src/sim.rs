@@ -706,6 +706,24 @@ impl SimSockets {
         self.port_base.saturating_add(index)
     }
 
+    /// Takes socket `index` from the free list, the others left in their order; `None` if it is not
+    /// there.
+    fn take_free(&self, index: u16) -> Option<u16> {
+        let mut above = Vec::new();
+        let mut found = false;
+        while let Some(free) = self.free.pop() {
+            if free == index {
+                found = true;
+                break;
+            }
+            above.push(free);
+        }
+        for free in above.into_iter().rev() {
+            let _ = self.free.push(free);
+        }
+        found.then_some(index)
+    }
+
     /// The bytes every socket's receive buffer holds at once: the send queue's bound.
     fn outbound_bound(&self) -> usize {
         self.sockets.len().saturating_mul(SIM_RECV_BUFFER_BYTES)
@@ -754,13 +772,26 @@ fn with_sockets<R>(f: impl FnOnce(&ShardContext, &SimSockets) -> R) -> Option<R>
         .flatten()
 }
 
-/// Binds a simulated socket on the current shard: its index and port.
-pub(crate) fn sim_bind() -> Result<(u16, u16), RtError> {
+/// Binds a simulated socket on the current shard: its index and port. A port of the shard's own
+/// range asked for by number is taken if free and refused if bound, as an OS binds one, so a node
+/// started again on its shard listens where its peers dial it; any other (port 0, or another shard's)
+/// is the next free port.
+pub(crate) fn sim_bind(requested: u16) -> Result<(u16, u16), RtError> {
     with_sockets(|_, sockets| {
-        let index = sockets.free.pop().ok_or(RtError::Capacity {
+        let full = || RtError::Capacity {
             what: "simulated sockets",
             bound: sockets.sockets.len(),
-        })?;
+        };
+        let index = match sockets.index_of(requested).filter(|_| requested != 0) {
+            Some(index) if sockets.socket(index).is_some_and(|s| s.bound.get()) => {
+                return Err(RtError::DriverRefused {
+                    call: "bind a simulated port already bound",
+                    code: None,
+                });
+            }
+            Some(index) => sockets.take_free(index).ok_or_else(full)?,
+            None => sockets.free.pop().ok_or_else(full)?,
+        };
         if let Some(socket) = sockets.socket(index) {
             socket.bound.set(true);
             socket.held.set(0);

@@ -82,6 +82,9 @@ pub(crate) enum Message<F> {
     /// Under `Waits::Told`, the caller's word to write what the owner holds (`Log::cut`),
     /// answered through its ticket once all of it is.
     Cut(Ticket),
+    /// Under `Waits::Told`, the caller's word to read the fetches the owner holds (`Log::serve`),
+    /// answered through its ticket once none is left.
+    Serve(Ticket),
 }
 
 /// What the owner hears, in the order it hears it: a message from its inbox, or what came back
@@ -295,6 +298,10 @@ pub(crate) struct Owner<F> {
     /// the device took, answered with the last frame that holds what they took (`Owner::cut`).
     cuts: Vec<Ticket>,
     cutting: Vec<Ticket>,
+    /// Under `Waits::Told`: the serves told and not yet answered (`Owner::serve`); and whether
+    /// the first fetch is on the device.
+    serving: Vec<Ticket>,
+    reading: bool,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -368,6 +375,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             frame_bytes: 0,
             cuts: Vec::new(),
             cutting: Vec::new(),
+            serving: Vec::new(),
+            reading: false,
         }
     }
 
@@ -564,13 +573,16 @@ impl<F: BlockFile + 'static> Owner<F> {
             Message::Release(group) => self.release(group),
             Message::Close => {
                 self.closing = true;
-                // Under `Waits::Told` a close writes what the owner holds, as a cut does.
+                // Under `Waits::Told` a close writes what the owner holds, as a cut does, and
+                // reads what it was asked, as a serve does.
                 if !self.untold() {
                     self.parked = false;
                     self.agenda.step = true;
+                    self.read_if_served();
                 }
             }
             Message::Cut(ticket) => self.cut(ticket),
+            Message::Serve(ticket) => self.serve(ticket),
         }
         None
     }
@@ -584,6 +596,23 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// yet answered, or the log closing, which writes what it holds as a cut would.
     pub(super) fn told(&self) -> bool {
         !self.cuts.is_empty() || !self.cutting.is_empty() || self.closing
+    }
+
+    /// Whether the first fetch may go to the device: as it comes, but under `Waits::Told` only
+    /// while a serve or a close asks for it.
+    pub(super) fn serves(&self) -> bool {
+        self.untold() || !self.serving.is_empty() || self.closing
+    }
+
+    /// A serve: under `Waits::Told`, the fetches the owner holds are read from the device and the
+    /// serve is answered once none is left; under the other waits, or with none held, at once.
+    fn serve(&mut self, mut ticket: Ticket) {
+        if self.untold() || self.fetches.is_empty() {
+            ticket.answer(Ok(Answer::Durable(Vec::new())));
+            return;
+        }
+        self.serving.push(ticket);
+        self.read_if_served();
     }
 
     /// A cut: under `Waits::Told`, the next batch takes what the owner holds and the cut is

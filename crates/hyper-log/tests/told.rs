@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault, SimFile};
-use hyper_log::{Config, Entries, Entry, Log, LogError, Pending, Update, Waits};
+use hyper_log::{Config, Entries, Entry, Fetched, Log, LogError, Page, Pending, Update, Waits};
 
 const ID: u128 = 0x746f_6c64;
 const BLOCK: usize = 4096;
@@ -220,4 +220,33 @@ fn a_close_writes_what_was_held_as_a_cut_would() {
     assert!(matches!(pending.poll(), Some(Ok(()))));
     let (log, _) = Log::open(file, config(Waits::Told), ID).unwrap();
     assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+}
+
+/// Under `Waits::Told` a fetch of entries the log no longer holds in memory waits for a serve
+/// (`Log::serve`), which is answered once the fetch is; a serve with nothing held, and any serve
+/// under the other waits, is answered at once.
+#[test]
+fn under_told_a_fetch_from_the_device_waits_for_a_serve() {
+    let log = Log::create(sim(8), config(Waits::Told), ID).unwrap();
+    // Past the group's cache (64 KiB): the first entries are read back from the device.
+    for index in 1..=24 {
+        log.submit(1, append(index, 8 << 10)).unwrap();
+        log.cut().unwrap().wait().unwrap();
+    }
+    let page = Page::payload(u64::MAX);
+    let fetching = log
+        .fetch_waking(1, 1, 2, page, Fetched::default(), None)
+        .unwrap();
+    std::thread::sleep(SETTLE);
+    assert!(
+        fetching.poll().is_none(),
+        "a read from the device waits for the serve"
+    );
+    log.serve().unwrap().wait().unwrap();
+    let fetched = fetching.poll().unwrap().unwrap();
+    assert_eq!(fetched.iter().count(), 1);
+    log.serve().unwrap().wait().unwrap();
+
+    let log = Log::create(sim(9), config(Waits::Never), ID).unwrap();
+    log.serve().unwrap().wait().unwrap();
 }

@@ -104,7 +104,8 @@ pub enum Waits {
     /// member's submissions one at a time.
     Never,
     /// Writes nothing until told: a batch is what was held and queued when the caller cuts
-    /// ([`Log::cut`]), and a submission admitted meanwhile waits for the next cut. For a
+    /// ([`Log::cut`]), and a submission admitted meanwhile waits for the next cut. It reads entries
+    /// from the device only when told too ([`Log::serve`]). For a
     /// simulation that decides when each write reaches the device: what one frame holds and when
     /// it is answered are then the caller's, not the log's threads'. A frame is confirmed on its
     /// own unless a cut already asks for the next, its confirmation made durable one way rather
@@ -1062,6 +1063,19 @@ impl<F: BlockFile + 'static> Log<F> {
         self.lines
             .inbox
             .send(Message::Cut(ticket))
+            .map_err(|_| LogError::Closed)?;
+        Ok(Pending(waiting))
+    }
+
+    /// Under [`Waits::Told`], tells the owner to read from the device the entries it was asked
+    /// for and holds (`Log::fetch_waking` and a group's fetches), which it reads only when told: the
+    /// returned handle is answered once every fetch held is answered, at once when none is. Under
+    /// the other waits the owner reads as it is asked, and the handle is answered at once.
+    pub fn serve(&self) -> Result<Pending, LogError> {
+        let (ticket, waiting) = ticket::call(None);
+        self.lines
+            .inbox
+            .send(Message::Serve(ticket))
             .map_err(|_| LogError::Closed)?;
         Ok(Pending(waiting))
     }

@@ -103,6 +103,13 @@ pub enum Waits {
     /// submitters never return within a wait, as the replica simulation's, which drives each
     /// member's submissions one at a time.
     Never,
+    /// Writes nothing until told: a batch is what was held and queued when the caller cuts
+    /// ([`Log::cut`]), and a submission admitted meanwhile waits for the next cut. For a
+    /// simulation that decides when each write reaches the device: what one frame holds and when
+    /// it is answered are then the caller's, not the log's threads'. A frame is confirmed on its
+    /// own unless a cut already asks for the next, its confirmation made durable one way rather
+    /// than the way the device measured cheaper, and nothing is filled ahead.
+    Told,
 }
 
 /// Entries to write from `first` on, replacing any the group holds at or after it.
@@ -930,6 +937,7 @@ impl<F: BlockFile + 'static> Log<F> {
         p.fills = crate::unwind::contained(|| file.fills_new_space()).unwrap_or(false);
         let (more, told) = sync_channel(device::MORE);
         let device = device::Device::new(file, pool, config.segment_bytes, told)
+            .steady(config.waits == Waits::Told)
             .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
         let wiring = owner::Wiring {
             device,
@@ -1041,6 +1049,21 @@ impl<F: BlockFile + 'static> Log<F> {
                 hears,
             },
         )
+    }
+
+    /// Under [`Waits::Told`], tells the writer to write what it holds: every submission it has
+    /// admitted, and any held for room, in frames from the next on. The returned handle is
+    /// answered once each of them is answered, durable or refused: `Ok` once the last frame that
+    /// took them is durable and confirmed, or at once when there were none; `Fenced` where the log
+    /// fenced. Under the other waits the writer writes without being told, and the handle is
+    /// answered at once.
+    pub fn cut(&self) -> Result<Pending, LogError> {
+        let (ticket, waiting) = ticket::call(None);
+        self.lines
+            .inbox
+            .send(Message::Cut(ticket))
+            .map_err(|_| LogError::Closed)?;
+        Ok(Pending(waiting))
     }
 
     /// Asks the owner and waits for its answer.

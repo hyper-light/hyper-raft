@@ -118,7 +118,8 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// After a message: a submission that came while the owner was parked starts a batch, and
     /// one that came while it gathered joins the batch.
     pub(super) fn went_on(&mut self) {
-        if self.intake.is_empty() {
+        // Under `Waits::Told` a batch starts only at a cut, which runs the loop (`Owner::cut`).
+        if self.intake.is_empty() || self.p.config.waits == Waits::Told {
             return;
         }
         if self.parked {
@@ -159,6 +160,17 @@ impl<F: BlockFile + 'static> Owner<F> {
                 return;
             }
             self.drain();
+            let told = self.p.config.waits == Waits::Told;
+            if told && !self.told() {
+                // Nothing is written until told: what is held and queued waits for a cut.
+                if !self.idle() {
+                    return;
+                }
+                continue;
+            }
+            // The batch takes the cuts told so far: they are answered with what it takes.
+            let cuts = std::mem::take(&mut self.cuts);
+            self.cutting.extend(cuts);
             let mut batch = std::mem::take(&mut self.schedule.held);
             let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             self.schedule.held = std::mem::take(&mut self.buffers.batch);
@@ -169,9 +181,22 @@ impl<F: BlockFile + 'static> Owner<F> {
                 return;
             }
             self.buffers.batch = batch;
+            // A cut that found nothing to write.
+            self.answer_cuts(None);
             if !self.idle() {
                 return;
             }
+        }
+    }
+
+    /// Answers the cuts the batch on the device took (`Owner::cut`): `Ok` once every submission
+    /// they took is answered, or refused as the batch was.
+    pub(super) fn answer_cuts(&mut self, refused: Option<fn() -> LogError>) {
+        for mut ticket in self.cutting.drain(..) {
+            ticket.answer(match refused {
+                None => Ok(Answer::Durable(Vec::new())),
+                Some(refusal) => Err(refusal()),
+            });
         }
     }
 
@@ -366,7 +391,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         reason = "hyper-log's owner times its own writes (CLAUDE.md §1, sans-io's one exception)"
     )]
     fn gather_then_commit(&mut self, batch: VecDeque<Submission<F>>, answered: u64, before: u64) {
-        if answered == 0 || self.p.config.waits == Waits::Never {
+        if answered == 0 || self.p.config.waits != Waits::Measured {
             self.commit_unless_fenced(batch);
             return;
         }
@@ -417,6 +442,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.answer(s, Err(LogError::Fenced));
             }
             self.buffers.batch = batch;
+            self.answer_cuts(Some(|| LogError::Fenced));
             self.agenda.step = true;
             return;
         }
@@ -787,13 +813,24 @@ impl<F: BlockFile + 'static> Owner<F> {
                     let tell = s.ticket.port()?;
                     Some(Doer { slot, tell })
                 });
-                let these = self.answers_of(&mut taken);
+                let mut these = self.answers_of(&mut taken);
+                // The cuts the batch took are answered with the frame that takes the last of
+                // it: this one, unless updates are held over for the next.
+                if self.schedule.held.is_empty() {
+                    let cuts = self.cutting.drain(..).map(|ticket| Answering {
+                        ticket,
+                        entries: Vec::new(),
+                    });
+                    these.extend(cuts);
+                }
                 let before = self
                     .unconfirmed
                     .as_mut()
                     .map(|u| std::mem::take(&mut u.answering))
                     .unwrap_or_default();
-                let more = !self.intake.is_empty() || !self.schedule.held.is_empty();
+                let waiting = !self.intake.is_empty() || !self.schedule.held.is_empty();
+                // Under `Waits::Told` what waits is written next only if told to.
+                let more = waiting && (self.p.config.waits != Waits::Told || self.told());
                 self.more_told = more;
                 self.phase = Phase::Writing(Writing {
                     taken,
@@ -1162,6 +1199,10 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// No frame was written, so none confirms the last: a confirmation does, so that no answer
     /// waits on traffic that may only ever be refused.
     fn no_frame(&mut self) {
+        // What the cuts took is answered, refused, unless some is held over for the next frame.
+        if self.schedule.held.is_empty() {
+            self.answer_cuts(None);
+        }
         if self.confirm(true) {
             return;
         }
@@ -1210,6 +1251,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         for s in taken.into_iter().map(|(s, _)| s).chain(batch).chain(held) {
             self.answer(s, Err(LogError::Fenced));
         }
+        self.answer_cuts(Some(|| LogError::Fenced));
         if let Some(before) = self.unconfirmed.take() {
             self.settle(before, Err(()), None);
         }

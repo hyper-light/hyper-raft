@@ -51,7 +51,7 @@ use crate::state::State;
 use crate::stats::{self, Tally};
 use crate::ticket::{Answer, Reply, Ticket};
 use crate::writer::{Key, Placement, Submission};
-use crate::{LogError, Params};
+use crate::{LogError, Params, Waits};
 
 use read::Fetch;
 pub(crate) use read::Query;
@@ -79,6 +79,9 @@ pub(crate) enum Message<F> {
     Release(u128),
     /// The log is closing: the owner answers what it holds and ends.
     Close,
+    /// Under `Waits::Told`, the caller's word to write what the owner holds (`Log::cut`),
+    /// answered through its ticket once all of it is.
+    Cut(Ticket),
 }
 
 /// What the owner hears, in the order it hears it: a message from its inbox, or what came back
@@ -288,6 +291,10 @@ pub(crate) struct Owner<F> {
     /// The bytes the last frame wrote: a fill's piece is no larger, so a frame that waits behind
     /// one waits no longer than behind another frame.
     frame_bytes: u64,
+    /// Under `Waits::Told`: the cuts told and not yet taken into a batch, and those the batch on
+    /// the device took, answered with the last frame that holds what they took (`Owner::cut`).
+    cuts: Vec<Ticket>,
+    cutting: Vec<Ticket>,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -359,6 +366,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             filled: None,
             unfilled: None,
             frame_bytes: 0,
+            cuts: Vec::new(),
+            cutting: Vec::new(),
         }
     }
 
@@ -553,9 +562,48 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             Message::Claim(group, ticket) => self.claim(group, ticket),
             Message::Release(group) => self.release(group),
-            Message::Close => self.closing = true,
+            Message::Close => {
+                self.closing = true;
+                // Under `Waits::Told` a close writes what the owner holds, as a cut does.
+                if !self.untold() {
+                    self.parked = false;
+                    self.agenda.step = true;
+                }
+            }
+            Message::Cut(ticket) => self.cut(ticket),
         }
         None
+    }
+
+    /// Whether the writer writes without being told (every waits but `Waits::Told`).
+    fn untold(&self) -> bool {
+        self.p.config.waits != Waits::Told
+    }
+
+    /// Under `Waits::Told`, whether the writer has been told to write what it holds: a cut not
+    /// yet answered, or the log closing, which writes what it holds as a cut would.
+    pub(super) fn told(&self) -> bool {
+        !self.cuts.is_empty() || !self.cutting.is_empty() || self.closing
+    }
+
+    /// A cut: under `Waits::Told`, the next batch takes what the owner holds and the cut is
+    /// answered once all of it is; under the other waits, at once. A frame on the device that a
+    /// next one now follows leaves its confirmation to that frame's record.
+    fn cut(&mut self, mut ticket: Ticket) {
+        if self.untold() {
+            ticket.answer(Ok(Answer::Durable(Vec::new())));
+            return;
+        }
+        if self.fenced {
+            ticket.answer(Err(LogError::Fenced));
+            return;
+        }
+        self.cuts.push(ticket);
+        if !self.intake.is_empty() || !self.schedule.held.is_empty() {
+            self.tell_more();
+        }
+        self.parked = false;
+        self.agenda.step = true;
     }
 
     /// A job and the device back from the thread that did it: the device is the owner's again,
@@ -613,7 +661,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 // them, comes after the word.
                 let admit = s.admit;
                 self.intake.push_back(s);
-                self.tell_more();
+                self.tell_admitted();
                 if admit && let Some(s) = self.intake.back() {
                     s.ticket.admit();
                 }
@@ -636,7 +684,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             if let Some(s) = self.waiting.remove(&seq) {
                 let admit = s.admit;
                 self.intake.push_back(s);
-                self.tell_more();
+                self.tell_admitted();
                 if admit && let Some(s) = self.intake.back() {
                     s.ticket.admit();
                 }
@@ -843,6 +891,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         };
         self.io.push_back((Job::Look(look), None));
         self.looking = true;
+    }
+
+    /// A submission admitted: another frame follows the one on the device, unless under
+    /// `Waits::Told` no cut asks for one yet.
+    fn tell_admitted(&mut self) {
+        if self.untold() || self.told() {
+            self.tell_more();
+        }
     }
 
     /// A submission was admitted while a frame is on the device: another frame follows it, so

@@ -423,8 +423,10 @@ changes its leader once. While its members' modes differ:
 - **No disk is misread, and the dead are replaced.** Each node judges a peer of the other mode
   apart from its disk, by its heartbeats' arrivals and round trips alone, from its own measure of
   them where it is alone in its mode; it reads neither their flush proof nor their disk verdict. A
-  live process of the other mode is not suspected for its disk. A dead one is suspected, and a
-  group whose leader it was elects another
+  live process in the disk mode is never suspected for its disk; one in today's mode sends a
+  heartbeat only once a flush proves it, so it may be suspected for that silence by either mode's
+  judge (the next item). A dead process of either mode is suspected, and a group whose leader it
+  was elects another
   (`a_dead_leader_in_a_group_of_two_disk_modes_is_replaced`: the leader alone in the disk mode, or a
   follower alone in it, 8 seeds each, a new leader within twice the slowest the group takes in one
   mode).

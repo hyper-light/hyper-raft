@@ -2415,7 +2415,9 @@ fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
     // The time from the leader's kill to a new leader, ms, and the suspicions and terms the mixed
     // group cost before the kill, the nodes `apart` names judging apart from their disks.
-    let failover = |seed: u64, apart: &dyn Fn(u64) -> Vec<u64>| -> (u64, usize, u64) {
+    // The nodes judging apart from their disks, of the leader's id.
+    type Apart = fn(u64) -> Vec<u64>;
+    let failover = |seed: u64, apart: Apart| -> (u64, usize, u64) {
         let mut world = World::with(seed, How::default());
         world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
         let leader = world.leader().unwrap();
@@ -2436,12 +2438,12 @@ fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
         ((world.now - killed_at) / MS, mixed.0, mixed.1)
     };
     let one_mode: Vec<u64> = (first..first + seeds)
-        .map(|seed| failover(seed, &|_| Vec::new()).0)
+        .map(|seed| failover(seed, |_| Vec::new()).0)
         .collect();
     let bound = 2 * one_mode.iter().copied().max().unwrap();
-    let shapes: [(&str, &dyn Fn(u64) -> Vec<u64>); 2] = [
-        ("the leader alone in the disk mode", &|leader| vec![leader]),
-        ("a follower alone in the disk mode", &|leader| {
+    let shapes: [(&str, Apart); 2] = [
+        ("the leader alone in the disk mode", |leader| vec![leader]),
+        ("a follower alone in the disk mode", |leader| {
             vec![leader % 3 + 1]
         }),
     ];

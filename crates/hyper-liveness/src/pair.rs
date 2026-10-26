@@ -1091,15 +1091,9 @@ impl Pair {
         if self.received.last.is_some_and(|last| beat.seq <= last.seq) {
             return Err(Refusal::Stale);
         }
-        let fresh_flush = beat.flush_age_ns <= beat.late_ns.saturating_add(beat.interval_ns);
         // A heartbeat of the other disk mode is judged apart from its sender's disk: its flush
         // proof, which that mode means otherwise, is not read (`take_mode`).
-        let apart = context.apart || other_mode;
-        if !apart && (beat.flushes <= self.received.flushes || !fresh_flush) {
-            self.counts.unproven = self.counts.unproven.saturating_add(1);
-            return Err(Refusal::Unproven);
-        }
-        self.received.flushes = self.received.flushes.max(beat.flushes);
+        self.prove(beat, context.apart || other_mode)?;
         self.keep_said(beat, arrival_ns);
         let granularity = context.granularity.ok_or(Refusal::Unmeasured)?;
         let mapped = self
@@ -1146,9 +1140,10 @@ impl Pair {
             sent_ns: beat.sent_ns,
         });
         self.received.last_mapped = Some(mapped);
-        if !other_mode {
-            self.counts.taken = self.counts.taken.saturating_add(1);
-        }
+        // Taken, whatever its mode: one of the other mode is counted besides as refused for its
+        // mode (`PairReport::other_mode`), and an owner that waits on heartbeats taken (to charge
+        // its election costs, or to know a peer heard) waits on it as on any.
+        self.counts.taken = self.counts.taken.saturating_add(1);
         // A heartbeat that ends a gap a freshness point judged is the one mistake that point can
         // make: its bound is charged, once. A peer's restart ends no gap a live peer left.
         if let Some(promise) = promise.filter(|_| first || lateness.is_some()) {
@@ -1164,15 +1159,28 @@ impl Pair {
         {
             self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
         }
-        // The node's pool is its evidence of its hosts' and paths' stalls: a sender of the other
-        // mode times its heartbeats by that mode's rule (today's waits on its flushes), so none of
-        // its feeds the pool; its own link configures from them as from any.
-        taken.lateness = lateness.filter(|_| !other_mode);
+        // Its lateness feeds the node's pool as any heartbeat's does: a node alone in its mode has
+        // no other evidence, and the node's evidence is never narrower than its widest configured
+        // link (`renew_evidence`).
+        taken.lateness = lateness;
         taken.own = self.received.configuration.is_some();
         changes[2] = self.settle(peer, arrival_ns);
         if other_mode {
             return Err(Refusal::OtherMode);
         }
+        Ok(())
+    }
+
+    /// Whether a heartbeat's flush proof holds, judged with today's mode (`apart` false): a flush
+    /// counted past the last the peer proved, fresh within the heartbeat's interval and lateness.
+    /// Judged apart from the sender's disk, any heartbeat proves its process alone.
+    fn prove(&mut self, beat: &Heartbeat, apart: bool) -> Result<(), Refusal> {
+        let fresh_flush = beat.flush_age_ns <= beat.late_ns.saturating_add(beat.interval_ns);
+        if !apart && (beat.flushes <= self.received.flushes || !fresh_flush) {
+            self.counts.unproven = self.counts.unproven.saturating_add(1);
+            return Err(Refusal::Unproven);
+        }
+        self.received.flushes = self.received.flushes.max(beat.flushes);
         Ok(())
     }
 
@@ -1646,7 +1654,8 @@ mod tests {
                 Some(Change::Trusted {
                     peer: 2,
                     at_ns: arrival
-                })
+                }),
+                None
             ]
         );
     }

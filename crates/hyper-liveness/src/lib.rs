@@ -905,7 +905,10 @@ impl Liveness {
         {
             self.feed_pool(lateness, Duration::from_nanos(beat.interval_ns));
         }
-        if self.evidence.is_none() && outcome.is_ok() && !taken.stopping {
+        // A heartbeat of the other disk mode is heard as any is: its sender's process is judged by
+        // it (`Refusal::OtherMode`), so a node alone in its mode starves for evidence no longer.
+        let heard = outcome.is_ok() || outcome == Err(Refusal::OtherMode);
+        if self.evidence.is_none() && heard && !taken.stopping {
             self.pool_starves_ns = self.starves(arrival_ns);
         }
         outcome

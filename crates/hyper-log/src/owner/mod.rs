@@ -593,15 +593,27 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Under `Waits::Told`, whether the writer has been told to write what it holds: a cut not
-    /// yet answered, or the log closing, which writes what it holds as a cut would.
+    /// yet answered, the log closing, which writes what it holds as a cut would, or a caller that
+    /// waits on its write from the moment it sent it (a blocking write, as a replica's open makes),
+    /// which can cut nothing until it is answered, so its waiting tells the writer.
     pub(super) fn told(&self) -> bool {
-        !self.cuts.is_empty() || !self.cutting.is_empty() || self.closing
+        !self.cuts.is_empty()
+            || !self.cutting.is_empty()
+            || self.closing
+            || self
+                .intake
+                .iter()
+                .chain(&self.schedule.held)
+                .any(|s| s.doer.is_some())
     }
 
     /// Whether the first fetch may go to the device: as it comes, but under `Waits::Told` only
-    /// while a serve or a close asks for it.
+    /// while a serve or a close asks for it, or a caller waits on a fetch held.
     pub(super) fn serves(&self) -> bool {
-        self.untold() || !self.serving.is_empty() || self.closing
+        self.untold()
+            || !self.serving.is_empty()
+            || self.closing
+            || self.fetches.iter().any(|f| f.waits)
     }
 
     /// A serve: under `Waits::Told`, the fetches the owner holds are read from the device and the

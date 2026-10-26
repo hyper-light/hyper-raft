@@ -246,7 +246,27 @@ fn under_told_a_fetch_from_the_device_waits_for_a_serve() {
     let fetched = fetching.poll().unwrap().unwrap();
     assert_eq!(fetched.iter().count(), 1);
     log.serve().unwrap().wait().unwrap();
+    // A caller that waits on its fetch as it asks could serve nothing until answered: read as asked.
+    let fetched = log.fetch(1, 1, 2, page, Fetched::default()).unwrap();
+    assert_eq!(fetched.iter().count(), 1);
+    let group = log.group(1).unwrap();
+    assert_eq!(group.entries(1, 2, u64::MAX).unwrap().len(), 1);
 
     let log = Log::create(sim(9), config(Waits::Never), ID).unwrap();
     log.serve().unwrap().wait().unwrap();
+}
+
+/// Under `Waits::Told` a caller that waits on its write from the moment it sends it (`Log::write`,
+/// a group's `write`, as a replica's open makes) is answered without a cut: it could make none
+/// until answered, so its waiting tells the writer. What was queued before it goes in its frame.
+#[test]
+fn under_told_a_blocking_write_tells_the_writer_by_waiting() {
+    let log = Log::create(sim(11), config(Waits::Told), ID).unwrap();
+    let queued = log.submit(2, append(1, 10)).unwrap();
+    log.write(1, append(1, 10)).unwrap();
+    assert!(matches!(queued.poll(), Some(Ok(()))));
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+    let mut group = log.group(3).unwrap();
+    group.write(append(1, 10)).unwrap();
+    assert_eq!(log.view(3).unwrap().unwrap().last, 1);
 }

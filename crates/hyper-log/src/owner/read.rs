@@ -24,6 +24,9 @@ pub(crate) enum Query {
         high: u64,
         page: Page,
         into: Fetched,
+        /// Its caller waits on its answer as it asks (`Log::fetch`, a group's `fetch`): under
+        /// `Waits::Told` it could serve nothing until answered, so it is read as it is asked.
+        waits: bool,
     },
     Flushed,
     Fenced,
@@ -37,6 +40,8 @@ pub(super) struct Fetch {
     ticket: Ticket,
     /// Reads made of entries that missed, which a second miss ends.
     retries: u32,
+    /// Its caller waits on its answer (`Query::Entries`).
+    pub(super) waits: bool,
 }
 
 /// Reads an entry that missed its place is given before it is called damaged: mantle-log looks
@@ -55,8 +60,9 @@ impl<F: BlockFile + 'static> Owner<F> {
                 high,
                 page,
                 into,
+                waits,
             } => {
-                self.fetch(group, (low, high, page), into, ticket);
+                self.fetch(group, (low, high, page), into, (ticket, waits));
                 return;
             }
             Query::Flushed => Ok(Answer::Flushed(self.schedule.frames, self.schedule.updates)),
@@ -144,7 +150,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         group: u128,
         range: (u64, u64, Page),
         mut into: Fetched,
-        mut ticket: Ticket,
+        (mut ticket, waits): (Ticket, bool),
     ) {
         into.clear();
         let mut reads = std::mem::replace(&mut self.spare_reads, Reads::none());
@@ -175,6 +181,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             reads,
             ticket,
             retries: 0,
+            waits,
         });
         self.read_if_served();
     }

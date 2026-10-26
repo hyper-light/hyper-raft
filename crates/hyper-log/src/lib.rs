@@ -105,12 +105,14 @@ pub enum Waits {
     Never,
     /// Writes nothing until told: a batch is what was held and queued when the caller cuts
     /// ([`Log::cut`]), and a submission admitted meanwhile waits for the next cut. It reads entries
-    /// from the device only when told too ([`Log::serve`]). For a
+    /// from the device for a fetch only when told too ([`Log::serve`]), or when the fetch's caller
+    /// waits on it (`Log::fetch`, a group's `fetch`). For a
     /// simulation that decides when each write reaches the device: what one frame holds and when
     /// it is answered are then the caller's, not the log's threads'. A frame is confirmed on its
     /// own unless a cut already asks for the next, its confirmation made durable one way rather
     /// than the way the device measured cheaper, and nothing is filled ahead. The restore of a
-    /// frame lost at open is the log's own, written as the log opens, which waits for it.
+    /// frame lost at open is the log's own, written as the log opens, which waits for it; and a
+    /// caller that waits on its write as it sends it (`write`) tells the writer by waiting.
     Told,
 }
 
@@ -1221,7 +1223,7 @@ impl<F: BlockFile + 'static> Log<F> {
         page: Page,
         into: Fetched,
     ) -> Result<Fetched, LogError> {
-        self.fetch_waking(group, low, high, page, into, None)?
+        self.send_fetch(group, low, high, page, into, (None, true))?
             .wait()
     }
 
@@ -1236,6 +1238,19 @@ impl<F: BlockFile + 'static> Log<F> {
         into: Fetched,
         waker: Option<Waker>,
     ) -> Result<Fetching, LogError> {
+        self.send_fetch(group, low, high, page, into, (waker, false))
+    }
+
+    /// Sends the owner a fetch: whether its caller waits on it as it asks (`Query::Entries`).
+    fn send_fetch(
+        &self,
+        group: u128,
+        low: u64,
+        high: u64,
+        page: Page,
+        into: Fetched,
+        (waker, waits): (Option<Waker>, bool),
+    ) -> Result<Fetching, LogError> {
         let (ticket, waiting) = ticket::call(waker);
         let query = Query::Entries {
             group,
@@ -1243,6 +1258,7 @@ impl<F: BlockFile + 'static> Log<F> {
             high,
             page,
             into,
+            waits,
         };
         self.lines
             .inbox

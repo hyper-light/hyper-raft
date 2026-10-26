@@ -2400,6 +2400,70 @@ fn judged_apart_ten_thousand_stalls_of_the_leaders_disk_start_no_election() {
     assert!(elections == 0 && unanswered == 0 && off_majority == 0);
 }
 
+/// Focal's condition 1's backstop (kiln CP-T2.2): a dead leader of a group whose members' disk
+/// modes differ, as in a rolling restart's window, is replaced. Each node judges a peer of the
+/// other mode apart from its disk, by its heartbeats' arrivals and round trips alone, so a process
+/// of the other mode that dies is suspected as any is. Two shapes, 8 seeds each: the leader alone
+/// in the disk mode, its followers in today's; and one follower alone in it, judging every peer by
+/// the other mode's heartbeats from its own measure of them. In each, every pair comes to judge its
+/// peer again with no suspicion and no term spent in two seconds of the mixed group; then the
+/// leader's node dies, and a new leader is elected no later than twice the slowest the same group
+/// takes in one mode.
+#[test]
+fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    // The time from the leader's kill to a new leader, ms, and the suspicions and terms the mixed
+    // group cost before the kill, the nodes `apart` names judging apart from their disks.
+    let failover = |seed: u64, apart: &dyn Fn(u64) -> Vec<u64>| -> (u64, usize, u64) {
+        let mut world = World::with(seed, How::default());
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let leader = world.leader().unwrap();
+        for id in apart(leader) {
+            world.nodes[(id - 1) as usize].liveness.set_disk_apart(true);
+        }
+        let max_term = |world: &World| (1..=3u64).map(|id| world.replica(id).term()).max().unwrap();
+        let term = max_term(&world);
+        let suspected = world.suspicions.len();
+        world.run_until(|w| (1..=3).all(|peer| w.judged(peer)));
+        let settled = world.now + 2_000 * MS;
+        world.run_until(|w| w.now >= settled);
+        let mixed = (world.suspicions.len() - suspected, max_term(&world) - term);
+        let leader = world.leader().unwrap();
+        let killed_at = world.now;
+        world.nodes[(leader - 1) as usize].alive = false;
+        world.run_until(|w| w.leader().is_some_and(|l| l != leader));
+        ((world.now - killed_at) / MS, mixed.0, mixed.1)
+    };
+    let one_mode: Vec<u64> = (first..first + seeds)
+        .map(|seed| failover(seed, &|_| Vec::new()).0)
+        .collect();
+    let bound = 2 * one_mode.iter().copied().max().unwrap();
+    let shapes: [(&str, &dyn Fn(u64) -> Vec<u64>); 2] = [
+        ("the leader alone in the disk mode", &|leader| vec![leader]),
+        ("a follower alone in the disk mode", &|leader| {
+            vec![leader % 3 + 1]
+        }),
+    ];
+    let mut failed = Vec::new();
+    for (shape, apart) in shapes {
+        for seed in first..first + seeds {
+            let (ms, suspicions, terms) = failover(seed, apart);
+            let line = format!(
+                "{shape}, seed {seed}: a new leader {ms} ms after the kill (one mode, this seed: \
+                 {} ms; the bound {bound} ms); in the mixed group before it, {suspicions} \
+                 suspicions and {terms} terms",
+                one_mode[(seed - first) as usize]
+            );
+            println!("{line}");
+            if ms > bound || suspicions > 0 || terms > 0 {
+                failed.push(line);
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Focal's condition 1: the group's disk mode is one setting. A replica opened with
 /// `Settings::disk` set to `Disk::Apart` applies ahead of its own disk (`Config::apply_unpersisted`)
 /// and states the mode, which its owner sets the node's stream to (`Replica::disk`); one opened with

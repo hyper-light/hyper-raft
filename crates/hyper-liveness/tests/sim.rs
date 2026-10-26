@@ -3692,9 +3692,12 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
 /// Focal's condition 1 on the disk mode (kiln's CP-T2.2): a heartbeat of the other mode is refused,
 /// typed, and its sender never misjudged. Node 1 judges its peers apart from their disks, nodes 2
 /// and 3 do not. Through ten of the same-mode pair's freshnesses every heartbeat node 1 takes from
-/// the others, and they from it, is refused (`Refusal::OtherMode`, counted in each pair's report),
-/// none is taken, and no node suspects or trusts a peer of the other mode; nodes 2 and 3 judge each
-/// other as ever. Each pair across the modes is told the mismatch once, as it began
+/// the others, and they from it, is refused for its disk (`Refusal::OtherMode`, counted in each
+/// pair's report), none is taken as one of the pair's mode, and each pair across the modes judges
+/// its peer apart from its disk, by its arrivals alone, with no suspicion: node 1, alone in its
+/// mode, from its own measure of the others' heartbeats. Nodes 2 and 3 judge each other as ever.
+/// Killed while it speaks the other mode, node 1 is suspected by both (the backstop: a dead
+/// process of either mode is suspected). Each pair across the modes is told the mismatch once, as it began
 /// (`Change::ModeDiffers`), and the pair of one mode never. Started again in their mode, node 1 is
 /// taken, its peers told once that its mode agrees again (`Change::ModeAgrees`), and killed after,
 /// it is suspected as any peer is.
@@ -3726,14 +3729,16 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                 assert!(
                     report.other_mode > 0
                         && report.taken == 0
+                        && report.judged
                         && !suspected
                         && sim.nodes[node].believed.get(&peer) != Some(&true)
-                        && sim.nodes[node].liveness.trust(peer) == Some(Trust::Unconfigured),
+                        && sim.nodes[node].liveness.trust(peer) != Some(Trust::Suspected),
                     "{name} seed {seed}: node {} of peer {peer} across the modes: refused for the \
-                     other mode {}, taken {}, suspected {suspected}, trust {:?}",
+                     other mode {}, taken {}, judged {}, suspected {suspected}, trust {:?}",
                     node + 1,
                     report.other_mode,
                     report.taken,
+                    report.judged,
                     sim.nodes[node].liveness.trust(peer)
                 );
             }
@@ -3775,6 +3780,22 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                     report.taken,
                     report.other_mode,
                     report.judged
+                );
+            }
+            // Killed while it speaks the other mode, node 1 is suspected by both: they judge its
+            // process by its heartbeats' arrivals.
+            let killed_other = sim.now;
+            sim.nodes[0].alive = false;
+            sim.run_until_suspected(0);
+            for node in 1..3 {
+                assert!(
+                    sim.nodes[node]
+                        .suspicions
+                        .iter()
+                        .any(|s| s.peer == 1 && s.at_ns >= killed_other),
+                    "{name} seed {seed}: node {} never suspected node 1, killed while it spoke \
+                     the other mode",
+                    node + 1
                 );
             }
             // Node 1 starts again in the others' mode: a new run, taken and judged as any.

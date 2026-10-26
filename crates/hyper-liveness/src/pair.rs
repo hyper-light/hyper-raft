@@ -433,10 +433,6 @@ impl Pair {
         if self.received.stopped {
             return Trust::Suspected;
         }
-        // A peer that speaks the other disk mode is judged by nothing it says (`Refusal::OtherMode`).
-        if self.received.other_mode {
-            return Trust::Unconfigured;
-        }
         match self.received.link.as_ref() {
             Some(link) => link.estimator.trust(),
             None if self.unheard.suspected => Trust::Suspected,
@@ -609,8 +605,8 @@ impl Pair {
     /// it to; none while that waits for the node's own proof, whose completion polls the stream.
     /// Read without building the trust, since every wake asked reads it of every pair.
     pub(crate) fn deadline(&self, local: &Local, now_ns: u64) -> Option<u64> {
-        // Judged by no point: a run that announced its stop, or a peer of the other disk mode.
-        if self.received.stopped || self.received.other_mode {
+        // Judged by no point: a run that announced its stop.
+        if self.received.stopped {
             return None;
         }
         let point = self.point()?;
@@ -901,9 +897,8 @@ impl Pair {
         local: &Local,
     ) -> (Option<Change>, bool) {
         // A run that announced its end is suspected from the announcement until the next run is
-        // heard: nothing of it is left to judge. One that speaks the other disk mode is judged by
-        // nothing it says, so by no point either, until it speaks this node's (`Refusal::OtherMode`).
-        if self.received.stopped || self.received.other_mode {
+        // heard: nothing of it is left to judge.
+        if self.received.stopped {
             return (None, false);
         }
         let at = match self.point() {
@@ -1069,27 +1064,7 @@ impl Pair {
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns, &context.local).0;
-        // A heartbeat of the other disk mode (kiln's CP-T2.2, Focal's condition 1): refused, typed,
-        // nothing taken from it, and the peer judged by no point while it speaks that mode.
-        if beat.apart != context.apart {
-            self.counts.other_mode = self.counts.other_mode.saturating_add(1);
-            // Told once, as the mismatch begins (`Change::ModeDiffers`).
-            if !self.received.other_mode {
-                self.received.other_mode = true;
-                changes[3] = Some(Change::ModeDiffers {
-                    peer,
-                    at_ns: arrival_ns,
-                });
-            }
-            return Err(Refusal::OtherMode);
-        }
-        if self.received.other_mode {
-            self.received.other_mode = false;
-            changes[3] = Some(Change::ModeAgrees {
-                peer,
-                at_ns: arrival_ns,
-            });
-        }
+        let other_mode = self.take_mode(peer, beat, arrival_ns, context, changes);
         if let Some(ended) = self.take_ended(peer, beat, arrival_ns, changes, taken) {
             return ended;
         }
@@ -1117,7 +1092,10 @@ impl Pair {
             return Err(Refusal::Stale);
         }
         let fresh_flush = beat.flush_age_ns <= beat.late_ns.saturating_add(beat.interval_ns);
-        if !context.apart && (beat.flushes <= self.received.flushes || !fresh_flush) {
+        // A heartbeat of the other disk mode is judged apart from its sender's disk: its flush
+        // proof, which that mode means otherwise, is not read (`take_mode`).
+        let apart = context.apart || other_mode;
+        if !apart && (beat.flushes <= self.received.flushes || !fresh_flush) {
             self.counts.unproven = self.counts.unproven.saturating_add(1);
             return Err(Refusal::Unproven);
         }
@@ -1168,7 +1146,9 @@ impl Pair {
             sent_ns: beat.sent_ns,
         });
         self.received.last_mapped = Some(mapped);
-        self.counts.taken = self.counts.taken.saturating_add(1);
+        if !other_mode {
+            self.counts.taken = self.counts.taken.saturating_add(1);
+        }
         // A heartbeat that ends a gap a freshness point judged is the one mistake that point can
         // make: its bound is charged, once. A peer's restart ends no gap a live peer left.
         if let Some(promise) = promise.filter(|_| first || lateness.is_some()) {
@@ -1184,10 +1164,54 @@ impl Pair {
         {
             self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
         }
-        taken.lateness = lateness;
+        // The node's pool is its evidence of its hosts' and paths' stalls: a sender of the other
+        // mode times its heartbeats by that mode's rule (today's waits on its flushes), so none of
+        // its feeds the pool; its own link configures from them as from any.
+        taken.lateness = lateness.filter(|_| !other_mode);
         taken.own = self.received.configuration.is_some();
         changes[2] = self.settle(peer, arrival_ns);
+        if other_mode {
+            return Err(Refusal::OtherMode);
+        }
         Ok(())
+    }
+
+    /// A heartbeat's disk mode (kiln's CP-T2.2, Focal's condition 1): whether it is of the other
+    /// mode than this node's. One of the other mode is judged apart from its sender's disk, taken
+    /// for its sender's process (its run, its arrival, its round trip) and refused for its disk
+    /// (`Refusal::OtherMode`): neither its flush proof nor its disk verdict is read, each of which
+    /// that mode means otherwise. So a peer of the other mode is never suspected for its disk by a
+    /// judge of today's mode, nor misread by one of the disk mode, and one that dies is suspected,
+    /// as every crashed process must be (completeness), so a group whose leader it was replaces
+    /// it. The owner is told once as the mismatch begins (`Change::ModeDiffers`) and once as it
+    /// ends (`Change::ModeAgrees`).
+    fn take_mode(
+        &mut self,
+        peer: PeerId,
+        beat: &Heartbeat,
+        arrival_ns: u64,
+        context: &Context<'_>,
+        changes: &mut [Option<Change>; 4],
+    ) -> bool {
+        let other = beat.apart != context.apart;
+        if other {
+            self.counts.other_mode = self.counts.other_mode.saturating_add(1);
+        }
+        if other != self.received.other_mode {
+            self.received.other_mode = other;
+            changes[3] = Some(if other {
+                Change::ModeDiffers {
+                    peer,
+                    at_ns: arrival_ns,
+                }
+            } else {
+                Change::ModeAgrees {
+                    peer,
+                    at_ns: arrival_ns,
+                }
+            });
+        }
+        other
     }
 
     /// A heartbeat that announces the end of the peer's run, or one of a run that announced its

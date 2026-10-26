@@ -406,6 +406,33 @@ or one every 100 ms), and answered nothing off a majority's disks; counted from 
 alone, the patience began a hand-over in 19 of 200 seeds with the leader's disk let go 3 ms after
 its followers', and spent one to three terms in 20 of 200 at one publish every 100 ms.
 
+**Switching the mode** (Focal's condition 1). The mode is the group's founding setting, each
+member's owner stating it from the group's one definition, as fates are stated (`Settings::disk`).
+A running group switches by a rolling restart, each member restarted in turn with the new setting.
+As in any rolling restart, its leader goes last, once the others run the new setting, so the group
+changes its leader once. While its members' modes differ:
+
+- **Safety holds.** Raft's safety rests on no liveness verdict, and each leader's commit rule is its
+  own. A leader in the disk mode answers what a majority's disks hold (condition 2's model,
+  hyper-check `tests/unpersisted.rs`); one in today's mode answers what its own disk and a
+  majority's hold.
+- **A mismatch is seen.** Heartbeats across the modes are refused for their disks
+  (`hyper_liveness::Refusal::OtherMode`) and counted (`PairReport::other_mode`). The owner is told
+  once as a peer's mode turns other and once as it agrees again (`Change::ModeDiffers`,
+  `Change::ModeAgrees`; `a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged`).
+- **No disk is misread, and the dead are replaced.** Each node judges a peer of the other mode
+  apart from its disk, by its heartbeats' arrivals and round trips alone, from its own measure of
+  them where it is alone in its mode; it reads neither their flush proof nor their disk verdict. A
+  live process of the other mode is not suspected for its disk. A dead one is suspected, and a
+  group whose leader it was elects another
+  (`a_dead_leader_in_a_group_of_two_disk_modes_is_replaced`: the leader alone in the disk mode, or a
+  follower alone in it, 8 seeds each, a new leader within twice the slowest the group takes in one
+  mode).
+- **A stalled disk in today's mode is still suspected.** A member in today's mode whose disk stalls
+  sends no heartbeat until a flush proves one, so it is suspected for its silence, as today's mode
+  suspects a stalled disk. Restart members onto healthy disks.
+- **The patience applies only on a leader in the disk mode.**
+
 ### 4.3 What a member opens with
 
 At open, from the log's view and the state machine's durable point `(index, term)`:

@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
+# that shows its checks catch it; no consumer enables it.
+mutants = ["hyper-raft/mutants"]
+
 [dependencies]
 hyper-block = { path = "../hyper-block" }
 hyper-liveness = { path = "../hyper-liveness" }

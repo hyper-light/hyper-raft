@@ -184,6 +184,9 @@ pub struct SimPath {
     reorders: bool,
     /// The loss process.
     loss: SimLoss,
+    /// How often a datagram is delivered twice, in parts per million: the copy after a delay of its
+    /// own, kept in the flow's order where the path keeps it.
+    duplicate_ppm: u32,
     /// The largest datagram the path carries; a larger one is dropped. `None` — no limit.
     mtu: Option<usize>,
     /// The bottleneck the path's datagrams are serialized through, if any.
@@ -203,6 +206,7 @@ impl SimPath {
         jitter_ns: 0,
         reorders: false,
         loss: SimLoss::NONE,
+        duplicate_ppm: 0,
         mtu: None,
         link: None,
     };
@@ -214,6 +218,7 @@ impl SimPath {
             jitter_ns,
             reorders: false,
             loss: SimLoss::NONE,
+            duplicate_ppm: 0,
             mtu: None,
             link: None,
         }
@@ -226,6 +231,7 @@ impl SimPath {
             jitter_ns,
             reorders: true,
             loss: SimLoss::NONE,
+            duplicate_ppm: 0,
             mtu: None,
             link: None,
         }
@@ -234,6 +240,15 @@ impl SimPath {
     /// This path, losing datagrams by `loss`.
     pub const fn with_loss(self, loss: SimLoss) -> SimPath {
         SimPath { loss, ..self }
+    }
+
+    /// This path, delivering `duplicate_ppm` datagrams in a million twice (a link's resend, a route
+    /// taken twice), the copy after a delay of its own. At 0 it draws nothing from the generator.
+    pub const fn with_duplicates(self, duplicate_ppm: u32) -> SimPath {
+        SimPath {
+            duplicate_ppm,
+            ..self
+        }
     }
 
     /// This path, dropping every datagram longer than `mtu` bytes.
@@ -317,6 +332,8 @@ pub struct SimFabricStats {
     pub dropped_unbound: u64,
     /// The largest backlog any link's queue held, in bytes.
     pub peak_queue_bytes: u64,
+    /// Datagrams a path's duplication sent a second time.
+    pub duplicated: u64,
 }
 
 /// A datagram the fabric holds until its arrival time.
@@ -503,6 +520,24 @@ impl SimFabric {
             arrival = arrival.max(*previous);
         }
         self.last_arrival.insert((from, path_dest), arrival);
+        if path.duplicate_ppm > 0 && chance(&mut self.rng, path.duplicate_ppm) {
+            let mut again = departure.saturating_add(path.draw(&mut self.rng));
+            if !path.reorders {
+                again = again.max(arrival);
+                self.last_arrival.insert((from, path_dest), again);
+            }
+            self.stats.duplicated = self.stats.duplicated.saturating_add(1);
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.saturating_add(1);
+            self.in_flight.insert(
+                (again, sequence),
+                InFlight {
+                    dest,
+                    bytes: bytes.clone(),
+                    from: wire_from,
+                },
+            );
+        }
         if arrival <= now {
             return self.arrive(dest, bytes, wire_from, now);
         }

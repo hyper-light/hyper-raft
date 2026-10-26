@@ -558,7 +558,10 @@ impl Node {
             }
             // The core judges processes alone: a disk's verdict is the shell's
             // (`hyper_durable::Replica::disk_slow`), and this member has none.
-            Change::DiskSlow { .. } | Change::DiskCaughtUp { .. } => return Ok(()),
+            Change::DiskSlow { .. }
+            | Change::DiskCaughtUp { .. }
+            | Change::ModeDiffers { .. }
+            | Change::ModeAgrees { .. } => return Ok(()),
         };
         heard(told).map(drop)
     }

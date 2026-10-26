@@ -620,6 +620,7 @@ impl Node {
                 }
                 Change::DiskSlow { .. } => heard(self.replica.disk_slow(peer))?,
                 Change::DiskCaughtUp { .. } => heard(self.replica.disk_caught_up(peer))?,
+                Change::ModeDiffers { .. } | Change::ModeAgrees { .. } => {}
             };
         }
         self.asked.changes = changes;

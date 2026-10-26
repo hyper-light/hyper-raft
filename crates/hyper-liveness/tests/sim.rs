@@ -328,6 +328,9 @@ struct Node {
     /// Each disk verdict its stream gave (`Change::DiskSlow`, `DiskCaughtUp`): the peer, whether
     /// slow, and the heartbeat's arrival.
     disks: Vec<(PeerId, bool, u64)>,
+    /// Each change of a peer's disk mode the stream told: the peer, whether its heartbeats turned
+    /// to the other mode (`Change::ModeDiffers`) or back, and when.
+    modes: Vec<(PeerId, bool, u64)>,
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
     /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
     believed: BTreeMap<PeerId, bool>,
@@ -420,6 +423,7 @@ impl Sim {
                     restarts: Vec::new(),
                     stops: Vec::new(),
                     disks: Vec::new(),
+                    modes: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
                     frozen_until: 0,
@@ -619,6 +623,9 @@ impl Sim {
                 // A disk's verdict leaves what the owner believes of the peer's process as it was.
                 Change::DiskSlow { peer, at_ns } => n.disks.push((peer, true, at_ns)),
                 Change::DiskCaughtUp { peer, at_ns } => n.disks.push((peer, false, at_ns)),
+                // A mode's mismatch leaves what the owner believes of the peer as it was.
+                Change::ModeDiffers { peer, at_ns } => n.modes.push((peer, true, at_ns)),
+                Change::ModeAgrees { peer, at_ns } => n.modes.push((peer, false, at_ns)),
                 // An announced stop: the peer held out as suspected until its next run (Mantle's).
                 Change::Stopped { peer, at_ns } => {
                     n.believed.insert(peer, true);
@@ -3687,8 +3694,10 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
 /// and 3 do not. Through ten of the same-mode pair's freshnesses every heartbeat node 1 takes from
 /// the others, and they from it, is refused (`Refusal::OtherMode`, counted in each pair's report),
 /// none is taken, and no node suspects or trusts a peer of the other mode; nodes 2 and 3 judge each
-/// other as ever. Started again in their mode, node 1 is taken, and killed after, it is suspected as
-/// any peer is.
+/// other as ever. Each pair across the modes is told the mismatch once, as it began
+/// (`Change::ModeDiffers`), and the pair of one mode never. Started again in their mode, node 1 is
+/// taken, its peers told once that its mode agrees again (`Change::ModeAgrees`), and killed after,
+/// it is suspected as any peer is.
 #[test]
 fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
     for world in [MACOS, BUSY, LINUX] {
@@ -3726,6 +3735,31 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                     report.other_mode,
                     report.taken,
                     sim.nodes[node].liveness.trust(peer)
+                );
+            }
+            // Each pair across the modes was told the mismatch once, as it began; a pair of one
+            // mode never.
+            let told = |sim: &Sim, node: usize, peer: PeerId| -> Vec<bool> {
+                sim.nodes[node]
+                    .modes
+                    .iter()
+                    .filter(|(of, ..)| *of == peer)
+                    .map(|(_, differs, _)| *differs)
+                    .collect()
+            };
+            for (node, peer) in [(0usize, 2u64), (0, 3), (1, 1), (2, 1)] {
+                assert_eq!(
+                    told(&sim, node, peer),
+                    vec![true],
+                    "{name} seed {seed}: node {} of peer {peer}: the mode's changes told",
+                    node + 1
+                );
+            }
+            for (node, peer) in [(1usize, 3u64), (2, 2)] {
+                assert!(
+                    told(&sim, node, peer).is_empty(),
+                    "{name} seed {seed}: node {} of peer {peer}, one mode, told a mode's change",
+                    node + 1
                 );
             }
             // The pair of one mode is judged by its own rules, today's flush proof: taken, never
@@ -3769,6 +3803,15 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                 })
             };
             sim.run_while(|sim| !trusted(sim), None);
+            for node in 1..3 {
+                assert_eq!(
+                    told(&sim, node, 1),
+                    vec![true, false],
+                    "{name} seed {seed}: node {} of node 1 started again in its mode: the mode's \
+                     changes told",
+                    node + 1
+                );
+            }
             let killed = sim.now;
             sim.nodes[0].alive = false;
             sim.run_until_suspected(0);

@@ -149,6 +149,9 @@ struct World {
     /// Each disk verdict a node's stream gave (`Change::DiskSlow`, `DiskCaughtUp`): when, the
     /// judge, the peer, and whether slow.
     disks: Vec<(u64, u64, u64, bool)>,
+    /// Each change of a peer's disk mode a node's stream told: when, the judge, the peer, and
+    /// whether its heartbeats turned to the other mode (`Change::ModeDiffers`) or back.
+    modes: Vec<(u64, u64, u64, bool)>,
     /// Each hand-over's order as it left (`MsgTimeoutNow`): when, the leader, and the heir it named.
     timeouts: Vec<(u64, u64, u64)>,
 }
@@ -276,6 +279,7 @@ impl World {
             broken: Vec::new(),
             votes: Vec::new(),
             disks: Vec::new(),
+            modes: Vec::new(),
             timeouts: Vec::new(),
         }
     }
@@ -336,6 +340,8 @@ impl World {
             Change::Stopped { peer, .. } => self.stops.push((at, *peer)),
             Change::DiskSlow { peer, at_ns } => self.disks.push((*at_ns, at, *peer, true)),
             Change::DiskCaughtUp { peer, at_ns } => self.disks.push((*at_ns, at, *peer, false)),
+            Change::ModeDiffers { peer, at_ns } => self.modes.push((*at_ns, at, *peer, true)),
+            Change::ModeAgrees { peer, at_ns } => self.modes.push((*at_ns, at, *peer, false)),
             Change::Trusted { .. } => {}
         }
     }
@@ -413,6 +419,18 @@ impl World {
                         }
                         Change::DiskCaughtUp { .. } => {
                             format!("{ms:9.3} n{id}: n{}'s disk caught up", change.peer())
+                        }
+                        Change::ModeDiffers { .. } => {
+                            format!(
+                                "{ms:9.3} n{id}: n{}'s heartbeats of the OTHER disk mode",
+                                change.peer()
+                            )
+                        }
+                        Change::ModeAgrees { .. } => {
+                            format!(
+                                "{ms:9.3} n{id}: n{}'s heartbeats of its disk mode again",
+                                change.peer()
+                            )
                         }
                         Change::Stopped { .. } => {
                             format!("{ms:9.3} n{id}: n{} announced its stop", change.peer())

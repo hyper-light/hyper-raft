@@ -289,6 +289,25 @@ pub enum Change {
         /// The heartbeat's arrival.
         at_ns: u64,
     },
+    /// The peer's heartbeats are of the other disk mode than this node's (kiln's CP-T2.2, Focal's
+    /// condition 1): each is refused (`Refusal::OtherMode`), nothing taken from it, until one of
+    /// this node's mode comes ([`Change::ModeAgrees`]). Told once as the mismatch begins, so that
+    /// a group left mixed is seen, not silent (focal maps it to a group event); meanwhile the peer
+    /// is judged by its heartbeats' arrivals alone, as a peer not yet heard is.
+    ModeDiffers {
+        /// The peer.
+        peer: PeerId,
+        /// The refused heartbeat's arrival.
+        at_ns: u64,
+    },
+    /// The peer's heartbeats are of this node's disk mode again, after [`Change::ModeDiffers`]:
+    /// taken as ever.
+    ModeAgrees {
+        /// The peer.
+        peer: PeerId,
+        /// The heartbeat's arrival.
+        at_ns: u64,
+    },
 }
 
 impl Change {
@@ -300,7 +319,9 @@ impl Change {
             | Self::Restarted { peer, .. }
             | Self::Stopped { peer, .. }
             | Self::DiskSlow { peer, .. }
-            | Self::DiskCaughtUp { peer, .. } => *peer,
+            | Self::DiskCaughtUp { peer, .. }
+            | Self::ModeDiffers { peer, .. }
+            | Self::ModeAgrees { peer, .. } => *peer,
         }
     }
 }
@@ -842,7 +863,7 @@ impl Liveness {
             local,
             apart: self.apart,
         };
-        let mut changes = [None, None, None];
+        let mut changes = [None, None, None, None];
         let mut taken = pair::Taken::default();
         let outcome = pair.take(from, &beat, arrival_ns, &context, &mut changes, &mut taken);
         for change in changes.into_iter().flatten() {

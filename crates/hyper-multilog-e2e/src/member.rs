@@ -585,7 +585,10 @@ impl Member {
             }
             // Each log's core judges processes alone: a disk's verdict is the shell's
             // (`hyper_durable::Replica::disk_slow`), and these members have none.
-            Change::DiskSlow { .. } | Change::DiskCaughtUp { .. } => Ok(()),
+            Change::DiskSlow { .. }
+            | Change::DiskCaughtUp { .. }
+            | Change::ModeDiffers { .. }
+            | Change::ModeAgrees { .. } => Ok(()),
         }
     }
 

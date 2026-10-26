@@ -1065,7 +1065,7 @@ impl Pair {
         beat: &Heartbeat,
         arrival_ns: u64,
         context: &Context<'_>,
-        changes: &mut [Option<Change>; 3],
+        changes: &mut [Option<Change>; 4],
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
         changes[0] = self.judge(peer, arrival_ns, &context.local).0;
@@ -1073,10 +1073,23 @@ impl Pair {
         // nothing taken from it, and the peer judged by no point while it speaks that mode.
         if beat.apart != context.apart {
             self.counts.other_mode = self.counts.other_mode.saturating_add(1);
-            self.received.other_mode = true;
+            // Told once, as the mismatch begins (`Change::ModeDiffers`).
+            if !self.received.other_mode {
+                self.received.other_mode = true;
+                changes[3] = Some(Change::ModeDiffers {
+                    peer,
+                    at_ns: arrival_ns,
+                });
+            }
             return Err(Refusal::OtherMode);
         }
-        self.received.other_mode = false;
+        if self.received.other_mode {
+            self.received.other_mode = false;
+            changes[3] = Some(Change::ModeAgrees {
+                peer,
+                at_ns: arrival_ns,
+            });
+        }
         if let Some(ended) = self.take_ended(peer, beat, arrival_ns, changes, taken) {
             return ended;
         }
@@ -1184,7 +1197,7 @@ impl Pair {
         peer: PeerId,
         beat: &Heartbeat,
         arrival_ns: u64,
-        changes: &mut [Option<Change>; 3],
+        changes: &mut [Option<Change>; 4],
         taken: &mut Taken,
     ) -> Option<Result<(), Refusal>> {
         let current = self.received.run == Some(beat.run);
@@ -1596,7 +1609,7 @@ mod tests {
             local: steady(),
             apart: false,
         };
-        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
         let arrival = until + MS;
         pair.take(2, &beat(7, 0), arrival, &context, &mut changes, &mut taken)
             .unwrap();
@@ -1646,7 +1659,7 @@ mod tests {
                     hold_ns: 50 * MS - 21 * MS,
                 });
             }
-            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
             pair.take(2, &heartbeat, arrival, &context, &mut changes, &mut taken)
                 .unwrap();
             latest = arrival;
@@ -1687,7 +1700,7 @@ mod tests {
         let mut theirs = beat(7, 0);
         theirs.sent_ns = now + 10 * us;
         let arrival = now + 30 * us;
-        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
         node.take(2, &theirs, arrival, &context, &mut changes, &mut taken)
             .unwrap();
         let sender = Sender {
@@ -1712,7 +1725,7 @@ mod tests {
         // The peer takes it 20 µs later, and suspects 15 ms after that.
         let mut peer = pair();
         let landed = ours.sent_ns + 20 * us;
-        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
         peer.take(1, &ours, landed, &context, &mut changes, &mut taken)
             .unwrap();
         let due = ours.sent_ns - ours.late_ns;
@@ -1786,7 +1799,7 @@ mod tests {
             local: steady(),
             apart: false,
         };
-        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
         let heard = last_due + 10_000;
         node.take(2, &beat(1, 0), heard, &context, &mut changes, &mut taken)
             .unwrap();
@@ -1872,7 +1885,7 @@ mod tests {
         // past the margin that evidence gives (a millisecond's deviation, an hour's exposure).
         for seq in 0..=1 {
             let arrival = seq * 10 * MS + if seq == 1 { 500 * MS } else { 0 };
-            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
             pair.take(
                 2,
                 &beat(7, seq),
@@ -1882,7 +1895,7 @@ mod tests {
                 &mut taken,
             )
             .unwrap();
-            assert_eq!(changes, [None, None, None]);
+            assert_eq!(changes, [None, None, None, None]);
             latest = arrival;
         }
         assert_eq!(pair.trust(), Trust::Unconfigured);
@@ -1925,7 +1938,7 @@ mod tests {
         let mut pair = pair();
         pair.election = Some(Duration::from_secs(1));
         for seq in 0..2 {
-            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
             pair.take(
                 2,
                 &beat(7, seq),

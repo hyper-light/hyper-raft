@@ -647,6 +647,12 @@ fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut Strin
             Entry::Told(Change::DiskCaughtUp { peer, at_ns }) => {
                 writeln!(out, "r {me} du {peer} {at_ns}")
             }
+            Entry::Told(Change::ModeDiffers { peer, at_ns }) => {
+                writeln!(out, "r {me} md {peer} {at_ns}")
+            }
+            Entry::Told(Change::ModeAgrees { peer, at_ns }) => {
+                writeln!(out, "r {me} ma {peer} {at_ns}")
+            }
             Entry::Holds { peer, trust } => {
                 writeln!(out, "r {me} h {peer} {}", trust_field(trust))
             }
@@ -756,6 +762,20 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
         ),
         "du" => (
             Entry::Told(Change::DiskCaughtUp {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "md" => (
+            Entry::Told(Change::ModeDiffers {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "ma" => (
+            Entry::Told(Change::ModeAgrees {
                 peer: number(2)?,
                 at_ns: number(3)?,
             }),

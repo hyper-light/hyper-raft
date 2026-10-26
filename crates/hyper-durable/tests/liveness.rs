@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::task::Waker;
 use std::time::Duration;
 
-use hyper_durable::{Disk, Output, Owner, Replica, Unbounded};
+use hyper_durable::{Bytes, Disk, Output, Owner, Replica, ReplicaError, Unbounded};
 use hyper_liveness::{
     Change, Liveness, Output as LiveOutput, Settings as LiveSettings, Write, is_liveness,
 };
@@ -60,7 +60,7 @@ const DEPTH: usize = 3;
 /// A millisecond.
 const MS: u64 = 1_000_000;
 
-type Member = Replica<SimStore, Kv, Unbounded>;
+type Member = Replica<SimStore, Kv, Bytes>;
 
 #[derive(Default)]
 struct Live {
@@ -83,7 +83,7 @@ impl LiveOutput for Live {
 
 struct Node {
     id: u64,
-    owner: Owner<SimStore, Kv, Unbounded>,
+    owner: Owner<SimStore, Kv, Bytes>,
     handle: hyper_durable::Handle,
     liveness: Liveness,
     /// When the stream's liveness write, out, is durable.
@@ -136,9 +136,13 @@ struct World {
     /// Its leaders apply their own entries before their writes of them are durable
     /// (`Config::apply_unpersisted`).
     ahead: bool,
-    /// How long a leader waits on a write of its own before it hands the lead on
-    /// (`Replica::set_disk_patience`).
-    patience: Option<Duration>,
+    /// The group's disk mode (`Settings::disk`): in `Disk::Apart` a leader's patience with its own
+    /// disk is the law's, its budget's room filling (`Replica::disk_fill`).
+    disk: Disk,
+    /// Each replica's budget, bytes (`How::budget`).
+    budget: u64,
+    /// Each proposal refused for room (`ReplicaError::Budget`): when, and the leader that refused it.
+    refused_for_room: Vec<(u64, u64)>,
     /// A timeline of what each node did from `from`, a line an event, kept while asked for.
     trace: Option<Trace>,
     /// Each Raft message a node sent that carried or depended on a term or vote its disk did not
@@ -204,9 +208,10 @@ fn breaks_promise(durable: (u64, u64), message: &Message, member: u64) -> bool {
 
 /// A replica's settings in the world: the cluster's, a leader applying its own entries before its
 /// write of them is durable where `ahead` (`Config::apply_unpersisted`, core step R-6).
-fn member_settings(id: u64, seed: u64, ahead: bool) -> hyper_durable::Settings {
+fn member_settings(id: u64, seed: u64, ahead: bool, disk: Disk) -> hyper_durable::Settings {
     let mut s = settings(id, seed);
     s.core.apply_unpersisted = ahead;
+    s.disk = disk;
     s
 }
 
@@ -224,14 +229,13 @@ impl World {
         };
         let nodes = (1..=3)
             .map(|id| {
-                let mut replica: Member = Replica::open(
-                    &member_settings(id, seed, how.apply_ahead),
+                let replica: Member = Replica::open(
+                    &member_settings(id, seed, how.apply_ahead, how.disk),
                     SimStore::new(DEPTH),
                     Kv::new(configuration.clone(), false),
-                    Unbounded,
+                    Bytes::new(how.budget()),
                 )
                 .unwrap();
-                replica.set_disk_patience(how.patience);
                 let mut owner = Owner::new(vec![Waker::noop().clone()]);
                 let handle = owner.insert(replica).map_err(|_| ()).unwrap();
                 let mut liveness = Liveness::new(LiveSettings {
@@ -274,7 +278,9 @@ impl World {
             one_log: false,
             apart: how.disk_apart,
             ahead: how.apply_ahead,
-            patience: how.patience,
+            disk: how.disk,
+            budget: how.budget(),
+            refused_for_room: Vec::new(),
             trace: None,
             broken: Vec::new(),
             votes: Vec::new(),
@@ -293,14 +299,13 @@ impl World {
         let disk = old.log_mut().disk.clone();
         let machine = old.machine().crashed();
         drop(old);
-        let mut replica: Member = Replica::open(
-            &member_settings(id, self.seed, self.ahead),
+        let replica: Member = Replica::open(
+            &member_settings(id, self.seed, self.ahead, self.disk),
             SimStore::from_disk(disk, DEPTH),
             machine,
-            Unbounded,
+            Bytes::new(self.budget),
         )
         .unwrap();
-        replica.set_disk_patience(self.patience);
         let mut owner = Owner::new(vec![Waker::noop().clone()]);
         let handle = owner.insert(replica).map_err(|_| ()).unwrap();
         let run = node.run + 1;
@@ -474,6 +479,9 @@ impl World {
             for (started, durable) in flushed {
                 node.liveness.on_durable(Write::Log, started, durable);
             }
+            // What waits on the node's disk, for its stream's own verdict (Focal's 5a).
+            node.liveness
+                .on_pending(node.owner.get(node.handle).unwrap().out_since());
             let replica = node.owner.get_mut(node.handle).unwrap();
             // The term and vote the node's disk holds as this turn's messages leave: nothing
             // becomes durable within a turn (`make_durable` above, at its start).
@@ -656,6 +664,18 @@ impl World {
             .flushing
             .map(|(started, durable)| (started, durable.max(end)));
         node.durable_at = node.durable_at.map(|due| due.max(end));
+    }
+
+    /// The node `id`'s device, stalled (`World::stall`), answers again at `at`: every write out on
+    /// it is durable then, no later than the stall would have held it.
+    fn release(&mut self, id: u64, at: u64) {
+        let node = &mut self.nodes[(id - 1) as usize];
+        node.held = node.held.min(at);
+        node.flushing = node
+            .flushing
+            .map(|(started, durable)| (started, durable.min(at).max(started)));
+        node.durable_at = node.durable_at.map(|due| due.min(at));
+        node.alarm = Some(node.alarm.map_or(at, |alarm| alarm.min(at)));
     }
 
     /// The next event, if one is due by `limit`; otherwise the clock moves to `limit`.
@@ -868,15 +888,17 @@ impl World {
             return false;
         };
         let node = &mut self.nodes[(leader - 1) as usize];
-        let ok = node
+        let proposed = node
             .owner
             .get_mut(node.handle)
             .unwrap()
-            .propose(Vec::new(), data.to_vec())
-            .is_ok();
+            .propose(Vec::new(), data.to_vec());
         node.owner.schedule(node.handle);
         node.alarm = Some(self.now);
-        ok
+        if let Err(ReplicaError::Budget(_)) = proposed {
+            self.refused_for_room.push((self.now, leader));
+        }
+        proposed.is_ok()
     }
 
     /// The leader proposes a change of its configuration: `kind` of `node`.
@@ -1477,6 +1499,16 @@ struct Stalled {
     off_majority: usize,
     /// The hand-overs the stall's leader's patience began.
     handed_over: u64,
+    /// The stall's leader's first hand-over order (`MsgTimeoutNow`), from the stall's start.
+    first_order_ns: Option<u64>,
+    /// Hand-over orders any other leader gave from the stall's start.
+    others_ordered: usize,
+    /// Proposals refused for room from the stall's start (`ReplicaError::Budget`), and the first,
+    /// from the stall's start.
+    refused_for_room: usize,
+    first_refusal_ns: Option<u64>,
+    /// The fill the stall's leader read as the stall began (`Replica::disk_fill`).
+    fill_ns: Option<u64>,
 }
 
 impl Stalled {
@@ -1507,8 +1539,9 @@ impl Stalled {
             "seed {}: leader {} term {}, ends {:?} ms, freshness {:.0} ms: {} terms spent, lead {}, \
              leaderless {:.0} ms; publishes p50 {:.1} p99 {:.1} p99.9 {:.1} max {:.1} ms, {} never \
              applied; offered in the stall {}, answered by its leader in it {}, the slowest {:.1} ms, \
-             never {}, the slowest ever {:.1} ms, off a majority's disks {}, hand-overs {}; \
-             suspicions [{}]",
+             never {}, the slowest ever {:.1} ms, off a majority's disks {}, hand-overs {} (the \
+             first ordered at {:?} ms, others' orders {}; the fill read at the stop {:?} ms), \
+             proposals refused for room {} (the first at {:?} ms); suspicions [{}]",
             self.seed,
             self.leader,
             self.term,
@@ -1529,6 +1562,11 @@ impl Stalled {
             unsigned(self.answer_most_ns),
             self.off_majority,
             self.handed_over,
+            self.first_order_ns.map(|ns| ns / MS),
+            self.others_ordered,
+            self.fill_ns.map(|ns| ns / MS),
+            self.refused_for_room,
+            self.first_refusal_ns.map(|ns| ns / MS),
             suspicions.join(", ")
         )
     }
@@ -1562,6 +1600,10 @@ fn stalled(seed: u64, how: How, ends: impl Fn(u64) -> [u64; 3]) -> Stalled {
             world.stall(id, from + end);
         }
     }
+    let fill_ns = world
+        .replica(leader.max(1))
+        .disk_fill()
+        .map(|fill| fill.as_nanos() as u64);
     let first = load
         .offered
         .partition_point(|offered| *offered < from.saturating_sub(1_000 * MS));
@@ -1657,6 +1699,22 @@ fn stalled(seed: u64, how: How, ends: impl Fn(u64) -> [u64; 3]) -> Stalled {
         }
     }
     let handed_over = world.replica(leader.max(1)).handed_over();
+    let first_order_ns = world
+        .timeouts
+        .iter()
+        .find(|(at, by, _)| *at >= from && *by == leader)
+        .map(|(at, ..)| at - from);
+    let others_ordered = world
+        .timeouts
+        .iter()
+        .filter(|(at, by, _)| *at >= from && *by != leader)
+        .count();
+    let refusals: Vec<u64> = world
+        .refused_for_room
+        .iter()
+        .filter(|(at, _)| *at >= from)
+        .map(|(at, _)| at - from)
+        .collect();
     Stalled {
         seed,
         leader,
@@ -1676,6 +1734,11 @@ fn stalled(seed: u64, how: How, ends: impl Fn(u64) -> [u64; 3]) -> Stalled {
         answer_most_ns,
         off_majority: load.off_majority,
         handed_over,
+        first_order_ns,
+        others_ordered,
+        refused_for_room: refusals.len(),
+        first_refusal_ns: refusals.first().copied(),
+        fill_ns,
     }
 }
 
@@ -1690,20 +1753,47 @@ struct How {
     /// The leader applies its own entries before its write of them is durable
     /// (`Config::apply_unpersisted`).
     apply_ahead: bool,
-    /// How long a leader waits on a write of its own before it hands the lead on
-    /// (`Replica::set_disk_patience`).
-    patience: Option<Duration>,
+    /// The group's disk mode (`Settings::disk`): in `Disk::Apart` each leader's patience with its
+    /// own disk is the law's, its budget's room filling (`Replica::disk_fill`).
+    disk: Disk,
+    /// Each replica's budget, bytes (`hyper_durable::Bytes`); none, one that refuses nothing the
+    /// world asks of it.
+    budget: Option<u64>,
+}
+
+impl How {
+    /// Each replica's budget, bytes.
+    fn budget(&self) -> u64 {
+        self.budget.unwrap_or(u64::MAX)
+    }
 }
 
 /// CP-T2.2 step 2's group: each node judging its peers' processes apart from their disks, its
-/// leader applying on its followers' disks while its own lags, and handing the lead on after 5 s
-/// of a write of its own out, past the 2 s stall the step's bar is.
+/// leader applying on its followers' disks while its own lags, and handing the lead on by the
+/// patience's law, at a budget of 64 MiB that the world's load (a publish a millisecond) fills in
+/// minutes, past the 2 s stall the step's bar is.
 const APART: How = How {
     one_log: false,
     disk_apart: true,
     apply_ahead: true,
-    patience: Some(Duration::from_secs(5)),
+    disk: Disk::Apart,
+    budget: Some(64 << 20),
 };
+
+/// A budget the world's load, a publish a millisecond, fills in about a second: 128 KiB, the
+/// group's own 15 KiB and a backlog of about a thousand entries, the core's slots doubling past the
+/// rest (`survey_of_the_patience`: the fill read at the stop 868 to 998 ms, the hand-over ordered
+/// 1,006 to 1,009 ms in, no proposal refused for room, 4 seeds).
+const SECOND_BUDGET: u64 = 128 << 10;
+
+/// A budget a publish every 100 ms fills in about ten seconds, the backlog's slots doubling past
+/// what the group's own leaves of it.
+const LIGHT_BUDGET: u64 = 24 << 10;
+
+/// A budget for a minute of stalls in turn: 1 MiB, about eight seconds of the world's load, the
+/// log uncompacted holding a minute of applied entries in it too (each entry's size counted, four
+/// bytes a slot, `Replica`'s `sizes`): at 128 KiB they alone filled every room by 15 s.
+const MINUTE_BUDGET: u64 = 1 << 20;
 
 /// The slowest answer a publish may take through a stall the group rides out: about twice the
 /// slowest the survey shows of a publish through one (5.3 ms, the leader judged apart).
@@ -2095,14 +2185,15 @@ fn judged_apart_a_hand_over_needs_no_vote_from_a_stalled_disk() {
 }
 
 /// CP-T2.2 step 2, Focal's condition 5: a leader whose disk stops hands the lead only to a voter
-/// whose disk isn't slow. The leader's disk stops for good and one follower's is held for 4 s, the
-/// leader's patience 1 s, under a publish a millisecond: the follower's own heartbeats say its disk
-/// is slow (`Change::DiskSlow`) before the patience ends, every hand-over the leader begins names
+/// whose disk isn't slow. The leader's disk stops for good and one follower's is held for 4 s, under
+/// a publish a millisecond that fills the leader's room in about a second (`SECOND_BUDGET`): the
+/// follower's own heartbeats say its disk is slow (`Change::DiskSlow`) before the patience ends,
+/// as it waits on a write, every hand-over the leader begins names
 /// the other follower, and that one leads once a second disk answers its campaign.
 #[test]
 fn judged_apart_a_hand_over_names_no_heir_whose_disk_is_slow() {
     let how = How {
-        patience: Some(Duration::from_secs(1)),
+        budget: Some(SECOND_BUDGET),
         ..APART
     };
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
@@ -2142,14 +2233,15 @@ fn judged_apart_a_hand_over_names_no_heir_whose_disk_is_slow() {
 }
 
 /// CP-T2.2 step 2, Focal's condition 5: with every other voter's disk slow, no hand-over begins
-/// and no term is spent. The leader's disk stops for good and both followers' are held for 4 s, the
-/// leader's patience 1 s, under a publish a millisecond: while both are held the leader names no
+/// and no term is spent. The leader's disk stops for good and both followers' are held for 4 s,
+/// under a publish a millisecond that fills the leader's room in about a second (`SECOND_BUDGET`):
+/// while both are held the leader names no
 /// heir (its patience finds none, `Replica::heirless`) and no member's term moves; once they
 /// answer, it hands the lead to one of them.
 #[test]
 fn judged_apart_no_hand_over_while_every_other_disk_is_slow() {
     let how = How {
-        patience: Some(Duration::from_secs(1)),
+        budget: Some(SECOND_BUDGET),
         ..APART
     };
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
@@ -2188,8 +2280,9 @@ fn judged_apart_no_hand_over_while_every_other_disk_is_slow() {
 }
 
 /// Focal's condition 6 on the disk mode: with every member's disk slow, no term is spent. Every
-/// member's disk stalls from one instant to a second past the leader's patience in the step's group
-/// (`APART`), under a publish a millisecond and under one every 100 ms, as on one disk the members
+/// member's disk stalls from one instant to a second past the leader's patience in the step's group,
+/// which the law ends as the leader's room fills (`SECOND_BUDGET`; `LIGHT_BUDGET` for the light
+/// load), under a publish a millisecond and under one every 100 ms, as on one disk the members
 /// share (Focal's doc 34): let go together, at doc 34's spread (1 and 3 ms apart, the leader's first
 /// and last) and at a journal's (150 and 300 ms apart, the leader's first). The leader's patience ends with both
 /// followers' disks judged slow, so it names no heir (`Replica::heirless`) and begins no hand-over,
@@ -2200,7 +2293,6 @@ fn judged_apart_no_hand_over_while_every_other_disk_is_slow() {
 /// alone slow past its patience, it may begin a hand-over to a follower heard caught up.
 #[test]
 fn judged_apart_every_disk_slow_past_the_patience_spends_no_term() {
-    let patience = APART.patience.unwrap().as_nanos() as u64;
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
     let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
     // Each shape's ends past the stall's own, the leader's and then its followers', and its load: a
@@ -2223,8 +2315,17 @@ fn judged_apart_every_disk_slow_past_the_patience_spends_no_term() {
     ];
     let mut failed = Vec::new();
     for (shape, spread, every_ns) in shapes {
+        // Each load's budget, filled in about a second, or ten under the light load.
+        let how = How {
+            budget: Some(if every_ns > MS {
+                LIGHT_BUDGET
+            } else {
+                SECOND_BUDGET
+            }),
+            ..APART
+        };
         for seed in first..first + seeds {
-            let mut world = World::with(seed, APART);
+            let mut world = World::with(seed, how);
             world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
             let mut load = Load::default();
             let settled = world.now + 2_000 * MS;
@@ -2237,12 +2338,26 @@ fn judged_apart_every_disk_slow_past_the_patience_spends_no_term() {
             );
             load.watch = leader;
             let from = world.now;
-            let end = from + patience + 1_000 * MS;
+            // Every disk stalls until a second past the leader's patience, which the law ends as
+            // its room fills: held with no end until it has, then let go at the shape's spread.
             let members = [leader, leader % 3 + 1, (leader + 1) % 3 + 1];
+            for member in members {
+                world.stall(member, u64::MAX);
+            }
+            let cap = from + 600_000 * MS;
+            while world.now < cap
+                && world.replica(leader).heirless() == heirless_before
+                && world.replica(leader).handed_over() == handed_before
+            {
+                let step = world.now + MS;
+                world.run_loaded(step, every_ns, &mut load);
+            }
+            let patience = world.now - from;
+            let end = world.now + 1_000 * MS;
             let mut ends = [0; 3];
             for (member, after) in members.iter().zip(spread) {
                 ends[(member - 1) as usize] = end + after;
-                world.stall(*member, end + after);
+                world.release(*member, end + after);
             }
             let mut sorted = ends;
             sorted.sort_unstable();
@@ -2332,17 +2447,19 @@ fn judged_apart_every_disk_slow_past_the_patience_spends_no_term() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// CP-T2.2 step 2: a leader whose disk stops for good, in a group whose patience is 1 s, hands the
-/// lead to a follower, and every publish is applied: a disk that stops costs a planned hand-over,
-/// not a leader that holds a lead it cannot keep durable. A hand-over the core gives up is begun
-/// again (seeds 3 and 6 begin two). The heir's campaign may take a second term: it skips pre-vote
-/// on the core's word, and its ballot's round (the quorum's round trip and one flush,
-/// `hyper_timing::Ballot`) can end before a vote that waited on the voter's flush comes (seed 1:
-/// 0.2 ms after it), so the test allows two terms and no more.
+/// Focal's condition 5, the fill test (kiln CP-T2.2): a leader whose disk stops for good, under a
+/// publish a millisecond that fills its budget's room in about a second (`SECOND_BUDGET`), hands
+/// the lead on before any proposal is refused for room, by the patience's law, and the group goes on
+/// with every publish applied. One hand-over: the lead moves once, to an heir whose disk answers,
+/// which orders none; the core may give up a transfer and the leader order it again (the old test's
+/// seeds 3 and 6), and the heir's campaign may take a second term (it skips pre-vote on the core's
+/// word, its ballot's round able to end before a vote that waited on the voter's flush: seed 1,
+/// 0.2 ms), so two orders and two terms are allowed and no more. No proposal at all is refused for
+/// room, before the hand-over or after: the heir's room is its own.
 #[test]
-fn judged_apart_a_leaders_disk_that_stops_costs_one_hand_over() {
+fn judged_apart_a_leaders_disk_that_stops_hands_over_before_its_room_fills() {
     let how = How {
-        patience: Some(Duration::from_secs(1)),
+        budget: Some(SECOND_BUDGET),
         ..APART
     };
     let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
@@ -2364,11 +2481,136 @@ fn judged_apart_a_leaders_disk_that_stops_costs_one_hand_over() {
             outcome.lost
                 && (1..=2).contains(&outcome.terms)
                 && (1..=2).contains(&outcome.handed_over)
-                && outcome.unapplied == 0,
+                && outcome.first_order_ns.is_some()
+                && outcome.others_ordered == 0
+                && outcome.refused_for_room == 0
+                && outcome.unapplied == 0
+                && outcome.off_majority == 0,
             "{}",
             outcome.line()
         );
     }
+}
+
+/// Focal's condition 5, the alternating stalls (kiln CP-T2.2): at most one forced hand-over a fill
+/// time, less a hand-over, however the group's disks stall in turn; no doubling is needed for it.
+/// For 60 s under a publish a millisecond (`MINUTE_BUDGET`), each leader's disk stalls as it takes
+/// the lead, the one before answering again, the worst turn there is: its backlog fills its room
+/// from the moment it leads. The next hand-over its patience orders comes no sooner than the fill
+/// it read as it took the lead, less the hand-over's time it read then, since its own backlog has to
+/// fill its room first, its disk not slow when it was named heir. Every publish is applied, none is
+/// answered off a majority's disks, no proposal is refused for room, and no term is spent but by a
+/// hand-over (two at most each, as in the fill test).
+#[test]
+fn judged_apart_disks_stalling_in_turn_hand_over_at_most_once_a_fill_time() {
+    let how = How {
+        budget: Some(MINUTE_BUDGET),
+        ..APART
+    };
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 8);
+    let mut failed = Vec::new();
+    for seed in first..first + seeds {
+        let mut world = World::with(seed, how);
+        world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+        let mut load = Load::default();
+        let settled = world.now + 2_000 * MS;
+        world.run_loaded(settled, MS, &mut load);
+        let term = (1..=3u64).map(|id| world.replica(id).term()).max().unwrap();
+        let from = world.now;
+        let until = from + 60_000 * MS;
+        // Each leader as it took the lead: when, who, and the fill and hand-over it read then.
+        let mut leads: Vec<(u64, u64, Option<Duration>, Option<Duration>)> = Vec::new();
+        let mut held: Option<u64> = None;
+        while world.now < until {
+            if let Some(leader) = world.leader()
+                && held != Some(leader)
+            {
+                if let Some(before) = held {
+                    world.release(before, world.now);
+                }
+                world.stall(leader, until);
+                held = Some(leader);
+                let replica = world.replica(leader);
+                leads.push((
+                    world.now,
+                    leader,
+                    replica.disk_fill(),
+                    replica.hand_over_time(),
+                ));
+            }
+            let step = world.now + MS;
+            world.run_loaded(step, MS, &mut load);
+        }
+        if let Some(last) = held {
+            world.release(last, world.now);
+        }
+        // Every publish offered in the minute, given a quiet period to be applied: the load goes on
+        // through it.
+        let offered = load.offered.len();
+        let drained = world.now + world.quiet();
+        world.run_loaded(drained, MS, &mut load);
+        // Each leadership's first order, from its start.
+        let mut short = Vec::new();
+        let mut orders = 0u64;
+        for (index, (began, leader, fill, hand_over)) in leads.iter().enumerate() {
+            let ended = leads.get(index + 1).map_or(until, |next| next.0);
+            let Some(ordered) = world
+                .timeouts
+                .iter()
+                .find(|(at, by, _)| (*began..ended).contains(at) && by == leader)
+                .map(|(at, ..)| at - began)
+            else {
+                continue;
+            };
+            orders += 1;
+            let least = fill.zip(*hand_over).map_or(0, |(fill, hand_over)| {
+                fill.saturating_sub(hand_over).as_nanos() as u64
+            });
+            if ordered < least {
+                short.push((*leader, ordered / MS, least / MS));
+            }
+        }
+        let terms = (1..=3u64).map(|id| world.replica(id).term()).max().unwrap() - term;
+        let refused = world
+            .refused_for_room
+            .iter()
+            .filter(|(at, _)| *at >= from)
+            .count();
+        let unapplied = load.applied[..offered]
+            .iter()
+            .filter(|applied| applied.is_none())
+            .count();
+        let line = format!(
+            "seed {seed}: {} leaderships in 60 s, {orders} hand-overs ordered, {terms} terms; \
+             each leadership (ms from the stalls' start, leader, fill and hand-over read as it \
+             led, ms) {:?}; ordered sooner than the fill less a hand-over (leader, ms, least ms) \
+             {short:?}; proposals refused for room {refused}, publishes never applied \
+             {unapplied}, answered off a majority's disks {}",
+            leads.len(),
+            leads
+                .iter()
+                .map(|(at, leader, fill, hand_over)| (
+                    (at - from) / MS,
+                    *leader,
+                    fill.map(|f| f.as_millis()),
+                    hand_over.map(|h| h.as_millis())
+                ))
+                .collect::<Vec<_>>(),
+            load.off_majority
+        );
+        println!("{line}");
+        if !short.is_empty()
+            || orders < 2
+            || terms > 2 * orders
+            || refused > 0
+            || unapplied > 0
+            || load.off_majority > 0
+        {
+            failed.push(line);
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// CP-T2.2 step 2's bar: a 2 s stall of the leader's disk alone over 10,000 seeds in the step's
@@ -2466,10 +2708,112 @@ fn a_dead_leader_in_a_group_of_two_disk_modes_is_replaced() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// Focal's 5b on the disk mode (kiln CP-T2.2): a replica keeps a disk's verdict only for a member
+/// its configuration names, and lets it go as the member leaves; bounded by the configuration, not by
+/// the liveness peers. A verdict for a member no configuration names is kept by none; one for a
+/// follower is kept, and gone once the follower's removal is applied, at every member.
+#[test]
+fn a_disk_verdict_is_kept_for_the_configurations_members_alone() {
+    let mut world = World::with(0, APART);
+    world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+    let leader = world.leader().unwrap();
+    let removed = if leader == 3 { 2 } else { 3 };
+    for id in 1..=3u64 {
+        let node = &mut world.nodes[(id - 1) as usize];
+        let replica = node.owner.get_mut(node.handle).unwrap();
+        replica.disk_slow(9).unwrap();
+        assert!(
+            !replica.disk_is_slow(9),
+            "n{id}: a verdict for a member no configuration names"
+        );
+        if id != removed {
+            replica.disk_slow(removed).unwrap();
+            assert!(replica.disk_is_slow(removed), "n{id}: a member's verdict");
+        }
+    }
+    assert!(world.change(ConfChangeType::RemoveNode, removed));
+    // The two that stay apply the removal; the removed one need not hear of it.
+    world.run_until(|w| {
+        (1..=3u64)
+            .filter(|id| *id != removed)
+            .all(|id| !w.replica(id).configuration().voters.contains(&removed))
+    });
+    for id in (1..=3u64).filter(|id| *id != removed) {
+        assert!(
+            !world.replica(id).disk_is_slow(removed),
+            "n{id} kept the verdict of a member that left"
+        );
+    }
+}
+
+/// What the patience's law reads in the step's group, by budget: the leader's disk stops for good
+/// under a publish a millisecond, after 2 s of the load, and the survey prints, a line a seed and
+/// budget, what the leader held, the fill and hand-over times it read at the stop, when it ordered
+/// its first hand-over and when a proposal was first refused for room, and the heir's fill once it
+/// led. A survey, not a check: run with `--ignored --nocapture`.
+#[test]
+#[ignore = "a survey of the patience's law for CP-T2.2, not a check"]
+fn survey_of_the_patience() {
+    let first = support::count("HYPER_DURABLE_LIVENESS_SEED", 0);
+    let seeds = support::count("HYPER_DURABLE_STALL_SEEDS", 4);
+    for budget in [64u64 << 10, 128 << 10, 256 << 10, 512 << 10] {
+        for seed in first..first + seeds {
+            let how = How {
+                budget: Some(budget),
+                ..APART
+            };
+            let mut world = World::with(seed, how);
+            world.run_until(|w| w.leader().is_some() && (1..=3).all(|peer| w.judged(peer)));
+            let mut load = Load::default();
+            let settled = world.now + 2_000 * MS;
+            world.run_loaded(settled, MS, &mut load);
+            let leader = world.leader().unwrap();
+            let from = world.now;
+            world.stall(leader, from + 600_000 * MS);
+            world.run_loaded(from + 20 * MS, MS, &mut load);
+            let read = |w: &World, id: u64| {
+                let r = w.replica(id);
+                (
+                    r.charged(),
+                    r.disk_fill().map(|f| f.as_millis()),
+                    r.hand_over_time().map(|h| h.as_micros()),
+                )
+            };
+            let at_stop = read(&world, leader);
+            world.run_loaded(from + 10_000 * MS, MS, &mut load);
+            let ordered = world
+                .timeouts
+                .iter()
+                .find(|(at, by, _)| *at >= from && *by == leader)
+                .map(|(at, _, to)| ((at - from) / MS, *to));
+            let refused = world
+                .refused_for_room
+                .iter()
+                .find(|(at, _)| *at >= from)
+                .map(|(at, by)| ((at - from) / MS, *by));
+            let heir = world.leader().unwrap_or(0);
+            println!(
+                "budget {} KiB, seed {seed}: leader n{leader} at the stop (held, fill ms, hand-over \
+                 us) {at_stop:?}; first hand-over (ms, heir) {ordered:?}; first refusal for room \
+                 (ms, leader) {refused:?}; leader at 10 s n{heir} {:?}; hand-overs begun {}",
+                budget >> 10,
+                if heir > 0 {
+                    Some(read(&world, heir))
+                } else {
+                    None
+                },
+                world.replica(leader).handed_over()
+            );
+        }
+    }
+}
+
 /// Focal's condition 1: the group's disk mode is one setting. A replica opened with
-/// `Settings::disk` set to `Disk::Apart` applies ahead of its own disk (`Config::apply_unpersisted`)
-/// and states the mode, which its owner sets the node's stream to (`Replica::disk`); one opened with
-/// the default does neither, and the core's own `apply_unpersisted`, core step R-6 alone, is kept.
+/// `Settings::disk` set to `Disk::Apart` applies ahead of its own disk (`Config::apply_unpersisted`),
+/// states the mode, which its owner sets the node's stream to (`Replica::disk`), and keeps the
+/// patience's law, no time stated (condition 5: a hand-over's time before any is timed, zero before
+/// its timing is measured); one opened with the default does none of it, and the core's own
+/// `apply_unpersisted`, core step R-6 alone, is kept. A budget that refuses nothing gives no fill.
 #[test]
 fn the_disk_mode_is_one_setting() {
     let configuration = ConfState {
@@ -2477,24 +2821,36 @@ fn the_disk_mode_is_one_setting() {
         ..ConfState::default()
     };
     let open = |disk: Disk, ahead: bool| -> Member {
-        let mut settings = member_settings(1, 0, ahead);
-        settings.disk = disk;
         Replica::open(
-            &settings,
+            &member_settings(1, 0, ahead, disk),
             SimStore::new(DEPTH),
             Kv::new(configuration.clone(), false),
-            Unbounded,
+            Bytes::new(u64::MAX),
         )
         .unwrap()
     };
-    let patience = Duration::from_secs(5);
-    let apart = open(Disk::Apart { patience }, false);
+    let apart = open(Disk::Apart, false);
     assert!(apart.core().raft.config().apply_unpersisted);
-    assert_eq!(apart.disk(), Disk::Apart { patience });
+    assert_eq!(apart.disk(), Disk::Apart);
     assert!(apart.disk().apart());
+    assert_eq!(apart.hand_over_time(), Some(Duration::ZERO));
+    assert_eq!(apart.disk_fill(), None, "nothing grows yet");
     let flushed = open(Disk::Flushed, false);
     assert!(!flushed.core().raft.config().apply_unpersisted);
     assert!(!flushed.disk().apart());
+    assert_eq!(flushed.hand_over_time(), None);
+    let unbounded: Replica<SimStore, Kv, Unbounded> = Replica::open(
+        &member_settings(1, 0, false, Disk::Apart),
+        SimStore::new(DEPTH),
+        Kv::new(configuration.clone(), false),
+        Unbounded,
+    )
+    .unwrap();
+    assert_eq!(
+        unbounded.disk_fill(),
+        None,
+        "an unbounded budget has no room to fill"
+    );
     assert!(
         open(Disk::Flushed, true)
             .core()

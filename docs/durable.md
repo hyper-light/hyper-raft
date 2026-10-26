@@ -380,31 +380,77 @@ committed what it applied, and its shorter log cannot elect it; §4.3 opens it.
 apart from its disk (`hyper_liveness::Liveness::set_disk_apart`, `docs/timing.md` §2.8), a leader
 whose own disk stalls keeps its lead, its appends leaving with no write of its own (`take_light`),
 its followers' durable answers committing, and applies and answers on their disks with this
-section's rule. The group states the mode once (`Settings::disk`, `Disk::Apart { patience }`): open
-takes the core's `apply_unpersisted` and the leader's patience from it, and the owner sets the node's
-liveness stream to it (`Replica::disk`), so its members never differ in it, and a member of the
-other mode is refused by its heartbeats, typed (`hyper_liveness::Refusal::OtherMode`). A disk that never comes back would then hold a lead it cannot keep durable, its
-unpersisted entries growing to the core's bound, so the shell bounds its patience: a leader whose
-oldest write has been out past it (`Replica::set_disk_patience`, none by default, a deadline the
-owner is woken at) hands the lead to the voter that holds most of its log, of those its detectors
-trust whose disks they don't judge slow (`Replica::disk_slow`, from each peer's own heartbeats,
-`hyper_liveness::Change::DiskSlow`), once such a voter has been there as long (`TimeoutNow`, which
-leaves without a write of its own), and begins again a hand-over the core gives up while the write
-is still out (`Replica::handed_over` counts them). With no such voter it names none
+section's rule. The group states the mode once (`Settings::disk`, `Disk::Apart`): open takes the
+core's `apply_unpersisted` and the law of the leader's patience from it, and the owner sets the
+node's liveness stream to it (`Replica::disk`), so its members never differ in it, and a member of
+the other mode is refused by its heartbeats, typed (`hyper_liveness::Refusal::OtherMode`).
+
+**The patience is a law** (Focal's condition 5; `src/patience.rs`). A stalled disk costs the group
+nothing until the backlog it doesn't hold fills the room the leader's budget has left and its
+proposals are refused, and a hand-over restores no commit the stalled disk blocks, every majority
+needing that disk. So a leader hands the lead on once its backlog would fill its room within a
+hand-over, and no time is stated. Each part is measured:
+
+- the room: the budget's own allowance (`Budget::room`, the group's, never a room other groups'
+  replicas share; `None` for a budget that refuses nothing, whose patience never ends for memory),
+  and the entries the core takes not yet durable before it refuses one (`Limits::unstable_entries`);
+- the entries the backlog takes before a proposal is refused, reckoned as the core holds them: each
+  its payload, at the mean of those it holds, and its slot, the core's `Vec` of slots doubling when
+  full and charged at once (`patience::entries_to_fill`). Reserving the next doubling's room at all
+  times instead handed the lead on a doubling early, half the patience gone;
+- the backlog's growth, entries a second at the tail of its rate: RFC 6298's bound,
+  `smoothed + 4 · deviation`, over the rate measured over each wait on the disk a completion ended,
+  or the rate of the wait under way where it is faster, so that a burst counts as it comes;
+- the hand-over's time, from the leader's order to the first commit of a later term it sees, at the
+  same bound over the hand-overs it ordered (`Replica::hand_over_time`); before any, the election
+  its timing law expects and that election's round (`hyper_raft::Timing`).
+
+Zero growth fills nothing and sets no deadline, and every product and quotient is checked. The
+patience ends a hand-over's time before the room would fill at the growth (`Replica::disk_fill`),
+and not before a hand-over's time has passed after both the leader's oldest write out and a voter
+there to take the lead: a disk that answers sooner than a hand-over could begins none, and neither
+does an heir come a moment before the leader's own disk answers (Focal's condition 6). At its end
+the leader hands the lead to the voter that holds most of its log, of those its detectors trust
+whose disks they don't judge slow (`Replica::disk_slow`, from each peer's own heartbeats,
+`hyper_liveness::Change::DiskSlow`; kept for the members the configuration names, let go as one
+leaves it), with `TimeoutNow`, which leaves without a write of its own, and orders again a hand-over
+the core gives up (`Replica::handed_over` counts them). With no such voter it names none
 (`Replica::heirless` counts the drives): an heir whose disk is slow could neither keep the lead's
-writes nor win its campaign, whose vote waits on its disk. The patience is with its disk lagging a
-voter's that could lead, so while every other disk is slow too, as when the members share one, the
-leader waits on its own as long as on theirs, and a voter's disk that answers a moment before its
-own is no cause to hand over. A stall shorter than the patience costs nothing: in the liveness
-harness, a 2 s stall of the leader's disk with a patience of 5 s started no election over 10,000
-seeds, and one that never ends, with a patience of 1 s, hands the lead on at its patience, its
-heir's campaign taking one term or two (the second where the heir's ballot round ended before a vote
-that waited on the voter's flush came). Every member's disk held a second past a patience of 5 s
-spent no term and began no hand-over over 200 seeds of each shape (let go together, 1 and 3 ms
-apart the leader's first or last, 150 and 300 ms apart the leader's first; a publish a millisecond,
-or one every 100 ms), and answered nothing off a majority's disks; counted from the leader's write
-alone, the patience began a hand-over in 19 of 200 seeds with the leader's disk let go 3 ms after
-its followers', and spent one to three terms in 20 of 200 at one publish every 100 ms.
+writes nor win its campaign, whose vote waits on its disk. Nothing doubles: a second hand-over needs
+the new leader's own backlog to fill its room, its disk not slow when it was named, so a group hands
+over at most once a fill time, less a hand-over, however its disks stall in turn.
+
+**A full budget still drains.** Its room gone, a replica refuses each input it would have to hold
+(focal's R28, §6), and three things it held kept it full for good once a stall had filled it, the
+liveness harness found, so each is undone. A reservation the budget refuses is asked again once the
+core has given back the room it holds spare (`Raft::trim`): a backlog's slots and a burst's message
+queues stay with the member once they drain, kept for the next one (core step R-4), and a member
+whose disk let go held them, empty, past its budget, refusing the entries it lacked. An answer to
+what the member asked (an append's, a heartbeat's, a vote's), which brings the core nothing it keeps
+and is answered with nothing, is taken whatever the room (`Replica::step`): a leader whose stalled
+disk had filled its room heard no acknowledgement again, and held its lead and its room though an
+heir had come. A request is reserved for as before: its answer waits behind the writes out, and
+taken with no room under a held disk, the answers piled up past the budget (777 KB of a member's
+128 KiB).
+
+**What it measured** (the liveness harness, `tests/liveness.rs`, a publish a millisecond):
+
+- a 2 s stall of the leader's disk at a budget of 64 MiB, which the load fills in minutes, started
+  no election over 10,000 seeds, every publish offered in it answered, the slowest in 5.2 ms, and
+  none off a majority's disks (`judged_apart_ten_thousand_stalls_of_the_leaders_disk_start_no_election`);
+- at a budget the load fills in about a second (128 KiB), a leader whose disk stops hands over before
+  any proposal is refused for room: its fill read at the stop 0.87 to 1.0 s, its order 1,006 to
+  1,009 ms in, no proposal refused in the run (8 seeds,
+  `judged_apart_a_leaders_disk_that_stops_hands_over_before_its_room_fills`);
+- each leader's disk stalled as it took the lead, for 60 s at 1 MiB: 7 hand-overs a seed, about
+  8.1 s apart, none sooner than the fill less a hand-over the new leader read as it took the lead, no
+  proposal refused for room, every publish applied, none answered off a majority's disks, at most
+  two terms a hand-over (8 seeds, `judged_apart_disks_stalling_in_turn_hand_over_at_most_once_a_fill_time`);
+- every member's disk held a second past the leader's patience (the law's, its room filling) spent
+  no term and began no hand-over in each shape of condition 6 (let go together, 1 and 3 ms apart the
+  leader's first or last, 150 and 300 ms apart the leader's first; a publish a millisecond, or one
+  every 100 ms at 24 KiB), answered nothing off a majority's disks, and answered every publish
+  offered in the stall after (8 seeds each).
 
 **Switching the mode** (Focal's condition 1). The mode is the group's founding setting, each
 member's owner stating it from the group's one definition, as fates are stated (`Settings::disk`).
@@ -1459,7 +1505,9 @@ directory once, at create.
   for their apply, which an owner bounding reads counts beside the core's) and `budget_mut` (an
   owner whose budget charges by lane says which before a call); and on ticks (§8), `tick`, `beat`,
   `set_randomized_election_timeout`, `set_patience`; and a leader's patience with its own disk,
-  `set_disk_patience`, and the hand-overs it began, `handed_over` (§4.2).
+  the law's (§4.2): `disk_fill`, `hand_over_time` and `hand_overs_timed`, the hand-overs it began,
+  `handed_over`, and `out_since`, its oldest write out, which its owner tells the node's liveness
+  stream (`Driven::out_since`, `hyper_liveness::Liveness::on_pending`).
   `Settings::elections` is stated by every owner, with no default. Every call runs inside the unwind boundary. A drive takes the log's answers first and
   only then, applies what the fence allows, one page at most (§2.2), takes at most one `Ready`
   (§7's quantum), and writes the
@@ -1473,7 +1521,11 @@ directory once, at create.
 - **`Owner`** (`src/owner.rs`): an arena by generational handle, one waker a slot made by the
   embedder, turns by deficit round robin with a quantum of one `Ready`. The crate spawns nothing.
 - **`Budget`**: reserved before an input, settled to the replica's resident bytes after each call;
-  `Unbounded` compiles both out.
+  `Unbounded` compiles both out. Its `room`, the free bytes of the group's own allowance (`None`
+  unbounded), is what a leader's patience in the disk mode weighs its backlog against (§4.2); a
+  reservation it refuses is asked again once the core gave back its spare room (`Raft::trim`), and
+  an answer to what the member asked is taken whatever the room (§4.2, "A full budget still
+  drains").
 
 What waits on core steps not built:
 

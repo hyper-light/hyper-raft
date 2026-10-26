@@ -409,12 +409,21 @@ pub struct Liveness {
     asked: Option<u64>,
     late_most: u64,
     flushes: Flushes,
+    /// Of those flushes, the ones within their tail as each came: the sender's floor in the disk
+    /// mode, whose heartbeats wait on no flush, so a stall's is no measure of what one costs.
+    steady: Flushes,
     /// The same flushes' tail, RFC 6298's bound over them: what the node's own wait on its disk is
     /// judged against in the disk mode (kiln's CP-T2.2).
     flush_tail: FlushTail,
-    /// In the disk mode, this node's own disk is slow: it has waited on it past both `flush_tail`
-    /// and `widest_freshness`.
+    /// In the disk mode, this node's own disk is slow: its oldest write not yet durable has waited
+    /// past both `flush_tail` and `widest_freshness`, and it stays slow until that wait is back
+    /// under the smoothed flush.
     own_disk_slow: bool,
+    /// When the oldest write on the node's log not yet durable was submitted, as its owner said
+    /// ([`on_pending`](Self::on_pending)); none when none is out.
+    pending: Option<u64>,
+    /// When the stream asked the liveness write that is out, if one is: a write pending as well.
+    flush_asked: Option<u64>,
     /// The widest freshness its pairs held at the last poll: how long its detectors trust a peer
     /// past its latest heartbeat, what a stall of the disk's would have been suspected after.
     widest_freshness: Option<Duration>,
@@ -556,7 +565,7 @@ fn send(
         return false;
     }
     match pair.send(sender, now_ns, message) {
-        pair::Sent::Message(length, lateness, probe) => {
+        pair::Sent::Message(length, lateness) => {
             if let Some(message) = message.get(..length) {
                 out.heartbeat(peer, message);
             }
@@ -568,9 +577,10 @@ fn send(
             // Its next slot already due (the interval fell while the stream was behind): the
             // flush that proves it is asked now, and its completion polls the stream. Left to a
             // wake, it asked none, and only a peer's heartbeat polled it again: a node that heard
-            // none sent nothing more. In the disk mode a probe is asked where nothing became
-            // durable in the heartbeat's slot, so the next is fresh on a disk that answers.
-            probe || pair.next_due().is_some_and(|due| due <= now_ns)
+            // none sent nothing more. In the disk mode nothing else asks one: a heartbeat's slot in
+            // which nothing became durable asks no probe, which was a flush an interval on an idle
+            // node (Focal's 5a).
+            pair.next_due().is_some_and(|due| due <= now_ns)
         }
         pair::Sent::NeedsFlush => true,
         pair::Sent::Nothing => false,
@@ -620,8 +630,11 @@ impl Liveness {
             asked: None,
             late_most: 0,
             flushes: Flushes::new(),
+            steady: Flushes::new(),
             flush_tail: FlushTail::new(),
             own_disk_slow: false,
+            pending: None,
+            flush_asked: None,
             widest_freshness: None,
             durable: Durable::default(),
             flushing: false,
@@ -823,15 +836,71 @@ impl Liveness {
         );
         // A full fold keeps its mean.
         let _ = self.flushes.on_flush(started_ns, durable_ns);
+        // Judged against the tail as it stood before it: a stall's flush is past it.
+        let took = Duration::from_nanos(durable_ns.saturating_sub(started_ns));
+        let tail = self
+            .flush_tail
+            .tail(self.granularity().unwrap_or(Duration::ZERO));
+        if tail.is_none_or(|tail| took <= tail) {
+            let _ = self.steady.on_flush(started_ns, durable_ns);
+        }
         self.flush_tail.on_flush(started_ns, durable_ns);
         if write == Write::Liveness {
             self.flushing = false;
+            self.flush_asked = None;
         }
         // Any completion is the device's progress: the stretch the stream waited ends with it.
         if let Some((since, None)) = self.stall
             && durable_ns >= since
         {
             self.stall = Some((since, Some(durable_ns)));
+        }
+    }
+
+    /// The oldest write on this node's log not yet durable: submitted at `submitted_ns`, or none
+    /// out. Its owner says so after each turn that may have changed it, as its log's writes come and
+    /// go (`hyper_durable::Replica::out_since`, the earliest over the node's replicas). In the disk
+    /// mode the node's own disk is judged by that write's wait, a disk with nothing to do being no
+    /// slow one, and its heartbeats carry the wait as their flush age (kiln's CP-T2.2, Focal's 5a);
+    /// today's mode reads neither.
+    pub fn on_pending(&mut self, submitted_ns: Option<u64>) {
+        self.pending = submitted_ns;
+    }
+
+    /// Judged apart from its disk, whether this node's own disk is slow at `now_ns`: once its
+    /// oldest write not yet durable has waited longer than its flushes' tail (RFC 6298's bound over
+    /// them, `FlushTail`) and the widest freshness its detectors hold, a stall the flush proof would
+    /// have been suspected for, and caught up once that wait is back under its smoothed flush, or no
+    /// write is out; its heartbeats say so (`Heartbeat::disk_slow`). Its flushes' own spikes are
+    /// shorter than its peers' patience with it, and are no verdict; a disk with nothing to do is
+    /// no slow one, and no probe is asked of it (Focal's 5a).
+    fn judge_own_disk(&self, now_ns: u64, granularity: Option<Duration>) -> bool {
+        let tail = self.flush_tail.tail(granularity.unwrap_or(Duration::ZERO));
+        let waited = self
+            .pending_since()
+            .map(|since| Duration::from_nanos(now_ns.saturating_sub(since)));
+        let judged = (
+            waited,
+            tail,
+            self.flush_tail.smoothed(),
+            self.widest_freshness,
+        );
+        let (Some(waited), Some(tail), Some(smoothed), Some(freshness)) = judged else {
+            return false;
+        };
+        self.apart
+            && if self.own_disk_slow {
+                waited > smoothed
+            } else {
+                waited > tail.max(freshness)
+            }
+    }
+
+    /// The oldest write pending on the node's log: its owner's, or the liveness write it asked.
+    fn pending_since(&self) -> Option<u64> {
+        match (self.pending, self.flush_asked) {
+            (Some(log), Some(asked)) => Some(log.min(asked)),
+            (log, asked) => log.or(asked),
         }
     }
 
@@ -941,6 +1010,7 @@ impl Liveness {
             stopped: true,
             apart: self.apart,
             disk_slow: self.own_disk_slow,
+            pending_ns: self.pending_since(),
         };
         for (&peer, pair) in &mut self.pairs {
             announce(pair, peer, &sender, now_ns, &mut self.message, out);
@@ -967,20 +1037,7 @@ impl Liveness {
         let mut wants_flush = false;
         let granularity = self.granularity();
         let floor = self.floor_at(granularity);
-        // Judged apart from its disk, this node's own disk is slow once it has waited on it longer
-        // than its flushes' tail (RFC 6298's bound over them, `FlushTail`) and the widest freshness
-        // its detectors hold, a stall the flush proof would have been suspected for, and caught up
-        // once a completion ends the wait: its heartbeats say so (`Heartbeat::disk_slow`). Its
-        // flushes' own spikes are shorter than its peers' patience with it, and are no verdict.
-        let tail = self.flush_tail.tail(granularity.unwrap_or(Duration::ZERO));
-        self.own_disk_slow = self.apart
-            && match (self.stall, tail, self.widest_freshness) {
-                (Some((since, None)), Some(tail), Some(freshness)) => {
-                    self.own_disk_slow
-                        || Duration::from_nanos(now_ns.saturating_sub(since)) > tail.max(freshness)
-                }
-                _ => false,
-            };
+        self.own_disk_slow = self.judge_own_disk(now_ns, granularity);
         let sender = pair::Sender {
             local_run: self.run,
             floor,
@@ -990,6 +1047,7 @@ impl Liveness {
             stopped: self.stopped,
             apart: self.apart,
             disk_slow: self.own_disk_slow,
+            pending_ns: self.pending_since(),
         };
         // The MTBF only for a pair that waits for a margin from the node's evidence, which a
         // configured node has none of: read at every poll, it was a float division and a
@@ -1036,6 +1094,7 @@ impl Liveness {
         self.judged_ns = self.judged_ns.max(now_ns);
         if wants_flush && !self.flushing {
             self.flushing = true;
+            self.flush_asked = Some(now_ns);
             out.flush();
         }
         self.asked = wake;
@@ -1080,14 +1139,24 @@ impl Liveness {
             .min()
     }
 
-    /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured.
+    /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured. Judged
+    /// apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), its heartbeats wait on no
+    /// flush, and `E[flush]` is the mean of the flushes within their tail as each came: a stall's,
+    /// past it, measures nothing a heartbeat costs. With every flush in it, the one that ended a
+    /// 13 s stall of every disk raised the floors of a lightly loaded group from 2 to 262 to 308 ms
+    /// at once, its links' intervals with them past the freshness their peers held them to, and
+    /// each suspected the others (kiln's CP-T2.2, a node judged apart asking no probe, Focal's 5a).
     pub fn floor(&self) -> Option<Duration> {
         self.floor_at(self.granularity())
     }
 
     /// The floor at the granularity `G` already read.
     fn floor_at(&self, granularity: Option<Duration>) -> Option<Duration> {
-        let flush = self.flushes.mean()?;
+        let flush = if self.apart {
+            self.steady.mean().or_else(|| self.flushes.mean())
+        } else {
+            self.flushes.mean()
+        }?;
         Some(flush.saturating_add(granularity.unwrap_or(Duration::ZERO)))
     }
 

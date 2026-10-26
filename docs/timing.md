@@ -1263,18 +1263,28 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   liveness harness (`tests/liveness.rs`, `survey_of_stalls`) a 2 s stall of the leader's disk alone
   spends a term in 8 of 8 seeds, both followers suspecting it within their freshness (59 to 88 ms).
   An owner may judge each peer's process apart from its disk instead: a heartbeat leaves when it is
-  due whatever a flush is doing, carrying the durable count and the age of the latest as ever; a
-  receiver takes one whether or not the count moved; and a freshness point that passed is judged
-  at the point, whatever the judge's own durability, so the own-proof rule above has nothing to
-  hold. Only a node's silence is then a failure. What its disk owes is the owner's to bound: a
-  leader whose own write stays out past its patience hands the lead on (hyper-durable's
-  `Replica::set_disk_patience`, `docs/durable.md` §4.2), and one that leads on its followers'
-  disks meanwhile answers on them (`Config::apply_unpersisted`). Every node of a group runs so, or
+  due whatever a flush is doing, carrying the durable count and, as its flush age, the age of the
+  node's oldest write not yet durable, zero when none (`Liveness::on_pending`, the owner telling
+  the stream what waits on its log); it asks no flush of its own for it, where a heartbeat's slot
+  in which nothing became durable once asked a probe, a flush an interval on an idle node (Focal's
+  5a); a receiver takes one whether or not the count moved; and a freshness point that passed is
+  judged at the point, whatever the judge's own durability, so the own-proof rule above has
+  nothing to hold. Only a node's silence is then a failure. The node judges its own disk slow once
+  its oldest write not yet durable has waited past its flushes' tail and the widest freshness its
+  detectors hold, and caught up once that wait is back under its smoothed flush or nothing waits: a
+  disk with nothing to do is no slow one. Its floor, `E[flush] + G`, is the mean of its flushes
+  within their tail as each came: its heartbeats wait on none, and a stall's flush, past the tail,
+  measures nothing one costs (with it, the flush that ended a 13 s stall of a lightly loaded
+  group's every disk raised its floors from 2 to 262 to 308 ms, their links' intervals past the
+  freshness their peers held them to, and each suspected the others). What its disk owes is the
+  owner's to bound: a leader hands the lead on by the patience's law, its backlog about to fill the
+  room its budget has left (hyper-durable's `Replica::disk_fill`, `docs/durable.md` §4.2), and one
+  that leads on its followers' disks meanwhile answers on them (`Config::apply_unpersisted`). Every node of a group runs so, or
   none, and the heartbeat says which (flags bit 2). A heartbeat of the other mode is refused for its
   disk (`Refusal::OtherMode`), and the owner is told as a peer's mode turns other and back
   (`Change::ModeDiffers`, `Change::ModeAgrees`). Its sender is judged apart from its disk while it
-  speaks that mode, by its heartbeats' arrivals and round trips alone, and they don't feed the node's
-  pool. So a mixed group, as in a rolling restart's window (`docs/durable.md` §4.2), is a typed
+  speaks that mode, by its heartbeats' arrivals and round trips alone, which feed the node's pool and
+  its evidence as any do, so a node alone in its mode judges from them. So a mixed group, as in a rolling restart's window (`docs/durable.md` §4.2), is a typed
   refusal, never a misjudgment of a disk, and a dead process of either mode is suspected (Focal's
   condition 1; before it, a node not in the mode refused its peers' unproven heartbeats as
   `Unproven` and suspected them). In the harness, in such a group, a 2 s stall of the leader's disk alone started no
@@ -1283,7 +1293,7 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   and of each in turn spends no term; and a killed node is suspected within its stated bound as
   before (`judged_apart_a_killed_peer_...`, `judged_apart_the_shell_..._fails_over_...`). The cost
   is the flush proof's: a node whose disk stops for good is not suspected for it, only handed
-  around by its own patience.
+  around by its own patience, once its backlog would fill its room.
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at

@@ -47,7 +47,7 @@ use hyper_timing::{Exposure, Trust};
 use hyper_tokio::{Stamped, Taken};
 
 use hyper_durable::{
-    Cause, Disk, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
+    Bytes, Cause, Disk, GroupStore, Output, Replica, ReplicaError, Settings as Shell,
 };
 use hyper_log::{Config as LogConfig, Log, Sealing, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
@@ -67,10 +67,11 @@ use crate::file::{self, FaultFile};
 use crate::machine::{Applied, Kv};
 
 /// Whether the members judge each peer's process apart from its disk, their leader committing on
-/// its followers' disks while its own lags and handing the lead on after [`DISK_PATIENCE`] of a
-/// write of its own out (kiln's CP-T2.2, `hyper_liveness::Liveness::set_disk_apart`,
-/// `Config::apply_unpersisted`, `Replica::set_disk_patience`): where
-/// `HYPER_DURABLE_E2E_DISK_APART` is set, so that the scenarios run in such a group too.
+/// its followers' disks while its own lags and handing the lead on by the patience's law, once its
+/// backlog would fill the room its budget has left within a hand-over (kiln's CP-T2.2,
+/// `hyper_liveness::Liveness::set_disk_apart`, `Config::apply_unpersisted`,
+/// `Replica::disk_fill`): where `HYPER_DURABLE_E2E_DISK_APART` is set, so that the scenarios run in
+/// such a group too.
 #[allow(
     clippy::disallowed_methods,
     reason = "a run of the scenarios says the group's shape in the environment its members inherit"
@@ -78,10 +79,6 @@ use crate::machine::{Applied, Kv};
 fn judged_apart() -> bool {
     std::env::var_os("HYPER_DURABLE_E2E_DISK_APART").is_some()
 }
-
-/// A leader's patience with a write of its own, in a group judged apart from its disks: past the
-/// 2 s stall kiln's CP-T2.2 asks a group to ride out.
-const DISK_PATIENCE: Duration = Duration::from_secs(5);
 
 /// The group every member's log holds: one group a log.
 pub const GROUP: u128 = 1;
@@ -171,7 +168,7 @@ struct Asker {
     id: u64,
 }
 
-type Member = Replica<GroupStore<FaultFile>, Kv, Unbounded>;
+type Member = Replica<GroupStore<FaultFile>, Kv, Bytes>;
 
 /// A member, its socket, and who waits on it.
 pub struct Node {
@@ -332,12 +329,10 @@ impl Node {
         })
         .map_err(|e| NodeError::Open(hyper_durable::OpenError::Core(e)))?;
         // The group's disk mode, one setting the group's every member states (Focal's condition 1):
-        // the replica takes the core's apply_unpersisted and its patience from it, the stream its
-        // judging apart.
+        // the replica takes the core's apply_unpersisted and the law of its patience from it, the
+        // stream its judging apart.
         let disk = if judged_apart() {
-            Disk::Apart {
-                patience: DISK_PATIENCE,
-            }
+            Disk::Apart
         } else {
             Disk::Flushed
         };
@@ -368,7 +363,10 @@ impl Node {
             ..ConfState::default()
         };
         let machine = Kv::new(configuration, settings.max_keys);
-        let replica = Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
+        // Its budget is the memory it states for its group, the room the patience's law weighs its
+        // backlog against (Focal's 5c: no time picked).
+        let budget = Bytes::new(log_config().group_bytes);
+        let replica = Replica::open(&shell, store, machine, budget).map_err(NodeError::Open)?;
         let mut liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
@@ -1191,6 +1189,8 @@ impl Node {
             if let Some((started, durable)) = driven.flushed {
                 self.liveness.on_durable(LiveWrite::Log, started, durable);
             }
+            // What waits on the member's disk, for its stream's own verdict (Focal's 5a).
+            self.liveness.on_pending(driven.out_since);
             self.track(now, made_before, out_before);
             self.writing();
             let submitted = self.replica.in_flight() > out_before;

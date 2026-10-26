@@ -21,7 +21,7 @@
     missing_docs
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use hyper_liveness::{
@@ -310,6 +310,9 @@ struct Node {
     charged: u64,
     /// The disk's flush queue: one write at a time, as one device.
     disk_busy_until: u64,
+    /// The log writes out on the disk, oldest first: when each was submitted. What the owner tells
+    /// its stream is pending (`Liveness::on_pending`, Focal's 5a).
+    log_out: VecDeque<u64>,
     /// Every heartbeat sent: to whom and the message, at what time.
     log: Vec<(u64, PeerId, Heartbeat)>,
     /// Every durable completion: when.
@@ -347,6 +350,17 @@ struct Node {
     /// freezes replayed so far.
     phase: u64,
     replayed: u64,
+}
+
+impl Node {
+    /// The owner took the answer to `write`: a log write leaves the disk's queue, oldest first, and
+    /// the stream is told what is pending after it.
+    fn taken_out(&mut self, write: Write) {
+        if write == Write::Log {
+            self.log_out.pop_front();
+            self.liveness.on_pending(self.log_out.front().copied());
+        }
+    }
 }
 
 struct Sim {
@@ -411,6 +425,7 @@ impl Sim {
                     disk_held_until: 0,
                     charged: 0,
                     disk_busy_until: 0,
+                    log_out: VecDeque::new(),
                     log: Vec::new(),
                     durable: Vec::new(),
                     liveness_writes: 0,
@@ -524,6 +539,11 @@ impl Sim {
         self.longest_write = self.longest_write.max(done - self.now);
         let started = self.now;
         self.writing += 1;
+        if write == Write::Log {
+            let n = &mut self.nodes[node];
+            n.log_out.push_back(started);
+            n.liveness.on_pending(n.log_out.front().copied());
+        }
         self.schedule(
             done,
             node,
@@ -585,6 +605,7 @@ impl Sim {
         n.believed.clear();
         n.alive = true;
         n.disk_busy_until = self.now;
+        n.log_out.clear();
     }
 
     fn drain(&mut self, node: usize) {
@@ -942,6 +963,7 @@ impl Sim {
                 let n = &mut self.nodes[node];
                 n.durable.push(now);
                 n.liveness.on_durable(write, started, now);
+                n.taken_out(write);
                 self.polled(node);
                 self.drain(node);
                 // The groups keep the log busy: their next write as this one completes.
@@ -1011,6 +1033,7 @@ impl Sim {
                     let n = &mut self.nodes[node];
                     n.durable.push(now);
                     n.liveness.on_durable(write, started, now);
+                    n.taken_out(write);
                     Some(write)
                 }
                 _ => None,
@@ -3095,8 +3118,10 @@ fn judged_apart_a_stalled_disk_is_not_suspected() {
 /// (`Change::DiskSlow`), and caught up (`Change::DiskCaughtUp`) within a freshness of its end; what
 /// the peers trust of its process is what the stream believes throughout (the sim's own check, every
 /// step), and the others' disks are judged as healthy ones are
-/// (`judged_apart_healthy_disks_draw_no_lasting_verdict`). In each world: idle (macOS's, Linux's: the
-/// stream's probes alone) and loaded (the busy one's log writes).
+/// (`judged_apart_healthy_disks_draw_no_lasting_verdict`). A disk is judged by what waits on it: in
+/// each world, idle (macOS's, Linux's: one log write left waiting on the held disk) and loaded (the
+/// busy one's log writes). An idle disk with nothing to do is no slow one
+/// (`judged_apart_an_idle_node_asks_no_flush_and_its_held_disk_draws_no_verdict`).
 #[test]
 fn judged_apart_a_held_disk_is_judged_slow_and_then_caught_up() {
     for world in [MACOS, BUSY, LINUX] {
@@ -3110,6 +3135,9 @@ fn judged_apart_a_held_disk_is_judged_slow_and_then_caught_up() {
             let peer = held as u64 + 1;
             let end = from + 3 * freshness;
             sim.nodes[held].disk_held_until = end;
+            if !world.busy {
+                sim.submit(held, Write::Log);
+            }
             sim.run_while(|_| true, Some(end + 2 * freshness));
             for judge in (0..3).filter(|j| *j != held) {
                 let verdicts: Vec<(PeerId, bool, u64)> = sim.nodes[judge]
@@ -3139,6 +3167,58 @@ fn judged_apart_a_held_disk_is_judged_slow_and_then_caught_up() {
                     freshness / MS
                 );
             }
+        }
+    }
+}
+
+/// Focal's 5a on the disk mode (kiln CP-T2.2): judged apart from their disks, idle nodes ask no
+/// flush of their own, a heartbeat's slot in which nothing became durable asking no probe, and an
+/// idle node's disk held for three freshnesses with nothing written to it draws no verdict: a disk
+/// with nothing to do is no slow one. Today's group, for the contrast, asks its flush proofs over the
+/// same six freshnesses. In macOS's and Linux's idle worlds, 8 seeds each.
+#[test]
+fn judged_apart_an_idle_node_asks_no_flush_and_its_held_disk_draws_no_verdict() {
+    for world in [MACOS, LINUX] {
+        let name = world.name;
+        for seed in seeds(45, 8) {
+            let asked = |apart: bool| {
+                let mut sim = Sim::new(3, world, seed);
+                if apart {
+                    sim.judge_apart();
+                }
+                let freshness = settled(&mut sim);
+                let from = sim.now;
+                let before: Vec<u64> = sim.nodes.iter().map(|n| n.liveness_writes).collect();
+                sim.nodes[2].disk_held_until = from + 3 * freshness;
+                sim.run_while(|_| true, Some(from + 6 * freshness));
+                let asked: Vec<u64> = sim
+                    .nodes
+                    .iter()
+                    .zip(&before)
+                    .map(|(n, before)| n.liveness_writes - before)
+                    .collect();
+                let verdicts: Vec<(usize, PeerId, bool)> = sim
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(judge, n)| {
+                        n.disks
+                            .iter()
+                            .filter(|(_, _, at)| *at > from)
+                            .map(move |(peer, slow, _)| (judge + 1, *peer, *slow))
+                    })
+                    .collect();
+                (asked, verdicts)
+            };
+            let (apart, verdicts) = asked(true);
+            let (today, _) = asked(false);
+            assert!(
+                apart.iter().all(|asked| *asked == 0)
+                    && verdicts.is_empty()
+                    && today.iter().all(|asked| *asked > 0),
+                "{name} seed {seed}: over six freshnesses, flushes asked judged apart {apart:?} \
+                 (today's group {today:?}); verdicts (judge, peer, slow) {verdicts:?}"
+            );
         }
     }
 }
@@ -3727,7 +3807,16 @@ fn a_heartbeat_of_the_other_mode_is_refused_and_its_sender_never_misjudged() {
                 .map_or(0, |f| f.as_nanos() as u64);
             let from = sim.now;
             sim.run_while(|_| true, Some(from + 10 * freshness));
-            for (node, peer) in [(0usize, 2u64), (0, 3), (1, 1), (2, 1)] {
+            // The pairs across the modes judged too, within a minute: a node alone in the disk mode
+            // asks no probe, so its floor rests on its first flush, and its links take longer to be
+            // configured (macOS seed 197568495619: past ten freshnesses, judged by 20 s).
+            let across = [(0usize, 2u64), (0, 3), (1, 1), (2, 1)];
+            let limit = sim.now + 60_000 * MS;
+            sim.run_while(
+                |sim| !across.iter().all(|&(node, peer)| judged(sim, node, peer)),
+                Some(limit),
+            );
+            for (node, peer) in across {
                 let report = sim.nodes[node].liveness.report(peer).unwrap();
                 assert!(
                     report.other_mode > 0 && report.taken > 0 && report.judged,

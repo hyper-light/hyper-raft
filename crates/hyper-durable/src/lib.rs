@@ -41,6 +41,7 @@ mod hyperlog;
 mod machine;
 mod memory;
 mod owner;
+mod patience;
 mod replica;
 mod store;
 

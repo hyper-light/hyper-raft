@@ -942,6 +942,13 @@ impl Outgoing {
             self.spares.insert(at.saturating_sub(1), emptied);
         }
     }
+    /// Gives back the room the queues hold past what waits ([`Raft::trim`]): the spares owners
+    /// gave back, and the queue's own slots past its messages. The room a burst grew is kept for
+    /// the next burst (`Outgoing::recycle`), and a member short of memory asks for it back.
+    pub(crate) fn trim(&mut self) {
+        self.spares = Vec::new();
+        self.msgs.shrink_to_fit();
+    }
     /// Whether the counter says what a walk of the messages says.
     pub(crate) fn check(&self) -> Result<()> {
         let payload = self.msgs.iter().fold(0usize, |bytes, message| {
@@ -1503,6 +1510,14 @@ impl<S: Storage> Raft<S> {
     /// This member's log.
     pub fn log(&self) -> &Log<S> {
         &self.log
+    }
+    /// Gives back the room this member holds spare: its entries' slots not yet durable past what
+    /// they take ([`Log::trim`]), and its message queues' past what waits
+    /// ([`Outgoing::trim`]). Each is kept so that the next burst grows nothing; an owner short of
+    /// memory asks for it back (hyper-durable's budget, kiln's CP-T2.2).
+    pub fn trim(&mut self) {
+        self.log.trim();
+        self.msgs.trim();
     }
     /// The storage this member reads.
     pub fn store(&self) -> &S {

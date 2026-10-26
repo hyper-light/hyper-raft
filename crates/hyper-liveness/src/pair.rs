@@ -50,6 +50,10 @@ pub(crate) struct Sender {
     pub(crate) apart: bool,
     /// In that mode, its own disk is slow (`Liveness::own_disk_slow`): its heartbeats say so.
     pub(crate) disk_slow: bool,
+    /// When the oldest write on the node's log not yet durable was submitted, if one is
+    /// (`Liveness::on_pending`): in the disk mode its heartbeats' flush age is that write's age,
+    /// zero when none, a disk with nothing to do being no slow one (Focal's 5a).
+    pub(crate) pending_ns: Option<u64>,
 }
 
 /// What a judge knows of its own durability (`docs/timing.md` §2.8, "A judge whose own proof
@@ -68,6 +72,19 @@ pub(crate) enum Held {
     /// Not until the judge's own proof comes; `probe` when none is outstanding and nothing is durable
     /// since the point, so the judge's next completion, of any write, is what it waits for.
     Waiting { probe: bool },
+}
+
+/// The flush age a heartbeat sent at `sent_ns` carries: in the disk mode the age of the node's
+/// oldest write not yet durable, zero when none (Focal's 5a); in today's, the age of its latest
+/// durable completion, `durable_ns`, which the flush proof is read from.
+fn flush_age(sender: &Sender, sent_ns: u64, durable_ns: u64) -> u64 {
+    if sender.apart {
+        sender
+            .pending_ns
+            .map_or(0, |since| sent_ns.saturating_sub(since))
+    } else {
+        sent_ns.saturating_sub(durable_ns)
+    }
 }
 
 impl Local {
@@ -207,10 +224,8 @@ pub(crate) fn scaled(pool: &Arrivals, window: u64) -> Arrivals {
 pub(crate) enum Sent {
     /// A heartbeat of this many bytes is in the node's buffer, and its lateness past the slot after
     /// the previous heartbeat sent the peer, nanoseconds: what the peer will take it as, but the
-    /// path's delay (`Stream::expected_ns`); `None` for the first. Third, in the disk mode, whether
-    /// a probe flush is wanted: nothing became durable in this heartbeat's slot, so the next is
-    /// fresh only if a write is made and answered before it.
-    Message(usize, Option<i64>, bool),
+    /// path's delay (`Stream::expected_ns`); `None` for the first.
+    Message(usize, Option<i64>),
     /// A heartbeat is due and no flush proves it.
     NeedsFlush,
     /// Nothing due.
@@ -702,8 +717,9 @@ impl Pair {
 
     /// Sends the heartbeat due, if a flush proves it: one made durable after the previous
     /// heartbeat was due, and newer than the one the previous heartbeat carried; or, where the node
-    /// judges each peer's process apart from its disk, whatever a flush is doing, carrying its
-    /// latest durable completion's age as ever (`Liveness::set_disk_apart`). A sender behind
+    /// judges each peer's process apart from its disk, whatever a flush is doing, carrying the age
+    /// of its oldest write not yet durable, zero when none (`Liveness::set_disk_apart`,
+    /// `Liveness::on_pending`), and asking no flush of its own for it (Focal's 5a). A sender behind
     /// its schedule sends the latest heartbeat due; the ones it skipped are never sent, and the
     /// peer takes them as that heartbeat's lateness, the stall's delay (`docs/timing.md` §2.2).
     pub(crate) fn send(&mut self, sender: &Sender, now_ns: u64, out: &mut [u8; MAX_BYTES]) -> Sent {
@@ -796,7 +812,7 @@ impl Pair {
             sent_ns,
             late_ns: sent_ns.saturating_sub(due),
             flushes: sender.durable_count,
-            flush_age_ns: sent_ns.saturating_sub(durable_ns),
+            flush_age_ns: flush_age(sender, sent_ns, durable_ns),
             apart: sender.apart,
             disk_slow: sender.apart && sender.disk_slow,
             echo,
@@ -833,7 +849,7 @@ impl Pair {
         // probe is asked where nothing became durable in this heartbeat's slot, never holding one:
         // the node's own wait on its disk is measured from it (`Liveness::own_disk_slow`), and the
         // next heartbeat is fresh on a disk that answers.
-        Sent::Message(length, own, sender.apart && durable_ns <= due)
+        Sent::Message(length, own)
     }
 
     /// The heartbeat that ends this node's run, in order ([`Heartbeat::stopping`]), written into
@@ -865,7 +881,7 @@ impl Pair {
             flushes: sender.durable_count,
             flush_age_ns: sender
                 .durable_ns
-                .map_or(0, |durable| sent_ns.saturating_sub(durable)),
+                .map_or(0, |durable| flush_age(sender, sent_ns, durable)),
             apart: sender.apart,
             disk_slow: sender.apart && sender.disk_slow,
             echo: None,
@@ -1745,6 +1761,7 @@ mod tests {
             stopped: false,
             apart: false,
             disk_slow: false,
+            pending_ns: None,
         };
         let mut out = [0; MAX_BYTES];
         let Sent::Message(length, ..) = node.send(&sender, now, &mut out) else {
@@ -1798,6 +1815,7 @@ mod tests {
                 stopped: false,
                 apart: false,
                 disk_slow: false,
+                pending_ns: None,
             };
             let mut out = [0; MAX_BYTES];
             match node.send(&sender, now, &mut out) {
@@ -1873,6 +1891,7 @@ mod tests {
                 stopped: false,
                 apart: false,
                 disk_slow: false,
+                pending_ns: None,
             };
             let mut out = [0; MAX_BYTES];
             assert!(
@@ -1913,6 +1932,7 @@ mod tests {
                 stopped: true,
                 apart,
                 disk_slow: true,
+                pending_ns: None,
             };
             let mut out = [0; MAX_BYTES];
             let length = node.goodbye(&sender, 10 * MS, &mut out);

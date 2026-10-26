@@ -1099,7 +1099,9 @@ fn judged_apart() -> bool {
 /// it if it led and take writes. Then it is killed and started again on its log. In a group judged
 /// apart from its disks (`HYPER_DURABLE_E2E_DISK_APART`, kiln's CP-T2.2) its heartbeats go on and no
 /// member suspects it: it takes writes as before, which commit on the others' disks if it leads,
-/// and a leader hands the lead on once a write of its own has been out its patience.
+/// and a leader leads on by the patience's law, its backlog of the scenario's few writes far from
+/// the room its budget has left (`Replica::disk_fill`; the hand-over that a filling backlog makes
+/// is the liveness harness's, `judged_apart_a_leaders_disk_that_stops_hands_over_before_its_room_fills`).
 fn stalled_disk(leader: bool) -> String {
     let name = if leader {
         "stall-leader"
@@ -1125,13 +1127,11 @@ fn stalled_disk(leader: bool) -> String {
         .collect();
     if judged_apart() {
         // Trusted still, the stalled member is asked as any other: what it answers is what the
-        // group does. Then another leads, the stalled member's patience ended if it led, and none
-        // suspects it.
+        // group does. The leader leads on, the stalled one if it led, its backlog far from its
+        // room, and none suspects the stalled member.
         cluster.write_some("while-stalled", WRITES);
-        let moved = cluster.until(|reports| {
-            reports
-                .iter()
-                .any(|(&id, r)| id != target && r.status.leads)
+        let kept = cluster.until(|reports| {
+            reports.get(&lead).is_some_and(|r| r.status.leads)
                 && others.iter().all(|id| {
                     reports
                         .get(id)
@@ -1139,8 +1139,9 @@ fn stalled_disk(leader: bool) -> String {
                 })
         });
         assert!(
-            moved,
-            "{name}: judged apart, no other member led, or one suspected the stalled member; {}",
+            kept,
+            "{name}: judged apart, the leader gave up the lead short of its room, or a member \
+             suspected the stalled one; {}",
             cluster.state()
         );
     } else {
@@ -1185,10 +1186,8 @@ fn stalled_disk(leader: bool) -> String {
 ///
 /// In a group judged apart from its disks (`HYPER_DURABLE_E2E_DISK_APART`, kiln's CP-T2.2) the
 /// stalled leader is trusted still: it takes the writes, which wait on its survivors' held devices
-/// and commit on their disks once they go on. Its survivors' disks judged slow while held, it names
-/// no heir through the hold, and once a write of its own has been out its patience and a survivor's
-/// disk has answered as long, it hands the lead to that survivor (12.2 s in on adas-mac-studio-3, a
-/// hold of 7 s and a patience of 5 s).
+/// and commit on their disks once they go on. By the patience's law it leads on, its backlog of the
+/// scenario's few writes far from the room its budget has left (`Replica::disk_fill`).
 fn stalled_devices() -> String {
     let name = "stalled-devices";
     let mut cluster = Cluster::start(name, 3);
@@ -1210,11 +1209,10 @@ fn stalled_devices() -> String {
     assert_eq!(cluster.order(lead, Order::StallFlush), Some(Outcome::Done));
     if judged_apart() {
         cluster.write_some("while-held", WRITES);
-        let handed =
-            cluster.until(|reports| reports.iter().any(|(&id, r)| id != lead && r.status.leads));
+        let kept = cluster.until(|reports| reports.get(&lead).is_some_and(|r| r.status.leads));
         assert!(
-            handed,
-            "{name}: judged apart, the stalled leader never handed the lead on; {}",
+            kept,
+            "{name}: judged apart, the stalled leader gave up the lead short of its room; {}",
             cluster.state()
         );
     } else {

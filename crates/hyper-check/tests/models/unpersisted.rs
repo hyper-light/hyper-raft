@@ -19,6 +19,13 @@
 //! (`LeaderHolds`). [`Mutant::LeaderMemory`] counts the leader's log in memory toward the majority,
 //! as Raft's TLA+ specification's `Agree` set counts the leader whatever its disk holds: sound
 //! there only because its log is durable at once. The search must find the defect it is for.
+//!
+//! **Acknowledgements in flight** (`Scope::in_flight`, Focal's condition 2's advisory): a durable
+//! answer goes into a bag of that many instead of acting at once, and a later step delivers one,
+//! whatever happened between: its receiver takes it only if it leads in the answer's own term, as
+//! the core drops a message of an older term than its own (`Raft::step_term`), and drops it
+//! otherwise. A stale acknowledgement delivered late is so explored, and [`Mutant::StaleAck`], which
+//! takes one whatever its term, is the defect the variant must find.
 
 use std::fmt;
 
@@ -38,6 +45,8 @@ pub enum Mutant {
     None,
     /// A leader counts its log in memory toward an entry's majority.
     LeaderMemory,
+    /// A leader takes a durable acknowledgement whatever its term (with acknowledgements in flight).
+    StaleAck,
 }
 
 /// What a scope searches.
@@ -49,6 +58,22 @@ pub struct Scope {
     pub max_len: usize,
     /// The rule taken out.
     pub mutant: Mutant,
+    /// Durable acknowledgements in flight at once, at most [`BAG`]; none, each acts as it is given.
+    pub in_flight: usize,
+}
+
+/// The most acknowledgements a scope keeps in flight.
+pub const BAG: usize = 2;
+
+/// A durable acknowledgement in flight: to whom and from whom (each plus one; zero, an empty
+/// slot), its sender's term as it was sent, and the index the sender's disk matched its leader's
+/// log through.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Ack {
+    pub to: u8,
+    pub from: u8,
+    pub term: u8,
+    pub index: u8,
 }
 
 /// The last entry of a log: `(term, index)`, ordered as Raft orders logs (thesis §3.6.1).
@@ -128,6 +153,8 @@ pub struct State {
     pub servers: [Server; SERVERS],
     pub chosen: [Chosen; MAX_LEN],
     pub answered: [Chosen; MAX_LEN],
+    /// The acknowledgements in flight, sorted, empty slots first.
+    pub bag: [Ack; BAG],
 }
 
 /// One step.
@@ -139,8 +166,11 @@ pub enum Action {
     Append { l: u8 },
     /// The follower `f` takes the leader `l`'s log through `k`, as Raft's append does.
     Replicate { l: u8, f: u8, k: u8 },
-    /// The follower `f` answers its leader for what its disk holds of the leader's log.
+    /// The follower `f` answers its leader for what its disk holds of the leader's log: at once, or
+    /// into the bag with acknowledgements in flight.
     DurableAnswer { f: u8 },
+    /// The acknowledgement in the bag's slot is delivered.
+    Deliver { slot: u8 },
     /// `s` issues a write of its log in memory.
     Issue { s: u8 },
     /// The write `s` issued is durable.
@@ -170,9 +200,17 @@ const PATHS: &[&str] = &[
     "crashed after an answer",
     "elected without the leader before",
 ];
+/// With acknowledgements in flight, one more: a stale one delivered.
+const PATHS_IN_FLIGHT: &[&str] = &[
+    "answered ahead of its disk",
+    "crashed after an answer",
+    "elected without the leader before",
+    "a stale acknowledgement delivered",
+];
 const AHEAD: u64 = 1;
 const CRASHED_AFTER: u64 = 1 << 1;
 const WITHOUT: u64 = 1 << 2;
+const STALE: u64 = 1 << 3;
 
 /// The model of a scope.
 pub struct Unpersisted {
@@ -313,8 +351,47 @@ impl Unpersisted {
             return None;
         }
         let mut next = *state;
-        next.servers[li].matched[fi] = j;
+        if self.scope.in_flight == 0 {
+            next.servers[li].matched[fi] = j;
+            return Some(self.checked(next, 0));
+        }
+        let ack = Ack {
+            to: li as u8 + 1,
+            from: f + 1,
+            term: s.term,
+            index: j,
+        };
+        let held = next.bag.iter().filter(|a| a.to != 0).count();
+        if held >= self.scope.in_flight.min(BAG) || next.bag.contains(&ack) {
+            return None;
+        }
+        let empty = next.bag.iter().position(|a| a.to == 0)?;
+        next.bag[empty] = ack;
+        next.bag.sort_unstable();
         Some(self.checked(next, 0))
+    }
+    /// The acknowledgement in `slot` delivered: its receiver takes it if it leads in its term (or,
+    /// the mutant's, whatever its term), else drops it, as the core drops a message of an older
+    /// term than its own.
+    fn deliver(&self, state: &State, slot: u8) -> Option<Step<State, Fault>> {
+        let ack = *state.bag.get(usize::from(slot))?;
+        if ack.to == 0 {
+            return None;
+        }
+        let mut next = *state;
+        next.bag[usize::from(slot)] = Ack::default();
+        next.bag.sort_unstable();
+        let li = usize::from(ack.to - 1);
+        let fi = usize::from(ack.from - 1);
+        let receiver = state.servers[li];
+        let stale = receiver.term > ack.term;
+        let takes =
+            receiver.leads && (receiver.term == ack.term || self.scope.mutant == Mutant::StaleAck);
+        if takes {
+            let matched = &mut next.servers[li].matched[fi];
+            *matched = (*matched).max(ack.index);
+        }
+        Some(self.checked(next, if stale { STALE } else { 0 }))
     }
     fn issue(&self, state: &State, s: u8) -> Option<Step<State, Fault>> {
         let si = usize::from(s);
@@ -490,6 +567,14 @@ fn renamed(state: &State, order: &[usize; SERVERS]) -> State {
         }
         out.servers[order[i]] = t;
     }
+    for (slot, ack) in state.bag.iter().enumerate() {
+        out.bag[slot] = Ack {
+            to: name(ack.to),
+            from: name(ack.from),
+            ..*ack
+        };
+    }
+    out.bag.sort_unstable();
     out
 }
 
@@ -500,7 +585,11 @@ impl Model for Unpersisted {
     type Key = State;
 
     fn paths(&self) -> &'static [&'static str] {
-        PATHS
+        if self.scope.in_flight == 0 {
+            PATHS
+        } else {
+            PATHS_IN_FLIGHT
+        }
     }
     fn initial(&self) -> State {
         State::default()
@@ -517,6 +606,9 @@ impl Model for Unpersisted {
         for s in 0..n {
             out.push(Action::Append { l: s });
             out.push(Action::DurableAnswer { f: s });
+            if usize::from(s) < self.scope.in_flight.min(BAG) {
+                out.push(Action::Deliver { slot: s });
+            }
             out.push(Action::Issue { s });
             out.push(Action::Complete { s });
             out.push(Action::Crash { s });
@@ -548,6 +640,7 @@ impl Model for Unpersisted {
             }
             Action::Replicate { l, f, k } => self.replicate(state, l, f, k),
             Action::DurableAnswer { f } => self.durable_answer(state, f),
+            Action::Deliver { slot } => self.deliver(state, slot),
             Action::Issue { s } => self.issue(state, s),
             Action::Complete { s } => self.complete(state, s),
             Action::Crash { s } => self.crash(state, s),

@@ -165,7 +165,8 @@ jobs:
     # Rust model 0.6 min at load 13 (2026-10-05): 4 × 17.1 is 68.4. The shell's simulation at 10,000
     # seeds of each shape adds 0.3 min at load 10 (2026-10-15), within it. Core step R-8's model
     # (tests/held.rs) adds 4.4 min here (2026-10-18): 4 × 4.4 more is 86. The persisted class's
-    # model (tests/unpersisted.rs) took 5.4 s in release on adas-mac-studio-3 (2026-10-25), within it.
+    # model (tests/unpersisted.rs) took 5.4 s in release on adas-mac-studio-3 (2026-10-25), and 23 s
+    # with its acknowledgements in flight (2026-10-26), within it.
     timeout-minutes: 86
     steps:
       - uses: actions/checkout@v5
@@ -182,7 +183,9 @@ jobs:
       # The persisted class's commits with a leader answering ahead of its own disk (core step R-6,
       # kiln's CP-T2.2): every entry answered on a majority's disks, its memory not counted, exhausted
       # at two terms and three indexes and at three terms and two (4.1 million classes, 518 MB), and
-      # the leader's memory counted refused by its shortest history.
+      # the leader's memory counted refused by its shortest history; with durable acknowledgements in
+      # flight, a bag of two, at three terms and two indexes (10.8 million classes, 1,079 MB), and a
+      # stale one taken without the core's term check refused likewise (Focal's condition 2).
       - run: cargo test --release -p hyper-check --locked --test unpersisted -- --ignored --test-threads 1
       # hyper-durable's simulation past the gates' 128 seeds a shape: seed 206 of its first shape had
       # two leaders of one term until a candidate's vote for itself waited for its write

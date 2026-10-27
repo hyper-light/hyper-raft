@@ -794,4 +794,56 @@ mod tests {
         })
         .unwrap();
     }
+
+    /// Quiver's three-machine lab (kiln's CP-T2.2 step 7, 2026-10-27): a Windows node's socket was never
+    /// read again after its read poll was widened for a write. Do: a socket's poll for a read is pending
+    /// (nothing to read) and is widened as `arm_events` widens it; then a datagram arrives. Expect: the
+    /// read is told. An AFD poll issued over the pending one, the pending one then cancelled, told
+    /// nothing, the wider poll outstanding for good; wepoll's order (cancel, then issue once the cancel is
+    /// taken) tells it.
+    #[test]
+    fn a_wider_poll_over_a_pending_one_still_tells_a_read() {
+        use crate::afd::{AFD_POLL_DISCONNECT, AFD_POLL_RECEIVE};
+        use crate::driver::{Driver, Kick};
+        use crate::interests::Readiness;
+        let port = super::prepare().unwrap();
+        let registration =
+            crate::registry::register(2, 1, crate::runtime::register_kick(Some(port))).unwrap();
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+        let Kick::Iocp(port) = kick else {
+            panic!("the IOCP driver's kick is its port");
+        };
+        let mut driver = super::IocpDriver::from_prepared(port).unwrap();
+        driver.reserve_handles(4).unwrap();
+        let ours = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let peer = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let raw = ours.readiness_handle();
+        let tag = crate::interests::tag_of(raw);
+        driver.arm_events(raw, AFD_POLL_RECEIVE, tag).unwrap();
+        driver
+            .arm_events(raw, AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT, tag)
+            .unwrap();
+        peer.send_to(b"x", ours.local_addr().unwrap()).unwrap();
+        let mut told: Vec<(u64, i32)> = Vec::new();
+        let read = |told: &[(u64, i32)]| {
+            told.iter()
+                .any(|(at, bits)| *at == tag && Readiness::from_bits(*bits).contains(Readiness::READ))
+        };
+        // Bounded: 30 waits of 100 ms.
+        for _ in 0..30 {
+            let mut out = Vec::new();
+            driver.wait(Some(100_000_000), &mut out).unwrap();
+            told.extend(out.iter().map(|c| (c.user_data, c.result)));
+            if read(&told) {
+                break;
+            }
+        }
+        let watched = driver.outstanding.contains_key(&raw);
+        drop(driver);
+        drop(registration);
+        assert!(
+            read(&told),
+            "the widened poll told no read in 3 s: told {told:?}, a poll in flight still {watched}"
+        );
+    }
 }

@@ -822,22 +822,21 @@ RFC 9000 §4.6), and an exchange is a stream.
   connections' together. A connection of a role outside the pool is raised to
   `streams_per_connection` once its role is known, so a node's replication is never held to its
   clients' pool.
-- **Granting** (`src/pool.rs`). A connection that joins while the pool has credit spare is raised
-  to its fair share at once (the pool over the connections in it, one stream at least), so a peer
-  nobody contends with waits no round trip before its second exchange. Under contention it holds
-  its handshake's grant. A peer blocked at its grant says so with STREAMS_BLOCKED (hyper-quic now
-  sends it, `crates/hyper-quic/VENDORED.md` §28), and the connection waits its turn, once. At each
-  poll, while the pool holds credit no connection is granted, the connection that has waited
-  longest is raised to its fair share, or by one if it holds that already, and sends its new
-  limit.
+- **Granting** (`src/pool.rs`). A connection that joins while the pool has credit spare is raised to
+  its fair share at once (the stream it keeps and the pool over the connections in it, §4aj), so a
+  peer nobody contends with waits no round trip before its second exchange. Under contention it
+  holds its handshake's grant. A peer blocked at its grant says so with STREAMS_BLOCKED (hyper-quic
+  now sends it, `crates/hyper-quic/VENDORED.md` §28), and the connection waits its turn, once. At
+  each poll, while the pool holds credit no connection is granted, the connection that has waited
+  longest is raised to its fair share, or by one if it holds that already, and sends its new limit.
 - **Giving back.** A grant lowered falls as the peer's streams end. When an exchange its peer opened
   ends, a connection gives one stream back if the pool is overspent: the owner shrank it, or the
   connections' handshake grants exceed it. While another connection waits, it gives one back if it
   holds more than a fair share (max-min fairness among the connections that want streams), and all
-  it holds if none of its peer's exchanges is open: credit goes with demand, as Breakwater issues
-  it only to clients with requests to send. A connection's own wait is no other's, so a lone one
-  keeps its grant; giving it back to grant it to itself again would leave it short until QUIC freed
-  the streams it held.
+  it holds but one if none of its peer's exchanges is open: the one stream it keeps goes back to its
+  peer in the reply, so a peer with a request at a time never asks for it (§4aj). A connection's
+  own wait is no other's, so a lone one keeps its grant; giving it back to grant it to itself again
+  would leave it short until QUIC freed the streams it held.
 - **When it goes back.** A served exchange settles its stream with the pool as its reply is
   finished, before the finish (`Endpoint::settle_credit`): QUIC gives the stream back to its peer
   once the request is read and the reply finished, not once the reply is acknowledged
@@ -848,16 +847,17 @@ RFC 9000 §4.6), and an exchange is a stream.
   reply was acknowledged, alone, took 59 (`a_pooled_servers_stream_goes_back_with_the_reply`).
 - **Taking back from the idle.** QUIC takes back no stream it announced, so a connection holding
   credit that opens nothing would keep it from every other: it gives back only as its exchanges
-  end. A connection with none of its peer's exchanges open is queued as idle, once: as it joins,
-  and as its last exchange ends with credit kept. While another waits and nothing is spare, the
-  endpoint takes back what an idle connection holds, in the pool's account (`Stats::pool.reclaimed`
-  counts it). Its peer may still open the streams it was told of, so the pool is overcommitted by
-  them, as Breakwater overcommits credit to idle clients and keeps its queue by refusing what an
-  overload sends past it: the owner's own admission.
+  end. A connection with none of its peer's exchanges open and more than the stream it keeps is
+  queued as idle, once: as it joins or is welcomed, and as its last exchange ends with credit kept.
+  While another waits and nothing is spare, the endpoint takes back what an idle connection holds
+  past the stream it keeps, in the pool's account (`Stats::pool.reclaimed` counts it). Its peer
+  may still open the streams it was told of, so the pool is overcommitted by them, as Breakwater
+  overcommits credit to idle clients and keeps its queue by refusing what an overload sends past
+  it: the owner's own admission.
 - **Bounds.** A connection waits once and is queued as idle once at most, so each queue holds no
-  more than the pooled connections. Exchanges open at the server at once are at most the pool,
-  plus the handshake grants not yet given back, plus what idle connections were told of before it
-  was taken back from them.
+  more than the pooled connections. Exchanges open at the server at once are at most the pool and
+  one a pooled connection (§4aj), plus the handshake grants not yet given back, plus what idle
+  connections were told of before it was taken back from them.
 - **The asker's side.** An exchange waiting for a stream is judged on whether its connection's
   credit queue moves (policy C), so it waits while streams come back. If none comes for a period,
   it is refused `Unsent`, a refusal of its own, where it was refused `Stalled`, which an exchange
@@ -2130,6 +2130,63 @@ timeout). `a_dial_failing_as_the_last_one_did_is_told_all_the_same` is told `Deg
 where the restarted endpoint has another key (within two keep-alives of the restart; the reset with
 the same key still closes the connection within one, before any degrading). hyper-quic's own tests
 are in VENDORED.md §45.
+
+## 4aj. A connection keeps one stream of its pool (2026-10-26, found by focal)
+
+focal's work mode puts 500 agents on one 1-CPU leader, each a connection of its own sending a
+request at a time (compare CI, 2026-10-26, a diagnostic summing every connection's frames). At
+100 claims a second the leader's listener received 2.60 STREAMS_BLOCKED frames a write and sent
+2.72 MAX_STREAMS, of 10.6 datagrams received and 9.9 sent a write. At 50 claims a second, below the
+leader's capacity, it received 0.30 STREAMS_BLOCKED a write, and the grants went in the replies. The
+pool held 142 streams for 502 connections. A connection whose last exchange ended while another
+waited gave back all it held (§4g), so its peer's next request said it was blocked and waited its
+turn for a grant. That cost two packets more each way a request, and their acknowledgements, under
+exactly the load where the server could least afford them: received STREAMS_BLOCKED rose from about
+150 a second to about 2,500 as the offered rate doubled.
+
+Breakwater does not ask a client to say its demand (Cho et al., OSDI 2020, §3.2.2): "A client
+notifies the server of its demand only if the demand information can be piggybacked on a request",
+the server speculates, and each client may hold "more credits than its latest demand",
+`Coc = max((Ctotal − Cissued) / nc, 1)`. "A new credit will be given to a client to whom the server
+is about to send a response", and "explicit credit messages are only generated when piggybacking a
+credit on a response is not possible". Its alternative, demand synchronization, tells each change of
+demand and answers it with explicit credit. In the paper's measurements, that "doubles RX and TX
+message overhead below and at the capacity" (§5, Figure 8).
+
+The pool now leaves each connection the least of Breakwater's credits: one stream (`pool::KEPT`). A
+connection never gives that stream back as an exchange ends, and is never made to give it back while
+idle. So its peer sends its next request with the stream its last reply gave back, in that reply's
+datagrams (`Endpoint::settle_credit`, §4g). The kept streams are outside the pool's account: the
+owner's size is the credit granted past them, so the pool is overcommitted by one stream a
+connection, as Breakwater's is by its least overcommitment, and the owner's admission holds what an
+overload sends past it, as Breakwater's AQM drops it. A connection's fair share is its kept stream
+and the pool over the connections. Credit past the kept stream goes as before: by demand
+(STREAMS_BLOCKED) in fair shares, given back as exchanges end, and taken back from the idle. A pool
+sized to nothing keeps nothing for its connections: its owner takes nothing until it sizes the pool
+again (`a_pool_sized_to_nothing_holds_its_peer_until_sized_again` still holds).
+
+The kept streams were first counted inside the pool. With more connections than the pool's size,
+nothing was ever spare, and a peer with two exchanges to ask at once waited for its first to end. In
+focal's work mode, 502 connections past a pool of 142, STREAMS_BLOCKED received rose from 0.30 a
+write to 1.33 at 50 claims a second (compare CI run 40455697570). Outside the account, the pool's
+streams go to the peers that want more, as before.
+
+Tests:
+
+- `exchange::peers_past_the_pool_each_keep_the_stream_their_reply_gives_back`: two connections, a
+  pool of one stream, each sending a request at a time. Twenty exchanges take 40 datagrams of the
+  peers' and 21 of the server's, and no grant is asked. With the last stream given back, they take
+  49 and 29, and the test fails.
+- `pool::tests`: `connections_past_the_pool_keep_one_stream_each` (four connections past a pool of
+  two each keep a stream, and the pool's two go to two that want more, which fails with the kept
+  streams counted inside the pool) and `a_pool_sized_to_nothing_keeps_nothing`; every grant the
+  other tests expect is one stream more, the stream kept, and the idle and parked tests take back
+  to it.
+- `exchange.rs`: a pooled peer holds no more than the pool's three and its kept stream open at the
+  server; a peer bounded by its credit holds and queues three each of a pool of two; and two waits
+  not parked fill a pool of one and the kept stream, nothing served behind them.
+- The in-memory network carries several endpoints on one side, each at an address of its own
+  (`tests/common`'s `Several`), so a test can make its server's pool contended.
 
 ## 5. Consumers
 

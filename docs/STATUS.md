@@ -122,6 +122,28 @@ restarted host's TCP answers with an RST. Test: a peer is told `Closed` within a
 restart, and only at its idle timeout (12 s) when the restarted endpoint has another key
 (`exchange::a_restarted_endpoint_resets_what_its_last_run_held`).
 
+Landed 2026-10-27: in hyper-transport, a pooled connection keeps one stream past its stream pool
+(`pool::KEPT`, outside the pool's account, `Pool::holding`; `docs/transport.md` §4aj). A connection
+gave back all it held as its last exchange ended while another waited, so its peer's next request
+said it was blocked and waited for a grant: focal's 1-CPU leader under 500 agents took 2.60
+STREAMS_BLOCKED and 2.72 MAX_STREAMS frames a write at 100 work claims a second, most in packets of
+their own. Breakwater leaves each client at least one credit, carried in the response (Cho et al.,
+OSDI 2020, §3.2.2); counted inside the pool, as first built, more connections than its size left
+nothing spare ever. Tests: two peers past a pool of one take 40 datagrams of theirs and 21 of the
+server's for twenty exchanges and ask no grant (49 and 29 with the stream given back); four
+connections past a pool of two each keep a stream and two that want more are granted the pool's two.
+
+Landed 2026-10-27: in hyper-quic and hyper-transport, a connection whose packets replies answer asks
+its peer to acknowledge within RFC 9000's default max_ack_delay, 25 ms (`Acknowledgement::Replies`,
+`REPLY_ACK_DELAY`; hyper-quic `TransportConfig::decimate_acks_within`, `crates/hyper-quic/VENDORED.md`
+§46; `docs/transport.md` §4ak), where a quarter of a short round trip, the peer's 1 ms granularity,
+had each request whose reply took longer acknowledged alone ahead of it: focal's leader sent 26%
+fewer datagrams a write and received 9 to 13% fewer. `Acknowledgement::Decimated` is the decimation
+as it was, for a stream whose congestion control waits on its acknowledgements. The cost is a lost
+request's last packet detected about 25 ms past the round trip on a path shorter than 4 ms. Tests:
+past the hundredth packet each way, twenty exchanges each answered 5 ms after its request take 40
+datagrams of the asker's and 21 of the server's under Replies, 61 and 41 decimated.
+
 Landed 2026-10-23: in hyper-quic, BBR paced at its model's rate, its least round trip taken only
 from packets in order (patches Q32 and Q33, `crates/hyper-quic/VENDORED.md` §42 and §43;
 `docs/transport.md` §4ag). Held by its window of twice its product and paced at five quarters of it,

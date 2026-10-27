@@ -303,6 +303,35 @@ mod tests {
         assert_eq!(entries_to_fill(&Backlog { room: 11, ..full }), 0);
     }
 
+    /// Focal's correction to condition 5: the growth [`entries_to_fill`] reckons (no slots, then
+    /// [`FEWEST_SLOTS`], then twice as many each time every slot is taken) is std's `RawVec` at
+    /// this toolchain, not a promise of `Vec`'s. Do: push the core's entries into a `Vec` one at a
+    /// time. Expect: each capacity the model predicts, so a toolchain that grows `Vec` otherwise
+    /// fails here rather than moving the patience unseen.
+    #[test]
+    fn a_vec_of_the_cores_entries_grows_as_the_patience_reckons() {
+        let mut entries: Vec<hyper_raft::proto::Entry> = Vec::new();
+        let mut slots = 0u64;
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        assert_eq!(
+            count(entries.capacity()),
+            slots,
+            "an empty Vec holds no slots"
+        );
+        for _ in 0..4_096 {
+            if count(entries.len()) == slots {
+                slots = slots.saturating_mul(2).max(FEWEST_SLOTS);
+            }
+            entries.push(hyper_raft::proto::Entry::default());
+            assert_eq!(
+                count(entries.capacity()),
+                slots,
+                "after {} entries",
+                entries.len()
+            );
+        }
+    }
+
     /// The growth is RFC 6298's fold over each wait's rate, its tail `smoothed + 4 · deviation`,
     /// sample for sample; and the wait under way's rate counts where faster, a burst as it comes.
     #[test]

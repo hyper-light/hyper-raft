@@ -1279,21 +1279,22 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   freshness their peers held them to, and each suspected the others). What its disk owes is the
   owner's to bound: a leader hands the lead on by the patience's law, its backlog about to fill the
   room its budget has left (hyper-durable's `Replica::disk_fill`, `docs/durable.md` §4.2), and one
-  that leads on its followers' disks meanwhile answers on them (`Config::apply_unpersisted`). Every node of a group runs so, or
-  none, and the heartbeat says which (flags bit 2). A heartbeat of the other mode is refused for its
-  disk (`Refusal::OtherMode`), and the owner is told as a peer's mode turns other and back
-  (`Change::ModeDiffers`, `Change::ModeAgrees`). Its sender is judged apart from its disk while it
-  speaks that mode, by its heartbeats' arrivals and round trips alone, which feed the node's pool and
-  its evidence as any do, so a node alone in its mode judges from them. So a mixed group, as in a rolling restart's window (`docs/durable.md` §4.2), is a typed
-  refusal, never a misjudgment of a disk, and a dead process of either mode is suspected (Focal's
-  condition 1; before it, a node not in the mode refused its peers' unproven heartbeats as
-  `Unproven` and suspected them). In the harness, in such a group, a 2 s stall of the leader's disk alone started no
-  election over 10,000 seeds, every publish offered in it answered by the leader within 5.2 ms on a
-  majority's disks (`judged_apart_ten_thousand_stalls_...`); a stall of every node's disk at once
+  that leads on its followers' disks meanwhile answers on them (`Config::apply_unpersisted`). Every
+  node of a group runs so, or none, and the heartbeat says which (flags bit 2). A heartbeat of the
+  other mode is refused for its disk (`Refusal::OtherMode`), and the owner is told as a peer's mode
+  turns other and back (`Change::ModeDiffers`, `Change::ModeAgrees`). Its sender is judged apart
+  from its disk while it speaks that mode, by its heartbeats' arrivals and round trips alone, which
+  feed the node's pool and its evidence as any do, so a node alone in its mode judges from them. So
+  a mixed group, as in a rolling restart's window (`docs/durable.md` §4.2), is a typed refusal,
+  never a misjudgment of a disk, and a dead process of either mode is suspected (Focal's condition
+  1; before it, a node not in the mode refused its peers' unproven heartbeats as `Unproven` and
+  suspected them). In the harness, in such a group, a 2 s stall of the leader's disk alone started
+  no election over 10,000 seeds, every publish offered in it answered by the leader within 5.2 ms on
+  a majority's disks (`judged_apart_ten_thousand_stalls_...`); a stall of every node's disk at once
   and of each in turn spends no term; and a killed node is suspected within its stated bound as
   before (`judged_apart_a_killed_peer_...`, `judged_apart_the_shell_..._fails_over_...`). The cost
-  is the flush proof's: a node whose disk stops for good is not suspected for it, only handed
-  around by its own patience, once its backlog would fill its room.
+  is the flush proof's: a node whose disk stops for good is not suspected for it, only handed around
+  by its own patience, once its backlog would fill its room.
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at

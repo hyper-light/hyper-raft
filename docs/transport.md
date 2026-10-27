@@ -2188,6 +2188,49 @@ Tests:
 - The in-memory network carries several endpoints on one side, each at an address of its own
   (`tests/common`'s `Several`), so a test can make its server's pool contended.
 
+## 4ak. A reply carries its request's acknowledgement (2026-10-27, found by focal)
+
+Every connection asked its peer to acknowledge as Google QUIC's receivers do (§4k): within a quarter
+of the smoothed round trip, which on a path shorter than 4 ms is the peer's 1 ms granularity. A
+request whose reply took longer than that was acknowledged alone, ahead of its reply. focal's work
+mode puts a 1-CPU leader under 500 agents, each write a request taking more than a millisecond to
+commit. With a frame-count diagnostic summing every connection's statistics (compare CI, 2026-10-26),
+its leader sent about 3.5 acknowledgement-only packets a write at 50 claims a second, of 8.4
+datagrams sent. Asked to acknowledge within RFC 9000's default max_ack_delay instead, it sent 26%
+fewer datagrams a write (8.92 to 6.56 at 50 a second, 7.55 to 5.87 at 100) and received 9 to 13%
+fewer.
+
+The acknowledgement frequency draft names the cost, "Sending UDP datagrams is very CPU intensive on
+some platforms" (draft-ietf-quic-ack-frequency-14 §2), and leaves the delay to the sender's needs
+(§8). Its advice to ask for an acknowledgement at least once a round trip (§8.1) keeps a sender's
+congestion control responsive while its window limits it, as it does for a stream of data. A request
+a reply answers is application-limited, and the reply carries the acknowledgement whenever it goes
+first. TCP's receivers hold an acknowledgement for the data they answer in the same way (RFC 1122
+§4.2.3.2's delayed ACK, at least 40 ms on Linux in an exchange of requests and replies).
+
+`Limits::acknowledgement` chooses per endpoint:
+
+- `Acknowledgement::Decimated` is §4k's decimation, for a stream of data whose congestion control
+  waits on its acknowledgements: a node's replication.
+- `Acknowledgement::Replies` is the same decimation (an ACK for every 10 ack-eliciting packets from
+  the 100th packet on), but within `REPLY_ACK_DELAY`, RFC 9000 §18.2's default max_ack_delay ("If this
+  value is absent, a default of 25 milliseconds is assumed"). This is hyper-quic's
+  `TransportConfig::decimate_acks_within` (`crates/hyper-quic/VENDORED.md` §46).
+
+What it costs is the time to detect the loss of the last packet of a request. Its probe timeout
+counts the delay asked (RFC 9002 §6.2.1, draft §7), so on a path shorter than 4 ms it is about 25 ms
+more than the round trip, where it was about 2 ms more. On a round trip of 100 ms or more, a quarter
+of it is 25 ms already, and nothing changes. A probe carries an IMMEDIATE_ACK, which takes the
+delay out of the probes after it (draft §7). Linux's TCP probes a lone lost segment no sooner than
+about 200 ms (its tail loss probe's delayed-ACK allowance).
+
+Tests:
+
+- `exchange::a_reply_carries_its_requests_acknowledgement`: past the hundredth packet each way,
+  twenty exchanges asked in turn, each answered 5 ms after its request, take 40 datagrams of the
+  asker's and 21 of the server's under `Replies`, and 61 and 41 decimated.
+- hyper-quic's `tests::decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

@@ -606,6 +606,68 @@ fn exchanges_past_the_stream_limit_wait_their_turn_and_the_table_is_bounded() {
     assert_eq!(server.answered, 6);
 }
 
+/// A connection whose packets replies answer asks its peer to acknowledge within RFC 9000's
+/// default max_ack_delay (`Acknowledgement::Replies`, docs/transport.md §4ak): from the hundredth
+/// packet on, a reply sent 5 ms after its request carries the request's acknowledgement, where a
+/// peer asked to acknowledge within a quarter of the round trip sent one alone at its 1 ms
+/// granularity, ahead of the reply. Twenty exchanges asked in turn take 40 datagrams of the
+/// asker's and 21 of the server's; decimated, 61 and 41.
+#[test]
+fn a_reply_carries_its_requests_acknowledgement() {
+    let pair = Pair::new();
+    let exchanges = |acknowledgement: hyper_transport::Acknowledgement| -> (u64, u64) {
+        let mut limits = limits();
+        limits.acknowledgement = acknowledgement;
+        let mut net = connected::<Mantle, Mantle>(&pair, limits, 256 << 20);
+        let (mut asker, mut server) = (Asker::new(), Server::new());
+        server.think = Duration::from_millis(5);
+        let mut ask = |net: &mut Net<Node<Mantle>, Node<Mantle>>, seed: u8| {
+            asker
+                .ask(
+                    &mut net.a,
+                    net.now,
+                    2,
+                    (Kind::Get, Class::Request),
+                    seed,
+                    Some(100),
+                    PERIOD,
+                )
+                .unwrap();
+            for _ in 0..TURNS {
+                net.exchange();
+                asker.drive(&mut net.a);
+                server.now = Some(net.now);
+                server.serve(&mut net.b);
+                if asker.finished() {
+                    return;
+                }
+                net.exchange();
+                net.advance_within(Duration::from_millis(1));
+            }
+            panic!("exchange {seed} never answered");
+        };
+        // Past the hundredth packet each way, where either asks its peer how to acknowledge.
+        for seed in 0..60 {
+            ask(&mut net, seed);
+        }
+        let before = net.datagrams;
+        for seed in 60..80 {
+            ask(&mut net, seed);
+        }
+        (net.datagrams[0] - before[0], net.datagrams[1] - before[1])
+    };
+    let (asks, sent) = exchanges(hyper_transport::Acknowledgement::Replies);
+    assert!(
+        asks <= 42 && sent <= 22,
+        "the server sent {sent} datagrams for 20 replies and the asker {asks}"
+    );
+    let (asks, decimated) = exchanges(hyper_transport::Acknowledgement::Decimated);
+    assert!(
+        decimated >= 38,
+        "decimated, the server sent {decimated} datagrams for 20 replies (and the asker {asks})"
+    );
+}
+
 /// A pooled server holds its peer to the pool it sizes (docs/transport.md §4g): of ten exchanges
 /// asked at once on a connection that may hold sixteen, no more than the pool's three and the
 /// stream the connection keeps (§4aj) are open at the server at once; the others wait at the asker

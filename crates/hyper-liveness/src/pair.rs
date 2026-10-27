@@ -620,7 +620,9 @@ impl Pair {
         // yet measured. Kept at nothing, every heartbeat came due at the instant it was asked, no
         // flush fell after the one before, and the stream proved none, sent none and asked no wake,
         // so its timer was never measured either: a restarted node its peers suspected for good
-        // (Quiver's simulation, kiln's CP-T2.2 step 6).
+        // (Quiver's simulation, kiln's CP-T2.2 step 6). One nanosecond and no more: a flush proves
+        // a heartbeat only if it falls strictly after the one before, and strictly after takes one
+        // positive step of the clock; a wider floor would only hold the first heartbeats back.
         let spacing = if self.stream.next.is_none() || self.stream.interval_ns == 0 {
             interval.max(1)
         } else {
@@ -698,7 +700,8 @@ impl Pair {
         self.counts.skipped = self.counts.skipped.saturating_add(skipped);
         self.stream.sent = Some(seq);
         self.stream.proof = sender.durable_count;
-        // Never nothing, which says no heartbeat was ever sent (`Pair::report`'s `sending`).
+        // Never nothing, which says no heartbeat was ever sent (`Pair::report`'s `sending`): at
+        // least one nanosecond, the one positive step of the clock that strictly after needs.
         self.stream.interval_ns = interval.max(1);
         self.stream.base_ns = base;
         if self.received.run.is_none() {

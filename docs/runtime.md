@@ -486,8 +486,11 @@ one-shot never holds.
   reallocates. A handle whose last waiter leaves is disarmed (IOCP cancels its AFD poll).
 - **An AFD poll delivers by the status its IRP completed with.** `STATUS_CANCELLED` delivers nothing, a poll
   that completed before its cancel delivers its events, and a failed one wakes both directions, as wepoll
-  maps it to `EPOLLERR`. A replacement poll is issued before the old one is cancelled, so a refused issue leaves the
-  waiters already served. A dropped driver awaits its cancelled polls' completions (`CancelIoEx` does not
+  maps it to `EPOLLERR`. A socket has one poll in flight, as wepoll and mio keep: a wider one is issued only
+  once the poll it replaces was cancelled and its completion taken. Issued over the pending poll, the pending
+  one then cancelled, the wider poll was never told, and the socket never read again (Quiver's three-machine
+  lab, 2026-10-27; `a_wider_poll_over_a_pending_one_still_tells_a_read`). A replacement the kernel refuses
+  wakes every waiter on the socket to retry and arm again, so none is left without a poll. A dropped driver awaits its cancelled polls' completions (`CancelIoEx` does not
   wait for a cancel to finish) until the last arrives, or at most the I/O manager's own timeout for a
   cancelled IRP, five minutes (Microsoft, *Canceling IRPs*). It counts a block still owed then, which is
   left to the kernel rather than freed.

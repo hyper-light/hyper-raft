@@ -244,6 +244,18 @@ impl Drop for Port {
     }
 }
 
+/// A socket's poll in flight. While `widen` holds events, the poll is being cancelled so that a poll
+/// for those events, issued once its completion is taken ([`IocpDriver::complete`]), replaces it: one
+/// poll a socket in flight, as wepoll and mio keep. An AFD poll issued over a pending one on the same
+/// socket, the pending one then cancelled, never completed, and the socket was never read again (Quiver's
+/// three-machine lab, CP-T2.2 step 7; `a_wider_poll_over_a_pending_one_still_tells_a_read`).
+#[derive(Clone, Copy, Debug)]
+struct Watch {
+    block: *mut Block,
+    /// The events, and the tag, of the poll that is to replace this one once its cancel is taken.
+    widen: Option<(u32, u64)>,
+}
+
 /// The driver. It borrows its port from the registry slot (see [`Port`]) and never closes it.
 pub struct IocpDriver {
     port: HANDLE,
@@ -260,7 +272,7 @@ pub struct IocpDriver {
     /// waiter leaves (`disarm`), so it holds at most the handles waited on, `handles_bound`. Reserved for
     /// twice that: hashbrown rehashes in place, without allocating, while the items are at most half its
     /// capacity (`RawTable::reserve_rehash`), so tombstones never make it grow (mantle's final review, 4).
-    outstanding: HashMap<i32, *mut Block>,
+    outstanding: HashMap<i32, Watch>,
     /// The handles `outstanding` may hold (`interests_per_shard`).
     handles_bound: usize,
     /// Polls issued and not yet reclaimed, cancelled ones included: what the drop drains.
@@ -353,12 +365,12 @@ impl IocpDriver {
     /// fires. A Windows `SOCKET` fits in a positive `i32` in practice (kernel handle-table values), so
     /// the readiness seam carries it as the same `i32` a Unix fd uses; it is reconstructed here as the
     /// low 32 bits, unsigned. The leaked poll block is owned by the kernel until `wait` reclaims it.
-    /// One outstanding AFD poll per socket (mantle's review, finding 8): a poll that already watches every
-    /// event wanted stays; otherwise one for the union is issued first and only then the old one cancelled,
-    /// so a refused issue leaves the old poll, and the waiters it serves, in place (mantle's final review,
-    /// second pass, finding 1: cancelling first stranded them when the issue failed).
+    /// One AFD poll per socket in flight (mantle's review, finding 8; [`Watch`]): a poll that already
+    /// watches every event wanted stays; otherwise it is cancelled, and a poll for the union is issued
+    /// once its completion is taken. A poll issued over the pending one, the pending one then cancelled,
+    /// was never told (Quiver's lab, 2026-10-27), where wepoll and mio cancel first and issue after.
     fn arm_events(&mut self, raw: i32, events: u32, tag: u64) -> Result<(), RtError> {
-        let Some(&old) = self.outstanding.get(&raw) else {
+        let Some(watch) = self.outstanding.get_mut(&raw) else {
             if self.outstanding.len() >= self.handles_bound {
                 return Err(RtError::Capacity {
                     what: "AFD polls",
@@ -366,19 +378,24 @@ impl IocpDriver {
                 });
             }
             let block = self.issue(raw, events, tag)?;
-            self.outstanding.insert(raw, block);
+            self.outstanding.insert(raw, Watch { block, widen: None });
             return Ok(());
         };
+        if let Some((wanted, _)) = watch.widen.as_mut() {
+            // Being cancelled already: its replacement watches these too.
+            *wanted |= events;
+            return Ok(());
+        }
         // SAFETY: an outstanding block is live until its completion is reclaimed, which removes it here.
-        let requested = unsafe { Block::requested(old) };
+        let requested = unsafe { Block::requested(watch.block) };
         if requested & events == events {
             return Ok(());
         }
-        let block = self.issue(raw, requested | events, tag)?;
-        self.outstanding.insert(raw, block);
+        watch.widen = Some((requested | events, tag));
+        let block = watch.block;
         if let Some(afd) = self.afd.as_ref() {
-            // SAFETY: the old block was in flight until just now (above); its completion still arrives.
-            unsafe { afd.cancel(old) };
+            // SAFETY: the block is in flight until its completion is reclaimed; its completion still arrives.
+            unsafe { afd.cancel(block) };
         }
         Ok(())
     }
@@ -404,18 +421,28 @@ impl IocpDriver {
     }
 
     /// Takes a poll's completion: reclaims its block and, unless it was cancelled, the readiness it carried.
+    /// A poll cancelled to be widened ([`Watch`]) has its replacement issued here, once the kernel is done
+    /// with it; a replacement the kernel refuses wakes every waiter on the socket, each to retry its call
+    /// and arm again, so none is left without a poll (mantle's final review, second pass, finding 1).
     fn complete(&mut self, block: *mut Block) -> Option<Completion> {
         // SAFETY: `block` is a `Block` leaked by `Afd::poll` and delivered by the port exactly once.
         let reclaimed = unsafe { Block::reclaim(block) };
         self.in_flight = self.in_flight.saturating_sub(1);
         let raw = crate::interests::handle_of(reclaimed.user_data)?;
-        let current = self.outstanding.get(&raw) == Some(&block);
-        if current {
-            self.outstanding.remove(&raw);
-        }
-        let fired = match reclaimed.outcome {
-            // A cancelled poll the driver replaced or disarmed: nothing happened to deliver.
+        let current = self
+            .outstanding
+            .get(&raw)
+            .is_some_and(|watch| watch.block == block);
+        let widen = if current {
+            self.outstanding.remove(&raw).and_then(|watch| watch.widen)
+        } else {
+            None
+        };
+        let mut fired = match reclaimed.outcome {
+            // A cancelled poll the driver disarmed: nothing happened to deliver.
             Outcome::Cancelled if !current => return None,
+            // Cancelled by this driver to be widened: nothing happened; its replacement is issued below.
+            Outcome::Cancelled if widen.is_some() => Readiness::NONE,
             // Cancelled while still the handle's poll — not by this driver (a thread's exit, another caller's
             // cancel): its waiters would wait on nothing, so they are woken to retry (the second pass's
             // hardening of finding 1).
@@ -431,6 +458,20 @@ impl IocpDriver {
                 fired
             }
         };
+        if let Some((events, tag)) = widen {
+            match self.issue(raw, events, tag) {
+                Ok(wider) => {
+                    self.outstanding.insert(raw, Watch {
+                        block: wider,
+                        widen: None,
+                    });
+                }
+                Err(_) => fired = Readiness::READ.union(Readiness::WRITE),
+            }
+        }
+        if fired == Readiness::NONE {
+            return None;
+        }
         Some(Completion {
             user_data: reclaimed.user_data,
             result: fired.bits(),
@@ -451,9 +492,9 @@ impl Drop for IocpDriver {
     /// it: a counted number of rounds would let kick packets end it before the polls' completions came.
     fn drop(&mut self) {
         if let Some(afd) = self.afd.as_ref() {
-            for (_, block) in self.outstanding.drain() {
+            for (_, watch) in self.outstanding.drain() {
                 // SAFETY: an outstanding block is live until its completion is reclaimed.
-                unsafe { afd.cancel(block) };
+                unsafe { afd.cancel(watch.block) };
             }
         }
         let deadline = crate::machine::clock::monotonic_ns().saturating_add(DRAIN_NS);
@@ -626,7 +667,7 @@ impl Driver for IocpDriver {
     }
 
     fn disarm(&mut self, raw: i32) {
-        if let Some(block) = self.outstanding.remove(&raw)
+        if let Some(Watch { block, widen: None }) = self.outstanding.remove(&raw)
             && let Some(afd) = self.afd.as_ref()
         {
             // SAFETY: an outstanding block is live until its completion is reclaimed; its completion, now
@@ -769,8 +810,9 @@ mod tests {
 
     /// Mantle's final review, second pass, finding 1. Do: a reader waits on a socket (its AFD poll in flight);
     /// a writer's wait on the same socket needs a wider poll, whose issue is refused; then a datagram arrives.
-    /// Expect: the writer's wait is refused, and the reader still wakes. The old poll used to be cancelled
-    /// before the wider one was issued, so the refusal left the reader with no poll and it slept for good.
+    /// Expect: the reader still wakes. The refused replacement of a poll cancelled to be widened wakes
+    /// every waiter on the socket, to retry and arm again ([`Watch`]): none is left without a poll, as the
+    /// reader once was when the old poll was cancelled and the issue after it refused.
     #[test]
     fn a_refused_wider_poll_leaves_the_waiters_already_on_the_socket() {
         let mut rt = LocalRuntime::new(&config()).unwrap();
@@ -782,7 +824,8 @@ mod tests {
                 // One yield: the loop arms the reader's poll before the writer asks for the wider one.
                 yield_now().await;
                 FAIL_NEXT_ISSUE.with(|fail| fail.set(true));
-                assert!(ours.writable().await.is_err(), "the wider poll was refused");
+                // Woken by the refusal, or refused: either way its wait ends.
+                let _ = ours.writable().await;
                 peer.send_to(b"x", to).unwrap();
             });
             match race2(joined, sleep(PATIENCE_NS)).await {

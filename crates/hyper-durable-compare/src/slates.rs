@@ -109,6 +109,7 @@ fn settings() -> Settings {
         },
         quiet: Duration::from_millis(10),
         elections: hyper_raft::Elections::Suspicion,
+        disk: hyper_durable::Disk::Flushed,
     }
 }
 
@@ -118,7 +119,9 @@ fn settle(r: &mut Replica<RamStore, Nothing, Unbounded>, now: &mut u64, out: &mu
     for _ in 0..1_000 {
         *now += 1;
         out.clear();
-        let driven = r.drive(*now, Waker::noop(), out).expect("the leader drives");
+        let driven = r
+            .drive(*now, Waker::noop(), out)
+            .expect("the leader drives");
         if !driven.more && driven.out == 0 {
             return;
         }
@@ -135,8 +138,8 @@ pub fn shell_transition(entries: u64, runs: usize) -> Vec<Duration> {
             ..ConfState::default()
         },
     };
-    let mut r = Replica::open(&settings(), RamStore::new(), machine, Unbounded)
-        .expect("a member opens");
+    let mut r =
+        Replica::open(&settings(), RamStore::new(), machine, Unbounded).expect("a member opens");
     let mut now = 0u64;
     let mut out = Output::default();
     r.campaign().expect("a sole voter campaigns");
@@ -148,7 +151,8 @@ pub fn shell_transition(entries: u64, runs: usize) -> Vec<Duration> {
         c
     };
     for n in 0..entries {
-        r.propose(Vec::new(), command(n)).expect("the leader takes it");
+        r.propose(Vec::new(), command(n))
+            .expect("the leader takes it");
         settle(&mut r, &mut now, &mut out);
     }
     let first = r.applied().index;

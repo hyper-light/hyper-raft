@@ -1162,6 +1162,31 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   `a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off` (a node of three restarted
   deaf for 10 s in the four worlds: no suspicion of it is of a heartbeat not yet due by its schedule,
   where with the doubling unannounced macOS's first seed had one 190 ms before it).
+- **A run that has taken none of this node's heartbeats** (2026-10-24, found by mantle). The interval a
+  peer asks of this node's stream is its detector's choice from that stream's heartbeats, and a peer
+  that started again asks nothing until its new run's link has evidence: a stream taking that went
+  to its floor, a flush a heartbeat, which a restart heard at once makes a few seconds' warm-up (in
+  this simulation's macOS and Linux worlds the surviving nodes' liveness writes rise from 11–30 a
+  second to 80–240 for about five seconds, and the run configures). mantle's roll restarts a founder
+  at a new port, which its peers send to at its old one until they are told, so the new run's
+  heartbeats reached them asking nothing while it heard none of theirs, and their streams to it ran at
+  their floors, sending where no one listened, for as long as that lasted: 40 to 200 liveness writes
+  a second on its busy CI runners against 1 to 2, on the host whose lateness makes the detectors'
+  mistakes. Such a run's heartbeats echo nothing, its sender having taken none of the receiver's, and
+  its ask is taken only once one echoes (`Pair::keep_said`): until then the stream keeps the interval
+  it was at, which the run's previous ask gave. It is no back-off, whose doublings a peer that takes
+  this node's heartbeats would not expect (the echo-less heartbeat is the doubling's only notice, and
+  the back-off's own heartbeats echo the peer's), and a stream that changes no gap changes nothing
+  its peer foresees; once the run takes a heartbeat and echoes it, its ask is taken and the warm-up
+  runs as before. A first run's stream starts with no ask, at its floor, as before. Measured with
+  the simulation at `dd764a0` and `313ada8` alike, the rise is the restart's: a peer only stopped
+  leaves its peers' streams at the interval it asked, their writes as they were. Test:
+  `a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat` (the third node of three restarted
+  deaf for 20 s in the four worlds, 8 seeds each: each other node's heartbeats to it keep their
+  interval and number at most the deaf time over it and two, its liveness writes at most its
+  heartbeats and one, and once heard every pair configures with no suspicion by the restarted node of
+  a heartbeat its sender did not yet have due; red at `313ada8`, whose hyper-liveness is `af01c51`'s,
+  macOS's first seed sending 2,159 heartbeats 6.97 ms apart where its stream had been at 110 ms).
 - **A stream keeps its schedule without hearing its peer.** A heartbeat sent whose next slot is
   already due asks at once for the flush that proves the next (`Liveness::poll`), and its completion
   polls the stream. Its next slot is due already where the interval fell while the stream was
@@ -1232,6 +1257,44 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   with the node's own proof recorded at each call: a point may pass untold, or be told later, only
   where the call shows that proof outstanding or ended since the peer was heard, or nothing durable
   since the point.
+- **Judged apart from the disk** (kiln's CP-T2.2, `Liveness::set_disk_apart`, off by default). The
+  flush proof makes a node whose disk stalls look crashed, and so a leader whose disk alone stalls
+  loses its lead though its process runs and its followers' disks are a majority: in hyper-durable's
+  liveness harness (`tests/liveness.rs`, `survey_of_stalls`) a 2 s stall of the leader's disk alone
+  spends a term in 8 of 8 seeds, both followers suspecting it within their freshness (59 to 88 ms).
+  An owner may judge each peer's process apart from its disk instead: a heartbeat leaves when it is
+  due whatever a flush is doing, carrying the durable count and, as its flush age, the age of the
+  node's oldest write not yet durable, zero when none (`Liveness::on_pending`, the owner telling
+  the stream what waits on its log); it asks no flush of its own for it, where a heartbeat's slot
+  in which nothing became durable once asked a probe, a flush an interval on an idle node (Focal's
+  5a); a receiver takes one whether or not the count moved; and a freshness point that passed is
+  judged at the point, whatever the judge's own durability, so the own-proof rule above has
+  nothing to hold. Only a node's silence is then a failure. The node judges its own disk slow once
+  its oldest write not yet durable has waited past its flushes' tail and the widest freshness its
+  detectors hold, and caught up once that wait is back under its smoothed flush or nothing waits: a
+  disk with nothing to do is no slow one. Its floor, `E[flush] + G`, is the mean of its flushes
+  within their tail as each came: its heartbeats wait on none, and a stall's flush, past the tail,
+  measures nothing one costs (with it, the flush that ended a 13 s stall of a lightly loaded
+  group's every disk raised its floors from 2 to 262 to 308 ms, their links' intervals past the
+  freshness their peers held them to, and each suspected the others). What its disk owes is the
+  owner's to bound: a leader hands the lead on by the patience's law, its backlog about to fill the
+  room its budget has left (hyper-durable's `Replica::disk_fill`, `docs/durable.md` §4.2), and one
+  that leads on its followers' disks meanwhile answers on them (`Config::apply_unpersisted`). Every
+  node of a group runs so, or none, and the heartbeat says which (flags bit 2). A heartbeat of the
+  other mode is refused for its disk (`Refusal::OtherMode`), and the owner is told as a peer's mode
+  turns other and back (`Change::ModeDiffers`, `Change::ModeAgrees`). Its sender is judged apart
+  from its disk while it speaks that mode, by its heartbeats' arrivals and round trips alone, which
+  feed the node's pool and its evidence as any do, so a node alone in its mode judges from them. So
+  a mixed group, as in a rolling restart's window (`docs/durable.md` §4.2), is a typed refusal,
+  never a misjudgment of a disk, and a dead process of either mode is suspected (Focal's condition
+  1; before it, a node not in the mode refused its peers' unproven heartbeats as `Unproven` and
+  suspected them). In the harness, in such a group, a 2 s stall of the leader's disk alone started
+  no election over 10,000 seeds, every publish offered in it answered by the leader within 5.2 ms on
+  a majority's disks (`judged_apart_ten_thousand_stalls_...`); a stall of every node's disk at once
+  and of each in turn spends no term; and a killed node is suspected within its stated bound as
+  before (`judged_apart_a_killed_peer_...`, `judged_apart_the_shell_..._fails_over_...`). The cost
+  is the flush proof's: a node whose disk stops for good is not suspected for it, only handed around
+  by its own patience, once its backlog would fill its room.
 - **The receiver** feeds each heartbeat to the pair's `LinkEstimator` at the sender's interval (a
   new interval or a new run re-anchors it; a restarted peer's heartbeats are numbered on from its
   last run's, so the link's history, the hosts' and the path's, stays and the peer is judged at
@@ -1481,6 +1544,44 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
     held the peer suspected while its owner trusted it, and a peer that died in its links' first
     heartbeats was never reported (a pair's unit test; the simulation's worlds had not reached it).
   The simulation holds every node's owner to it after every step (`told_is_believed`).
+- **A stop announced** (2026-10-24, asked by mantle). The MTBF counts what a detector must catch
+  (§2.2: a crash, detected within `E(D) + α + η`, then an election), and a node its owner stops in
+  order hands over what it leads before it goes (mantle's orderly stop: each range it leads
+  transferred and shown led elsewhere), so its stop and its next start are no failure; counted one,
+  as every restart was, a rolling update charged each node's peers a failure at every roll, and a
+  node started with no history (`Exposure::new()`) read an MTBF of twice a few seconds from it. The
+  owner's announcement (`Liveness::stop`) sends each peer the run's last heartbeat, flagged
+  `stopping` (the flags' bit 1, `codec`), which claims no life, so no flush proves it and the
+  receiver takes from it only that the run it took last has ended in order. The receiver then counts
+  that run's successor's start, or its own letting go of the pair while it suspects the peer, as no
+  failure (`Taken::after_stop`), answers the announcement once with its next heartbeat, which echoes
+  it and is proven as any (since 2026-10-25), sends the ended run nothing else, where each heartbeat
+  to it asked a flush of its own, and answers its successor's first heartbeat at once, numbered
+  next, skipping no slot of the stop (`Stream::resume`). It suspects the peer at once and until the
+  successor's first heartbeat (`Change::Stopped`, since 2026-10-25): the announcement is the peer's
+  own word that its run has ended, which the run's freshness point would say only the detector's
+  margin later, and a heartbeat of the stopped run the announcement overtook is refused as stale
+  (§2.9, "A voter's stop announced"). The stopping node learns that a peer took it from the echo of
+  the answer (`Liveness::stop_taken`), and until then sends the announcement again at the stream's
+  interval, so that a lost announcement, or a lost answer, is asked again as a heartbeat would be;
+  stamped after every heartbeat the stream sent before it, an echo of it names an announcement
+  alone. A node that announced may run on, its members leading and following, as an owner that
+  announces before it hands over does: its polls judge as before, and send the announcement and
+  nothing else. Taken by a build that reads only the echo's bit (which refuses it as malformed, the
+  version unchanged so every other heartbeat of a new build reads as before), it costs what an
+  unannounced stop costs, and is never answered. An owner keeps the evidence across its runs with
+  `Liveness::history` and `hyper_timing::Exposure::of`. Tests:
+  `a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing` (the third
+  node of three announces its stop and stops, in the four worlds, 8 seeds each: its peers count no
+  failure at its restart, sent it only the answer after the announcement, and answered its new run
+  at once, numbered next; a peer let go while suspected after it counts none). With the rule taken
+  out, a failure was counted at the first seed; with the gate on sending taken out, 92 heartbeats
+  went to the stopped run in 10 s.
+  `a_stop_announced_is_answered_once_and_the_stopping_node_knows_it_was_taken` (the third announces
+  and runs on, its first announcement to the first node lost: it knows both took it, the first only
+  after an announcement sent again; each peer answered each announcement it took once and sent
+  nothing else; the third sent nothing once answered). `--bench allocs`: 0 allocations,
+  reallocations, bytes and faults a heartbeat in every cell, 89 to 130 ns a heartbeat.
 - **The detection bound** each suspicion states: NFD-E suspects at `τ_{h+1} = EA_{h+1} + α` on the
   receiver's clock, and the sender's last heartbeat was due at `σ_h` on its own; the time between
   is `τ_{h+1} − σ_h − θ`, `θ` the clocks' offset. Each echoed heartbeat `j` bounds `θ` from below:
@@ -1682,48 +1783,61 @@ spend a term and depose a leader that never left.
   `crates/hyper-raft/ORIGIN.md`, "L-2").
 - **A member campaigns only while it and the members it trusts are a quorum** of each half of its
   configuration: a campaign that cannot win is not run, and costs nothing while a partition lasts.
-- **A leader steps down** once it and those it trusts are no quorum of either half (check-quorum
-  from the detectors, Raft §6.2), at once: the detector already waited its `η + α`.
-- **A leader that stops leading in its term hands over**: a transfer's order (`MsgTimeoutNow`,
-  dissertation §3.10) to a voter, which campaigns at once. Its followers trust its node, which
-  lives, and on ticks their lease would have run out; nothing else would make them campaign. The
-  schedules found it twice: a leader that removed itself with no voter holding its whole log (seed 7
-  of the four settings), and one that stepped down for want of a quorum. The heir's campaign moves
-  its voters to a later term, where they know no leader, and an heir that cannot win leaves them
-  there all the same. Until its term moves or it follows another leader of it, a member that led its
-  term and cannot campaign hands over again a round and a draw after the last, as a candidate asks
-  again, for the order may be lost, but never within the election the law expects (`T_E`,
-  `Timing::election`) of its last order, nor campaigns within it (`Watch::ordered`): each order forces
-  a campaign, and a second before the first can finish makes two candidates that split the vote.
+- **A pre-candidate its detectors leave no quorum stops asking** and follows the leader it left
+  again, in its term (`Raft::stop_asking`, `Watch::left`): its campaign could win only by the vote
+  of a member it suspects, and the leader it left, which leads on, grants no vote but a forced one.
+  While it asked it dropped what that leader sent (a pre-candidate does not hear a leader it
+  suspects, below), so the leader, with no other voter up, committed nothing.
+- **A leader its detectors leave no quorum leads on** (it and those it trusts are no quorum of
+  either half: check-quorum from the detectors, dissertation §6.2) and hands over only to a voter
+  that can be elected without it: its order to campaign (next) carries `IF_ELECTED_WITHOUT`, and the
+  heir campaigns on it only where it and the voters it trusts, the leader apart, are a quorum of each
+  half of its own configuration (`Raft::takes_order`). Until 2026-10-24 it stepped down at once, the
+  detector having waited its `η + α`; "A leader its detectors leave no quorum", below, has why it no
+  longer does and what that keeps.
+- **A leader left no quorum, and a leader that stops leading in its term, hand over**: a transfer's
+  order (`MsgTimeoutNow`, dissertation §3.10) to a voter, which campaigns at once, unconditionally
+  from a member that leads nothing (its vote is free) and only where it can be elected without the
+  leader from one that leads on. Its followers trust its node, which lives, and on ticks their
+  lease would have run out; nothing else would make them campaign. The schedules found it twice: a
+  leader that removed itself with no voter holding its whole log (seed 7 of the four settings), and
+  one that stepped down for want of a quorum. The heir's campaign moves its voters to a later term,
+  where they know no leader, and an heir that cannot win leaves them there all the same. Until its
+  term moves, or it follows another leader of it, or (leading) its detectors leave it a quorum again,
+  a member hands over again a round and a draw after the last, as a candidate asks again, for the
+  order may be lost, but never within the election the law expects (`T_E`, `Timing::election`) of its
+  last order, nor, having led, campaigns within it (`Watch::ordered`): each order may force a
+  campaign, and a second before the first can finish makes two candidates that split the vote.
   Re-ordered a round and a draw after the last, about a millisecond on loopback, stepped-down members
   forced a new heir every 4 to 9 ms and two within one millisecond, and votes split (mantle's cluster
   suite pinned on Linux at `eb85154`, 776 orders in one round of it;
-  `a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last`: orders 4.12 ms apart
-  against a `T_E` of 4.40 ms without the rule). A member of a later term answers an old order (as it
-  answers an old leader's heartbeat), which moves the sender's term.
+  `no_heir_is_ordered_within_an_expected_election_of_the_last`: orders 4.12 ms apart against a `T_E`
+  of 4.40 ms without the rule). A member of a later term answers an old order (as it answers an old
+  leader's heartbeat), which moves the sender's term.
 
   *Who the heir is* (`Raft::hand_over`). The heirs are every other voter, in order: those the
   leader's detectors trust before those they suspect, then the most of its log held first, then by
   id; each hand-over names the next (`Watch::handovers`, from the first again at each term the member
-  leads), so the order at the step-down goes to the trusted voter that holds the most. At the
-  step-down it orders at once only where it still trusts a voter: trusting none, it may be the one
-  that stalled (a host that froze suspects every peer at once), while its followers trust it, so
-  the `led` path decides a round and a draw later (`wake_follower`), campaigning if it trusts a
-  quorum again, which re-elects it, and otherwise handing over. Ordered at the step-down, the heir's
-  campaign moved the group's leadership at every short stall: mantle's cluster tests on a loaded
-  Linux runner (run 39525134119, job 118977876472) cut a leader off, let the others elect, rejoined
-  it, and found the leader elected during the cut replaced around the rejoin in three tests of
-  three (`a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`, red on
-  `757740c`). A voter the leader suspects is still an heir. A spare that replaces a failed voter
+  leads and each time its detectors leave it no quorum), so the first order goes to the trusted voter
+  that holds the most. A leader left no quorum orders at once only where it still trusts a voter:
+  trusting none, it may be the one that stalled (a host that froze suspects every peer at once),
+  while its followers trust it, so it orders a round and a draw later, and not at all if it trusts a
+  quorum again first, which ends the stall with nothing lost: no term moves. Ordered at once, the
+  heir's campaign moved the group's leadership at every short stall: mantle's cluster tests on a
+  loaded Linux runner (run 39525134119, job 118977876472) cut a leader off, let the others elect,
+  rejoined it, and found the leader elected during the cut replaced around the rejoin in three
+  tests of three (`a_leader_that_suspects_every_voter_for_less_than_a_round_leads_on`, red on
+  `757740c`; until 2026-10-24 it stepped down and was elected again in a later term). A voter the
+  leader suspects is still an heir. A spare that replaces a failed voter
   is an heir the leader trusts while it has not taken the joint entry and refuses the order as a
   learner by its own configuration; the next order goes to the next heir
   (`a_leader_whose_heir_is_a_spare_that_has_not_taken_its_change_still_hands_over`: `{1, 2, 3}` to
   `{1, 2, 4}`, 3 dead, the leader suspecting 2 as well; orders `[4, 2]` and 2 elected, where on
   `1b85eaf` the orders were `[4, 4, 4, 4, 4]` and no term moved, the one trusted heir named for
   good). A suspicion is one-way evidence: that the leader does not hear a
-  voter says nothing of whether the voter hears the leader, and a leader steps down exactly when it
-  and those it trusts are no quorum, so it may suspect every other voter while they all hear it and
-  trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
+  voter says nothing of whether the voter hears the leader, and a leader is left no quorum exactly
+  when it and those it trusts are none, so it may suspect every other voter while they all hear it
+  and trust it. Taking heirs only among the voters it trusted, it handed over to none, could not campaign
   itself (it trusts no quorum), and the range stayed leaderless for as long as its suspicions lasted:
   for ever under one-way loss (mantle's node simulation, a leader whose plane went deaf, seed 1: it
   suspected both followers at 9.2 ms and sent no order, and the cell elected again at 335 ms only
@@ -1734,17 +1848,18 @@ spend a term and depose a leader that never left.
   the test's 4.63 s). The turn passes over every heir, not only those that hold the most: the first
   may be dead, or one that cannot campaign (a learner by its own configuration) or cannot win while
   its followers keep their lease on the leader (a leader that restarted marked named such a member
-  again and again, core step R-7, seed 75 of the faults at rest by suspicion). Only the order at the
-  step-down knows what each holds: a follower's progress is reset (`Raft::reset`), as a restarted
-  leader's is, so the orders after it turn through the heirs it trusts and then the rest. Tests
-  (`tests/suspicion.rs`): `a_leader_that_suspects_every_other_voter_hands_over_all_the_same`
-  (leader 1 of three suspects 2 and 3, which trust it for good; it orders a round and a draw after
-  its step-down; on `1b85eaf` no order and no leader for the quiet period) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` (leader 1 of five
-  steps down trusting only 2, which alone holds its last entry and is dead, then suspects 2 as well;
-  on `1b85eaf` no leader within the quiet period), each red before; and
+  again and again, core step R-7, seed 75 of the faults at rest by suspicion). A leader that leads on
+  knows what each holds; a member that led and leads no more does not, its followers' progress
+  reset (`Raft::reset`), as a restarted leader's is, so its orders turn through the heirs it trusts
+  and then the rest. Tests (`tests/suspicion.rs`):
+  `a_leader_that_suspects_every_other_voter_hands_over_all_the_same` (leader 1 of three suspects 2
+  and 3, which trust it for good; it orders a round and a draw later; on `1b85eaf` no order and no
+  leader for the quiet period) and `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over`
+  (leader 1 of five is left no quorum trusting only 2, which alone holds its last entry and is dead,
+  then suspects 2 as well; on `1b85eaf` no leader within the quiet period), each red before; and
   `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts`, red with the turn counted
-  from the member's start, which at its second step-down named a suspected voter (`[2]`, where it
-  trusted only 3).
+  from the member's start, which the second time it was left no quorum named a suspected voter
+  (`[2]`, where it trusted only 3).
 - **What ends a follower's trust in its leader**, besides its detector: a request for votes from
   that leader (a member asks only while it does not lead, and terms only rise at it); its
   incarnation's end (`restarted`); a configuration that names it no voter; and a request from a
@@ -1770,15 +1885,24 @@ spend a term and depose a leader that never left.
   retransmission timeout RFC 6298 §2 computes, mean plus four deviations over the granularity, as
   RFC 9002 §6.2.1's), which recovers what was lost. A group with nothing in flight is sent nothing
   and woken for nothing. A member the leader suspects is left out, as CockroachDB quiesces a range
-  whose behind replicas are on non-live nodes, and a leader that trusts a member again sends it a
-  heartbeat, as CockroachDB wakes such ranges when the node becomes live
-  (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`). What it sent
-  the member while suspecting it, it takes for lost, as raft takes a transport's report that a
-  member is unreachable (`MsgUnreachable`): the window is given up and the member probed from what
-  it is known to hold. A member cut off while its group committed was sent a window of what the cut
-  lost, and a full window is asked about only once a beat passes unanswered: without the rule it
-  caught up a round tail after the heal, and never at a leader whose owner had given it no timing
-  (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while suspected is taken for lost").
+  whose behind replicas are on non-live nodes, while the members it trusts leave it a quorum; left
+  none, it counts them all, for it commits only by some it suspects, and an append lost on its way
+  to one waited, unsent again, until the leader trusted it
+  (`a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`, red on `313ada8`). A leader
+  that trusts a member again sends it a heartbeat, as CockroachDB wakes such ranges when the node
+  becomes live (`replica_raft_quiesce.go`, `Store.nodeIsLiveCallback`; `docs/research/timing.md`).
+  What it sent the member while suspecting it, it takes for lost, as raft takes a transport's
+  report that a member is unreachable (`MsgUnreachable`): the window is given up and the member
+  probed from what it is known to hold. A member cut off while its group committed was sent a
+  window of what the cut lost, and a full window is asked about only once a beat passes
+  unanswered: without the rule it caught up a round tail after the heal, and never at a leader whose
+  owner had given it no timing (hyper-raft `ORIGIN.md`, "Trusted again, what was sent while
+  suspected is taken for lost"). One with nothing in flight that holds the leader's whole log lost
+  nothing and is not probed, trusted again or seen to start again (`Raft::holds_all`): probed, it
+  could answer only with nothing new, which moves no probe on (`Progress::maybe_update`), and the
+  leader beat once a round, a heartbeat to every member, until the group's next write, after every
+  mistake its detectors withdrew (`a_leader_that_trusts_again_a_member_that_holds_its_log_goes_quiet`,
+  red on `313ada8` and `af01c51`: the idle group never came to rest).
 - **A transfer** is given up `TRANSFER_ROUNDS` (two) rounds after it began, the order reaching the
   transferee and the new leader's append coming back with the transferee's vote round between
   (dissertation §3.10: given up when not finished within an election), or at once when the
@@ -1788,6 +1912,149 @@ spend a term and depose a leader that never left.
   (`docs/durable.md` I9), and until then it waits for that write with no campaign armed, for a
   campaign at a wake before it moved its term past the write it waited for, and an owner wakes a
   member after every call (`a_sole_voter_waits_for_its_own_vote_and_campaigns_once`).
+
+**A leader its detectors leave no quorum** (2026-10-24, found by mantle's roll test). Check-quorum
+is a means for clients: "a leader in Raft steps down if an election timeout elapses without a
+successful round of heartbeats to a majority of its cluster", so that the clients a cut-off leader
+holds retry their requests with another server (dissertation §6.2, "Routing requests to the
+leader"). Raft's safety does not rest on it (§3.6.3): a leader commits only what a quorum of its term
+holds, and a read is answered only once a majority acknowledged a heartbeat round of its term
+(ReadIndex, §6.4). A step-down by suspicion is worth what it lets the group gain: another voter
+leading where this one cannot. A voter elected by the stepped-down leader's own vote is never that
+voter: its request reached the leader and the leader's grant reached it, so the two exchange messages
+and it could have followed the leader as well, and the group pays an election and a gap with no
+leader for a leader no better placed. Where every quorum without the leader holds a voter that cannot
+vote, one of three stopped in a rolling restart, every voter that could be elected needs the leader's
+vote, and a step-down only costs. The leader cannot tell that case from the one the step-down is for:
+a suspicion is one-way evidence, and its detectors suspect a stopped voter and a live one it does not
+hear alike (the deaf leader above). Each heir can tell for itself, by its own detectors, whether it
+and the voters it trusts, the leader apart, are a quorum. So the leader leads on and orders its heirs
+in turn as a stepped-down leader did, timed as before, and each order tells the heir to campaign only
+where it could be elected without the leader (`proto::IF_ELECTED_WITHOUT`, `Raft::takes_order`). A
+deaf leader's followers hear one another, and the heir told is elected by them
+(`a_leader_that_suspects_every_other_voter_hands_over_all_the_same`); with the third voter stopped,
+the heir suspects it, does nothing, and the group keeps its leader and its term. The follower's side
+is the same argument: a member campaigns only while it and those it trusts are a quorum, and a
+pre-candidate that loses that quorum stops asking and follows the leader it left again.
+
+What it keeps. Election Safety ("at most one leader can be elected in a given term", Figure 3.2) and
+the rest of Raft's properties are the votes' and the logs', which the rule leaves as they were: it
+withholds a step-down and makes a forced campaign conditional, so it only refuses or delays a
+campaign, which the TLA+ models already take at any time and with no reason (`docs/models/README.md`,
+"What the model leaves out"); the model of the rule itself is below. The followers' lease, a vote
+refused while they trust their leader (thesis §4.2.3, §9.6), is unchanged, and a leader grants no
+vote but a forced one while it leads. No read is answered by a lease: the thesis's (§6.4.1) "assumes
+a bound on clock drift across servers" and rests on a majority's acknowledgment of the leader's
+heartbeats, so a leader that leads on with no trusted quorum answers a read only once a majority
+acknowledged a heartbeat round of its term, its beats reaching the voters it suspects as well
+(`Raft::active`); a lease added later must rest on such an acknowledgment, never on the role
+(`a_leader_left_no_quorum_answers_no_read_without_a_quorums_acknowledgement`: a leader cut off while
+its voters elected another and committed a write answered no read, and followed once it heard
+them). A leader cut off from every voter leads on in its term, as a Raft leader does until a later
+term reaches it ("if a candidate or leader discovers that its term is out of date, it immediately
+reverts to follower state", §3.3): it commits nothing, its reads wait for answers that do not come,
+and its owner's asks of it time out where a step-down refused them at once, while a voter that can
+be elected without it is elected. A read whose round a cut lost is asked again at the leader's next
+beat, where a step-down let it go unanswered: hyper-durable's simulation now settles only once every
+leader has answered the reads it took, where it had settled at the first moment its write was
+applied everywhere, which can come before that beat. It sends one order an expected election at
+most while it is left no quorum, as a stepped-down member did. The detector's configuration still
+charges every mistake an election (§2.2), now an upper bound where a mistake can produce no leader.
+
+The evidence (mantle serve-cell `abef6120`, CI's busy shape: ubuntu-24.04, the tests on CPUs 0–1
+beside two busy loops; the roll test failed about one round in eight). At the third stop of a roll,
+leader L, restarted 4 s before, suspected F, the one other live voter, three times in 1.7 s while
+their QUIC connection stayed up; each time `Raft::suspect` found no trusted quorum and L stepped down
+with no heir it trusted, leading nothing, and was elected again at the next term 150–250 ms later
+(terms 5 to 9). At the first stop, two members had suspected each other since 250 ms after their links
+keyed, neither suspicion withdrawn; once the third voter stopped, each leader lost its trusted quorum
+the moment it suspected the stopped voter, its heir won by the stepped-down leader's vote and stepped
+down in turn within 7–20 ms, each follower campaigning at once, and terms went 3 to 8 in about
+100 ms. The detector plans such mistakes: `configure_arrivals` on that host's lateness (mean 5 ms,
+deviation 40 ms, a mature history; `G` 1 ms, floor 10 ms) recurs one per pair, at `T_E` of 100 and
+300 ms, every 2.1 and 4.8 s at an MTBF of 2 s, 7 and 16 s at 10 s, 27 and 60 s at a minute, 145 and
+318 s at ten minutes, 518 and 1,102 s at an hour, 4,237 and 8,256 s at a day; a young link (`m` about
+60) three to five times as often, and a node started on no history (`Exposure::new()`) has an MTBF of
+twice a few seconds just after a restart. With exactly a quorum of live voters each mistake between
+the two cost the group its leader. Tests (`tests/suspicion.rs`, each red on `313ada8` and on
+`af01c51`):
+`a_leader_that_suspects_its_one_live_voter_while_the_third_is_stopped_leads_on` (the third stop: three
+mistakes, each longer than a round, a draw and two expected elections, a write taken and committed
+during each, the order given and declined; red at the first, member 1 a follower at 10 ms),
+`voters_that_suspect_each_other_for_good_keep_their_leader_once_the_third_is_stopped` (the first
+stop; red, member 1 a follower at 19.0 ms), and
+`a_leader_without_a_trusted_quorum_beats_the_voters_it_suspects`. The rules the old step-down tests
+stated are restated (`a_leader_is_left_no_quorum_when_its_detectors_suspect_a_majority_of_either_half`,
+`a_leader_left_no_quorum_hands_over_to_a_voter_elected_without_it`,
+`a_leader_that_suspects_every_voter_for_less_than_a_round_leads_on`).
+
+The model (`docs/models/Suspicion.tla`, its Rust mirror `crates/hyper-check/tests/suspicion.rs`,
+`docs/models/README.md`). The rules alone, with detectors wrong at any time: three voters, the third
+stopped, three terms, 11,376 states, and every group settled on a leader keeps it and its term
+(`Stable`) with one leader a term and no pre-candidate asking where it could not be elected without
+those it suspects; every voter up, two terms, 1,306,432 states, one leader a term. Each part of the
+rule taken out is refused: the step-down before it and an unconditional order lose a settled
+leader, and a pre-candidate that asks on asks with no quorum to win by. Two claims are refused, so
+the scopes reach what they are for: a settled leader its detectors leave no quorum, and, with every
+voter up, a candidate a conditional order made granted a quorum, the hand-over of a leader that
+hears none of its voters. TLC checks the same configurations in CI's model job, part `suspicion`.
+
+**A voter's stop announced** (2026-10-25, asked by mantle). mantle's roll holds that once both
+remaining voters of a range name its new leader, neither says the range has no leader until the
+stopped node is back, and holds it by the rules, not by the odds. A stop was detected as any silence
+is: the stopped run was trusted until its freshness point passed, the detector's margin after its
+last heartbeat, and a remaining voter that wrongly suspected its leader meanwhile counted the
+stopped voter in a quorum it trusted, asked for pre-votes and dropped its leader's messages, naming
+no leader. Each step is what the rules allow with every voter up, so only taking the stopped voter
+out closes it. A peer that takes the stopping heartbeat (§2.8, "A stop announced") now suspects the
+run at once and until its successor's first heartbeat, and its owner tells each core it shares a
+group with that the member stopped (`Change::Stopped`, `RawNode::stopped`), from which the degraded
+group's rule above applies. The stopping node may still run its members while it closes (mantle's
+announcement goes a turn before its connections close), and what it sent before may arrive after: an
+order its leader sent it before taking the announcement makes it campaign, forced, and its request,
+which no lease refuses, would take the leader to its term. So a member that took the announcement
+drops the stopping member's requests for votes, of any term, forced or not, and whatever it sends of
+a later term than its own, orders it to campaign never, and beats on no account of it, until its
+node is heard again (`Raft::drops`, `Raft::hand_over`, `Raft::active`). Dropped as lost messages
+are, they cost Raft's safety nothing; its run is ending, so they cost the group no election it could
+win. Tests: `a_stop_announced_is_suspected_at_its_arrival_and_its_run_never_trusted_again`
+(hyper-liveness; on the code before, node 1 held node 3 trusted to 8,585,804,112 ns, past the
+announcement's arrival at 8,342,860,603 ns: the macOS world's first seed),
+`a_voters_announced_stop_leaves_no_window_for_a_wrong_suspicion` (hyper-durable, liveness and
+replicas on one clock, 64 seeds: before, the follower told its leader is suspected left it, a
+pre-candidate naming no leader, at the first seed) and
+`a_member_whose_stop_was_announced_takes_no_leader_from_its_group` (hyper-raft: without the drops
+and the heir rule, the leader ended a follower in term 3, from term 1). The model's `stop`
+configuration (`docs/models/README.md`) has every voter up and the third leaving at any time, what
+it sent arriving after it stops, each remaining voter taking the announcement at any time, and the
+detectors wrong at any time: from the moment both took the announcement and follow one leader in its
+term, they keep it (5,454,016 states, TLC's count the mirror's). Detected as a silence and claimed
+from the stop, it is refused at the window (`SuspicionStopUnannounced.cfg`); with the announcement
+taken as a suspicion alone, at the stopping voter's forced campaign (`SuspicionStopNoDrop.cfg`).
+
+What the rule claims, and what it leaves to the owner. It holds from the moment both remaining
+voters have taken the announcement. Before that the group is whole, or its stopped voter dead but
+trusted, and Raft's rules for a whole group stand: a follower that wrongly suspects its leader asks
+for votes, and names no leader while it asks, whatever the stopping voter grants. An owner that
+announces as its stop's last act, after it handed over what it led, has the claim from the
+announcement's arrival, and the stretch from each handover to it is the whole group's. One that
+announces first, its members still running, and hands over once each peer answered
+(`Liveness::stop_taken`, §2.8), gives each group the degraded group's rule before its new leader is
+named: the stopping member's transfers are still taken (an order of its own term is no later term),
+its followers, which suspect it, move the lead themselves where a transfer does not, and its own
+member learns the new leader from the transferee's first append of its term, which a leader sends
+every member, suspected or not (`Raft::bcast_append`); the stop drops only what the stopping member
+sends of a later term, and its answers to that append are of the same term. A leader beats on no
+suspected member's account while it trusts a quorum, so an append to the stopping member that its
+transport loses is sent again only with the leader's next round or write; an owner that would not
+rest on the transport may count a group handed once its member no longer leads in a later term than
+the one it handed over in, which an answer to any message it sends of its older term tells it, a
+transfer asked again among them. The model's `handed` configuration has the stopping voter leading,
+its announcement taken by each remaining voter at any time, and its transfer made only once both
+took it: from the moment it handed over and both follow one leader in its term, they keep it; made
+at any time, it is refused (`SuspicionStopUnwaited.cfg`). A wait the owner ends early, a peer
+suspected rather than answered, gives no such moment for that peer's groups: suspected by the
+stopping node, it may still trust it.
 
 **Time** is the owner's monotonic clock in nanoseconds, a `u64`, for the core, the durable shell
 (`Replica::drive`, `deadline`, `Driven::wake` and `flushed`) and hyper-liveness alike. The core
@@ -2405,6 +2672,13 @@ and election law; the remaining items keep their numbers, and item 10 is what L-
   the measured mistake durations compare with the span decides whether it would move.
   `crates/hyper-raft/ORIGIN.md`, "A draw at every arming", has the first numbers, from schedules
   whose detectors are wrong one time in ten.
+- **13. An announcement answered. Built (2026-10-25).** A stop's announcement was one datagram
+  (§2.8, "A stop announced"): lost, its peer detected the stop as a silence, and a remaining voter
+  that wrongly suspected its leader before then asked for votes (§2.9, "A voter's stop announced");
+  and its sender could not tell that a peer took it. A peer that takes it now answers it once with
+  its next heartbeat, which echoes it and is proven as any, the stopping node sends it again at the
+  stream's interval until the answer comes, and an owner learns which peers took it
+  (`Liveness::stop_taken`), so that it may hand over once each did.
 
 ## 4. Steps
 

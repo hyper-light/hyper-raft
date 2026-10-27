@@ -427,7 +427,9 @@ impl Node {
         for peer in &now {
             if self.attached.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
-                let told = if self.liveness.trust(*peer) == Some(Trust::Suspected) {
+                let told = if self.liveness.stopped(*peer) {
+                    self.raw.stopped(*peer)
+                } else if self.liveness.trust(*peer) == Some(Trust::Suspected) {
                     self.raw.suspect(*peer)
                 } else {
                     self.raw.trust(*peer)
@@ -549,6 +551,17 @@ impl Node {
                 self.restarts = self.restarts.saturating_add(1);
                 self.raw.restarted(peer)
             }
+            Change::Stopped { at_ns, .. } => {
+                self.told.retain(|(told, _)| *told != peer);
+                self.told.push((peer, *at_ns));
+                self.raw.stopped(peer)
+            }
+            // The core judges processes alone: a disk's verdict is the shell's
+            // (`hyper_durable::Replica::disk_slow`), and this member has none.
+            Change::DiskSlow { .. }
+            | Change::DiskCaughtUp { .. }
+            | Change::ModeDiffers { .. }
+            | Change::ModeAgrees { .. } => return Ok(()),
         };
         heard(told).map(drop)
     }

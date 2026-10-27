@@ -47,7 +47,7 @@ use hyper_timing::{Exposure, Trust};
 use hyper_tokio::{Stamped, Taken};
 
 use hyper_durable::{
-    Cause, GroupStore, Output, Replica, ReplicaError, Settings as Shell, Unbounded,
+    Bytes, Cause, Disk, GroupStore, Output, Replica, ReplicaError, Settings as Shell,
 };
 use hyper_log::{Config as LogConfig, Log, Sealing, Waits};
 use hyper_raft::proto::{ConfChangeSingle, ConfChangeTransition, ConfChangeV2, ConfState, Message};
@@ -65,6 +65,20 @@ use hyper_seal::keys::{KeyId, WrappingKey};
 use crate::control::{self, Order, Point, Report};
 use crate::file::{self, FaultFile};
 use crate::machine::{Applied, Kv};
+
+/// Whether the members judge each peer's process apart from its disk, their leader committing on
+/// its followers' disks while its own lags and handing the lead on by the patience's law, once its
+/// backlog would fill the room its budget has left within a hand-over (kiln's CP-T2.2,
+/// `hyper_liveness::Liveness::set_disk_apart`, `Config::apply_unpersisted`,
+/// `Replica::disk_fill`): where `HYPER_DURABLE_E2E_DISK_APART` is set, so that the scenarios run in
+/// such a group too.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a run of the scenarios says the group's shape in the environment its members inherit"
+)]
+fn judged_apart() -> bool {
+    std::env::var_os("HYPER_DURABLE_E2E_DISK_APART").is_some()
+}
 
 /// The group every member's log holds: one group a log.
 pub const GROUP: u128 = 1;
@@ -154,7 +168,7 @@ struct Asker {
     id: u64,
 }
 
-type Member = Replica<GroupStore<FaultFile>, Kv, Unbounded>;
+type Member = Replica<GroupStore<FaultFile>, Kv, Bytes>;
 
 /// A member, its socket, and who waits on it.
 pub struct Node {
@@ -314,6 +328,14 @@ impl Node {
             depth: 1,
         })
         .map_err(|e| NodeError::Open(hyper_durable::OpenError::Core(e)))?;
+        // The group's disk mode, one setting the group's every member states (Focal's condition 1):
+        // the replica takes the core's apply_unpersisted and the law of its patience from it, the
+        // stream its judging apart.
+        let disk = if judged_apart() {
+            Disk::Apart
+        } else {
+            Disk::Flushed
+        };
         let shell = Shell {
             core: Config {
                 max_size_per_msg,
@@ -328,6 +350,7 @@ impl Node {
             // applied, at one write a lull (`docs/durable.md` §4.1).
             quiet: Duration::ZERO,
             elections: hyper_raft::Elections::Suspicion,
+            disk,
         };
         let store = GroupStore::claim(&log, GROUP).map_err(|e| match e {
             hyper_durable::ClaimError::Log(e) => NodeError::Log(e),
@@ -340,8 +363,11 @@ impl Node {
             ..ConfState::default()
         };
         let machine = Kv::new(configuration, settings.max_keys);
-        let replica = Replica::open(&shell, store, machine, Unbounded).map_err(NodeError::Open)?;
-        let liveness = Liveness::new(LiveSettings {
+        // Its budget is the memory it states for its group, the room the patience's law weighs its
+        // backlog against (Focal's 5c: no time picked).
+        let budget = Bytes::new(log_config().group_bytes);
+        let replica = Replica::open(&shell, store, machine, budget).map_err(NodeError::Open)?;
+        let mut liveness = Liveness::new(LiveSettings {
             local: settings.id,
             run,
             max_peers: settings.voters.len(),
@@ -349,6 +375,7 @@ impl Node {
             resolution: stamped.clock().resolution(),
         })
         .map_err(NodeError::Liveness)?;
+        liveness.set_disk_apart(replica.disk().apart());
         Ok(Self {
             replica,
             log,
@@ -487,12 +514,7 @@ impl Node {
             if self.attached.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
                 // What the stream believes of it now (hyper-durable's `Owner::pairs`).
-                let suspected = self.liveness.trust(*peer) == Some(Trust::Suspected);
-                heard(if suspected {
-                    self.replica.suspect(*peer)
-                } else {
-                    self.replica.trust(*peer)
-                })?;
+                heard(self.replica.believe_of(&self.liveness, *peer))?;
             }
         }
         for peer in &self.attached {
@@ -589,6 +611,14 @@ impl Node {
                     self.restarts = self.restarts.saturating_add(1);
                     heard(self.replica.restarted(peer))?
                 }
+                Change::Stopped { at_ns, .. } => {
+                    self.told.retain(|(told, _)| *told != peer);
+                    self.told.push((peer, *at_ns));
+                    heard(self.replica.stopped(peer))?
+                }
+                Change::DiskSlow { .. } => heard(self.replica.disk_slow(peer))?,
+                Change::DiskCaughtUp { .. } => heard(self.replica.disk_caught_up(peer))?,
+                Change::ModeDiffers { .. } | Change::ModeAgrees { .. } => None,
             };
         }
         self.asked.changes = changes;
@@ -1159,6 +1189,8 @@ impl Node {
             if let Some((started, durable)) = driven.flushed {
                 self.liveness.on_durable(LiveWrite::Log, started, durable);
             }
+            // What waits on the member's disk, for its stream's own verdict (Focal's 5a).
+            self.liveness.on_pending(driven.out_since);
             self.track(now, made_before, out_before);
             self.writing();
             let submitted = self.replica.in_flight() > out_before;

@@ -2259,8 +2259,8 @@ Tests:
   order; the coding is charged while it holds sources, nothing is refused, and nothing is charged once
   the connection is gone.
 - hyper-quic's `replication::the_code_repairs_what_replication_loses` (focal's load on hyper-sim's
-  network: the commit's median within a tenth of the loss-free path's with the code, more than one
-  and a half times it without).
+  network, in focal's batches of 64 datagrams: the commit's median within a tenth of the loss-free
+  path's with the code, more than one and a half times it without).
 
 ## 5. Consumers
 

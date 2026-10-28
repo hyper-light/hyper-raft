@@ -154,10 +154,14 @@ packet from the repairs by Gaussian elimination and takes its STREAM frames, the
 its sender's congestion control and never acknowledged (RFC 9265 §6.3). focal's leader, sending each
 follower about 720 packets a second, held most appends a round trip behind a retransmission under
 80 ms and 3% loss, its commit's median 1.8 times the loss-free path's: on hyper-sim's network at
-that load the code brings the commit's median to the loss-free path's at 1, 3 and 5% loss (164 ms at
-3% against 163 loss-free and 300 to 303 uncoded, its 99th percentile 237 to 277 against 464 to
-483), its repairs 10% of its sources at 3% and none on a path that loses nothing. What the coding
-holds is charged as it is held, and forgotten where the budget refuses. Tests: hyper-quic's
+that load, in focal's batches of 64 datagrams, the code brings the commit's median to the loss-free
+path's at 1, 3, 5 and 10% loss (164 to 165 ms at 3% against 163 loss-free and 291 to 293 uncoded,
+its 99th percentile 286 against 440 to 476; 166 ms at 10% against 433 to 443), its repairs 10% of
+its sources at 3% and none on a path that loses nothing. A repair is begun only where a datagram holds it whole, so one larger than
+a GSO batch's first datagram begins the next batch (dropped, it had left focal's followers 16 to 22%
+of their losses rebuilt), and a packet begun for a repair alone is ack-eliciting, under the window
+and the pacer. What the coding holds is charged as it is held, and forgotten where the budget
+refuses. Tests: hyper-quic's
 `erasure` and `connection::fec` units and `tests/replication.rs` (the rule above, the loss-free path
 uncoded, the run twice from seed and trace); hyper-transport's
 `exchange::frames_on_a_lane_cross_a_lossy_path_coded_and_the_coding_is_charged`.

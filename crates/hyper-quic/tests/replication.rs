@@ -14,7 +14,12 @@
 //! holding the stream a round trip until it is retransmitted, so most appends wait on a repair,
 //! and the commit, the first follower's answer, took 1.8 times the loss-free path's at the median.
 //! The connections leave BBR's startup first, filling a bottleneck with a catch-up, as focal's do:
-//! an application-limited flow never ends its startup, and in startup BBR ignores its recovery.
+//! an application-limited flow never ends its startup, and in startup BBR ignores its recovery. A
+//! follower still catching up is sent none of the appends falling due meanwhile, and a run is
+//! measured from when the leader has read every follower's answer to its catch-up: appends written
+//! behind it measured its drain, and at 10% loss, where the code's repairs and retransmissions take
+//! half as much of the bottleneck again, the drain outlasted a fixed ten-second warm-up (the coded
+//! commit's 99th percentile 1.1 to 1.3 s from ten seconds, 258 to 294 ms from fifteen).
 //!
 //! A run is its seed's: the world orders every arrival and timer, the appends fall due at times
 //! drawn from the seed, and the endpoints' keys and nonces change no size and no time.
@@ -78,6 +83,10 @@ struct Scenario {
     /// Whether the endpoints search the path's MTU (RFC 8899), as focal's do: their datagrams grow
     /// past RFC 9000's 1,200 bytes, which a pacer or a window cuts a datagram back to.
     mtud: bool,
+    /// The datagrams a connection makes at once, each but the last its first's size (GSO): what
+    /// focal's driver asks for (hyper-rt-transport's `SEGMENTS_A_TRANSMIT`, Linux's
+    /// `UDP_MAX_SEGMENTS`), whether its socket segments them or sends them one a call.
+    segments: usize,
     /// Each direction's bottleneck, bits a second, with a queue of one bandwidth-delay product:
     /// none, or a link a bulk transfer fills, so BBR measures the path and leaves its startup.
     rate_bits_per_second: Option<u64>,
@@ -90,12 +99,6 @@ struct Scenario {
 impl Scenario {
     fn end(&self) -> u64 {
         self.seconds * SECOND
-    }
-
-    /// Measured from ten seconds: the handshake, the catch-up and BBR's startup are over, the
-    /// catch-up's 8 MB at the bottleneck's 20 Mbit/s taking 3.2 seconds alone.
-    fn warm(&self) -> u64 {
-        10 * SECOND
     }
 
     /// The bytes one direction of one connection holds at most: its bottleneck's queue, what has
@@ -164,9 +167,10 @@ impl Scenario {
 
 /// focal's replication (the module's documentation): two followers, each sent 110 appends of
 /// 7.5 KB a second over 80 ms one way, answered by 64 bytes each, the endpoints searching the
-/// path's MTU as focal's do, behind a 20 Mbit/s bottleneck
+/// path's MTU and making their datagrams in batches of 64 as focal's do, behind a 20 Mbit/s bottleneck
 /// (three times the appends' 6.6 Mbit/s) that an 8 MB catch-up fills first, long enough for BBR
-/// to find the bottleneck's rate; for 25 seconds, the last 15 measured (some 1,650 appends a run).
+/// to find the bottleneck's rate; for 25 seconds, measured from the catch-ups' answers to two
+/// seconds before the end.
 fn replication(loss_ppm: u32, fec_window: Option<u32>, seed: u64) -> Scenario {
     Scenario {
         one_way_ns: 80 * MS,
@@ -177,6 +181,7 @@ fn replication(loss_ppm: u32, fec_window: Option<u32>, seed: u64) -> Scenario {
         followers: 2,
         fec_window,
         mtud: true,
+        segments: 64,
         rate_bits_per_second: Some(20_000_000),
         catch_up_bytes: 8_000_000,
         seconds: 25,
@@ -332,11 +337,14 @@ struct Pair {
     connected: bool,
     /// Whether the catch-up was written.
     caught_up: bool,
+    /// When the leader read the follower's answer to its catch-up: the appends falling due before
+    /// are not written.
+    answered_catch_up: Option<u64>,
     /// The next append to write.
     next: usize,
     /// The leader's packets lost and sources and repairs sent, and the follower's rebuilt and
     /// left to retransmission, when the measurement began.
-    at_warm: Option<Counts>,
+    at_start: Option<Counts>,
     /// When each append's answer was read, and when the follower read it whole.
     answered: Vec<Option<u64>>,
     delivered: Vec<Option<u64>>,
@@ -345,16 +353,16 @@ struct Pair {
 /// What a run measured.
 #[derive(Clone, Debug, Default)]
 struct Measured {
-    /// Each append due after the warm-up: from due to its first answer read (its commit),
+    /// Each append due once measured: from due to its first answer read (its commit),
     /// nanoseconds, sorted.
     committed: Vec<u64>,
     /// From due to the first follower's answer of each, per follower, sorted.
     answered: Vec<Vec<u64>>,
     /// From due to read whole by the first follower.
     delivered: Vec<u64>,
-    /// Appends due after the warm-up and not committed by the end.
+    /// Appends due once measured and not committed by the end.
     uncommitted: usize,
-    /// What the leaders and followers counted after the warm-up.
+    /// What the leaders and followers counted once measured.
     counts: Counts,
     closed: Option<String>,
 }
@@ -431,6 +439,9 @@ struct Run {
     pairs: Vec<Pair>,
     /// When each append falls due, by number.
     due: Vec<u64>,
+    /// When the leader had read every follower's answer to its catch-up: the run is measured from
+    /// then.
+    start: Option<u64>,
     closed: Option<String>,
     scratch: Vec<u8>,
 }
@@ -511,8 +522,9 @@ impl Run {
                 ),
                 connected: false,
                 caught_up: false,
+                answered_catch_up: None,
                 next: 0,
-                at_warm: None,
+                at_start: None,
                 answered: vec![None; due.len()],
                 delivered: vec![None; due.len()],
             });
@@ -524,6 +536,7 @@ impl Run {
             net,
             pairs,
             due,
+            start: None,
             closed: None,
             scratch: Vec::with_capacity(2 * DATAGRAM as usize),
         }
@@ -572,14 +585,18 @@ impl Run {
                 unsent.extend_from_slice(&u64::MAX.to_le_bytes());
                 unsent.extend_from_slice(&now.to_le_bytes());
                 unsent.resize(unsent.len() + scenario.catch_up_bytes - APPEND_HEADER, 0xc3);
+            } else {
+                pair.answered_catch_up = Some(now);
             }
-        }
-        if pair.at_warm.is_none() && now >= scenario.warm() {
-            pair.at_warm = Some(Counts::of(pair));
         }
         if pair.connected {
             while pair.next < due.len() && due[pair.next] <= now {
                 let number = pair.next as u64;
+                if pair.answered_catch_up.is_none() {
+                    // Behind the catch-up it would measure the catch-up's drain
+                    pair.next += 1;
+                    continue;
+                }
                 let length = u32::try_from(scenario.append_bytes).unwrap();
                 let unsent = &mut pair.leader.unsent;
                 unsent.extend_from_slice(&length.to_le_bytes());
@@ -601,6 +618,7 @@ impl Run {
             );
             taken += answer;
             if number == u64::MAX {
+                pair.answered_catch_up.get_or_insert(now);
                 continue;
             }
             pair.answered[usize::try_from(number).unwrap()] = Some(now);
@@ -656,6 +674,7 @@ impl Run {
             net,
             pairs,
             due,
+            start,
             closed,
             scratch,
         } = self;
@@ -700,19 +719,23 @@ impl Run {
         };
         loop {
             scratch.clear();
-            let Some(transmit) = connection.poll_transmit(at, 1, scratch, side.endpoint.configs())
+            let Some(transmit) =
+                connection.poll_transmit(at, scenario.segments, scratch, side.endpoint.configs())
             else {
                 break;
             };
-            let size = transmit.size;
-            net.send(
-                world,
-                (node, peer),
-                scratch[..size].to_vec(),
-                size,
-                Ev::Arrive,
-            )
-            .unwrap();
+            // Each datagram of a batch on its own, as the network carries them
+            let segment = transmit.segment_size.unwrap_or(transmit.size);
+            for datagram in scratch[..transmit.size].chunks(segment) {
+                net.send(
+                    world,
+                    (node, peer),
+                    datagram.to_vec(),
+                    datagram.len(),
+                    Ev::Arrive,
+                )
+                .unwrap();
+            }
         }
         let timer = connection
             .poll_timeout()
@@ -725,6 +748,13 @@ impl Run {
             (t, a) => t.or(a),
         };
         world.wake(node, deadline).unwrap();
+        // Measured from when every follower has answered its catch-up
+        if start.is_none() && pairs.iter().all(|pair| pair.answered_catch_up.is_some()) {
+            *start = Some(now);
+            for pair in pairs.iter_mut() {
+                pair.at_start = Some(Counts::of(pair));
+            }
+        }
     }
 
     fn arrive(&mut self, node: NodeId, ticket: Ticket) {
@@ -800,14 +830,20 @@ impl Run {
                 Step::Spent => panic!("{}: the run spent its steps", self.scenario.name()),
             }
         }
-        let warm = self.scenario.warm();
+        // A run in which a follower never answered its catch-up measures nothing
+        let start = self.start.unwrap_or(end);
+        let closed = self.closed.clone().or_else(|| {
+            self.start
+                .is_none()
+                .then(|| "a follower never answered its catch-up".to_string())
+        });
         let mut measured = Measured {
-            closed: self.closed.clone(),
+            closed,
             answered: vec![Vec::new(); self.pairs.len()],
             ..Measured::default()
         };
         for (number, due) in self.due.iter().enumerate() {
-            if *due < warm || *due >= end - 2 * SECOND {
+            if *due < start || *due >= end - 2 * SECOND {
                 continue;
             }
             let mut first: Option<u64> = None;
@@ -831,8 +867,8 @@ impl Run {
             answered.sort_unstable();
         }
         for pair in &self.pairs {
-            let at_warm = pair.at_warm.unwrap_or_default();
-            measured.counts.add(Counts::of(pair).since(at_warm));
+            let at_start = pair.at_start.unwrap_or_default();
+            measured.counts.add(Counts::of(pair).since(at_start));
         }
         // What a replay must reproduce: every commit's time and the code's counts
         for committed in &measured.committed {
@@ -894,7 +930,7 @@ fn row(path: &Scenario, m: &Measured) -> String {
 /// commit's median is more than one and a half times the loss-free path's (the head-of-line wait
 /// this scenario reproduces); with it, over a window of 128 sources, the median is within a tenth
 /// of the loss-free path's, the 99th percentile within two and a half times its median, and the
-/// followers rebuild at least four in five of the sources lost after the warm-up.
+/// followers rebuild at least four in five of the sources lost while measured.
 #[test]
 fn the_code_repairs_what_replication_loses() {
     let pki = Pki::new();

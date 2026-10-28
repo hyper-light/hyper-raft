@@ -461,10 +461,13 @@ impl IocpDriver {
         if let Some((events, tag)) = widen {
             match self.issue(raw, events, tag) {
                 Ok(wider) => {
-                    self.outstanding.insert(raw, Watch {
-                        block: wider,
-                        widen: None,
-                    });
+                    self.outstanding.insert(
+                        raw,
+                        Watch {
+                            block: wider,
+                            widen: None,
+                        },
+                    );
                 }
                 Err(_) => fired = Readiness::READ.union(Readiness::WRITE),
             }
@@ -869,8 +872,9 @@ mod tests {
         peer.send_to(b"x", ours.local_addr().unwrap()).unwrap();
         let mut told: Vec<(u64, i32)> = Vec::new();
         let read = |told: &[(u64, i32)]| {
-            told.iter()
-                .any(|(at, bits)| *at == tag && Readiness::from_bits(*bits).contains(Readiness::READ))
+            told.iter().any(|(at, bits)| {
+                *at == tag && Readiness::from_bits(*bits).contains(Readiness::READ)
+            })
         };
         // Bounded: 30 waits of 100 ms.
         for _ in 0..30 {

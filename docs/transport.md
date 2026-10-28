@@ -2131,6 +2131,33 @@ where the restarted endpoint has another key (within two keep-alives of the rest
 the same key still closes the connection within one, before any degrading). hyper-quic's own tests
 are in VENDORED.md §45.
 
+## 4al. An owner that holds a body it began to read (2026-10-27, found by mantle)
+
+A period that moves nothing through this side's own doing is no evidence against the peer (§4a):
+an owner not reading the body it is answered with holds the exchange, unjudged. `ours_to_move` took
+the owner as not reading while its last read had all it asked for (`Exchange::starved` clear). An
+owner whose last read wanted more than had arrived, and that then stopped reading, left `starved`
+set while its peer filled the stream's window and stopped, held by flow control, and the next period
+that brought nothing was judged against the peer: the owner's side refused the exchange `Stalled`
+for the window its owner held. mantle's node holds a PutObject's body while the chunks it carries
+go durable and reads on once they have; on windows-x86_64, whose durable writes took 0.5-2.9 s, a
+32 MiB PutObject into a cell whose volumes were full, its body held while each volume's cleaner gave
+its verdict, was refused so by the node, the client waiting with no period of its own (mantle CI
+run 40612231375, `serve.rs`'s fill test, `Lost(Stalled)`).
+
+A read that wanted more is evidence against the sender until more arrives for the owner: from then
+the owner is told (`BodyReady`, `Exchange::ready_sent`), and a period that brings nothing is the
+window it holds. `ours_to_move` now takes the body as unread while the owner's last read had all it
+asked for, or since bytes arrived for it after one that wanted more. An asker whose own period is
+shorter than the hold still ends the exchange itself, as unread (focal's audit F38): how long it
+waits for a peer that holds its request is the asker's to say.
+
+Tests (`tests/exchange.rs`): `an_owner_that_reads_then_holds_a_body_is_not_refused_by_its_own_side`:
+the server reads a bulk body as it arrives, each read wanting more than had come, then holds it
+for three periods once a megabyte is written, its asker giving it eight; the exchange completes,
+nothing refused on either side. Without the change the server refuses it `Stalled` (by its own
+judgement; the asker is told `Stalled` by its peer).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

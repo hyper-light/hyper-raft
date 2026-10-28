@@ -1621,8 +1621,9 @@ fn ticks_and_suspicion_do_not_mix() {
 /// candidate's own writes (the owner's ballot): asking again a round and a draw on, it moved on
 /// before every grant came and spent a term each time, for ever while the voter's disk stayed slow
 /// (Quiver's lab, kiln's CP-T2.2 step 7: 113 terms for one leader's kill, 70 % of the grants
-/// coming after their candidate had moved on). Two candidacies go before the first late grant
-/// tells the wait; the third is elected.
+/// coming after their candidate had moved on). The candidacies that start before the first grant
+/// can come go, each at least a round and a pre-vote's round trip; the one under way when it
+/// comes waits for its own grant and is elected.
 #[test]
 fn a_candidate_waits_for_a_voter_that_writes_its_vote_slowly() {
     let (timing, _) = timing_for(3);
@@ -1647,6 +1648,11 @@ fn a_candidate_waits_for_a_voter_that_writes_its_vote_slowly() {
             sim.term(3) - before
         );
         let terms = sim.term(3) - before;
-        assert!(terms <= 3, "seed {seed}: {terms} terms to elect node 3");
+        let round = timing.round.as_nanos() as u64;
+        let bound = 1 + (slow + 2 * LATENCY).div_ceil(round + 2 * LATENCY);
+        assert!(
+            terms <= bound,
+            "seed {seed}: {terms} terms to elect node 3, more than {bound}"
+        );
     }
 }

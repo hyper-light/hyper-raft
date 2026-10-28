@@ -1666,9 +1666,10 @@ data while its path loses. The code is RFC 8681's sliding-window random linear c
 (RFC 8682, its seed-1 validation vector tested), all nonzero (§3.6, DT 15). A source is a packet's
 frames as sent; a repair combines the sources sent since the oldest the peer has not acknowledged,
 none older than the loss delay (RFC 9002 §6.1.2), at most the span over which three repairs go. It
-codes only while the window holds that span, and sends repairs at three times the loss rate RFC
-5348 §5.4's average loss interval measures, `3p/(1 − p)`, that factor measured (`fec.rs`'s
-`REPAIRS_PER_LOSS`). A receiver keeps the sources it holds and the repairs' equations in reduced row
+sends repairs at three times the loss rate RFC 5348 §5.4's average loss interval measures,
+`3p/(1 − p)`, that factor measured (`fec.rs`'s `REPAIRS_PER_LOSS`), and codes only while the window
+holds that span and a repair falls due within each loss delay: a repair that comes after a loss's
+retransmission rebuilds nothing in time, so a sparse connection (an asker's requests) is not coded. A receiver keeps the sources it holds and the repairs' equations in reduced row
 echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames.
 The packet stays lost to its sender's loss detection and congestion control and is never
 acknowledged (RFC 9265 §6.3: "a recovered packet must be considered as a lost packet";

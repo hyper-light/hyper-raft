@@ -11,6 +11,11 @@
 //! repair could rebuild it. And it combines at most the sources over which three repairs go at
 //! that rate, so each source is in about three repairs' spans: a repair's work is its span times
 //! a source's bytes, and the span stays bounded however fast the connection sends.
+//!
+//! And it codes only while it sends often enough for a repair to be due within each loss delay: a
+//! repair that comes after a loss's retransmission rebuilds nothing the retransmission does not,
+//! so a connection whose packets of stream data are too few for that (an asker's requests, a few
+//! a second) leaves its losses to retransmission and keeps nothing for repairs.
 
 use crate::erasure::{Decoder, Encoder, Span};
 use crate::frame::{FEC_SOURCE_MAX, FecRepair};
@@ -110,6 +115,8 @@ pub(super) struct Sending {
     losses: LossRate,
     /// Repairs owed, in millionths of one: each source sent adds the repair rate.
     credit: u64,
+    /// The packets of stream data sent in the current loss delay and the last.
+    meter: Meter,
     /// The most sources a repair combines: the smaller of the two endpoints' windows.
     limit: usize,
     /// The repair the sources sent called for, made as the last of them went, to go in the next
@@ -125,6 +132,7 @@ impl Sending {
             encoder: Encoder::new(limit),
             losses: LossRate::default(),
             credit: 0,
+            meter: Meter::default(),
             limit: limit.max(1),
             ready: None,
             scratch: Vec::new(),
@@ -159,11 +167,19 @@ impl Sending {
     }
 
     /// Whether the connection codes now: its path loses, and often enough that a span covering
-    /// each source as many times as `SPANS_PER_SOURCE` fits the window. A rarer loss is left to
-    /// retransmission: a code that sparse would rebuild few losses, and each source it marked
-    /// would still give up its packet's reserve for a repair.
+    /// each source as many times as `SPANS_PER_SOURCE` fits the window; and it sends packets of
+    /// stream data often enough that a repair is due within each loss delay. A rarer loss, or a
+    /// sparser connection, is left to retransmission: a code that sparse would rebuild few
+    /// losses in time, and each source it marked would still give up its packet's reserve for a
+    /// repair.
     pub(super) fn active(&self) -> bool {
-        self.span().is_some()
+        self.span().is_some() && self.meter.per_period().saturating_mul(self.repair_ppm()) >= PPM
+    }
+
+    /// A packet of stream data was sent at `now`, coded or not: its rate decides whether the
+    /// connection codes.
+    pub(super) fn stream_packet(&mut self, now: Instant, loss_delay: Duration) {
+        self.meter.sent(now, loss_delay);
     }
 
     /// Whether a repair is due.
@@ -238,6 +254,36 @@ impl Sending {
         self.encoder
             .held_bytes()
             .saturating_add(self.scratch.capacity())
+    }
+}
+
+/// The packets of stream data a connection sent in its current loss delay and in the one before.
+#[derive(Default)]
+struct Meter {
+    /// When the current period began.
+    start: Option<Instant>,
+    count: u64,
+    /// The last whole period's count; none when it ended a period or more before the current one.
+    last: u64,
+}
+
+impl Meter {
+    fn sent(&mut self, now: Instant, period: Duration) {
+        let elapsed = self.start.map(|start| now.saturating_duration_since(start));
+        if elapsed.is_none_or(|elapsed| elapsed >= period) {
+            self.last = match elapsed {
+                Some(elapsed) if elapsed < period.saturating_mul(2) => self.count,
+                _ => 0,
+            };
+            self.start = Some(now);
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    /// The packets a loss delay: the current period's or the last's, whichever is more.
+    fn per_period(&self) -> u64 {
+        self.count.max(self.last)
     }
 }
 
@@ -329,6 +375,23 @@ mod tests {
         assert_eq!(sending.repair_ppm(), 93_749);
         // Each source in three repairs' spans: 3 / 0.093749, 33 sources, within a window of 64
         assert_eq!(sending.span(), Some(33));
+        // and coded only while a repair is due within each loss delay: one at 0.093749 a packet
+        // takes 11 packets within it
+        let mut sending = sending;
+        let (now, delay) = (Instant::now(), Duration::from_millis(100));
+        for packet in 0..10u32 {
+            sending.stream_packet(now + Duration::from_millis(u64::from(packet)), delay);
+        }
+        assert!(
+            !sending.active(),
+            "10 packets a loss delay owe no repair within it"
+        );
+        sending.stream_packet(now + Duration::from_millis(10), delay);
         assert!(sending.active());
+        // A period past, the count stays the last period's; two past, it is forgotten
+        sending.stream_packet(now + Duration::from_millis(150), delay);
+        assert!(sending.active());
+        sending.stream_packet(now + Duration::from_millis(400), delay);
+        assert!(!sending.active());
     }
 }

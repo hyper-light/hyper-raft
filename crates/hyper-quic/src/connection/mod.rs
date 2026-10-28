@@ -4913,7 +4913,7 @@ impl Connection {
 
         // STREAM
         let source = space_id == SpaceId::Data
-            && self.write_stream_frames(buf, max_size, !is_0rtt, &mut sent);
+            && self.write_stream_frames(now, buf, max_size, !is_0rtt, &mut sent);
         // A source's frames, what follows its stream data among them, leave a repair's room
         let frames_max = if source {
             max_size.saturating_sub(fec::REPAIR_RESERVE)
@@ -4967,6 +4967,7 @@ impl Connection {
     /// is read past its end when it is rebuilt, padded to its repair's length.
     fn write_stream_frames(
         &mut self,
+        now: Instant,
         buf: &mut Vec<u8>,
         max_size: usize,
         coded: bool,
@@ -4994,7 +4995,14 @@ impl Connection {
             .frame_tx
             .stream
             .saturating_add(sent.stream_frames.len() as u64);
-        if !coding || sent.stream_frames.is_empty() {
+        if sent.stream_frames.is_empty() {
+            return false;
+        }
+        let loss_delay = self.loss_delay();
+        if coded && let Some(sending) = &mut self.fec.sending {
+            sending.stream_packet(now, loss_delay);
+        }
+        if !coding {
             return false;
         }
         let Some(sending) = &self.fec.sending else {

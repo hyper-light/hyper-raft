@@ -144,6 +144,24 @@ request's last packet detected about 25 ms past the round trip on a path shorter
 past the hundredth packet each way, twenty exchanges each answered 5 ms after its request take 40
 datagrams of the asker's and 21 of the server's under Replies, 61 and 41 decimated.
 
+Landed 2026-10-28: in hyper-quic and hyper-transport, forward erasure correction of a
+connection's stream data (hyper-quic `TransportConfig::fec_window`, `crates/hyper-quic/VENDORED.md`
+§47; hyper-transport `Limits::fec_window`, `docs/transport.md` §4al). While a path loses, each 1-RTT
+packet of stream data is a source of RFC 8681's sliding-window random linear code over GF(2^8), its
+coefficients from TinyMT32 (RFC 8682), repairs going at three times the loss rate RFC 5348's average
+loss interval measures, over the sources the peer has not acknowledged; a receiver rebuilds a lost
+packet from the repairs by Gaussian elimination and takes its STREAM frames, the packet still lost to
+its sender's congestion control and never acknowledged (RFC 9265 §6.3). focal's leader, sending each
+follower about 720 packets a second, held most appends a round trip behind a retransmission under
+80 ms and 3% loss, its commit's median 1.8 times the loss-free path's: on hyper-sim's network at
+that load the code brings the commit's median to the loss-free path's at 1, 3 and 5% loss (164 ms at
+3% against 163 loss-free and 300 to 303 uncoded, its 99th percentile 237 to 277 against 464 to
+483), its repairs 10% of its sources at 3% and none on a path that loses nothing. What the coding
+holds is charged as it is held, and forgotten where the budget refuses. Tests: hyper-quic's
+`erasure` and `connection::fec` units and `tests/replication.rs` (the rule above, the loss-free path
+uncoded, the run twice from seed and trace); hyper-transport's
+`exchange::frames_on_a_lane_cross_a_lossy_path_coded_and_the_coding_is_charged`.
+
 Landed 2026-10-23: in hyper-quic, BBR paced at its model's rate, its least round trip taken only
 from packets in order (patches Q32 and Q33, `crates/hyper-quic/VENDORED.md` §42 and §43;
 `docs/transport.md` §4ag). Held by its window of twice its product and paced at five quarters of it,

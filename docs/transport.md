@@ -2231,6 +2231,37 @@ Tests:
   asker's and 21 of the server's under `Replies`, and 61 and 41 decimated.
 - hyper-quic's `tests::decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer`.
 
+## 4al. A connection's lost packets rebuilt from its repairs (2026-10-28, found by focal)
+
+focal's leader replicates to each follower on one ordered lane, each append a frame behind the
+last. Under 80 ms and 3% loss each way it sent each follower about 720 packets a second (about 4 KB
+of entry a write), so about twenty a second were lost on each lane, and each held every frame after
+it until its retransmission arrived, a round trip and a loss delay later: most appends waited on one,
+and a write's commit, the first follower's answer, took 1.8 times the loss-free path's at the
+median. Fewer, larger appends carry the same bytes in as many packets, and measured worse.
+
+`Limits::fec_window` turns on hyper-quic's forward erasure correction for the endpoint's
+connections (`crates/hyper-quic/VENDORED.md` §47): while a path loses, each packet of stream data is
+a source of RFC 8681's random linear code, repairs go at three times the measured loss rate, and a
+receiver rebuilds a lost packet from the repairs after it, without the round trip. What a
+connection's coding holds grows while its path loses, between the observations that true up its
+state's charge (§4x), so the endpoint charges it as it is held: after each of the connection's
+transmits and each time anything reaches it, `Connection::fec_held_bytes` is charged on
+`Lane::Window` (accounting only), grown as it grows and given back as it shrinks. A growth the
+budget refuses forgets the coding (`Connection::fec_forget`, counted in `Stats::fec_refused`): its
+losses are repaired by retransmission, so nothing it held was owed. `Stats::fec_charged` is what the
+connections' coding holds now.
+
+Tests:
+
+- `exchange::frames_on_a_lane_cross_a_lossy_path_coded_and_the_coding_is_charged`: 2,000 frames of a
+  kilobyte on a lane over a path losing 3% each way, coded over 128 packets, arrive once, whole and in
+  order; the coding is charged while it holds sources, nothing is refused, and nothing is charged once
+  the connection is gone.
+- hyper-quic's `replication::the_code_repairs_what_replication_loses` (focal's load on hyper-sim's
+  network: the commit's median within a tenth of the loss-free path's with the code, more than one
+  and a half times it without).
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

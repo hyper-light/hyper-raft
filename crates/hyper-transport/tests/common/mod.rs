@@ -369,6 +369,7 @@ pub fn limits() -> Limits {
         receive_chunks: (16 << 20) / hyper_transport::RECEIVE_CHUNK + 1,
         retry_bytes: None,
         acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        fec_window: None,
     }
 }
 
@@ -599,13 +600,45 @@ impl<A: Drive, B: Drive> Net<A, B> {
         Self::with_links(now, a, b, source, 0)
     }
 
+    /// The network losing `loss_ppm` of each way's datagrams independently, `one_way` apart, its
+    /// world's draws from seed `seed`: a loss draw for each datagram, no more than `datagrams` each
+    /// way.
+    pub fn lossy(
+        now: Instant,
+        a: A,
+        b: B,
+        loss_ppm: u32,
+        one_way: Duration,
+        seed: u64,
+        datagrams: usize,
+    ) -> Self {
+        let mut net = Self::with_world(now, a, b, hyper_sim::Source::Seed(seed), 0, 2 * datagrams);
+        let one_way = u64::try_from(one_way.as_nanos()).unwrap();
+        let path = hyper_sim::net::Path::in_order(one_way, 0)
+            .with_loss(hyper_sim::net::Loss::random(loss_ppm));
+        net.wire.set_pair_path(A, B, path).unwrap();
+        net.wire.set_pair_path(B, A, path).unwrap();
+        net
+    }
+
     fn with_links(now: Instant, a: A, b: B, source: hyper_sim::Source, links: usize) -> Self {
+        Self::with_world(now, a, b, source, links, 0)
+    }
+
+    fn with_world(
+        now: Instant,
+        a: A,
+        b: B,
+        source: hyper_sim::Source,
+        links: usize,
+        trace_words: usize,
+    ) -> Self {
         let limits = hyper_sim::Limits {
             events: 1 << 12,
             nodes: 2,
             streams: 8,
             steps: u64::MAX,
-            trace_words: 0,
+            trace_words,
         };
         let mut world =
             hyper_sim::World::new(source, hyper_sim::Discipline::Ordered, limits).unwrap();

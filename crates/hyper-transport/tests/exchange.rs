@@ -72,6 +72,20 @@ where
     connected_from(pair, limits, budget, source, |_| {})
 }
 
+/// Node 1 and node 2 connected on the network `build` makes of them.
+fn connected_through<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    build: impl FnOnce(Instant, Node<A>, Node<B>) -> Net<Node<A>, Node<B>>,
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    connected_with(pair, limits, budget, |_| {}, build)
+}
+
 /// [`connected_on`], node 2 prepared by `prepare` before node 1 dials it.
 fn connected_from<A, B>(
     pair: &Pair,
@@ -79,6 +93,24 @@ fn connected_from<A, B>(
     budget: u64,
     source: hyper_sim::Source,
     prepare: impl FnOnce(&mut Node<B>),
+) -> Net<Node<A>, Node<B>>
+where
+    A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+    B: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
+{
+    connected_with(pair, limits, budget, prepare, |now, a, b| {
+        Net::of(now, a, b, source)
+    })
+}
+
+/// Node 1 and node 2 connected on the network `build` makes, node 2 prepared by `prepare` before
+/// node 1 dials it.
+fn connected_with<A, B>(
+    pair: &Pair,
+    limits: Limits,
+    budget: u64,
+    prepare: impl FnOnce(&mut Node<B>),
+    build: impl FnOnce(Instant, Node<A>, Node<B>) -> Net<Node<A>, Node<B>>,
 ) -> Net<Node<A>, Node<B>>
 where
     A: hyper_transport::Classes<Kind = Kind, Class = Class, Role = Role>,
@@ -107,7 +139,7 @@ where
     a.set_oracle(true);
     b.set_oracle(true);
     prepare(&mut b);
-    let mut net = Net::of(now, a, b, source);
+    let mut net = build(now, a, b);
     let address = net.b_address;
     net.a.connect(now, 2, address).unwrap();
     let (mut one, mut two) = (false, false);
@@ -1422,6 +1454,75 @@ fn frames_on_a_lane_arrive_in_order() {
         assert_eq!(order, sorted, "lane {lane} kept its order");
         assert_eq!(order.len(), 320);
     }
+}
+
+/// Frames on a lane cross a path that loses 3% of its datagrams each way with its connections
+/// coded (`Limits::fec_window`): each arrives once, whole and in its order; what the coding holds
+/// is charged as it is held, and none of it is charged once the connection is gone.
+#[test]
+fn frames_on_a_lane_cross_a_lossy_path_coded_and_the_coding_is_charged() {
+    let pair = Pair::new();
+    let mut coded = limits();
+    coded.lane_window = 64;
+    coded.lanes_per_peer = 1;
+    coded.fec_window = Some(128);
+    // 2,000 frames of a kilobyte, a datagram each with the acknowledgements and the repairs, each
+    // way, twice over for retransmissions and the handshake
+    let mut net = connected_through::<Mantle, Mantle>(&pair, coded, 256 << 20, |now, a, b| {
+        Net::lossy(now, a, b, 30_000, Duration::from_millis(20), 7, 16_000)
+    });
+    let mut server = Server::new();
+    let (mut sent, mut charged) = (0u32, 0u64);
+    for round in 0..250u32 {
+        for index in 0..8u32 {
+            let mut frame = [round.to_be_bytes(), index.to_be_bytes()].concat();
+            frame.resize(1_000, u8::try_from(index).unwrap());
+            // A full lane takes the frame once it says it has room again
+            let mut tries = 0;
+            loop {
+                match net.a.send_frame(2, 0, Kind::Append, &frame) {
+                    Ok(()) => break,
+                    Err(Refusal::LaneFull) if tries < TURNS => {
+                        net.until(TURNS, |net| {
+                            server.serve(&mut net.b);
+                            events(&mut net.a)
+                                .iter()
+                                .any(|event| matches!(event, Event::LaneRoom { .. }))
+                        });
+                        tries += 1;
+                    }
+                    Err(other) => panic!("frame {round}.{index}: {other:?}"),
+                }
+            }
+            sent += 1;
+        }
+        net.exchange();
+        server.serve(&mut net.b);
+        charged = charged.max(net.a.stats().fec_charged);
+    }
+    net.until(TURNS, |net| {
+        server.serve(&mut net.b);
+        server.frames.len() as u32 == sent
+    });
+    let order: Vec<(u32, u32)> = server
+        .frames
+        .iter()
+        .map(|(peer, lane, frame)| {
+            assert_eq!((*peer, *lane, frame.len()), (1, 0, 1_000));
+            let index = u32::from_be_bytes(frame[4..8].try_into().unwrap());
+            assert!(frame[8..].iter().all(|byte| u32::from(*byte) == index));
+            (u32::from_be_bytes(frame[..4].try_into().unwrap()), index)
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(order, sorted, "the lane kept its order");
+    assert_eq!(order.len(), 2_000, "{sent} sent");
+    assert_eq!(net.a.stats().fec_refused, 0);
+    assert!(charged > 0, "the sender never coded on a path losing 3%");
+    net.a.disconnect(net.now, 2);
+    net.until(TURNS, |net| net.a.stats().connections == 0);
+    assert_eq!(net.a.stats().fec_charged, 0);
 }
 
 /// A lane frame of a kind that carries its own CRC-32C is checked by it as it arrives

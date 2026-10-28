@@ -75,6 +75,9 @@ struct Scenario {
     followers: usize,
     /// The forward erasure correction's window, both endpoints' (`TransportConfig::fec_window`).
     fec_window: Option<u32>,
+    /// Whether the endpoints search the path's MTU (RFC 8899), as focal's do: their datagrams grow
+    /// past RFC 9000's 1,200 bytes, which a pacer or a window cuts a datagram back to.
+    mtud: bool,
     /// Each direction's bottleneck, bits a second, with a queue of one bandwidth-delay product:
     /// none, or a link a bulk transfer fills, so BBR measures the path and leaves its startup.
     rate_bits_per_second: Option<u64>,
@@ -160,7 +163,8 @@ impl Scenario {
 }
 
 /// focal's replication (the module's documentation): two followers, each sent 110 appends of
-/// 7.5 KB a second over 80 ms one way, answered by 64 bytes each, behind a 20 Mbit/s bottleneck
+/// 7.5 KB a second over 80 ms one way, answered by 64 bytes each, the endpoints searching the
+/// path's MTU as focal's do, behind a 20 Mbit/s bottleneck
 /// (three times the appends' 6.6 Mbit/s) that an 8 MB catch-up fills first, long enough for BBR
 /// to find the bottleneck's rate; for 25 seconds, the last 15 measured (some 1,650 appends a run).
 fn replication(loss_ppm: u32, fec_window: Option<u32>, seed: u64) -> Scenario {
@@ -172,6 +176,7 @@ fn replication(loss_ppm: u32, fec_window: Option<u32>, seed: u64) -> Scenario {
         answer_bytes: 64,
         followers: 2,
         fec_window,
+        mtud: true,
         rate_bits_per_second: Some(20_000_000),
         catch_up_bytes: 8_000_000,
         seconds: 25,
@@ -234,7 +239,7 @@ fn transport(scenario: &Scenario) -> TransportConfig {
         .stream_receive_window(VarInt::from_u64(window).unwrap())
         .receive_window(VarInt::from_u64(window).unwrap())
         .send_window(window)
-        .mtu_discovery_config(None)
+        .mtu_discovery_config(scenario.mtud.then(hyper_quic::MtuDiscoveryConfig::default))
         .fec_window(scenario.fec_window)
         .congestion(Congestion::Bbr(BbrConfig::default()));
     transport
@@ -361,6 +366,8 @@ struct Counts {
     lost: u64,
     sources: u64,
     repairs: u64,
+    /// The leaders' repairs dropped, too large for a datagram they could send.
+    dropped: u64,
     rebuilt: u64,
     left: u64,
 }
@@ -373,6 +380,7 @@ impl Counts {
             counts.lost = stats.path.lost_packets;
             counts.sources = stats.frame_tx.fec_source;
             counts.repairs = stats.frame_tx.fec_repair;
+            counts.dropped = stats.fec_repairs_dropped;
         }
         if let Some((_, connection)) = &pair.follower.connection {
             let stats = connection.stats();
@@ -387,6 +395,7 @@ impl Counts {
             lost: self.lost - then.lost,
             sources: self.sources - then.sources,
             repairs: self.repairs - then.repairs,
+            dropped: self.dropped - then.dropped,
             rebuilt: self.rebuilt - then.rebuilt,
             left: self.left - then.left,
         }
@@ -396,6 +405,7 @@ impl Counts {
         self.lost += other.lost;
         self.sources += other.sources;
         self.repairs += other.repairs;
+        self.dropped += other.dropped;
         self.rebuilt += other.rebuilt;
         self.left += other.left;
     }
@@ -485,7 +495,8 @@ impl Run {
                 leader: Side::new(
                     leader,
                     format!("10.0.{index}.1:4433").parse().unwrap(),
-                    Endpoint::new(EndpointConfig::default(), None, false, rng(leader)).unwrap(),
+                    Endpoint::new(EndpointConfig::default(), None, scenario.mtud, rng(leader))
+                        .unwrap(),
                 ),
                 follower: Side::new(
                     follower,
@@ -493,7 +504,7 @@ impl Run {
                     Endpoint::new(
                         EndpointConfig::default(),
                         Some(server_config),
-                        false,
+                        scenario.mtud,
                         rng(follower),
                     )
                     .unwrap(),
@@ -883,7 +894,7 @@ fn row(path: &Scenario, m: &Measured) -> String {
 /// commit's median is more than one and a half times the loss-free path's (the head-of-line wait
 /// this scenario reproduces); with it, over a window of 128 sources, the median is within a tenth
 /// of the loss-free path's, the 99th percentile within two and a half times its median, and the
-/// followers rebuild at least four in five of the leader's losses after the warm-up.
+/// followers rebuild at least four in five of the sources lost after the warm-up.
 #[test]
 fn the_code_repairs_what_replication_loses() {
     let pki = Pki::new();
@@ -913,8 +924,14 @@ fn the_code_repairs_what_replication_loses() {
             "loss-free median {base} ns: {}",
             row(&coded_path, &coded)
         );
+        // A datagram its pacer or window cuts is never shorter than the repair due: none is dropped,
+        // though the sources grew past the smallest datagram with the path's MTU
+        assert_eq!(coded.counts.dropped, 0, "{}", row(&coded_path, &coded));
+        // Of the sources lost: the leader's losses count its repairs and its MTU probes too,
+        // which nothing rebuilds
+        let sources_lost = coded.counts.rebuilt + coded.counts.left;
         assert!(
-            coded.counts.rebuilt * 5 >= coded.counts.lost * 4,
+            coded.counts.rebuilt * 5 >= sources_lost * 4,
             "{}",
             row(&coded_path, &coded)
         );

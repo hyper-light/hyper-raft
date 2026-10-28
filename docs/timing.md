@@ -1445,13 +1445,28 @@ lateness, the stall's delay (§2.2; `PairReport::skipped` counts them).
   the link's correlation, which a longer Allan level at the link's interval resolves ("The interval
   the evidence needs").
 
-  A peer from which no heartbeat has come is judged from the node's first poll with the pair
-  attached: one interval at the node's own floor (the pool's premise is that the stalls, and the
-  floors, are the hosts') and the evidence's margin for a window of one; its suspicion states that
-  time as its bound, from the attach. `PairReport::judged` says a margin judges,
-  `PairReport::freshness` the `η + α` in force, and `PairReport::interval` the interval the peer's
-  heartbeats come at, or a longer one asked, judged or not: what an owner waiting on a young link's
-  evidence waits past.
+  A peer from which no heartbeat has come is judged from the latest moment its owner said it can
+  reach the peer (`Liveness::reachable`: a connection made, its path keyed), or, before any, from
+  the node's first poll with the pair attached: one interval at the node's own floor (the pool's
+  premise is that the stalls, and the floors, are the hosts') and the evidence's margin for a window
+  of one; its suspicion states that time as its bound, and a suspicion told holds until a heartbeat
+  answers it. The time before is no silence of the peer's: a peer not yet started, or a path not yet
+  up, carries no heartbeat of either side. And a stream backed off while nothing came sends at the
+  first flush that proves a heartbeat once the peer is reachable, not at its backed-off slot, its
+  back-off running on (each heartbeat states its gap, the rule the peer reads off it) until the
+  peer's first heartbeat answers it. Judged from the attach, mantle's founders, started tens of
+  seconds apart on one CPU, each measuring its devices first, suspected each other: a survivor given
+  evidence by the third node 0.4 s after all three connected judged the other survivor, never heard,
+  from its own start and suspected it at once, and their streams, backed off to seconds, first heard
+  each other 1.3 s later; the survivor took the suspicion of its range's next leader into the term
+  (the roll test, 2026-10-28). The simulation
+  (`nodes_that_reach_each_other_late_judge_no_silence_from_before`) shows each half: judged from the
+  attach, a node given evidence while its peer's host was starved stated a point a minute before it
+  could reach the peer; sent at the backed-off slot, a node that flushed 10 ms after it could reach
+  its peer sent it nothing for 0.58 s, until it heard the peer. `PairReport::judged` says a margin
+  judges, `PairReport::freshness` the `η + α` in force, and `PairReport::interval` the interval the
+  peer's heartbeats come at, or a longer one asked, judged or not: what an owner waiting on a young
+  link's evidence waits past.
 - **Judged with no evidence of its own: a starved pool, and the node's own stream** (§3, item 10).
   The node's evidence comes from its links' heartbeats; a node all of whose links fell silent
   before its pool measured anything and before any link configured is fed nothing more, and judged

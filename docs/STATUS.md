@@ -160,7 +160,14 @@ its 99th percentile 286 against 440 to 476; 166 ms at 10% against 433 to 443), i
 its sources at 3% and none on a path that loses nothing. A repair is begun only where a datagram holds it whole, so one larger than
 a GSO batch's first datagram begins the next batch (dropped, it had left focal's followers 16 to 22%
 of their losses rebuilt), and a packet begun for a repair alone is ack-eliciting, under the window
-and the pacer. What the coding holds is charged as it is held, and forgotten where the budget
+and the pacer. A repair begins a transmit of its own, and a path that loses its packets in bursts
+(netem drops a segmented send whole) is spanned so that a burst is in as many repairs' spans for
+each of its packets as a single loss: with each transmit lost whole at 3%, 83 to 84% of the losses
+rebuilt where 78% were, the commit's 90th percentile 196 to 197 ms where it was 229 to 246. And
+BBR's recovery window is never less than what the path delivered in its latest round trip
+(BBRv3's `inflight_latest` bound, draft-ietf-ccwg-bbr-06 §5.5.10.3; VENDORED.md §48): conserved at
+what a burst left in flight, the uncoded commit's median was 182 to 208 ms, now 166 to 172 (163
+loss-free). What the coding holds is charged as it is held, and forgotten where the budget
 refuses. Tests: hyper-quic's
 `erasure` and `connection::fec` units and `tests/replication.rs` (the rule above, the loss-free path
 uncoded, the run twice from seed and trace); hyper-transport's

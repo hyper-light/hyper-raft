@@ -83,6 +83,10 @@ struct Scenario {
     /// Whether the endpoints search the path's MTU (RFC 8899), as focal's do: their datagrams grow
     /// past RFC 9000's 1,200 bytes, which a pacer or a window cuts a datagram back to.
     mtud: bool,
+    /// Whether a transmit's datagrams are lost together, as netem loses a segmented send (it
+    /// decides each socket buffer's loss before it segments one, `net/sched/sch_netem.c`'s
+    /// `netem_enqueue`), the loss focal's compare runs apply; else each is lost on its own.
+    batch_loss: bool,
     /// The datagrams a connection makes at once, each but the last its first's size (GSO): what
     /// focal's driver asks for (hyper-rt-transport's `SEGMENTS_A_TRANSMIT`, Linux's
     /// `UDP_MAX_SEGMENTS`), whether its socket segments them or sends them one a call.
@@ -150,7 +154,7 @@ impl Scenario {
 
     fn name(&self) -> String {
         format!(
-            "{} ms one way, {:.1}% loss, {}/s of {} B, {} followers{}{}, seed {}",
+            "{} ms one way, {:.1}% loss, {}/s of {} B, {} followers{}{}{}, seed {}",
             self.one_way_ns / MS,
             f64::from(self.loss_ppm) / 10_000.0,
             self.appends_per_second,
@@ -160,6 +164,11 @@ impl Scenario {
                 .map_or_else(String::new, |window| format!(", coded over {window}")),
             self.rate_bits_per_second
                 .map_or_else(String::new, |rate| format!(", {} Mbit/s", rate / 1_000_000)),
+            if self.batch_loss {
+                ", each transmit lost whole"
+            } else {
+                ""
+            },
             self.seed
         )
     }
@@ -181,6 +190,7 @@ fn replication(loss_ppm: u32, fec_window: Option<u32>, seed: u64) -> Scenario {
         followers: 2,
         fec_window,
         mtud: true,
+        batch_loss: false,
         segments: 64,
         rate_bits_per_second: Some(20_000_000),
         catch_up_bytes: 8_000_000,
@@ -724,17 +734,20 @@ impl Run {
             else {
                 break;
             };
-            // Each datagram of a batch on its own, as the network carries them
+            // Each datagram of a batch on its own, as the network carries them, or the batch as
+            // one, lost whole; each message its datagrams' size first
             let segment = transmit.segment_size.unwrap_or(transmit.size);
-            for datagram in scratch[..transmit.size].chunks(segment) {
-                net.send(
-                    world,
-                    (node, peer),
-                    datagram.to_vec(),
-                    datagram.len(),
-                    Ev::Arrive,
-                )
-                .unwrap();
+            let batch = &scratch[..transmit.size];
+            let messages = if scenario.batch_loss {
+                batch.chunks(batch.len().max(1))
+            } else {
+                batch.chunks(segment)
+            };
+            for message in messages {
+                let mut payload = u32::try_from(segment).unwrap().to_le_bytes().to_vec();
+                payload.extend_from_slice(message);
+                net.send(world, (node, peer), payload, message.len(), Ev::Arrive)
+                    .unwrap();
             }
         }
         let timer = connection
@@ -774,28 +787,32 @@ impl Run {
         } else {
             (&mut pair.follower, pair.leader.address)
         };
-        scratch.clear();
-        let bytes = BytesMut::from(delivery.payload.as_slice());
-        match side.endpoint.handle(at, from, None, None, bytes, scratch) {
-            Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                if let Some((own, connection)) = &mut side.connection
-                    && *own == handle
-                {
-                    connection.handle_event(event, side.endpoint.configs_mut());
+        let (segment, datagrams) = delivery.payload.split_at(4);
+        let segment = u32::from_le_bytes(segment.try_into().unwrap()) as usize;
+        for datagram in datagrams.chunks(segment.max(1)) {
+            scratch.clear();
+            let bytes = BytesMut::from(datagram);
+            match side.endpoint.handle(at, from, None, None, bytes, scratch) {
+                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                    if let Some((own, connection)) = &mut side.connection
+                        && *own == handle
+                    {
+                        connection.handle_event(event, side.endpoint.configs_mut());
+                    }
                 }
+                Some(DatagramEvent::NewConnection(incoming)) => {
+                    scratch.clear();
+                    let accepted = side
+                        .endpoint
+                        .accept(incoming, at, scratch, None, None)
+                        .unwrap_or_else(|error| panic!("the follower refused: {:?}", error.cause));
+                    side.connection = Some(accepted);
+                }
+                Some(DatagramEvent::Response(transmit)) => {
+                    panic!("a stateless response on an established path: {transmit:?}")
+                }
+                None => {}
             }
-            Some(DatagramEvent::NewConnection(incoming)) => {
-                scratch.clear();
-                let accepted = side
-                    .endpoint
-                    .accept(incoming, at, scratch, None, None)
-                    .unwrap_or_else(|error| panic!("the follower refused: {:?}", error.cause));
-                side.connection = Some(accepted);
-            }
-            Some(DatagramEvent::Response(transmit)) => {
-                panic!("a stateless response on an established path: {transmit:?}")
-            }
-            None => {}
         }
         self.serve(node);
     }
@@ -950,27 +967,65 @@ fn the_code_repairs_what_replication_loses() {
             "the scenario does not hold its appends: {}",
             row(&plain_path, &plain)
         );
-        assert!(
-            Measured::at(&coded.committed, 500) * 10 <= base * 11,
-            "loss-free median {base} ns: {}",
-            row(&coded_path, &coded)
-        );
-        assert!(
-            Measured::at(&coded.committed, 990) * 2 <= base * 5,
-            "loss-free median {base} ns: {}",
-            row(&coded_path, &coded)
-        );
-        // A datagram its pacer or window cuts is never shorter than the repair due: none is dropped,
-        // though the sources grew past the smallest datagram with the path's MTU
-        assert_eq!(coded.counts.dropped, 0, "{}", row(&coded_path, &coded));
-        // Of the sources lost: the leader's losses count its repairs and its MTU probes too,
-        // which nothing rebuilds
-        let sources_lost = coded.counts.rebuilt + coded.counts.left;
-        assert!(
-            coded.counts.rebuilt * 5 >= sources_lost * 4,
-            "{}",
-            row(&coded_path, &coded)
-        );
+        repaired(base, &coded_path, &coded);
+    }
+}
+
+/// What a coded run is held to beside the loss-free path's median commit, `base`: every append
+/// committed, the median within a tenth of `base` and the 99th percentile within two and a half
+/// times it, no repair dropped, and at least four in five of the sources lost rebuilt.
+fn repaired(base: u64, path: &Scenario, coded: &Measured) {
+    assert!(
+        coded.closed.is_none(),
+        "{}: {:?}",
+        path.name(),
+        coded.closed
+    );
+    assert_eq!(coded.uncommitted, 0, "{}", row(path, coded));
+    assert!(
+        Measured::at(&coded.committed, 500) * 10 <= base * 11,
+        "loss-free median {base} ns: {}",
+        row(path, coded)
+    );
+    assert!(
+        Measured::at(&coded.committed, 990) * 2 <= base * 5,
+        "loss-free median {base} ns: {}",
+        row(path, coded)
+    );
+    // A datagram its pacer or window cuts is never shorter than the repair due: none is dropped,
+    // though the sources grew past the smallest datagram with the path's MTU
+    assert_eq!(coded.counts.dropped, 0, "{}", row(path, coded));
+    // Of the sources lost: the leader's losses count its repairs and its MTU probes too, which
+    // nothing rebuilds
+    let sources_lost = coded.counts.rebuilt + coded.counts.left;
+    assert!(
+        coded.counts.rebuilt * 5 >= sources_lost * 4,
+        "{}",
+        row(path, coded)
+    );
+}
+
+/// The code repairs what a segmented send loses whole. **The rule, fixed before any run:** over
+/// seeds 1 and 2 of focal's replication at 3% loss each way, each transmit of up to 64 datagrams
+/// lost or kept whole, as netem loses focal's (`net/sched/sch_netem.c`'s `netem_enqueue` decides
+/// each socket buffer's loss before it segments one), the coded run is held to what the
+/// datagram-by-datagram one is (`repaired`). Its losses come in bursts of a transmit's
+/// datagrams: with single losses' spans, and a repair in the transmit of the sources before it,
+/// the followers rebuilt 78% of their losses (focal's: 77 to 82%), and with the leader's
+/// recovery window conserved at what its last burst left in flight, the uncoded commit's median
+/// was 182 to 208 ms (163 loss-free).
+#[test]
+fn the_code_repairs_what_a_segmented_send_loses_whole() {
+    let pki = Pki::new();
+    for seed in 1..=2 {
+        let clean = measure(replication(0, Some(128), seed), &pki);
+        let base = Measured::at(&clean.committed, 500);
+        let coded_path = Scenario {
+            batch_loss: true,
+            ..replication(30_000, Some(128), seed)
+        };
+        let coded = measure(coded_path, &pki);
+        repaired(base, &coded_path, &coded);
     }
 }
 
@@ -1000,16 +1055,19 @@ fn print_the_appends_commits_under_loss() {
         "| Path | committed p50 / p90 / p99 ms | delivered p50 / p99 ms | uncommitted | leader packets lost | sources / repairs | rebuilt / left |"
     );
     println!("|---|---|---|---|---|---|---|");
-    for loss in [0, 5_000, 10_000, 30_000, 50_000, 100_000] {
-        for window in [None, Some(64), Some(128)] {
-            for seed in 1..=2 {
-                let path = Scenario {
-                    seconds: 40,
-                    ..replication(loss, window, seed)
-                };
-                let m = measure(path, &pki);
-                println!("{}", row(&path, &m));
-                assert!(m.closed.is_none(), "{}: {:?}", path.name(), m.closed);
+    for batch_loss in [false, true] {
+        for loss in [0, 5_000, 10_000, 30_000, 50_000, 100_000] {
+            for window in [None, Some(64), Some(128)] {
+                for seed in 1..=2 {
+                    let path = Scenario {
+                        seconds: 40,
+                        batch_loss,
+                        ..replication(loss, window, seed)
+                    };
+                    let m = measure(path, &pki);
+                    println!("{}", row(&path, &m));
+                    assert!(m.closed.is_none(), "{}: {:?}", path.name(), m.closed);
+                }
             }
         }
     }

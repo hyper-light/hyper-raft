@@ -146,7 +146,7 @@ datagrams of the asker's and 21 of the server's under Replies, 61 and 41 decimat
 
 Landed 2026-10-28: in hyper-quic and hyper-transport, forward erasure correction of a
 connection's stream data (hyper-quic `TransportConfig::fec_window`, `crates/hyper-quic/VENDORED.md`
-§47; hyper-transport `Limits::fec_window`, `docs/transport.md` §4al). While a path loses, each 1-RTT
+§47; hyper-transport `Limits::fec_window`, `docs/transport.md` §4an). While a path loses, each 1-RTT
 packet of stream data is a source of RFC 8681's sliding-window random linear code over GF(2^8), its
 coefficients from TinyMT32 (RFC 8682), repairs going at three times the loss rate RFC 5348's average
 loss interval measures, over the sources the peer has not acknowledged; a receiver rebuilds a lost

@@ -2231,7 +2231,112 @@ Tests:
   asker's and 21 of the server's under `Replies`, and 61 and 41 decimated.
 - hyper-quic's `tests::decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer`.
 
-## 4al. A connection's lost packets rebuilt from its repairs (2026-10-28, found by focal)
+## 4al. An owner that holds a body it began to read (2026-10-27, found by mantle)
+
+A period that moves nothing through this side's own doing is no evidence against the peer (§4a):
+an owner not reading the body it is answered with holds the exchange, unjudged. `ours_to_move` took
+the owner as not reading while its last read had all it asked for (`Exchange::starved` clear). An
+owner whose last read wanted more than had arrived, and that then stopped reading, left `starved`
+set while its peer filled the stream's window and stopped, held by flow control, and the next period
+that brought nothing was judged against the peer: the owner's side refused the exchange `Stalled`
+for the window its owner held. mantle's node holds a PutObject's body while the chunks it carries
+go durable and reads on once they have; on windows-x86_64, whose durable writes took 0.5-2.9 s, a
+32 MiB PutObject into a cell whose volumes were full, its body held while each volume's cleaner gave
+its verdict, was refused so by the node, the client waiting with no period of its own (mantle CI
+run 40612231375, `serve.rs`'s fill test, `Lost(Stalled)`).
+
+A read that wanted more is evidence against the sender until more arrives for the owner: from then
+the owner is told (`BodyReady`, `Exchange::ready_sent`), and a period that brings nothing is the
+window it holds. `ours_to_move` now takes the body as unread while the owner's last read had all it
+asked for, or since bytes arrived for it after one that wanted more. An asker whose own period is
+shorter than the hold still ends the exchange itself, as unread (focal's audit F38): how long it
+waits for a peer that holds its request is the asker's to say.
+
+Tests (`tests/exchange.rs`): `an_owner_that_reads_then_holds_a_body_is_not_refused_by_its_own_side`:
+the server reads a bulk body as it arrives, each read wanting more than had come, then holds it
+for three periods once a megabyte is written, its asker giving it eight; the exchange completes,
+nothing refused on either side. Without the change the server refuses it `Stalled` (by its own
+judgement; the asker is told `Stalled` by its peer).
+
+## 4am. A server says it is at work on what it serves (2026-10-31, found by mantle)
+
+An exchange is judged by its connection moving (§4a, `src/progress.rs`): what was sent,
+acknowledged or received in a period. A server whose answer waits on its own work sends nothing
+while it works, and is cut though it lives. mantle measured both of its cases. On CI's busy runner a
+node's read of a chunk from a peer took 3,039 ms, and its client cut the get at 3,080 ms, 9 ms after
+the chunk came: a body paused between blocks. On adacachy at load 112 to 315, a node holding a
+40 GiB put's chunk while its device stalled (a log flush of 5.9 s) had the transfer cut at its
+sender's period, and the put was refused for want of another volume (mantle
+`docs/measurements/2026-10-29-a-node-cut-while-it-works.md`, `2026-10-28-transfer-scale.md`). A
+longer period only moves the cut and finds a stuck server later. A server that says what it is doing
+tells the two apart: S3 sends whitespace while a CompleteMultipartUpload runs, and HTTP has 102
+Processing (RFC 2518 §10.1; mantle research/77 F1, D1).
+
+**The owner says so.** `Endpoint::working(exchange)`: the owner of an exchange it serves says that
+its work for it advanced, an ask of its own answered or a byte of its reply made. It says so as its
+work moves and never on a timer, since a note on a clock would be a keepalive that hides a stuck
+server. An exchange the endpoint asked, or one whose reply was written whole, is passed over.
+
+**The wire.** Each connection makes at most one note a beat, a third of the serve period
+(`NOTES_A_PERIOD`: two notes lost leave one inside the least period an asker gives, as RFC 9000
+§10.1 makes the idle timeout three probe timeouts). A note names the streams of every exchange
+vouched for since the last, each a QUIC variable-length integer (RFC 9000 §16), and the next is made
+only once it is written whole. Notes go on a unidirectional stream of their own, opened with the
+lane opener of `NOTES_LANE` (`LaneId::MAX`): ordered, and a few bytes a note. QUIC lets each peer
+open one unidirectional stream past `Limits::lanes_per_peer` for it. A second notes lane, an owner's
+lane past the bound, and an owner's frame or hold on `NOTES_LANE` are refused `Lanes`. The beat
+assumes no asker gives an exchange a period shorter than the serve period, as mantle's client floors
+its period at it.
+
+**The asker's judgement.** A note names exchanges by their streams. An exchange the endpoint asked
+on that stream, still waiting, is vouched for. Any other is passed over, such as one its asker gave
+up and asked again on a stream of its own, which QUIC never reuses, so a late note revives no
+attempt given up. A vouched exchange's wait starts again from the note (`Carry::vouched`). A
+request the peer has whole is then waited on through that window alone: the peer's work is stated,
+and it is not given a second window to answer in. A window with neither a note nor the progress it
+is judged on without one ends the exchange, so a server whose notes stop is given up within a period
+of its last, as one that never sent a note is.
+
+**Reviewed** (hyper-raft's agent, 2026-10-31). A unidirectional stream was chosen over an interim
+reply prefix like HTTP's 1xx, which covers only the asking phase, where the case traced most is a
+body paused between blocks. The owner's vouch is tied strictly to its own work moving. Both sides
+derive the period rather than carry it in the request, so there is nothing to get wrong across a
+restart. Each attempt is an exchange with a stream, and so an id, of its own.
+
+**Costs.** A note is a variable-length integer for each exchange vouched for, 2 bytes for a stream
+id under 16,384, and a connection sends at most one a beat. Its buffer is reserved once, at the
+connection's first note, to `streams_per_connection` ids of 8 bytes each. Each note is still a
+stream write, and hyper-quic's send buffer and the receiver's assembler each allocate for one, as
+they do for a lane frame (2.02 allocations a frame in the same benchmark). Measured by the allocs benchmark
+(`cargo bench -p hyper-transport --bench allocs`, the Apple M5 Max of docs/benchmarks.md,
+2026-10-31), a head-only exchange whose reply was held three beats:
+
+| Exchange, no body | Allocations | Reallocations | Bytes | Time |
+|---|---|---|---|---|
+| reply sent at once | 6.35 | 0.00 | 791 | 11.3 µs |
+| reply held three beats | 6.34 | 0.00 | 789 | 23.9 µs |
+| reply held three beats, a note at each | 12.35 | 0.00 | 1,276 | 41.1 µs |
+
+So a note costs 2.0 allocations, 162 bytes allocated and 5.7 µs over both ends, at most one a beat
+on a connection: the cost grows with how long an exchange waits, not with how many exchanges run.
+What it replaces is a cut exchange asked again, every byte of it sent anew.
+
+Tests:
+
+- `exchange::a_server_that_says_it_is_at_work_is_waited_for_past_the_period`: a server that thinks
+  five periods and says so at each turn is answered after them, its notes at most one a beat; one
+  that says nothing is refused `Stalled` within two periods.
+- `exchange::a_body_paused_while_its_server_says_it_is_at_work_is_waited_for`: a 1 MiB reply paused
+  four periods after 256 KiB is read whole while its server says so, and refused `Stalled` within
+  the pause while it does not.
+- `exchange::a_server_whose_notes_stop_is_given_up_within_a_period_of_the_last`: notes through three
+  periods of ten, refused after three and before five. Held a window more past the last note, as a
+  request the peer was just given, it was refused at six.
+- `exchange::a_note_keeps_only_the_exchanges_it_names`: of two exchanges on one connection, the one
+  vouched for is answered and the other refused `Stalled`.
+- `exchange::the_notes_lane_is_refused_to_its_owner`.
+
+## 4an. A connection's lost packets rebuilt from its repairs (2026-10-28, found by focal)
 
 focal's leader replicates to each follower on one ordered lane, each append a frame behind the
 last. Under 80 ms and 3% loss each way it sent each follower about 720 packets a second (about 4 KB

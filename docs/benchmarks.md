@@ -4049,6 +4049,25 @@ and when it is queued, and of its lane when it is polled. Two earlier series of 
 `Writable`, a check of the flag and the hold; one read does both now (`Arena::hold_if`,
 `Arena::release_with`).
 
+### A server's notes that it is at work (2026-10-31)
+
+`Endpoint::working` (docs/transport.md §4am). The same bench on the same Apple M5 Max (18 cores,
+128 GiB), macOS 26.4.1, rustc 1.98.1, 2026-10-31 at 16:50 PDT, at a load average of 8 to 20 from
+other work; 500 exchanges after 200 for each held row. A held reply waits three beats of the notes,
+a third of the serve period each, on the in-memory network's clock, which costs the host no time
+but the timers' turns; the two held rows differ by the notes alone:
+
+| Workload | Allocations | Reallocations | Bytes | Time (in memory) |
+|---|---|---|---|---|
+| hyper-transport exchange, 16 B heads, no body | 6.35 | 0.00 | 791 | 11.3 µs |
+| hyper-transport exchange, no body, its reply held three beats | 6.34 | 0.00 | 789 | 23.9 µs |
+| the same, a note at each beat | 12.35 | 0.00 | 1,276 | 41.1 µs |
+
+A note costs 2.0 allocations, 162 bytes and 5.7 µs over both ends: hyper-quic copies a write into a
+buffer of its own (`SendStream::write`) and its assembler holds what arrives, one allocation each, as
+for a lane frame. Its buffer is reserved at the connection's first note and reused. A connection
+sends at most one a beat, so what notes cost grows with the time exchanges wait, not their number.
+
 ## Against focal-wire
 
 `crates/hyper-transport-compare` (a workspace of its own; focal-wire from focal at `99191da`): two

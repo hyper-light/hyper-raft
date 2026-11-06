@@ -10069,3 +10069,44 @@ laws' ratios move only with the best of each cell):
 | Copa | 1.038 | 2.48 (step to 2M 10M 100ms seed 1) | 1.224 | — |
 
 Before (`c8c3cb6`): BBR 1.484, worst 4.00 (buffer 4 BDP), goodput 1.019, Jain 0.533.
+
+## mantle's door: a stream's writes, a receiver's credit, an owned body, a ring's growth (2026-11-06)
+
+The cuts of mantle's ledger of its native door (mantle `docs/research/80-the-doors-costs.md`, "The
+sites") made here, each measured by its counting test (exact counts, red before and green after)
+and by the benches below, `main` (`0856e05`) against the branch, two fresh processes each,
+interleaved: hyper-quic VENDORED.md §49, docs/transport.md §4ao, docs/runtime.md (the ring's
+buffers), docs/durable.md (`Owner::pairs`).
+
+- AMD Ryzen 9 9950X3D2 (32 threads), 122 GiB, Linux 7.2.9 (CachyOS), rustc 1.98.1, each bench
+  pinned to CPUs 0-7 in a capped scope (`systemd-run --user --scope -p MemoryMax=8G
+  -p MemorySwapMax=0 taskset -c 0-7`), the box shared with other sessions' builds and gates (load 29
+  to 47); times are within each other's runs at this load, and a difference is claimed only for the
+  counts.
+
+| Counting test | Before | After |
+|---|---|---|
+| hyper-quic `allocs::credit_sent_back_allocates_nothing`: a server's transmissions through 1 MiB received in 4 KiB writes, 12,000-byte windows | 175 allocations, 24,236 bytes | 0, 0 |
+| hyper-quic `allocs::an_owned_write_allocates_nothing`: 262 writes after a stream's first | 87 allocations, 13,920 bytes | 0, 0 |
+| hyper-quic `allocs::a_borrowed_write_allocates_its_copy_alone`: the same, borrowed | 349 allocations | 262, each write's copy |
+| hyper-transport `body_bytes`: a 64 KiB body in 4 KiB writes, the writer's calls | 18 allocations, 66,140 bytes (borrowed) | 1 allocation, 604 bytes (owned) |
+| hyper-rt `ring_growth`: a ring grown from one buffer to 64 | 63 allocations, 1,008 minor faults | 63 allocations, 63 minor faults |
+| hyper-durable `pairs`: 1,000 calls with the configuration unchanged | 1,000 allocations, 32,000 bytes | 0, 0 |
+
+`cargo bench -p hyper-transport --bench allocs` (per exchange, both endpoints, two runs each; the
+runs' counts were the same):
+
+| Workload | allocations before | after | bytes before | after |
+|---|---|---|---|---|
+| exchange, no body | 6.35 | 6.00 | 791 | 712 |
+| exchange, no body, reply held three beats, a note at each | 12.35 | 9.00 | 1,276 | 718 |
+| exchange, 4 KiB bodies | 10.35 | 10.00 | 8,991 | 8,912 |
+| exchange, 64 KiB bodies | 10.39 | 10.00 | 131,878 | 131,792 |
+| lane frame, 512 B | 2.02 (0.12 reallocations) | 2.00 (0.12) | 613 | 610 |
+| bare hyper-quic stream, 64 KiB + 16 B each way | 192.08 | 192.00 | 269,093 | 269,076 |
+
+`cargo bench -p hyper-quic --bench vs_upstream -- 12`, a bulk MiB, client to server: 762.1
+allocations before, 758.0 after (4.49 and 4.50 reallocations, the space's queue of stream records
+grown once a connection); p50 against upstream in the same process 1.172 and 1.174 before, 1.088
+and 1.139 after. `cargo bench -p hyper-rt-transport --bench connections`: 21.4 to 21.6 allocations
+an exchange before, 21.0 to 21.1 after, at every count of connections from 1 to 512.

@@ -2367,6 +2367,30 @@ Tests:
   network, in focal's batches of 64 datagrams: the commit's median within a tenth of the loss-free
   path's with the code, more than one and a half times it without).
 
+## 4ao. A body written from the owner's buffers (2026-11-06, found by mantle)
+
+A body written with `Endpoint::write_body` is borrowed: QUIC keeps what it may have to send again,
+so each piece taken was copied into a buffer of its own (hyper-quic's `ByteSlice::pop_chunk`), an
+allocation of its bytes a write. mantle's ledger of its native door (mantle
+`docs/research/80-the-doors-costs.md`, "The sites") counted 16.8 MB of these copies an operation on
+a native PUT of 8 MiB's servers, the replicas' bodies, and 8.39 MB on its client, where the bodies
+were already held as shared buffers. `Endpoint::write_body_bytes` takes the body as `Bytes` and
+hands each piece to QUIC by reference (`SendStream::write_chunks`): nothing is copied, and the piece
+is freed once the peer acknowledges it. The checksum, the credit and the order are the borrowed
+write's; what is taken, fewer than offered when credit runs out, leaves the rest the owner's to offer
+again (`from.slice(taken..)`). The wire is the same either way: QUIC packs a stream's frames by
+offset, not by the writes that made them.
+
+The message's prefix and head, written from its reservation, and the trailer stay borrowed writes,
+a copy each: the reservation's buffer goes back to its accountant (`Fixed` recycles it), so handing it
+to QUIC would move the allocation into the next reservation, not remove it.
+
+Measured (`tests/body_bytes.rs`, a 64 KiB request body in 4 KiB pieces, the second exchange of a
+connection, the writer's calls alone): borrowed, its seventeen writes allocated 18 times, 66,140
+bytes, the copies, the trailer's and its stream's queue growing (3 reallocations); owned, once,
+604 bytes, the trailer's copy and the queue's growth. Tests: `body_bytes::an_owned_body_is_written_without_copying`,
+`a_borrowed_body_is_copied_as_it_is_written`.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

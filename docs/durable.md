@@ -1147,6 +1147,24 @@ every leader drive against the leader's own tracker (`tests/keep.rs`), and red w
 taken out. The two methods have no defaults: a store says what it does with the mark, and a wrapper
 passes it on, where a default that did nothing let a wrapper drop it unseen.
 
+A member whose next entries are at or before the mark and gone from the handle is caught up from the
+log's file without the replica or the log's writes waiting on the read (`LogStore::catch_up`,
+`LogStore::entries_or_catch_up`; kiln, 2026-11-06: a reconnecting runner's catch-up read held the log's
+one-job device and its owner's thread, and its leader's writes and its other members' appends waited
+for it). The core's read of such a page is answered `LogTemporarilyUnavailable`, which leaves the
+member's progress as it was, and the store opens a run there: the entries one read of the log gives
+from that index, read by hyper-log's fetcher on a second handle to the file, by positioned reads, off
+the device and off the owner's thread, one run of the group's at a time. The run's answer wakes the
+owner; at the end of the drive it woke, the replica has the core send each member whose next index a
+read run holds its page (`RawNode::send_append`), and the page the core takes opens the run after it,
+read while this one is sent. A run that holds no member's next index goes; a run read before the
+log's entries there were replaced, its last entry's term no longer the handle's, is read again. Every
+other reader of `LogStore::entries` is answered at once, as before, and so is a store that takes
+neither method, by their defaults. Held by `tests/catch_up.rs`: a learner 8 MiB behind whose first
+read is held at the file while its leader writes 32 entries, each durable, applied and taken by the
+other learner while the read is held, and the learner caught up page by page once it is let go; on
+the old code the writes waited for the read.
+
 ## 9. The API
 
 ```rust

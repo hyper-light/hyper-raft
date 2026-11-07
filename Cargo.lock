@@ -752,6 +752,7 @@ dependencies = [
  "hyper-raft",
  "hyper-sim",
  "hyper-timing",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

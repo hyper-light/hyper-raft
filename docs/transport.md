@@ -2241,3 +2241,55 @@ Tests:
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision
 it came from, and drive them with their own runtimes. A refinement lands here once, after every consumer's
 suite passes against it, and reaches all three.
+
+## 4ap. A driver held still reads before its timers (2026-11-07, found by mantle)
+
+mantle's node test (mantle `e718cddb`, its `docs/measurements/2026-11-06-node-test-holds.md`) held a
+node still 4 s with `SIGSTOP`. At its first turn after `SIGCONT` the node timed out a client's
+connection (`ConnectionLost(TimedOut)`). What the client had sent during the hold sat unread in the
+node's socket, and the client's own idle timer had 0.55 s left. hyper-rt-transport's driver turn
+drained only the sockets whose readiness it had already taken, read the clock and fired the timers
+due, and took the readiness that fired only after that, at its park. A driver whose task had not run
+for a while so judged its connections' idle timers (RFC 9000 §10.1) before reading what its peers
+sent meanwhile. A whole host held still with datagrams in flight both ways lost connections that
+reading first keeps.
+
+The driver now takes the rule hyper-raft's E2E members took for their heartbeats (`d712a5f`): a
+timer fires only at a clock read before a drain that took every datagram queued by then. Each turn
+(`Driver::poll_event`):
+
+1. reads the shard's clock;
+2. takes the readiness that fired since it last looked, arming none (`Driver::take_ready`: the
+   listener's wait where one is armed, and what fired of the peers' group);
+3. drains each socket that may hold datagrams up to that reading;
+4. calls `handle_timeout` at that reading only where every socket's drain was whole;
+5. sends at a fresh reading.
+
+hyper-rt's `Taken::whole` says a receive was whole: it took every datagram queued as it began. That
+is the case when it emptied the socket, when it reached a datagram the kernel stamped after it began,
+or when it took the bytes `FIONREAD` counted queued where that count covers the whole queue (Windows,
+the BSDs, the fabric; not Linux, where it covers the next datagram alone). A drain that reaches a
+datagram stamped after its reading counts as whole, though it leaves more. A rule of "every socket
+emptied" (the members' rule, and the first diagnostic in mantle's probes) would hold timers back for
+as long as a peer kept sending: pacing, delayed acknowledgements and loss probes too.
+
+A drain cut at its bound on calls (`TURNS` a socket) leaves its socket for the next turn, whose
+clock the timers then wait for. At a poll's last turn the timers are judged whatever the drain left,
+so a peer that outruns every drain delays them by at most one poll and never starves them. The
+endpoint is told the drain's datagrams at their reads, after the reading the timers are judged at:
+the timers go back by the drain's length, which hyper-quic's arithmetic takes (`saturating_duration_since`
+throughout), and a connection's idle timer, restarted at a datagram's read, is not due at the earlier
+reading. Readiness stays one-shot: `take_ready` only takes what fired, and `to_arm` is still armed at
+the park. `held` transmits, the listener's room measurement and `yields` are unchanged.
+
+Tests (hyper-rt-transport `tests/held_still.rs`, real sockets, the hold the only wall-clock wait):
+
+- `a_driver_held_past_its_idle_timeout_reads_what_came_before_it_times_out`: idle timeout 4 s; the
+  server is not polled for 5 s, and the client sends it a frame 2 s into the hold. Polled again, the
+  server takes the frame, neither side sees the connection close, and it carries a frame each way
+  after. Before: the server's first turn closed it.
+- `drivers_held_together_past_their_idle_timeouts_keep_the_connection`: each side sends a frame and
+  both are held 5 s. Each takes the other's frame, and both keep the connection. Before: whichever
+  side was polled first closed it.
+- hyper-rt `a_receive_is_whole_when_it_took_all_that_was_queued_as_it_began`.
+

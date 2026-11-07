@@ -894,6 +894,13 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   - A socket made by `Batched::lent` holds no receive buffers. It receives into a `Ring` its owner
     lends it for the call (`receive_with`), so a driver of many sockets holds one batch of buffers
     for all of them.
+  - A receive buffer is made with its room and nothing written (2026-11-06, found by mantle). On
+    Linux `recvmmsg` is offered each buffer's whole room and the buffer's length is set to what the
+    kernel wrote; elsewhere, where the receive takes an initialised slice, the buffer is zeroed the
+    first time it is received into. Zeroed as it was made, every page of a `Ring`'s growth was
+    faulted in for bytes nothing reads: growing a ring from one buffer to 64 touched 1,008 pages,
+    and now 63, the allocator's own beside each (`tests/ring_growth.rs`; mantle's ledger counted a
+    ring growing 15 buffers an operation through a native PUT of 8 MiB, docs/research/80).
   - A segmented message refused EIO or EINVAL turns segmentation off, and the message goes again
     unsegmented, in both the outbox's sends and `send_segments` (docs/transport.md §4h; before, only
     EIO did, and a socket refused EINVAL dropped every segmented message).

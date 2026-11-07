@@ -1069,7 +1069,8 @@ node's detectors believe (`Replica::suspect`, `trust`, `restarted`) and its grou
 flight. The clock is the owner's monotonic clock in nanoseconds, a `u64`, as the core's and
 hyper-liveness's are (`docs/timing.md` §2.9: one type a simulated world drives every sans-io crate
 by; an owner with an `Instant` converts at its edge). The node's liveness stream (L-3) is wired by
-the owner: `Owner::pairs` keeps the stream told which peers each replica's group has,
+the owner: `Owner::pairs` keeps the stream told which peers each replica's group has (called after
+every drive, it tells an unchanged configuration in place and allocates nothing: `tests/pairs.rs`),
 `Owner::believe` takes each of its changes to the replicas with a member on that node (a
 suspicion, trust again, a restart to `Replica::restarted`), `Owner::measure` derives each group's
 timing from what the stream measured (`Replica::measure`) and charges every pair its groups'

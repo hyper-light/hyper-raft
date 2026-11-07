@@ -114,10 +114,17 @@ struct Learner {
     matched: u64,
     /// Appends with entries it took.
     pages: u64,
+    /// Answers held a round, for a learner whose answers come late; none for one that answers at once.
+    late: Option<Vec<Message>>,
 }
 
 impl Learner {
     fn answer(&mut self, r: &mut Member, sent: &[Message]) {
+        if let Some(held) = self.late.as_mut() {
+            for answer in std::mem::take(held) {
+                r.step(answer).unwrap();
+            }
+        }
         for m in sent
             .iter()
             .filter(|m| m.to == self.id && m.msg_type == MessageType::MsgAppend)
@@ -139,7 +146,10 @@ impl Learner {
                 answer.reject = true;
                 answer.reject_hint = self.matched;
             }
-            r.step(answer).unwrap();
+            match self.late.as_mut() {
+                Some(held) => held.push(answer),
+                None => r.step(answer).unwrap(),
+            }
         }
     }
 }
@@ -256,11 +266,13 @@ fn a_leader_writes_and_appends_while_a_members_catch_up_is_read_from_its_file() 
             id: 2,
             matched: 0,
             pages: 0,
+            late: None,
         },
         Learner {
             id: 3,
             matched: 0,
             pages: 0,
+            late: None,
         },
     ];
     r.campaign().unwrap();
@@ -345,5 +357,86 @@ fn a_leader_writes_and_appends_while_a_members_catch_up_is_read_from_its_file() 
         writing[writing.len() - 1],
         (BEHIND * ENTRY) >> 20,
         learners[1].pages,
+    );
+}
+
+/// Do: a sole voter writes 8 MiB in 16 KiB entries on a log of 1 MiB segments, then a learner joins holding nothing
+/// and answers each append a round late, so the window the leader sends it ahead of its answers (8 appends, half a run)
+/// fills while each run of the log is sent and the next is read. Expect: every run read from the file once. Before, a
+/// run read while the learner was still in the one before it held none of its next index and was let go, and was read
+/// again once the learner reached it, a time for each window it took to cross the run before (kiln's store::group,
+/// 2026-11-07: 47 reads for 48 MiB of 8 MiB runs).
+#[test]
+fn a_learner_that_answers_late_is_sent_each_run_read_once() {
+    const ENTRY: usize = 16 << 10;
+    const BEHIND: usize = 512;
+    const SEGMENT: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let file = Trapped {
+        file: DeviceFile::open(
+            &dir.path().join("log"),
+            true,
+            CachingRequest::PreferDirect,
+            Alignment::new(4096).unwrap(),
+        )
+        .unwrap(),
+        trap: Cell::new(None),
+    };
+    let config = Config {
+        segment_bytes: SEGMENT,
+        max_segments: 64,
+        max_groups: 4,
+        group_entries: 1 << 16,
+        group_bytes: 1 << 26,
+        group_cache: 1 << 16,
+        queue_submissions: 64,
+        waits: Waits::Never,
+    };
+    let log = Log::create(file, config, 0x006c_6174_6531).unwrap();
+    let mut settings = settings(1, 3);
+    settings.core.max_size_per_msg = 64 << 10;
+    settings.core.max_committed_size_per_ready = 1 << 20;
+    let kv = Kv::new(
+        ConfState {
+            voters: vec![1],
+            ..ConfState::default()
+        },
+        false,
+    );
+    let mut r = Replica::open(
+        &settings,
+        GroupStore::claim(&log, 1).unwrap(),
+        kv,
+        Unbounded,
+    )
+    .unwrap();
+    let (tell, woken) = sync_channel(1 << 12);
+    let (waker, _) = hyper_measure::wake::waker(0, tell);
+    let mut learners = [Learner {
+        id: 3,
+        matched: 0,
+        pages: 0,
+        late: Some(Vec::new()),
+    }];
+    r.campaign().unwrap();
+    settle(&mut r, &waker, &woken, &mut learners, true);
+    for batch in 0..BEHIND / 32 {
+        for _ in 0..32 {
+            r.propose(Vec::new(), vec![batch as u8; ENTRY]).unwrap();
+        }
+        settle(&mut r, &waker, &woken, &mut learners, true);
+    }
+    let asked = r.log().handle().asked();
+    add_learner(&mut r, 3);
+    let last = r.core().raft.log().last_index().unwrap();
+    while learners[0].matched < last {
+        settle(&mut r, &waker, &woken, &mut learners, true);
+    }
+    let reads = r.log().handle().asked() - asked;
+    let runs = (BEHIND * ENTRY) as u64 / SEGMENT + 1;
+    assert!(
+        reads <= runs,
+        "{reads} reads of the log's file for {} MiB in runs of a {SEGMENT}-byte segment ({runs} at most)",
+        (BEHIND * ENTRY) >> 20
     );
 }

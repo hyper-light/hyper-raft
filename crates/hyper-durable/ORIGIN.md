@@ -302,3 +302,17 @@ slates by the rule inside its own core (`crates/cluster/src/fold.rs`).
   shared with production): a write while the read was held, median 9.3 ms, most 18.1 ms, against a
   batch of 32 before at 12.0 ms; learner 3 caught up 8 MiB in 182 pages of 64 KiB in 11.7 ms, where a
   read a page took 43 to 50 ms.
+
+## The run after a member's is kept until it reaches it (2026-11-07)
+
+- **The defect.** The run read while a member was sent the one before it held none of the member's
+  next indexes yet, and was let go at the next drive and read again once the member reached it: a
+  member whose answers come back slower than its window fills, any member across a network, was
+  sent each run after the first read several times over. Measured in kiln's store::group (a runner
+  48 MiB behind, 8 MiB runs, adas-mac-studio-3, 2026-11-07): 47 and 48 reads of the log's file at
+  820346685304, its pages sent over 349 and 510 ms; 6 reads with the change, over 136 and 146 ms.
+- **The change** (`CatchUp::wanted`). A run is kept while it holds a member's next index, waits for
+  one, or begins where a run holding one ends: one run read ahead of each member, at most.
+- **Test** (`tests/catch_up.rs`): `a_learner_that_answers_late_is_sent_each_run_read_once`: a learner
+  8 MiB behind on a log of 1 MiB segments that answers a round late is sent each run read once (9
+  reads at most); at 820346685304 it took 11.

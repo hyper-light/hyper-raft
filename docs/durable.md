@@ -1157,8 +1157,9 @@ from that index, read by hyper-log's fetcher on a second handle to the file, by 
 the device and off the owner's thread, one run of the group's at a time. The run's answer wakes the
 owner; at the end of the drive it woke, the replica has the core send each member whose next index a
 read run holds its page (`RawNode::send_append`), and the page the core takes opens the run after it,
-read while this one is sent. A run that holds no member's next index goes; a run read before the
-log's entries there were replaced, its last entry's term no longer the handle's, is read again. Every
+read while this one is sent and kept until the member reaches it. Any other run that holds no
+member's next index goes; a run read before the log's entries there were replaced, its last entry's
+term no longer the handle's, is read again. Every
 other reader of `LogStore::entries` is answered at once, as before, and so is a store that takes
 neither method, by their defaults. Held by `tests/catch_up.rs`: a learner 8 MiB behind whose first
 read is held at the file while its leader writes 32 entries, each durable, applied and taken by the

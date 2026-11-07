@@ -85,8 +85,8 @@ pub struct GroupStore<F: BlockFile + 'static> {
 /// at a time ([`Step::Reading`]), and is held once read ([`Step::Read`]), the core told meanwhile
 /// that the store does not hold the page yet. At the end of every drive the replica has the core
 /// send their pages to the members whose next index a read run holds; each page the core takes
-/// opens the run after it, so the next run is read while this one is sent. A run that holds no
-/// member's next index is let go.
+/// opens the run after it, so the next run is read while this one is sent, and kept until the
+/// member reaches it. Any other run that holds no member's next index is let go.
 #[derive(Default)]
 struct CatchUp {
     /// The owner's waker, which a run's answer wakes: none until the replica first calls, and
@@ -95,7 +95,8 @@ struct CatchUp {
     /// The mark after which the replica reads entries back itself ([`LogStore::keep_after`]): an
     /// entry at or before it no read of the replica's own wants, only a member catching up.
     mark: u64,
-    /// The runs, in the order asked: those holding a member's next index, and the one being read.
+    /// The runs, in the order asked: those holding a member's next index, the one after each of
+    /// them, and the one being read.
     runs: VecDeque<Run>,
 }
 
@@ -116,19 +117,38 @@ enum Step {
 }
 
 impl Run {
-    /// Whether the run, read, holds the entry at `index`: one that failed holds its first index,
-    /// whose reader is answered its failure.
-    fn holds(&self, index: u64) -> bool {
-        let end = match &self.step {
+    /// The index past the entries the run holds, read: one that failed holds its first index,
+    /// whose reader is answered its failure; one not read yet holds nothing.
+    fn end(&self) -> u64 {
+        let held = match &self.step {
             Step::Read(Ok(fetched)) => u64::try_from(fetched.len()).unwrap_or(u64::MAX),
             Step::Read(Err(_)) => 1,
             Step::Waiting | Step::Reading(_) => 0,
         };
-        index.checked_sub(self.low).is_some_and(|at| at < end)
+        self.low.saturating_add(held)
+    }
+
+    /// Whether the run, read, holds the entry at `index`.
+    fn holds(&self, index: u64) -> bool {
+        index >= self.low && index < self.end()
     }
 }
 
 impl CatchUp {
+    /// Whether `r` is wanted still, the members' next indexes `lows`: being read, waiting for or
+    /// holding a member's next index, or right after a run that holds one, read while that is sent.
+    fn wanted(&self, r: &Run, lows: &[u64]) -> bool {
+        let waits = matches!(r.step, Step::Waiting);
+        matches!(r.step, Step::Reading(_))
+            || lows
+                .iter()
+                .any(|&low| r.holds(low) || (waits && low == r.low))
+            || self
+                .runs
+                .iter()
+                .any(|before| before.end() == r.low && lows.iter().any(|&low| before.holds(low)))
+    }
+
     /// Opens a run at `low` unless one begins there.
     fn open(&mut self, low: u64) {
         if !self.runs.iter().any(|r| r.low == low) {
@@ -838,12 +858,7 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         c.take_in();
         let mut at = 0;
         while let Some(r) = c.runs.get(at) {
-            let wanted = match r.step {
-                Step::Reading(_) => true,
-                Step::Waiting => lows.contains(&r.low),
-                Step::Read(_) => lows.iter().any(|&low| r.holds(low)),
-            };
-            if wanted {
+            if c.wanted(r, lows) {
                 at = at.saturating_add(1);
                 continue;
             }

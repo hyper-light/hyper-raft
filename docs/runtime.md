@@ -925,6 +925,11 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
     so another call would only answer `EAGAIN`, one a drain (0.59 a message at 10k msgs/s, strace of
     a bus node; `IoStats::receives_empty` counts the calls that find nothing). What lands after it
     is a readiness the arm that follows sees, since epoll's re-arm looks again (2026-10-16).
+  - `Taken::whole` says whether it took every datagram queued as it began (2026-11-07): it emptied
+    the socket, reached a datagram stamped after it began, or took the bytes the socket counted
+    where `FIONREAD` counts the whole queue (not Linux, where it counts the next datagram). A receive
+    its bound on calls cut is not whole. hyper-rt-transport's driver judges its timers at the
+    reading a drain began only when every socket's drain was whole (`docs/transport.md` §4ap).
   - `UdpSocket::queued_bytes` is `FIONREAD` as each platform counts it: every queued datagram's on
     Windows and the BSDs, the next one's on Linux, every one's on the fabric.
   - `Arrival::read_ns` carries the read time beside the stamp (docs/transport.md §4h).

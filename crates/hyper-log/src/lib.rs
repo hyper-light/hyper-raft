@@ -213,6 +213,10 @@ pub struct Recovery {
     pub damaged: Vec<u128>,
     /// Groups restored from the persist record of a last frame that no longer reads.
     pub restored: Vec<u128>,
+    /// Last frames that no longer read and were written back whole from their copies: a frame
+    /// answered at its own flush and damaged since, or one whose copy reached the medium before a
+    /// crash tore it (docs/durable.md §6.2). Either way nothing it held is lost.
+    pub copied: u64,
 }
 
 /// Entries fetched: the caller's reservation, which the log fills with each entry's term and

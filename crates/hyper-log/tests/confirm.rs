@@ -62,7 +62,8 @@ impl BlockFile for Timed {
 fn config() -> Config {
     Config {
         segment_bytes: 16 * BLOCK as u64,
-        max_segments: 8,
+        // Room for twelve entries too large for a copy, none compacted.
+        max_segments: 32,
         max_groups: 4,
         group_entries: 1 << 16,
         group_bytes: 1 << 24,
@@ -72,8 +73,13 @@ fn config() -> Config {
     }
 }
 
-/// Twelve entries written one after another, each waited for, so every frame is confirmed on its
-/// own: the log's statistics after.
+/// Bytes of each entry: more than a copy slot of [`config`]'s persist area holds (its 64 KiB less
+/// two record blocks, halved, 28 KiB, a block of it the copy's header), so no frame has a copy and
+/// each is confirmed (docs/durable.md §6.2).
+const ENTRY_BYTES: usize = 7 * BLOCK;
+
+/// Twelve entries written one after another, each waited for, each too large for a copy, so every
+/// frame is confirmed on its own: the log's statistics after.
 fn confirmations(durable: Duration, flush: Duration) -> Box<hyper_log::LogStats> {
     let file = Timed {
         file: SimFile::new(
@@ -94,7 +100,7 @@ fn confirmations(durable: Duration, flush: Duration) -> Box<hyper_log::LogStats>
                     first: index,
                     entries: vec![Entry {
                         term: 1,
-                        bytes: index.to_le_bytes().to_vec(),
+                        bytes: vec![u8::try_from(index).unwrap(); ENTRY_BYTES],
                     }],
                 }),
                 ..Update::default()

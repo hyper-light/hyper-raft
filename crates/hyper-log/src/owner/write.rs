@@ -842,6 +842,15 @@ impl<F: BlockFile + 'static> Owner<F> {
                 // Under `Waits::Told` what waits is written next only if told to.
                 let more = waiting && (self.p.config.waits != Waits::Told || self.told());
                 self.more_told = more;
+                // A frame no other follows at once is answered at its own flush, its copy
+                // written with it; one that opens a segment, or that the copy's slot cannot
+                // hold, is confirmed as before (docs/durable.md §6.2).
+                let copy = if more || target.opens {
+                    None
+                } else {
+                    self.copy_of(&frame, at, sequence)
+                };
+                let (copy, copy_at) = copy.unwrap_or((AlignedBuf::empty(), 0));
                 self.phase = Phase::Writing(Writing {
                     taken,
                     sweep,
@@ -860,12 +869,41 @@ impl<F: BlockFile + 'static> Owner<F> {
                         before,
                         these,
                         more,
+                        copy,
+                        copy_at,
                     }),
                     doer,
                 ));
             }
             Err(e) => self.failed(VecDeque::new(), laid.taken, e),
         }
+    }
+
+    /// The copy of `frame`, to be written at `at` with sequence `sequence`, laid out with its
+    /// header in the buffer kept for copies, and where it goes: `None` where the persist area has
+    /// no copy slots or the frame does not fit one, the frame then confirmed as before.
+    fn copy_of(&mut self, frame: &AlignedBuf, at: u64, sequence: u64) -> Option<(AlignedBuf, u64)> {
+        let slots = crate::recover::copy_slots(&self.p.config, self.p.align, self.seal.is_some())
+            .ok()??;
+        let block = self.p.align.get();
+        let bytes = frame.as_slice();
+        let need = self.p.align.up(bytes.len())?.checked_add(block)?;
+        if u64::try_from(need).ok()? > slots.1 {
+            return None;
+        }
+        let header = format::CopyHeader {
+            log: self.p.id,
+            sequence,
+            at,
+            len: u64::try_from(bytes.len()).ok()?,
+        };
+        let mut buf = aligned(self.buffers.copy.take(), need, self.p.align).ok()?;
+        let laid = buf
+            .extend_from_slice(&header.encode(bytes))
+            .and_then(|()| buf.extend_zeros(block.saturating_sub(format::COPY_HEADER_LEN)))
+            .and_then(|()| buf.extend_from_slice(bytes));
+        laid.ok()?;
+        Some((buf, crate::recover::copy_at(slots, sequence)))
     }
 
     /// The answers of a frame's updates, taken from them for the device to give: each ticket,

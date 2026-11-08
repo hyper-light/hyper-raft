@@ -85,6 +85,74 @@ pub const PERSIST_HEADER_LEN: usize = 44;
 /// start, entries and uncertainty.
 pub const PERSIST_GROUP_LEN: usize = 97;
 
+/// The first bytes of a frame's copy, written with a frame that no frame follows at once
+/// (docs/durable.md §6.2).
+pub const COPY_MAGIC: [u8; 4] = *b"MNLC";
+/// Bytes of a frame's copy before the frame: magic, format, padding, the log's ID, the frame's
+/// sequence, the file offset the frame was written at, its length, and a CRC-32C over these and
+/// the frame's bytes.
+pub const COPY_HEADER_LEN: usize = 52;
+
+/// A frame's copy's header: whose frame it is, where the frame was written, and how long it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyHeader {
+    /// The log's ID.
+    pub log: u128,
+    /// The frame's sequence.
+    pub sequence: u64,
+    /// The file offset the frame was written at.
+    pub at: u64,
+    /// The frame's length, unpadded.
+    pub len: u64,
+}
+
+impl CopyHeader {
+    /// The header's bytes for a copy of `frame`, its CRC over them and the frame's bytes.
+    pub fn encode(&self, frame: &[u8]) -> [u8; COPY_HEADER_LEN] {
+        let mut w = Writer::with_capacity(COPY_HEADER_LEN);
+        w.bytes(&COPY_MAGIC);
+        w.u8(FORMAT);
+        w.zeros(3);
+        w.u128(self.log);
+        w.u64(self.sequence);
+        w.u64(self.at);
+        w.u64(self.len);
+        let mut crc = crate::codec::Crc32c::new();
+        crc.update(w.as_slice());
+        crc.update(frame);
+        w.u32(crc.finish());
+        let mut out = [0u8; COPY_HEADER_LEN];
+        if let Some(head) = w.as_slice().get(..COPY_HEADER_LEN) {
+            out.copy_from_slice(head);
+        }
+        out
+    }
+
+    /// The copy at the start of `bytes`, its frame's bytes at `frame_at`: its header and the
+    /// frame, if the magic, format and CRC hold.
+    pub fn decode(bytes: &[u8], frame_at: usize) -> Option<(Self, &[u8])> {
+        let head = bytes.get(..COPY_HEADER_LEN)?;
+        let mut r = Reader::new(head);
+        if r.take(4)? != COPY_MAGIC || r.u8()? != FORMAT {
+            return None;
+        }
+        r.take(3)?;
+        let header = Self {
+            log: r.u128()?,
+            sequence: r.u64()?,
+            at: r.u64()?,
+            len: r.u64()?,
+        };
+        let stored = r.u32()?;
+        let len = usize::try_from(header.len).ok()?;
+        let frame = bytes.get(frame_at..frame_at.checked_add(len)?)?;
+        let mut crc = crate::codec::Crc32c::new();
+        crc.update(head.get(..COPY_HEADER_LEN.checked_sub(4)?)?);
+        crc.update(frame);
+        (crc.finish() == stored).then_some((header, frame))
+    }
+}
+
 /// A segment's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {

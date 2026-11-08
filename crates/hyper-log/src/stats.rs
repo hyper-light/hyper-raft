@@ -139,6 +139,24 @@ pub(crate) struct Timing {
     pub(crate) zeroed: u64,
 }
 
+impl Timing {
+    /// A confirmation that took no I/O: a frame's copy, written and flushed with it, stands for
+    /// it, durable when the frame's flush ended at `flushed_at` (docs/durable.md §6.2).
+    pub(crate) fn confirmed_by(flushed_at: Option<Instant>) -> Self {
+        Self {
+            took_ns: 0,
+            write_ns: 0,
+            flush_ns: None,
+            bytes: 0,
+            flushed_at,
+            durable_write: false,
+            durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed: 0,
+        }
+    }
+}
+
 /// The nanoseconds from `from` to `to`, saturating.
 pub(crate) fn nanos(from: Instant, to: Instant) -> u64 {
     u64::try_from(to.saturating_duration_since(from).as_nanos()).unwrap_or(u64::MAX)

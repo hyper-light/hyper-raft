@@ -151,6 +151,9 @@ struct Buffers<F> {
     /// frame's bytes at most, a segment and a block.
     frame: Option<AlignedBuf>,
     record: Option<AlignedBuf>,
+    /// The aligned buffer the last frame's copy was laid out in: a block and one frame's bytes
+    /// at most (docs/durable.md §6.2).
+    copy: Option<AlignedBuf>,
     /// The ordering's keys and each group's last key (`writer::order`).
     keyed: Vec<(Key, u64, Submission<F>)>,
     last: HashMap<u128, Key>,
@@ -885,6 +888,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 frame,
                 record,
                 confirm,
+                copy,
                 result,
                 timing,
                 confirming,
@@ -893,6 +897,9 @@ impl<F: BlockFile + 'static> Owner<F> {
             } => {
                 self.buffers.frame = Some(frame);
                 self.buffers.record = Some(record);
+                if copy.capacity() > 0 {
+                    self.buffers.copy = Some(copy);
+                }
                 self.tally.job(&timing, true);
                 self.frame_bytes = timing.bytes;
                 // A device that confirms the frame on its own goes on to it as the flush ends.
@@ -1000,6 +1007,7 @@ impl<F> Buffers<F> {
             record_bytes: Payload::default(),
             frame: None,
             record: None,
+            copy: None,
             keyed: Vec::new(),
             last: HashMap::new(),
             seen: HashSet::new(),

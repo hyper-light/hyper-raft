@@ -342,6 +342,81 @@ pub(crate) fn persist_at(slot: u64, sequence: u64) -> u64 {
     if sequence.is_multiple_of(2) { 0 } else { slot }
 }
 
+/// Where the two slots of frames' copies are, and the bytes of each: the persist area past its
+/// two record slots, halved and aligned down to the block. The copy of the frame of sequence `s`
+/// goes in slot `s mod 2`, as its record does, so the copy of the frame before survives a torn
+/// write of this one (docs/durable.md §6.2). `None` where the area has no room for a copy.
+pub(crate) fn copy_slots(
+    config: &Config,
+    align: Alignment,
+    sealed: bool,
+) -> Result<Option<(u64, u64)>, LogError> {
+    let records = persist_slot(config, align, sealed)?
+        .checked_mul(2)
+        .ok_or(LogError::Config("persist records past u64"))?;
+    let room = persist_area(config).saturating_sub(records) / 2;
+    let each = align.down_u64(room);
+    let block = block_of(align)?;
+    Ok((each > block).then_some((records, each)))
+}
+
+/// The file offset of the copy slot of the frame of `sequence`, given [`copy_slots`].
+pub(crate) fn copy_at((start, each): (u64, u64), sequence: u64) -> u64 {
+    if sequence.is_multiple_of(2) {
+        start
+    } else {
+        start.saturating_add(each)
+    }
+}
+
+/// The copy of the frame of `sequence` in its slot, if one reads whole there: where the frame
+/// was written and its bytes, padded to the block.
+fn copy_of<F: BlockFile>(
+    file: &F,
+    config: &Config,
+    id: u128,
+    sealed: bool,
+    sequence: u64,
+) -> Result<Option<(u64, AlignedBuf)>, LogError> {
+    let align = file.layout_block();
+    let Some(slots) = copy_slots(config, align, sealed)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = copy_slot(file, slots, sequence)? else {
+        return Ok(None);
+    };
+    let frame_at =
+        usize::try_from(block_of(align)?).map_err(|_| LogError::Config("a copy slot"))?;
+    let found = format::CopyHeader::decode(bytes.as_slice(), frame_at)
+        .filter(|(header, _)| header.log == id && header.sequence == sequence);
+    let Some((header, frame)) = found else {
+        return Ok(None);
+    };
+    let mut out = AlignedBuf::zeroed(frame.len(), align).map_err(|e| LogError::Disk(e.into()))?;
+    out.extend_from_slice(frame)
+        .map_err(|e| LogError::Disk(e.into()))?;
+    Ok(Some((header.at, out)))
+}
+
+/// The bytes of the copy slot of the frame of `sequence`, if the file holds the whole slot.
+fn copy_slot<F: BlockFile>(
+    file: &F,
+    slots: (u64, u64),
+    sequence: u64,
+) -> Result<Option<AlignedBuf>, LogError> {
+    let at = copy_at(slots, sequence);
+    let len = file.len()?;
+    if at.checked_add(slots.1).is_none_or(|end| end > len) {
+        return Ok(None);
+    }
+    let size = usize::try_from(slots.1).map_err(|_| LogError::Config("a copy slot"))?;
+    let mut bytes =
+        AlignedBuf::zeroed(size, file.layout_block()).map_err(|e| LogError::Disk(e.into()))?;
+    bytes.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
+    file.read_exact_at(bytes.as_mut_slice(), at)?;
+    Ok(Some(bytes))
+}
+
 /// Writes `record` at `at`, the start of a persist slot, padded to the block, a sealed log's MAC
 /// after it.
 pub(crate) fn write_record<F: BlockFile>(
@@ -993,6 +1068,7 @@ fn erase<F: BlockFile>(
     heads: &Headers,
     last: &Last,
     copy: Option<RecordCopy>,
+    copies: Option<(u64, u64)>,
     sealer: Option<&Sealer>,
 ) -> Result<u64, LogError> {
     let mut flush = false;
@@ -1026,6 +1102,14 @@ fn erase<F: BlockFile>(
             flush = true;
         }
     }
+    // Both copies' headers go: a copy names its frame's sequence, which the frame after the last
+    // valid one takes again once this open ends, and a copy left from before would then name it.
+    if let Some(slots) = copies {
+        for sequence in [0, 1] {
+            file.write_all_at(zeros.as_slice(), copy_at(slots, sequence))?;
+            flush = true;
+        }
+    }
     if flush {
         file.sync_data()?;
     }
@@ -1042,8 +1126,41 @@ pub(crate) fn open<F: BlockFile>(
     let shape = Shape::of(file, config, id)?;
     let heads = headers(file, &shape, sealer.as_deref_mut())?;
     let mac = sealer.as_deref().map(Sealer::frame_mac);
-    let mut reader = Reader::new(file, file.layout_block(), shape.segment, mac)?;
-    let last = last_frame(&mut reader, &shape, &heads)?;
+    let mut reader = Reader::new(file, file.layout_block(), shape.segment, mac.clone())?;
+    let mut last = last_frame(&mut reader, &shape, &heads)?;
+    // 2a. A frame no frame followed at once was answered at its own flush, its copy written in
+    // that flush (docs/durable.md §6.2): where the frame after the last valid one no longer
+    // reads and its copy does, the frame is written back from the copy before anything else.
+    let mut copied = 0;
+    let mut copy_read = false;
+    // The frame goes right after the last valid one, in its segment, whatever newer segment's
+    // opening a crash left torn after it (a copied frame never opens a segment).
+    if let Some(next) = last.sequence.checked_add(1)
+        && let Some((at, mut frame)) = copy_of(file, config, id, sealer.is_some(), next)?
+        && at == last.after
+    {
+        // The copy proves the frame's flush ended: it was written in that flush. Should the frame
+        // still not read once written back (its blocks read wrong whatever is written there), it
+        // is damage, never a torn tail.
+        copy_read = true;
+        let end = shape.end_of(heads.slot(last.incarnation)?)?;
+        let bytes = frame.padded().map_err(|e| LogError::Disk(e.into()))?;
+        let fits = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|n| at.checked_add(n))
+            .is_some_and(|stop| stop <= end);
+        if fits {
+            file.write_all_at(bytes, at)?;
+            file.sync_data()?;
+            reader = Reader::new(file, file.layout_block(), shape.segment, mac)?;
+            let again = last_frame(&mut reader, &shape, &heads)?;
+            if again.sequence == next {
+                copied = 1;
+                copy_read = false;
+            }
+            last = again;
+        }
+    }
     lost_headers(&mut reader, &shape, &heads)?;
     if last.tail > last.incarnation {
         return Err(LogError::Damaged(
@@ -1058,7 +1175,7 @@ pub(crate) fn open<F: BlockFile>(
         file,
         config,
         id,
-        last.sequence,
+        (last.sequence, copy_read),
         (&groups, &fenced),
         &mut damaged,
         sealer.as_deref(),
@@ -1076,7 +1193,8 @@ pub(crate) fn open<F: BlockFile>(
     }));
     let live = live_of(heads.incarnation.len(), &groups, &fenced, &replay.used);
     let copy = copy.filter(|_| !restores.is_empty());
-    let head_offset = erase(file, &shape, &heads, &last, copy, sealer.as_deref())?;
+    let copies = copy_slots(config, file.layout_block(), sealer.is_some())?;
+    let head_offset = erase(file, &shape, &heads, &last, copy, copies, sealer.as_deref())?;
     let opened = Opened {
         groups,
         damaged,
@@ -1084,6 +1202,7 @@ pub(crate) fn open<F: BlockFile>(
         live,
         head_offset,
         frames: replay.frames,
+        copied,
     };
     let (state, recovery) = opened.into_state(heads, &last, shape.slots, &restores)?;
     Ok((state, recovery, restores))
@@ -1097,6 +1216,8 @@ struct Opened {
     live: Live,
     head_offset: u64,
     frames: u64,
+    /// Frames written back from their copies.
+    copied: u64,
 }
 
 impl Opened {
@@ -1172,6 +1293,7 @@ impl Opened {
             frames: self.frames,
             damaged: all,
             restored,
+            copied: self.copied,
         };
         Ok((state, recovery))
     }
@@ -1204,7 +1326,7 @@ fn restores<F: BlockFile>(
     file: &F,
     config: &Config,
     id: u128,
-    last: u64,
+    (last, copy_read): (u64, bool),
     (groups, fenced): (&HashMap<u128, state::Group>, &HashMap<u128, Place>),
     damaged: &mut Vec<u128>,
     sealer: Option<&Sealer>,
@@ -1225,7 +1347,13 @@ fn restores<F: BlockFile>(
             records.push((at, p));
         }
     }
-    let confirmed = records.iter().any(|(_, p)| p.confirms >= sequence);
+    // A later frame's record proves the frame's flush ended: a frame is written only after the
+    // flush of the one before (PAR §3.3.3: "if e_{i+1} or p_{i+1} is present").
+    // So does the frame's copy, read whole where the frame no longer does (docs/durable.md §6.2).
+    let confirmed = copy_read
+        || records
+            .iter()
+            .any(|(_, p)| p.confirms >= sequence || p.sequence > sequence);
     let own = persist_at(slot, sequence);
     let other = if own == 0 { slot } else { 0 };
     let chosen = [own, other].into_iter().find_map(|from| {

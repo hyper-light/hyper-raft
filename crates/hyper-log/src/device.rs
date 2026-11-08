@@ -330,6 +330,10 @@ pub(crate) struct Frame {
     pub(crate) these: Vec<Answering>,
     /// The owner knew when it laid the frame out that another follows.
     pub(crate) more: bool,
+    /// The frame's copy, written in its flush where no frame follows at once (docs/durable.md
+    /// §6.2), and where it goes; empty where the frame has none.
+    pub(crate) copy: AlignedBuf,
+    pub(crate) copy_at: u64,
 }
 
 /// What the device answers.
@@ -341,6 +345,8 @@ pub(crate) enum Completion {
         record: AlignedBuf,
         /// The frame's own confirmation, unless the device is writing it.
         confirm: AlignedBuf,
+        /// The buffer the frame's copy was laid out in, if it had one.
+        copy: AlignedBuf,
         result: Result<(), LogError>,
         /// The frame's writes and flush, timed.
         timing: Timing,
@@ -612,17 +618,23 @@ impl<F: BlockFile> Device<F> {
         }
     }
 
-    /// A frame, its record and one flush; the frame before answered; this one confirmed and
-    /// answered unless another frame follows.
+    /// A frame, its record, its copy where it has one, and one flush; the frame before answered;
+    /// this one answered at once where it has a copy, else confirmed and answered unless another
+    /// frame follows.
     fn frame(
         &mut self,
         mut f: Frame,
         answers: &mut Vec<Answering>,
         lines: &Lines<F>,
     ) -> Completion {
-        let (result, timing) =
-            self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
-        let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
+        let copied = !f.copy.is_empty();
+        let copy = copied.then_some((&mut f.copy, f.copy_at));
+        let (result, timing) = self.write_then_flush(
+            (&mut f.frame, f.at),
+            Some((&mut f.record, f.record_at)),
+            copy,
+        );
+        let confirming = result.is_ok() && (copied || !(f.more || self.follows(f.sequence)));
         if result.is_ok() {
             // This frame's record confirms the frame before.
             answers.append(&mut f.before);
@@ -632,6 +644,7 @@ impl<F: BlockFile> Device<F> {
                 frame: f.frame,
                 record: f.record,
                 confirm: f.confirm,
+                copy: f.copy,
                 result,
                 timing,
                 confirming,
@@ -641,10 +654,12 @@ impl<F: BlockFile> Device<F> {
         }
         // The owner publishes the frame, and gives back the frame before's room, while the
         // confirmation is written; the frame before's callers are answered then.
+        let flushed_at = timing.flushed_at;
         let flushed = Completion::Frame {
             frame: f.frame,
             record: f.record,
             confirm: AlignedBuf::empty(),
+            copy: f.copy,
             result,
             timing,
             confirming,
@@ -665,7 +680,14 @@ impl<F: BlockFile> Device<F> {
                 answering.durable();
             }
         }
-        let (result, timing) = self.confirm(&mut f.confirm, f.record_at);
+        // A frame with its copy needs no confirmation: its flush made the copy durable with it,
+        // and recovery restores the frame from the copy should it no longer read (docs/durable.md
+        // §6.2). Its callers are answered with the frame before's, at the frame's own flush.
+        let (result, timing) = if copied {
+            (Ok(()), Timing::confirmed_by(flushed_at))
+        } else {
+            self.confirm(&mut f.confirm, f.record_at)
+        };
         if result.is_ok() {
             answers.append(&mut f.these);
         }
@@ -698,6 +720,7 @@ impl<F: BlockFile> Device<F> {
         &mut self,
         first: (&mut AlignedBuf, u64),
         second: Option<(&mut AlignedBuf, u64)>,
+        third: Option<(&mut AlignedBuf, u64)>,
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
@@ -709,6 +732,9 @@ impl<F: BlockFile> Device<F> {
                 let from = stats::now();
                 bytes = bytes.saturating_add(self.write(buf, at)?);
                 record_ns = Some(stats::nanos(from, stats::now()));
+            }
+            if let Some((buf, at)) = third {
+                bytes = bytes.saturating_add(self.write(buf, at)?);
             }
             Ok(())
         });

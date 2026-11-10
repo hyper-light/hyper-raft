@@ -161,13 +161,18 @@ mod new {
     use super::*;
     use hyper_tls as tls;
     verification!(tls);
+    fn provider() -> &'static tls::crypto::CryptoProvider {
+        static PROVIDER: std::sync::OnceLock<tls::crypto::CryptoProvider> =
+            std::sync::OnceLock::new();
+        PROVIDER.get_or_init(tls::crypto::aws_lc_rs::default_provider)
+    }
     pub(super) fn client(
         server_rpk: bool,
         client_rpk: bool,
         offer: bool,
     ) -> rustls_test::TestClient {
         let kt = KeyType::Ed25519;
-        let provider = Box::leak(Box::new(tls::crypto::aws_lc_rs::default_provider()));
+        let provider = provider();
         let builder = tls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&tls::version::TLS13])
             .unwrap();
@@ -221,7 +226,7 @@ mod new {
         offer: bool,
     ) -> rustls_test::TestServer {
         let kt = KeyType::Ed25519;
-        let provider = Box::leak(Box::new(tls::crypto::aws_lc_rs::default_provider()));
+        let provider = provider();
         let verifier: Box<dyn tls::server::danger::ClientCertVerifier> = if client_rpk {
             Box::new(Pin {
                 key: kt.get_client_spki().as_ref().to_vec(),
@@ -481,17 +486,19 @@ fn run_case(
 ) -> (usize, usize) {
     SERVER_COMPRESSIONS.store(0, Ordering::Relaxed);
     CLIENT_COMPRESSIONS.store(0, Ordering::Relaxed);
-    let client = if new_client {
-        Peer::NewClient(new::client(server_rpk, client_rpk, offer))
-    } else {
-        Peer::OldClient(old::client(server_rpk, client_rpk, offer))
-    };
-    let server = if new_server {
-        Peer::NewServer(new::server(server_rpk, client_rpk, offer))
-    } else {
-        Peer::OldServer(old::server(server_rpk, client_rpk, offer))
-    };
-    let (flights, measured) = cost::measure(|| handshake(client, server));
+    let (flights, measured) = cost::measure(|| {
+        let client = if new_client {
+            Peer::NewClient(new::client(server_rpk, client_rpk, offer))
+        } else {
+            Peer::OldClient(old::client(server_rpk, client_rpk, offer))
+        };
+        let server = if new_server {
+            Peer::NewServer(new::server(server_rpk, client_rpk, offer))
+        } else {
+            Peer::OldServer(old::server(server_rpk, client_rpk, offer))
+        };
+        handshake(client, server)
+    });
     let counts = (
         CLIENT_COMPRESSIONS.load(Ordering::Relaxed),
         SERVER_COMPRESSIONS.load(Ordering::Relaxed),

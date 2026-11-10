@@ -507,3 +507,32 @@ openssl_interop -- --ignored`. slates ships the same group, checked against Open
 - **Checked.** hyper-tls's own IR at opt-level 0 holds no cycle through hyper-tls code (focal's
   `scripts/check_recursion.py`). The six cycles left are inside the standard library's own
   generic code it instantiates.
+
+## 10. Experimental RPK certificate-compression policy (2026-11-10)
+
+This isolated candidate is not adopted by Shards. TLS 1.3 sends raw public keys using ordinary
+Certificate messages, including when an older peer offers RFC 8879 compression. X509 selection,
+compression algorithms/quality, certificate-type negotiation, exact SPKI pins and signature
+verification remain unchanged. The existing resolver predicates determine the only accepted
+negotiated own-certificate type; a resolver that dynamically supports both types is not supported
+by this API. No size threshold, new cache or memory entitlement is introduced.
+
+RFC 8879 §4 permits an ordinary Certificate response to a compression offer. OpenSSL 3.6.0
+`ssl/statem/statem_clnt.c` `do_compressed_cert` and `ssl/statem/statem_srvr.c` `do_compressed_cert`
+both select compressed sending only for X509. The local Ed25519 RPK certificate body is 53 bytes;
+the existing Brotli Amortized result has a 65-byte CompressedCertificate body and requests a
+33,554,432-byte H10 forest allocation. The established type policy avoids that optional work
+without changing legal codec inputs or growing the resource budget. This does not fix ordinary
+X509 compression's existing allocation cost.
+
+`tests/rpk_compression_policy.rs` checks pinned RPK and real-root X509 mutual authentication against
+unmodified rustls 0.23.45 peers in both roles. Its ignored matrix records encrypted TLS byte counts
+and allocation phases for baseline, sender-only, receiver-only and combined frozen source variants;
+`HYPER_MATRIX_EXPECT` changes only the expected test result, never production behavior. The original
+baseline fails `rpk_senders_avoid_compression_with_older_offering_peers` because both RPK senders
+invoke Brotli. Test phase construction/teardown and wire buffers are included in allocation totals;
+foreign C allocator and kernel/socket costs are not covered by this sans-I/O fixture.
+
+Sources: <https://www.rfc-editor.org/rfc/rfc8879#section-4>,
+<https://github.com/openssl/openssl/blob/openssl-3.6.0/ssl/statem/statem_clnt.c#L402>,
+<https://github.com/openssl/openssl/blob/openssl-3.6.0/ssl/statem/statem_srvr.c#L430>.

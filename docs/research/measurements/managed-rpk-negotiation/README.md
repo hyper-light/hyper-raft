@@ -155,6 +155,16 @@ Actual compile logs are retained; restoration rewrites owned files with current
 mtimes, and git diff confirms no mutation remains. [Raw results](results/) include
 the initial fixture compile/lint failures as well as passing checkpoints;
 [summary.json](results/summary.json) verifies all-X509 exact wire/count equivalence.
+At5b4df56, the same production TLS source also passes a real loopback TCP fixture:
+16 new/old-role X509/RPK/mixed capability cases and8 wrong-pin negatives,
+exact encrypted flight byte counts, binary application roundtrip, FD9→9.
+All4 focused tests pass and strict clippy passes. Both TLS implementations remain
+the existing adapters/verifiers/codecs; only delivery between them traverses a
+real TCP socket. This is native TLS interoperability, not old/new Shards QUIC
+cross-process proof. [Raw native log](results/native-old-peer-fixed.log),
+[clippy](results/native-old-peer-clippy-fixed.log) and exact source are retained;
+the initial test-only complexity lint failure is preserved too. Production delta
+is identical to tested233; no new consumer pin is implied by test-only additions.
 Native
 real-socket equivalent2N/shared cold/warm/allocation/latency and QUIC packet counts,
 noise, parent/kernel/socket/cgroup charges, page faults/copies and instrumentation

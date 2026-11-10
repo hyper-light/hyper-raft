@@ -17,13 +17,14 @@
 use hyper_measure::{alloc, cost};
 use rustls_test::KeyType;
 use std::io::{Read as _, Write as _};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[global_allocator]
 static GLOBAL: alloc::Counting = alloc::Counting;
-static SERVER_COMPRESSIONS: AtomicUsize = AtomicUsize::new(0);
-static CLIENT_COMPRESSIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static SERVER_COMPRESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLIENT_COMPRESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // The old/new trait adapters call the respective established verifier/codec;
 // their differing ownership signatures are confined to this oracle fixture.
@@ -142,9 +143,9 @@ macro_rules! verification {
                 level: $tls::compress::CompressionLevel,
             ) -> Result<Vec<u8>, $tls::compress::CompressionFailed> {
                 if self.0 {
-                    SERVER_COMPRESSIONS.fetch_add(1, Ordering::Relaxed);
+                    SERVER_COMPRESSIONS.with(|count| count.set(count.get() + 1));
                 } else {
-                    CLIENT_COMPRESSIONS.fetch_add(1, Ordering::Relaxed);
+                    CLIENT_COMPRESSIONS.with(|count| count.set(count.get() + 1));
                 }
                 $tls::compress::BROTLI_COMPRESSOR.compress(input, level)
             }
@@ -171,6 +172,14 @@ mod new {
         client_rpk: bool,
         offer: bool,
     ) -> rustls_test::TestClient {
+        client_pinned(server_rpk, client_rpk, offer, false)
+    }
+    pub(super) fn client_pinned(
+        server_rpk: bool,
+        client_rpk: bool,
+        offer: bool,
+        reject: bool,
+    ) -> rustls_test::TestClient {
         let kt = KeyType::Ed25519;
         let provider = provider();
         let builder = tls::ClientConfig::builder_with_provider(provider)
@@ -180,7 +189,13 @@ mod new {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Box::new(Pin {
-                    key: kt.get_spki().as_ref().to_vec(),
+                    key: if reject {
+                        kt.get_client_spki()
+                    } else {
+                        kt.get_spki()
+                    }
+                    .as_ref()
+                    .to_vec(),
                     algorithms: provider.signature_verification_algorithms,
                 }))
         } else {
@@ -225,11 +240,25 @@ mod new {
         client_rpk: bool,
         offer: bool,
     ) -> rustls_test::TestServer {
+        server_pinned(server_rpk, client_rpk, offer, false)
+    }
+    pub(super) fn server_pinned(
+        server_rpk: bool,
+        client_rpk: bool,
+        offer: bool,
+        reject: bool,
+    ) -> rustls_test::TestServer {
         let kt = KeyType::Ed25519;
         let provider = provider();
         let verifier: Box<dyn tls::server::danger::ClientCertVerifier> = if client_rpk {
             Box::new(Pin {
-                key: kt.get_client_spki().as_ref().to_vec(),
+                key: if reject {
+                    kt.get_spki()
+                } else {
+                    kt.get_client_spki()
+                }
+                .as_ref()
+                .to_vec(),
                 algorithms: provider.signature_verification_algorithms,
             })
         } else {
@@ -383,6 +412,19 @@ enum Peer {
     OldClient(upstream_rustls::ClientConnection),
     OldServer(upstream_rustls::ServerConnection),
 }
+#[derive(Debug)]
+enum TlsError {
+    New(hyper_tls::Error),
+    Old(upstream_rustls::Error),
+}
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::New(error) => write!(formatter, "candidate: {error}"),
+            Self::Old(error) => write!(formatter, "oracle: {error}"),
+        }
+    }
+}
 impl Peer {
     fn handshaking(&self) -> bool {
         match self {
@@ -408,7 +450,7 @@ impl Peer {
             Self::OldServer(p) => p.write_tls(out).unwrap(),
         }
     }
-    fn receive(&mut self, mut input: &[u8]) {
+    fn receive(&mut self, mut input: &[u8]) -> Result<(), TlsError> {
         while !input.is_empty() {
             let n = match self {
                 Self::NewClient(p) => p.read_tls(&mut input).unwrap(),
@@ -419,18 +461,10 @@ impl Peer {
             assert!(n > 0);
         }
         match self {
-            Self::NewClient(p) => {
-                p.process_new_packets().unwrap();
-            }
-            Self::NewServer(p) => {
-                p.process_new_packets().unwrap();
-            }
-            Self::OldClient(p) => {
-                p.process_new_packets().unwrap();
-            }
-            Self::OldServer(p) => {
-                p.process_new_packets().unwrap();
-            }
+            Self::NewClient(p) => p.process_new_packets().map(|_| ()).map_err(TlsError::New),
+            Self::NewServer(p) => p.process_new_packets().map(|_| ()).map_err(TlsError::New),
+            Self::OldClient(p) => p.process_new_packets().map(|_| ()).map_err(TlsError::Old),
+            Self::OldServer(p) => p.process_new_packets().map(|_| ()).map_err(TlsError::Old),
         }
     }
     fn send_application(&mut self, bytes: &[u8]) {
@@ -450,32 +484,32 @@ impl Peer {
         }
     }
 }
-fn transfer(from: &mut Peer, to: &mut Peer) -> usize {
+fn transfer(from: &mut Peer, to: &mut Peer) -> Result<usize, TlsError> {
     let mut bytes = Vec::new();
     while from.pending() {
         assert!(from.write(&mut bytes) > 0);
     }
     let n = bytes.len();
     if n > 0 {
-        to.receive(&bytes);
+        to.receive(&bytes)?;
     }
-    n
+    Ok(n)
 }
-fn handshake(mut client: Peer, mut server: Peer) -> Vec<(usize, usize)> {
+fn handshake(mut client: Peer, mut server: Peer) -> Result<Vec<(usize, usize)>, TlsError> {
     let mut flights = Vec::new();
     while client.handshaking() || server.handshaking() || client.pending() || server.pending() {
-        let up = transfer(&mut client, &mut server);
-        let down = transfer(&mut server, &mut client);
+        let up = transfer(&mut client, &mut server)?;
+        let down = transfer(&mut server, &mut client)?;
         assert!(up + down > 0, "TLS handshake stopped making progress");
         flights.push((up, down));
     }
     let payload = b"exact\0\xffpayload";
     client.send_application(payload);
-    transfer(&mut client, &mut server);
+    transfer(&mut client, &mut server)?;
     let mut got = vec![0; payload.len()];
     server.read_application(&mut got);
     assert_eq!(got, payload);
-    flights
+    Ok(flights)
 }
 fn run_case(
     new_client: bool,
@@ -484,8 +518,8 @@ fn run_case(
     client_rpk: bool,
     offer: bool,
 ) -> (usize, usize) {
-    SERVER_COMPRESSIONS.store(0, Ordering::Relaxed);
-    CLIENT_COMPRESSIONS.store(0, Ordering::Relaxed);
+    SERVER_COMPRESSIONS.set(0);
+    CLIENT_COMPRESSIONS.set(0);
     let (flights, measured) = cost::measure(|| {
         let client = if new_client {
             Peer::NewClient(new::client(server_rpk, client_rpk, offer))
@@ -497,12 +531,9 @@ fn run_case(
         } else {
             Peer::OldServer(old::server(server_rpk, client_rpk, offer))
         };
-        handshake(client, server)
+        handshake(client, server).unwrap()
     });
-    let counts = (
-        CLIENT_COMPRESSIONS.load(Ordering::Relaxed),
-        SERVER_COMPRESSIONS.load(Ordering::Relaxed),
-    );
+    let counts = (CLIENT_COMPRESSIONS.get(), SERVER_COMPRESSIONS.get());
     println!("case new_client={new_client} new_server={new_server} server_rpk={server_rpk} client_rpk={client_rpk} offer={offer} compressions={counts:?} flights={flights:?} cost={measured:?}");
     counts
 }
@@ -512,6 +543,32 @@ fn rpk_senders_avoid_compression_with_older_offering_peers() {
     assert!(alloc::installed());
     assert_eq!(run_case(true, false, true, true, true), (0, 0));
     assert_eq!(run_case(false, true, true, true, true), (0, 0));
+}
+
+#[test]
+fn certificate_type_policy_preserves_exact_pins_against_old_peers() {
+    for offer in [false, true] {
+        for server_rpk in [false, true] {
+            let client = Peer::OldClient(old::client(server_rpk, true, offer));
+            let server = Peer::NewServer(new::server_pinned(server_rpk, true, offer, true));
+            assert!(matches!(
+                handshake(client, server),
+                Err(TlsError::New(hyper_tls::Error::InvalidCertificate(
+                    hyper_tls::CertificateError::ApplicationVerificationFailure
+                )))
+            ));
+        }
+        for client_rpk in [false, true] {
+            let client = Peer::NewClient(new::client_pinned(true, client_rpk, offer, true));
+            let server = Peer::OldServer(old::server(true, client_rpk, offer));
+            assert!(matches!(
+                handshake(client, server),
+                Err(TlsError::New(hyper_tls::Error::InvalidCertificate(
+                    hyper_tls::CertificateError::ApplicationVerificationFailure
+                )))
+            ));
+        }
+    }
 }
 
 #[test]

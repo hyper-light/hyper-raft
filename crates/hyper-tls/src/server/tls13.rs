@@ -145,6 +145,9 @@ mod client_hello {
             let cert_compressor = client_hello
                 .certificate_compression_algorithms
                 .as_ref()
+                // The validated resolver fixes the negotiated certificate type.
+                // RPKs use ordinary Certificate messages (VENDORED.md §10).
+                .filter(|_| !cx.config.cert_resolver.only_raw_public_keys())
                 .and_then(|offered|
                     // prefer server order when choosing a compression: the client's
                     // extension here does not denote any preference.

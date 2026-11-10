@@ -1,0 +1,515 @@
+//! Certificate-type compression policy against unmodified rustls 0.23.45 peers.
+//! Both implementations use the same Ed25519 fixtures, exact SPKI pins or the
+//! fixture's real X509 roots, and their normal TLS 1.3 signature verification.
+//! Byte/flight accounting includes encrypted TLS records, not plaintext crypto.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::disallowed_types,
+    missing_docs
+)]
+
+use hyper_measure::{alloc, cost};
+use rustls_test::KeyType;
+use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[global_allocator]
+static GLOBAL: alloc::Counting = alloc::Counting;
+static SERVER_COMPRESSIONS: AtomicUsize = AtomicUsize::new(0);
+static CLIENT_COMPRESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+// The old/new trait adapters call the respective established verifier/codec;
+// their differing ownership signatures are confined to this oracle fixture.
+macro_rules! verification {
+    ($tls:ident) => {
+        #[derive(Debug)]
+        pub(super) struct Pin {
+            pub(super) key: Vec<u8>,
+            pub(super) algorithms: $tls::crypto::WebPkiSupportedAlgorithms,
+        }
+        impl Pin {
+            fn check(
+                &self,
+                key: &$tls::pki_types::CertificateDer<'_>,
+                chain: &[$tls::pki_types::CertificateDer<'_>],
+            ) -> Result<(), $tls::Error> {
+                if key.as_ref() == self.key && chain.is_empty() {
+                    Ok(())
+                } else {
+                    Err($tls::Error::InvalidCertificate(
+                        $tls::CertificateError::ApplicationVerificationFailure,
+                    ))
+                }
+            }
+            fn signature(
+                &self,
+                message: &[u8],
+                cert: &$tls::pki_types::CertificateDer<'_>,
+                sig: &$tls::DigitallySignedStruct,
+            ) -> Result<$tls::client::danger::HandshakeSignatureValid, $tls::Error> {
+                $tls::crypto::verify_tls13_signature_with_raw_key(
+                    message,
+                    &$tls::pki_types::SubjectPublicKeyInfoDer::from(cert.as_ref()),
+                    sig,
+                    &self.algorithms,
+                )
+            }
+        }
+        impl $tls::client::danger::ServerCertVerifier for Pin {
+            fn verify_server_cert(
+                &self,
+                key: &$tls::pki_types::CertificateDer<'_>,
+                chain: &[$tls::pki_types::CertificateDer<'_>],
+                _: &$tls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: $tls::pki_types::UnixTime,
+            ) -> Result<$tls::client::danger::ServerCertVerified, $tls::Error> {
+                self.check(key, chain)?;
+                Ok($tls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &$tls::pki_types::CertificateDer<'_>,
+                _: &$tls::DigitallySignedStruct,
+            ) -> Result<$tls::client::danger::HandshakeSignatureValid, $tls::Error> {
+                Err($tls::Error::General("fixture is TLS 1.3 only".into()))
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                key: &$tls::pki_types::CertificateDer<'_>,
+                sig: &$tls::DigitallySignedStruct,
+            ) -> Result<$tls::client::danger::HandshakeSignatureValid, $tls::Error> {
+                self.signature(message, key, sig)
+            }
+            fn supported_verify_schemes(&self) -> Vec<$tls::SignatureScheme> {
+                self.algorithms.supported_schemes()
+            }
+            fn requires_raw_public_keys(&self) -> bool {
+                true
+            }
+        }
+        impl $tls::server::danger::ClientCertVerifier for Pin {
+            fn root_hint_subjects(&self) -> &[$tls::DistinguishedName] {
+                &[]
+            }
+            fn verify_client_cert(
+                &self,
+                key: &$tls::pki_types::CertificateDer<'_>,
+                chain: &[$tls::pki_types::CertificateDer<'_>],
+                _: $tls::pki_types::UnixTime,
+            ) -> Result<$tls::server::danger::ClientCertVerified, $tls::Error> {
+                self.check(key, chain)?;
+                Ok($tls::server::danger::ClientCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &$tls::pki_types::CertificateDer<'_>,
+                _: &$tls::DigitallySignedStruct,
+            ) -> Result<$tls::client::danger::HandshakeSignatureValid, $tls::Error> {
+                Err($tls::Error::General("fixture is TLS 1.3 only".into()))
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                key: &$tls::pki_types::CertificateDer<'_>,
+                sig: &$tls::DigitallySignedStruct,
+            ) -> Result<$tls::client::danger::HandshakeSignatureValid, $tls::Error> {
+                self.signature(message, key, sig)
+            }
+            fn supported_verify_schemes(&self) -> Vec<$tls::SignatureScheme> {
+                self.algorithms.supported_schemes()
+            }
+            fn requires_raw_public_keys(&self) -> bool {
+                true
+            }
+        }
+        #[derive(Debug)]
+        pub(super) struct Spy(pub(super) bool);
+        impl $tls::compress::CertCompressor for Spy {
+            fn compress(
+                &self,
+                input: Vec<u8>,
+                level: $tls::compress::CompressionLevel,
+            ) -> Result<Vec<u8>, $tls::compress::CompressionFailed> {
+                if self.0 {
+                    SERVER_COMPRESSIONS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    CLIENT_COMPRESSIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                $tls::compress::BROTLI_COMPRESSOR.compress(input, level)
+            }
+            fn algorithm(&self) -> $tls::CertificateCompressionAlgorithm {
+                $tls::CertificateCompressionAlgorithm::Brotli
+            }
+        }
+        pub(super) static SERVER: Spy = Spy(true);
+        pub(super) static CLIENT: Spy = Spy(false);
+    };
+}
+
+mod new {
+    use super::*;
+    use hyper_tls as tls;
+    verification!(tls);
+    pub(super) fn client(
+        server_rpk: bool,
+        client_rpk: bool,
+        offer: bool,
+    ) -> rustls_test::TestClient {
+        let kt = KeyType::Ed25519;
+        let provider = Box::leak(Box::new(tls::crypto::aws_lc_rs::default_provider()));
+        let mut config = rustls_test::make_client_config_with_versions_with_auth(
+            kt,
+            &[&tls::version::TLS13],
+            provider,
+        );
+        if server_rpk {
+            config.dangerous().set_certificate_verifier(Box::new(Pin {
+                key: kt.get_spki().as_ref().to_vec(),
+                algorithms: provider.signature_verification_algorithms,
+            }));
+        }
+        if client_rpk {
+            let signing = provider
+                .key_provider
+                .load_private_key(kt.get_client_key())
+                .unwrap();
+            config.client_auth_cert_resolver = Box::new(
+                tls::client::AlwaysResolvesClientRawPublicKeys::new(tls::sign::CertifiedKey::new(
+                    vec![tls::pki_types::CertificateDer::from(
+                        kt.get_client_spki().as_ref().to_vec(),
+                    )],
+                    signing,
+                )),
+            );
+        }
+        config.cert_compressors = vec![&CLIENT];
+        if !offer {
+            config.cert_decompressors.clear();
+        }
+        rustls_test::TestClient::new(config, "localhost".try_into().unwrap()).unwrap()
+    }
+    pub(super) fn server(
+        server_rpk: bool,
+        client_rpk: bool,
+        offer: bool,
+    ) -> rustls_test::TestServer {
+        let kt = KeyType::Ed25519;
+        let provider = Box::leak(Box::new(tls::crypto::aws_lc_rs::default_provider()));
+        let verifier: Box<dyn tls::server::danger::ClientCertVerifier> = if client_rpk {
+            Box::new(Pin {
+                key: kt.get_client_spki().as_ref().to_vec(),
+                algorithms: provider.signature_verification_algorithms,
+            })
+        } else {
+            tls::server::WebPkiClientVerifier::builder_with_provider(
+                rustls_test::get_client_root_store(kt),
+                provider,
+            )
+            .build()
+            .unwrap()
+        };
+        let builder = tls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&tls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(verifier);
+        let mut config = if server_rpk {
+            let signing = provider
+                .key_provider
+                .load_private_key(kt.get_key())
+                .unwrap();
+            builder.with_cert_resolver(Box::new(
+                tls::server::AlwaysResolvesServerRawPublicKeys::new(tls::sign::CertifiedKey::new(
+                    vec![tls::pki_types::CertificateDer::from(
+                        kt.get_spki().as_ref().to_vec(),
+                    )],
+                    signing,
+                )),
+            ))
+        } else {
+            builder
+                .with_single_cert(kt.get_chain(), kt.get_key())
+                .unwrap()
+        };
+        config.cert_compressors = vec![&SERVER];
+        if !offer {
+            config.cert_decompressors.clear();
+        }
+        rustls_test::TestServer::new(config).unwrap()
+    }
+}
+
+mod old {
+    use super::*;
+    use upstream_rustls as tls;
+    verification!(tls);
+    fn roots() -> tls::RootCertStore {
+        use tls::pki_types::pem::PemObject as _;
+        let mut roots = tls::RootCertStore::empty();
+        roots
+            .add(
+                tls::pki_types::CertificateDer::from_pem_slice(
+                    KeyType::Ed25519.bytes_for("ca.cert"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        roots
+    }
+    pub(super) fn client(server_rpk: bool, client_rpk: bool, offer: bool) -> tls::ClientConnection {
+        let kt = KeyType::Ed25519;
+        let provider = Arc::new(tls::crypto::aws_lc_rs::default_provider());
+        let builder = tls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&tls::version::TLS13])
+            .unwrap();
+        let builder = if server_rpk {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Pin {
+                    key: kt.get_spki().as_ref().to_vec(),
+                    algorithms: provider.signature_verification_algorithms,
+                }))
+        } else {
+            builder.with_root_certificates(roots())
+        };
+        let mut config = if client_rpk {
+            let signing = provider
+                .key_provider
+                .load_private_key(kt.get_client_key())
+                .unwrap();
+            builder.with_client_cert_resolver(Arc::new(
+                tls::client::AlwaysResolvesClientRawPublicKeys::new(Arc::new(
+                    tls::sign::CertifiedKey::new(
+                        vec![tls::pki_types::CertificateDer::from(
+                            kt.get_client_spki().as_ref().to_vec(),
+                        )],
+                        signing,
+                    ),
+                )),
+            ))
+        } else {
+            builder
+                .with_client_auth_cert(kt.get_client_chain(), kt.get_client_key())
+                .unwrap()
+        };
+        config.cert_compressors = vec![&CLIENT];
+        if !offer {
+            config.cert_decompressors.clear();
+        }
+        tls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap()
+    }
+    pub(super) fn server(server_rpk: bool, client_rpk: bool, offer: bool) -> tls::ServerConnection {
+        let kt = KeyType::Ed25519;
+        let provider = Arc::new(tls::crypto::aws_lc_rs::default_provider());
+        let verifier: Arc<dyn tls::server::danger::ClientCertVerifier> = if client_rpk {
+            Arc::new(Pin {
+                key: kt.get_client_spki().as_ref().to_vec(),
+                algorithms: provider.signature_verification_algorithms,
+            })
+        } else {
+            tls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots()),
+                provider.clone(),
+            )
+            .build()
+            .unwrap()
+        };
+        let builder = tls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&tls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(verifier);
+        let mut config = if server_rpk {
+            let signing = provider
+                .key_provider
+                .load_private_key(kt.get_key())
+                .unwrap();
+            builder.with_cert_resolver(Arc::new(
+                tls::server::AlwaysResolvesServerRawPublicKeys::new(Arc::new(
+                    tls::sign::CertifiedKey::new(
+                        vec![tls::pki_types::CertificateDer::from(
+                            kt.get_spki().as_ref().to_vec(),
+                        )],
+                        signing,
+                    ),
+                )),
+            ))
+        } else {
+            builder
+                .with_single_cert(kt.get_chain(), kt.get_key())
+                .unwrap()
+        };
+        config.cert_compressors = vec![&SERVER];
+        if !offer {
+            config.cert_decompressors.clear();
+        }
+        tls::ServerConnection::new(Arc::new(config)).unwrap()
+    }
+}
+
+enum Peer {
+    NewClient(rustls_test::TestClient),
+    NewServer(rustls_test::TestServer),
+    OldClient(upstream_rustls::ClientConnection),
+    OldServer(upstream_rustls::ServerConnection),
+}
+impl Peer {
+    fn handshaking(&self) -> bool {
+        match self {
+            Self::NewClient(p) => p.is_handshaking(),
+            Self::NewServer(p) => p.is_handshaking(),
+            Self::OldClient(p) => p.is_handshaking(),
+            Self::OldServer(p) => p.is_handshaking(),
+        }
+    }
+    fn pending(&self) -> bool {
+        match self {
+            Self::NewClient(p) => p.wants_write(),
+            Self::NewServer(p) => p.wants_write(),
+            Self::OldClient(p) => p.wants_write(),
+            Self::OldServer(p) => p.wants_write(),
+        }
+    }
+    fn write(&mut self, out: &mut Vec<u8>) -> usize {
+        match self {
+            Self::NewClient(p) => p.write_tls(out).unwrap(),
+            Self::NewServer(p) => p.write_tls(out).unwrap(),
+            Self::OldClient(p) => p.write_tls(out).unwrap(),
+            Self::OldServer(p) => p.write_tls(out).unwrap(),
+        }
+    }
+    fn receive(&mut self, mut input: &[u8]) {
+        while !input.is_empty() {
+            let n = match self {
+                Self::NewClient(p) => p.read_tls(&mut input).unwrap(),
+                Self::NewServer(p) => p.read_tls(&mut input).unwrap(),
+                Self::OldClient(p) => p.read_tls(&mut input).unwrap(),
+                Self::OldServer(p) => p.read_tls(&mut input).unwrap(),
+            };
+            assert!(n > 0);
+        }
+        match self {
+            Self::NewClient(p) => {
+                p.process_new_packets().unwrap();
+            }
+            Self::NewServer(p) => {
+                p.process_new_packets().unwrap();
+            }
+            Self::OldClient(p) => {
+                p.process_new_packets().unwrap();
+            }
+            Self::OldServer(p) => {
+                p.process_new_packets().unwrap();
+            }
+        }
+    }
+    fn send_application(&mut self, bytes: &[u8]) {
+        match self {
+            Self::NewClient(p) => p.writer().write_all(bytes).unwrap(),
+            Self::NewServer(p) => p.writer().write_all(bytes).unwrap(),
+            Self::OldClient(p) => p.writer().write_all(bytes).unwrap(),
+            Self::OldServer(p) => p.writer().write_all(bytes).unwrap(),
+        }
+    }
+    fn read_application(&mut self, bytes: &mut [u8]) {
+        match self {
+            Self::NewClient(p) => p.reader().read_exact(bytes).unwrap(),
+            Self::NewServer(p) => p.reader().read_exact(bytes).unwrap(),
+            Self::OldClient(p) => p.reader().read_exact(bytes).unwrap(),
+            Self::OldServer(p) => p.reader().read_exact(bytes).unwrap(),
+        }
+    }
+}
+fn transfer(from: &mut Peer, to: &mut Peer) -> usize {
+    let mut bytes = Vec::new();
+    while from.pending() {
+        assert!(from.write(&mut bytes) > 0);
+    }
+    let n = bytes.len();
+    if n > 0 {
+        to.receive(&bytes);
+    }
+    n
+}
+fn handshake(mut client: Peer, mut server: Peer) -> Vec<(usize, usize)> {
+    let mut flights = Vec::new();
+    while client.handshaking() || server.handshaking() || client.pending() || server.pending() {
+        let up = transfer(&mut client, &mut server);
+        let down = transfer(&mut server, &mut client);
+        assert!(up + down > 0, "TLS handshake stopped making progress");
+        flights.push((up, down));
+    }
+    let payload = b"exact\0\xffpayload";
+    client.send_application(payload);
+    transfer(&mut client, &mut server);
+    let mut got = vec![0; payload.len()];
+    server.read_application(&mut got);
+    assert_eq!(got, payload);
+    flights
+}
+fn run_case(
+    new_client: bool,
+    new_server: bool,
+    server_rpk: bool,
+    client_rpk: bool,
+    offer: bool,
+) -> (usize, usize) {
+    SERVER_COMPRESSIONS.store(0, Ordering::Relaxed);
+    CLIENT_COMPRESSIONS.store(0, Ordering::Relaxed);
+    let client = if new_client {
+        Peer::NewClient(new::client(server_rpk, client_rpk, offer))
+    } else {
+        Peer::OldClient(old::client(server_rpk, client_rpk, offer))
+    };
+    let server = if new_server {
+        Peer::NewServer(new::server(server_rpk, client_rpk, offer))
+    } else {
+        Peer::OldServer(old::server(server_rpk, client_rpk, offer))
+    };
+    let (flights, measured) = cost::measure(|| handshake(client, server));
+    let counts = (
+        CLIENT_COMPRESSIONS.load(Ordering::Relaxed),
+        SERVER_COMPRESSIONS.load(Ordering::Relaxed),
+    );
+    println!("case new_client={new_client} new_server={new_server} server_rpk={server_rpk} client_rpk={client_rpk} offer={offer} compressions={counts:?} flights={flights:?} cost={measured:?}");
+    counts
+}
+
+#[test]
+fn rpk_senders_avoid_compression_with_older_offering_peers() {
+    assert!(alloc::installed());
+    assert_eq!(run_case(true, false, true, true, true), (0, 0));
+    assert_eq!(run_case(false, true, true, true, true), (0, 0));
+}
+
+#[test]
+#[ignore = "explicit admitted complete certificate-type/new-old matrix"]
+fn certificate_type_and_old_peer_matrix() {
+    assert!(alloc::installed());
+    for new_client in [false, true] {
+        for new_server in [false, true] {
+            for server_rpk in [false, true] {
+                for client_rpk in [false, true] {
+                    for offer in [false, true] {
+                        let counts =
+                            run_case(new_client, new_server, server_rpk, client_rpk, offer);
+                        let expect_client =
+                            usize::from(offer && (!client_rpk || (!new_client && !new_server)));
+                        let expect_server =
+                            usize::from(offer && (!server_rpk || (!new_client && !new_server)));
+                        assert_eq!(counts, (expect_client, expect_server));
+                    }
+                }
+            }
+        }
+    }
+}

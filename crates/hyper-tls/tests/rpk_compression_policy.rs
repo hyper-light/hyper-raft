@@ -496,23 +496,34 @@ impl Peer {
     }
 }
 fn transfer(from: &mut Peer, to: &mut Peer) -> Result<usize, TlsError> {
-    let mut bytes = Vec::new();
-    while from.pending() {
-        if from.write(&mut bytes) == 0 {
-            return Err(TlsError::NoProgress);
-        }
-    }
+    let bytes = outbound(from)?;
     let n = bytes.len();
     if n > 0 {
         to.receive(&bytes)?;
     }
     Ok(n)
 }
-fn handshake(mut client: Peer, mut server: Peer) -> Result<Vec<(usize, usize)>, TlsError> {
+fn outbound(from: &mut Peer) -> Result<Vec<u8>, TlsError> {
+    let mut bytes = Vec::new();
+    while from.pending() {
+        if from.write(&mut bytes) == 0 {
+            return Err(TlsError::NoProgress);
+        }
+    }
+    Ok(bytes)
+}
+fn handshake(client: Peer, server: Peer) -> Result<Vec<(usize, usize)>, TlsError> {
+    handshake_with(client, server, |from, to, _| transfer(from, to))
+}
+fn handshake_with(
+    mut client: Peer,
+    mut server: Peer,
+    mut deliver: impl FnMut(&mut Peer, &mut Peer, bool) -> Result<usize, TlsError>,
+) -> Result<Vec<(usize, usize)>, TlsError> {
     let mut flights = Vec::new();
     while client.handshaking() || server.handshaking() || client.pending() || server.pending() {
-        let up = transfer(&mut client, &mut server)?;
-        let down = transfer(&mut server, &mut client)?;
+        let up = deliver(&mut client, &mut server, true)?;
+        let down = deliver(&mut server, &mut client, false)?;
         if up + down == 0 {
             return Err(TlsError::NoProgress);
         }
@@ -520,13 +531,108 @@ fn handshake(mut client: Peer, mut server: Peer) -> Result<Vec<(usize, usize)>, 
     }
     let payload = b"exact\0\xffpayload";
     client.send_application(payload);
-    transfer(&mut client, &mut server)?;
+    deliver(&mut client, &mut server, true)?;
     let mut got = vec![0; payload.len()];
     server.read_application(&mut got);
     if got != payload {
         return Err(TlsError::ChangedPayload);
     }
     Ok(flights)
+}
+
+#[cfg(target_os = "linux")]
+fn socket_handshake(client: Peer, server: Peer) -> Result<Vec<(usize, usize)>, TlsError> {
+    use std::net::{TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(TlsError::Io)?;
+    let address = listener.local_addr().map_err(TlsError::Io)?;
+    let mut outbound_socket = TcpStream::connect(address).map_err(TlsError::Io)?;
+    let mut inbound_socket = listener.accept().map_err(TlsError::Io)?.0;
+    // Only a failure guard, matching the existing native TLS tests; no probes.
+    for socket in [&outbound_socket, &inbound_socket] {
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(120)))
+            .map_err(TlsError::Io)?;
+        socket
+            .set_write_timeout(Some(std::time::Duration::from_secs(120)))
+            .map_err(TlsError::Io)?;
+    }
+    handshake_with(client, server, |from, to, client_to_server| {
+        let bytes = outbound(from)?;
+        let n = bytes.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let (writer, reader) = if client_to_server {
+            (&mut outbound_socket, &mut inbound_socket)
+        } else {
+            (&mut inbound_socket, &mut outbound_socket)
+        };
+        writer.write_all(&bytes).map_err(TlsError::Io)?;
+        let mut received = vec![0; n];
+        reader.read_exact(&mut received).map_err(TlsError::Io)?;
+        to.receive(&received)?;
+        Ok(n)
+    })
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "explicit admitted real TCP old-peer interoperability fixture"]
+fn native_old_peer_certificate_policy() {
+    let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let pairs = [(false, false), (false, true), (true, false), (true, true)];
+    for (server_rpk, client_rpk) in pairs {
+        for offer in [false, true] {
+            for new_client in [false, true] {
+                CLIENT_COMPRESSIONS.set(0);
+                SERVER_COMPRESSIONS.set(0);
+                let (client, server) = if new_client {
+                    (
+                        Peer::NewClient(new::client(server_rpk, client_rpk, offer)),
+                        Peer::OldServer(old::server(server_rpk, client_rpk, offer)),
+                    )
+                } else {
+                    (
+                        Peer::OldClient(old::client(server_rpk, client_rpk, offer)),
+                        Peer::NewServer(new::server(server_rpk, client_rpk, offer)),
+                    )
+                };
+                let flights = socket_handshake(client, server).unwrap();
+                assert_eq!(CLIENT_COMPRESSIONS.get(), usize::from(offer && !client_rpk));
+                assert_eq!(SERVER_COMPRESSIONS.get(), usize::from(offer && !server_rpk));
+                println!("native_tcp new_client={new_client} server_rpk={server_rpk} client_rpk={client_rpk} offer={offer} flights={flights:?}");
+            }
+        }
+    }
+    for offer in [false, true] {
+        for (server_rpk, client_rpk) in pairs {
+            if server_rpk {
+                assert!(matches!(
+                    socket_handshake(
+                        Peer::NewClient(new::client_pinned(true, client_rpk, offer, true)),
+                        Peer::OldServer(old::server(true, client_rpk, offer))
+                    ),
+                    Err(TlsError::New(hyper_tls::Error::InvalidCertificate(
+                        hyper_tls::CertificateError::ApplicationVerificationFailure
+                    )))
+                ));
+            }
+            if client_rpk {
+                assert!(matches!(
+                    socket_handshake(
+                        Peer::OldClient(old::client(server_rpk, true, offer)),
+                        Peer::NewServer(new::server_pinned(server_rpk, true, offer, true))
+                    ),
+                    Err(TlsError::New(hyper_tls::Error::InvalidCertificate(
+                        hyper_tls::CertificateError::ApplicationVerificationFailure
+                    )))
+                ));
+            }
+        }
+    }
+    let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    assert_eq!(before, after);
+    println!("native_tcp_cleanup fds_before={before} fds_after={after}");
 }
 fn run_case(
     new_client: bool,

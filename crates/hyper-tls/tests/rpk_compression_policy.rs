@@ -580,6 +580,14 @@ fn socket_handshake(client: Peer, server: Peer) -> Result<Vec<(usize, usize)>, T
 #[ignore = "explicit admitted real TCP old-peer interoperability fixture"]
 fn native_old_peer_certificate_policy() {
     let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    native_old_peer_positive_cases();
+    native_old_peer_pin_rejections();
+    let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    assert_eq!(before, after);
+    println!("native_tcp_cleanup fds_before={before} fds_after={after}");
+}
+#[cfg(target_os = "linux")]
+fn native_old_peer_positive_cases() {
     let pairs = [(false, false), (false, true), (true, false), (true, true)];
     for (server_rpk, client_rpk) in pairs {
         for offer in [false, true] {
@@ -604,6 +612,10 @@ fn native_old_peer_certificate_policy() {
             }
         }
     }
+}
+#[cfg(target_os = "linux")]
+fn native_old_peer_pin_rejections() {
+    let pairs = [(false, false), (false, true), (true, false), (true, true)];
     for offer in [false, true] {
         for (server_rpk, client_rpk) in pairs {
             if server_rpk {
@@ -630,9 +642,6 @@ fn native_old_peer_certificate_policy() {
             }
         }
     }
-    let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
-    assert_eq!(before, after);
-    println!("native_tcp_cleanup fds_before={before} fds_after={after}");
 }
 fn run_case(
     new_client: bool,

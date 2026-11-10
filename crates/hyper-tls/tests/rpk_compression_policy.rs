@@ -600,28 +600,24 @@ fn certificate_type_and_old_peer_matrix() {
         "baseline" | "sender" | "receiver" | "both"
     ));
     println!("expected_source_policy={policy}");
-    for new_client in [false, true] {
-        for new_server in [false, true] {
-            for server_rpk in [false, true] {
-                for client_rpk in [false, true] {
-                    for offer in [false, true] {
-                        let counts =
-                            run_case(new_client, new_server, server_rpk, client_rpk, offer);
-                        let expect_client = expected_compression(
-                            offer,
-                            client_rpk,
-                            sender && new_client,
-                            receiver && new_server,
-                        );
-                        let expect_server = expected_compression(
-                            offer,
-                            server_rpk,
-                            sender && new_server,
-                            receiver && new_client,
-                        );
-                        assert_eq!(counts, (expect_client, expect_server));
-                    }
-                }
+    let pairs = [(false, false), (false, true), (true, false), (true, true)];
+    for (new_client, new_server) in pairs {
+        for (server_rpk, client_rpk) in pairs {
+            for offer in [false, true] {
+                let counts = run_case(new_client, new_server, server_rpk, client_rpk, offer);
+                let expect_client = expected_compression(
+                    offer,
+                    client_rpk,
+                    sender && new_client,
+                    receiver && new_server,
+                );
+                let expect_server = expected_compression(
+                    offer,
+                    server_rpk,
+                    sender && new_server,
+                    receiver && new_client,
+                );
+                assert_eq!(counts, (expect_client, expect_server));
             }
         }
     }

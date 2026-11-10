@@ -11,6 +11,8 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros,
     clippy::disallowed_types,
+    // This fixture's environment selects an expectation for a frozen source variant.
+    clippy::disallowed_methods,
     missing_docs
 )]
 
@@ -416,12 +418,18 @@ enum Peer {
 enum TlsError {
     New(hyper_tls::Error),
     Old(upstream_rustls::Error),
+    Io(std::io::Error),
+    NoProgress,
+    ChangedPayload,
 }
 impl std::fmt::Display for TlsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::New(error) => write!(formatter, "candidate: {error}"),
             Self::Old(error) => write!(formatter, "oracle: {error}"),
+            Self::Io(error) => write!(formatter, "fixture IO: {error}"),
+            Self::NoProgress => formatter.write_str("TLS stopped making progress"),
+            Self::ChangedPayload => formatter.write_str("application payload changed"),
         }
     }
 }
@@ -453,12 +461,15 @@ impl Peer {
     fn receive(&mut self, mut input: &[u8]) -> Result<(), TlsError> {
         while !input.is_empty() {
             let n = match self {
-                Self::NewClient(p) => p.read_tls(&mut input).unwrap(),
-                Self::NewServer(p) => p.read_tls(&mut input).unwrap(),
-                Self::OldClient(p) => p.read_tls(&mut input).unwrap(),
-                Self::OldServer(p) => p.read_tls(&mut input).unwrap(),
-            };
-            assert!(n > 0);
+                Self::NewClient(p) => p.read_tls(&mut input),
+                Self::NewServer(p) => p.read_tls(&mut input),
+                Self::OldClient(p) => p.read_tls(&mut input),
+                Self::OldServer(p) => p.read_tls(&mut input),
+            }
+            .map_err(TlsError::Io)?;
+            if n == 0 {
+                return Err(TlsError::NoProgress);
+            }
         }
         match self {
             Self::NewClient(p) => p.process_new_packets().map(|_| ()).map_err(TlsError::New),
@@ -487,7 +498,9 @@ impl Peer {
 fn transfer(from: &mut Peer, to: &mut Peer) -> Result<usize, TlsError> {
     let mut bytes = Vec::new();
     while from.pending() {
-        assert!(from.write(&mut bytes) > 0);
+        if from.write(&mut bytes) == 0 {
+            return Err(TlsError::NoProgress);
+        }
     }
     let n = bytes.len();
     if n > 0 {
@@ -500,7 +513,9 @@ fn handshake(mut client: Peer, mut server: Peer) -> Result<Vec<(usize, usize)>, 
     while client.handshaking() || server.handshaking() || client.pending() || server.pending() {
         let up = transfer(&mut client, &mut server)?;
         let down = transfer(&mut server, &mut client)?;
-        assert!(up + down > 0, "TLS handshake stopped making progress");
+        if up + down == 0 {
+            return Err(TlsError::NoProgress);
+        }
         flights.push((up, down));
     }
     let payload = b"exact\0\xffpayload";
@@ -508,7 +523,9 @@ fn handshake(mut client: Peer, mut server: Peer) -> Result<Vec<(usize, usize)>, 
     transfer(&mut client, &mut server)?;
     let mut got = vec![0; payload.len()];
     server.read_application(&mut got);
-    assert_eq!(got, payload);
+    if got != payload {
+        return Err(TlsError::ChangedPayload);
+    }
     Ok(flights)
 }
 fn run_case(
@@ -590,15 +607,17 @@ fn certificate_type_and_old_peer_matrix() {
                     for offer in [false, true] {
                         let counts =
                             run_case(new_client, new_server, server_rpk, client_rpk, offer);
-                        let expect_client = usize::from(
-                            offer
-                                && !(client_rpk
-                                    && ((sender && new_client) || (receiver && new_server))),
+                        let expect_client = expected_compression(
+                            offer,
+                            client_rpk,
+                            sender && new_client,
+                            receiver && new_server,
                         );
-                        let expect_server = usize::from(
-                            offer
-                                && !(server_rpk
-                                    && ((sender && new_server) || (receiver && new_client))),
+                        let expect_server = expected_compression(
+                            offer,
+                            server_rpk,
+                            sender && new_server,
+                            receiver && new_client,
                         );
                         assert_eq!(counts, (expect_client, expect_server));
                     }
@@ -606,4 +625,13 @@ fn certificate_type_and_old_peer_matrix() {
             }
         }
     }
+}
+
+fn expected_compression(
+    offer: bool,
+    rpk: bool,
+    sender_policy: bool,
+    receiver_policy: bool,
+) -> usize {
+    usize::from(offer && !(rpk && (sender_policy || receiver_policy)))
 }

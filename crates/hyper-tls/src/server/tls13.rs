@@ -145,9 +145,6 @@ mod client_hello {
             let cert_compressor = client_hello
                 .certificate_compression_algorithms
                 .as_ref()
-                // The validated resolver fixes the negotiated certificate type.
-                // RPKs use ordinary Certificate messages (VENDORED.md §10).
-                .filter(|_| !cx.config.cert_resolver.only_raw_public_keys())
                 .and_then(|offered|
                     // prefer server order when choosing a compression: the client's
                     // extension here does not denote any preference.
@@ -861,7 +858,9 @@ mod client_hello {
             context: PayloadU8::empty(),
             extensions: CertificateRequestExtensions {
                 signature_algorithms: Some(config.verifier.supported_verify_schemes()),
+                // RPK receivers do not request optional compression (VENDORED.md §10).
                 certificate_compression_algorithms: match config.cert_decompressors.as_slice() {
+                    _ if config.verifier.requires_raw_public_keys() => None,
                     &[] => None,
                     decomps => Some(decomps.iter().map(|decomp| decomp.algorithm()).collect()),
                 },

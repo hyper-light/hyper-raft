@@ -495,7 +495,8 @@ fn offer_tls13_extensions(
                 resumption_count: ticket_req.resumption_count,
             });
 
-    if !config.cert_decompressors.is_empty() {
+    // RPK receivers do not request optional compression (VENDORED.md §10).
+    if !config.verifier.requires_raw_public_keys() && !config.cert_decompressors.is_empty() {
         exts.certificate_compression_algorithms = Some(
             config
                 .cert_decompressors

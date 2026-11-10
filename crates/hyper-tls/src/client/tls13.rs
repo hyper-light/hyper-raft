@@ -877,9 +877,6 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
             .extensions
             .certificate_compression_algorithms
             .as_deref()
-            // This resolver is also the validated client certificate type.
-            // RPKs use ordinary Certificate messages (VENDORED.md §10).
-            .filter(|_| !cx.config.client_auth_cert_resolver.only_raw_public_keys())
             .and_then(|offered| {
                 cx.config
                     .cert_compressors

@@ -1,0 +1,12 @@
+diff --git a/crates/hyper-tls/src/server/tls13.rs b/crates/hyper-tls/src/server/tls13.rs
+index 3dd735c..81e3bed 100644
+--- a/crates/hyper-tls/src/server/tls13.rs
++++ b/crates/hyper-tls/src/server/tls13.rs
+@@ -147,7 +147,6 @@ mod client_hello {
+                 .as_ref()
+                 // The validated resolver fixes the negotiated certificate type.
+                 // RPKs use ordinary Certificate messages (VENDORED.md §10).
+-                .filter(|_| !cx.config.cert_resolver.only_raw_public_keys())
+                 .and_then(|offered|
+                     // prefer server order when choosing a compression: the client's
+                     // extension here does not denote any preference.

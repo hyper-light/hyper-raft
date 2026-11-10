@@ -1,0 +1,4102 @@
+{
+  "rows": [
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 327,
+        "reallocations": 58,
+        "moved": 31,
+        "frees": 326,
+        "bytes": 150207,
+        "live": 64,
+        "peak": 82978
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 510,
+        "reallocations": 72,
+        "moved": 51,
+        "frees": 509,
+        "bytes": 69191263,
+        "live": 64,
+        "peak": 34367001
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 304,
+        "reallocations": 51,
+        "moved": 35,
+        "frees": 303,
+        "bytes": 134610,
+        "live": 64,
+        "peak": 78879
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 463,
+        "reallocations": 64,
+        "moved": 41,
+        "frees": 462,
+        "bytes": 69035489,
+        "live": 64,
+        "peak": 34353905
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 313,
+        "reallocations": 57,
+        "moved": 44,
+        "frees": 312,
+        "bytes": 139070,
+        "live": 64,
+        "peak": 79273
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 472,
+        "reallocations": 70,
+        "moved": 54,
+        "frees": 471,
+        "bytes": 69040093,
+        "live": 64,
+        "peak": 34361215
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 290,
+        "reallocations": 49,
+        "moved": 39,
+        "frees": 289,
+        "bytes": 123353,
+        "live": 64,
+        "peak": 72804
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 425,
+        "reallocations": 61,
+        "moved": 40,
+        "frees": 424,
+        "bytes": 68884309,
+        "live": 64,
+        "peak": 34332186
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 321,
+        "reallocations": 59,
+        "moved": 47,
+        "frees": 318,
+        "bytes": 151361,
+        "live": 272,
+        "peak": 82842
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 501,
+        "reallocations": 73,
+        "moved": 61,
+        "frees": 500,
+        "bytes": 69192029,
+        "live": 64,
+        "peak": 34366577
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 293,
+        "reallocations": 51,
+        "moved": 42,
+        "frees": 292,
+        "bytes": 134186,
+        "live": 64,
+        "peak": 78559
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 451,
+        "reallocations": 65,
+        "moved": 44,
+        "frees": 450,
+        "bytes": 69035067,
+        "live": 64,
+        "peak": 34353585
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 305,
+        "reallocations": 57,
+        "moved": 48,
+        "frees": 304,
+        "bytes": 139856,
+        "live": 64,
+        "peak": 78929
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 463,
+        "reallocations": 70,
+        "moved": 55,
+        "frees": 462,
+        "bytes": 69040737,
+        "live": 64,
+        "peak": 34360791
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 48,
+        "moved": 35,
+        "frees": 278,
+        "bytes": 122797,
+        "live": 64,
+        "peak": 72484
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 413,
+        "reallocations": 61,
+        "moved": 48,
+        "frees": 412,
+        "bytes": 68883827,
+        "live": 64,
+        "peak": 34331786
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 315,
+        "reallocations": 58,
+        "moved": 43,
+        "frees": 314,
+        "bytes": 157421,
+        "live": 64,
+        "peak": 90282
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 497,
+        "reallocations": 72,
+        "moved": 58,
+        "frees": 496,
+        "bytes": 69198405,
+        "live": 64,
+        "peak": 34374305
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 292,
+        "reallocations": 51,
+        "moved": 34,
+        "frees": 291,
+        "bytes": 141828,
+        "live": 64,
+        "peak": 86247
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 450,
+        "reallocations": 65,
+        "moved": 51,
+        "frees": 449,
+        "bytes": 69042855,
+        "live": 64,
+        "peak": 34361081
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 302,
+        "reallocations": 56,
+        "moved": 42,
+        "frees": 301,
+        "bytes": 146152,
+        "live": 64,
+        "peak": 86601
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 460,
+        "reallocations": 70,
+        "moved": 58,
+        "frees": 459,
+        "bytes": 69047315,
+        "live": 64,
+        "peak": 34368543
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 49,
+        "moved": 40,
+        "frees": 278,
+        "bytes": 130629,
+        "live": 64,
+        "peak": 80020
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 413,
+        "reallocations": 61,
+        "moved": 43,
+        "frees": 412,
+        "bytes": 68891523,
+        "live": 64,
+        "peak": 34339514
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 307,
+        "reallocations": 58,
+        "moved": 49,
+        "frees": 306,
+        "bytes": 158189,
+        "live": 64,
+        "peak": 89938
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 488,
+        "reallocations": 73,
+        "moved": 58,
+        "frees": 487,
+        "bytes": 69199151,
+        "live": 64,
+        "peak": 34373881
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 281,
+        "reallocations": 51,
+        "moved": 38,
+        "frees": 280,
+        "bytes": 141460,
+        "live": 64,
+        "peak": 85927
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 438,
+        "reallocations": 65,
+        "moved": 54,
+        "frees": 437,
+        "bytes": 69042335,
+        "live": 64,
+        "peak": 34360761
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 294,
+        "reallocations": 57,
+        "moved": 43,
+        "frees": 293,
+        "bytes": 147124,
+        "live": 64,
+        "peak": 86257
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 451,
+        "reallocations": 70,
+        "moved": 55,
+        "frees": 450,
+        "bytes": 69047913,
+        "live": 64,
+        "peak": 34368119
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 268,
+        "reallocations": 48,
+        "moved": 36,
+        "frees": 267,
+        "bytes": 130103,
+        "live": 64,
+        "peak": 79700
+      }
+    },
+    {
+      "policy": "baseline",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 401,
+        "reallocations": 62,
+        "moved": 52,
+        "frees": 400,
+        "bytes": 68891045,
+        "live": 64,
+        "peak": 34339114
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 327,
+        "reallocations": 58,
+        "moved": 27,
+        "frees": 326,
+        "bytes": 150189,
+        "live": 64,
+        "peak": 82978
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 510,
+        "reallocations": 72,
+        "moved": 47,
+        "frees": 509,
+        "bytes": 69191271,
+        "live": 64,
+        "peak": 34367001
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 304,
+        "reallocations": 52,
+        "moved": 33,
+        "frees": 303,
+        "bytes": 134722,
+        "live": 64,
+        "peak": 78879
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 463,
+        "reallocations": 65,
+        "moved": 46,
+        "frees": 462,
+        "bytes": 69035591,
+        "live": 64,
+        "peak": 34353905
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 313,
+        "reallocations": 56,
+        "moved": 43,
+        "frees": 312,
+        "bytes": 139002,
+        "live": 64,
+        "peak": 79273
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 472,
+        "reallocations": 69,
+        "moved": 54,
+        "frees": 471,
+        "bytes": 69039925,
+        "live": 64,
+        "peak": 34361215
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 290,
+        "reallocations": 48,
+        "moved": 31,
+        "frees": 289,
+        "bytes": 123275,
+        "live": 64,
+        "peak": 72804
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 425,
+        "reallocations": 62,
+        "moved": 48,
+        "frees": 424,
+        "bytes": 68884461,
+        "live": 64,
+        "peak": 34332186
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 321,
+        "reallocations": 58,
+        "moved": 48,
+        "frees": 318,
+        "bytes": 151191,
+        "live": 272,
+        "peak": 82842
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 501,
+        "reallocations": 73,
+        "moved": 58,
+        "frees": 500,
+        "bytes": 69191997,
+        "live": 64,
+        "peak": 34366577
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 293,
+        "reallocations": 51,
+        "moved": 31,
+        "frees": 292,
+        "bytes": 134236,
+        "live": 64,
+        "peak": 78559
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 451,
+        "reallocations": 64,
+        "moved": 44,
+        "frees": 450,
+        "bytes": 69035011,
+        "live": 64,
+        "peak": 34353585
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 305,
+        "reallocations": 56,
+        "moved": 43,
+        "frees": 304,
+        "bytes": 139784,
+        "live": 64,
+        "peak": 78929
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1473,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4013,
+      "counts": {
+        "allocations": 400,
+        "reallocations": 64,
+        "moved": 51,
+        "frees": 399,
+        "bytes": 34661829,
+        "live": 64,
+        "peak": 34360620
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 49,
+        "moved": 40,
+        "frees": 278,
+        "bytes": 122947,
+        "live": 64,
+        "peak": 72484
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1479,
+          1492
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3376,
+      "counts": {
+        "allocations": 350,
+        "reallocations": 55,
+        "moved": 47,
+        "frees": 349,
+        "bytes": 34504761,
+        "live": 64,
+        "peak": 34331615
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 315,
+        "reallocations": 58,
+        "moved": 45,
+        "frees": 314,
+        "bytes": 157449,
+        "live": 64,
+        "peak": 90282
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 497,
+        "reallocations": 73,
+        "moved": 53,
+        "frees": 496,
+        "bytes": 69198547,
+        "live": 64,
+        "peak": 34374305
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 292,
+        "reallocations": 52,
+        "moved": 40,
+        "frees": 291,
+        "bytes": 142006,
+        "live": 64,
+        "peak": 86247
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3965,
+      "counts": {
+        "allocations": 387,
+        "reallocations": 58,
+        "moved": 47,
+        "frees": 386,
+        "bytes": 34661991,
+        "live": 64,
+        "peak": 34361081
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 302,
+        "reallocations": 57,
+        "moved": 44,
+        "frees": 301,
+        "bytes": 146280,
+        "live": 64,
+        "peak": 86601
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 460,
+        "reallocations": 70,
+        "moved": 56,
+        "frees": 459,
+        "bytes": 69047229,
+        "live": 64,
+        "peak": 34368543
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 48,
+        "moved": 38,
+        "frees": 278,
+        "bytes": 130437,
+        "live": 64,
+        "peak": 80020
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3376,
+      "counts": {
+        "allocations": 350,
+        "reallocations": 56,
+        "moved": 46,
+        "frees": 349,
+        "bytes": 34510877,
+        "live": 64,
+        "peak": 34338620
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 307,
+        "reallocations": 58,
+        "moved": 49,
+        "frees": 306,
+        "bytes": 158175,
+        "live": 64,
+        "peak": 89938
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 488,
+        "reallocations": 73,
+        "moved": 61,
+        "frees": 487,
+        "bytes": 69199191,
+        "live": 64,
+        "peak": 34373881
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 281,
+        "reallocations": 51,
+        "moved": 41,
+        "frees": 280,
+        "bytes": 141378,
+        "live": 64,
+        "peak": 85927
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3965,
+      "counts": {
+        "allocations": 375,
+        "reallocations": 58,
+        "moved": 48,
+        "frees": 374,
+        "bytes": 34661425,
+        "live": 64,
+        "peak": 34360761
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 294,
+        "reallocations": 56,
+        "moved": 42,
+        "frees": 293,
+        "bytes": 146934,
+        "live": 64,
+        "peak": 86257
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1473,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4013,
+      "counts": {
+        "allocations": 388,
+        "reallocations": 63,
+        "moved": 48,
+        "frees": 387,
+        "bytes": 34668973,
+        "live": 64,
+        "peak": 34367948
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 268,
+        "reallocations": 49,
+        "moved": 42,
+        "frees": 267,
+        "bytes": 130181,
+        "live": 64,
+        "peak": 79700
+      }
+    },
+    {
+      "policy": "sender",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1479,
+          1492
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3364,
+      "counts": {
+        "allocations": 275,
+        "reallocations": 49,
+        "moved": 40,
+        "frees": 274,
+        "bytes": 131203,
+        "live": 64,
+        "peak": 79737
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 327,
+        "reallocations": 58,
+        "moved": 24,
+        "frees": 326,
+        "bytes": 150281,
+        "live": 64,
+        "peak": 82978
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 510,
+        "reallocations": 73,
+        "moved": 51,
+        "frees": 509,
+        "bytes": 69191289,
+        "live": 64,
+        "peak": 34367001
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 304,
+        "reallocations": 52,
+        "moved": 42,
+        "frees": 303,
+        "bytes": 134720,
+        "live": 64,
+        "peak": 78879
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 463,
+        "reallocations": 65,
+        "moved": 44,
+        "frees": 462,
+        "bytes": 69035663,
+        "live": 64,
+        "peak": 34353905
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 313,
+        "reallocations": 56,
+        "moved": 45,
+        "frees": 312,
+        "bytes": 138948,
+        "live": 64,
+        "peak": 79273
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 472,
+        "reallocations": 70,
+        "moved": 53,
+        "frees": 471,
+        "bytes": 69040031,
+        "live": 64,
+        "peak": 34361215
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 290,
+        "reallocations": 49,
+        "moved": 35,
+        "frees": 289,
+        "bytes": 123437,
+        "live": 64,
+        "peak": 72804
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 425,
+        "reallocations": 62,
+        "moved": 50,
+        "frees": 424,
+        "bytes": 68884413,
+        "live": 64,
+        "peak": 34332186
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 321,
+        "reallocations": 58,
+        "moved": 38,
+        "frees": 318,
+        "bytes": 151191,
+        "live": 272,
+        "peak": 82842
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 501,
+        "reallocations": 73,
+        "moved": 56,
+        "frees": 500,
+        "bytes": 69192009,
+        "live": 64,
+        "peak": 34366577
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 293,
+        "reallocations": 52,
+        "moved": 37,
+        "frees": 292,
+        "bytes": 134298,
+        "live": 64,
+        "peak": 78559
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2090
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3956,
+      "counts": {
+        "allocations": 385,
+        "reallocations": 58,
+        "moved": 47,
+        "frees": 384,
+        "bytes": 34654158,
+        "live": 64,
+        "peak": 34353585
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 305,
+        "reallocations": 57,
+        "moved": 42,
+        "frees": 304,
+        "bytes": 139856,
+        "live": 64,
+        "peak": 78929
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 463,
+        "reallocations": 70,
+        "moved": 54,
+        "frees": 462,
+        "bytes": 69040807,
+        "live": 64,
+        "peak": 34360791
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 49,
+        "moved": 35,
+        "frees": 278,
+        "bytes": 123013,
+        "live": 64,
+        "peak": 72484
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1495
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3367,
+      "counts": {
+        "allocations": 347,
+        "reallocations": 55,
+        "moved": 40,
+        "frees": 346,
+        "bytes": 34502840,
+        "live": 64,
+        "peak": 34331036
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 315,
+        "reallocations": 59,
+        "moved": 45,
+        "frees": 314,
+        "bytes": 157537,
+        "live": 64,
+        "peak": 90282
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 497,
+        "reallocations": 73,
+        "moved": 60,
+        "frees": 496,
+        "bytes": 69198521,
+        "live": 64,
+        "peak": 34374305
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 292,
+        "reallocations": 51,
+        "moved": 36,
+        "frees": 291,
+        "bytes": 141802,
+        "live": 64,
+        "peak": 86247
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 450,
+        "reallocations": 64,
+        "moved": 43,
+        "frees": 449,
+        "bytes": 69042717,
+        "live": 64,
+        "peak": 34361081
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 302,
+        "reallocations": 57,
+        "moved": 44,
+        "frees": 301,
+        "bytes": 146336,
+        "live": 64,
+        "peak": 86601
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4004,
+      "counts": {
+        "allocations": 392,
+        "reallocations": 64,
+        "moved": 45,
+        "frees": 391,
+        "bytes": 34667620,
+        "live": 64,
+        "peak": 34368220
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 48,
+        "moved": 37,
+        "frees": 278,
+        "bytes": 130491,
+        "live": 64,
+        "peak": 80020
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1492
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3367,
+      "counts": {
+        "allocations": 345,
+        "reallocations": 55,
+        "moved": 40,
+        "frees": 344,
+        "bytes": 34511768,
+        "live": 64,
+        "peak": 34339227
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 307,
+        "reallocations": 59,
+        "moved": 46,
+        "frees": 306,
+        "bytes": 158367,
+        "live": 64,
+        "peak": 89938
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 488,
+        "reallocations": 72,
+        "moved": 53,
+        "frees": 487,
+        "bytes": 69199035,
+        "live": 64,
+        "peak": 34373881
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 281,
+        "reallocations": 51,
+        "moved": 42,
+        "frees": 280,
+        "bytes": 141390,
+        "live": 64,
+        "peak": 85927
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2090
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3956,
+      "counts": {
+        "allocations": 373,
+        "reallocations": 59,
+        "moved": 43,
+        "frees": 372,
+        "bytes": 34661478,
+        "live": 64,
+        "peak": 34360761
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 294,
+        "reallocations": 57,
+        "moved": 46,
+        "frees": 293,
+        "bytes": 147058,
+        "live": 64,
+        "peak": 86257
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4004,
+      "counts": {
+        "allocations": 384,
+        "reallocations": 63,
+        "moved": 49,
+        "frees": 383,
+        "bytes": 34668274,
+        "live": 64,
+        "peak": 34367876
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 268,
+        "reallocations": 48,
+        "moved": 39,
+        "frees": 267,
+        "bytes": 130087,
+        "live": 64,
+        "peak": 79700
+      }
+    },
+    {
+      "policy": "receiver",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 269,
+        "reallocations": 49,
+        "moved": 38,
+        "frees": 268,
+        "bytes": 130529,
+        "live": 64,
+        "peak": 79692
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 327,
+        "reallocations": 58,
+        "moved": 27,
+        "frees": 326,
+        "bytes": 150233,
+        "live": 64,
+        "peak": 82978
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 510,
+        "reallocations": 72,
+        "moved": 47,
+        "frees": 509,
+        "bytes": 69191249,
+        "live": 64,
+        "peak": 34367001
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 304,
+        "reallocations": 52,
+        "moved": 37,
+        "frees": 303,
+        "bytes": 134788,
+        "live": 64,
+        "peak": 78879
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3977,
+      "counts": {
+        "allocations": 463,
+        "reallocations": 65,
+        "moved": 46,
+        "frees": 462,
+        "bytes": 69035679,
+        "live": 64,
+        "peak": 34353905
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 313,
+        "reallocations": 56,
+        "moved": 42,
+        "frees": 312,
+        "bytes": 138924,
+        "live": 64,
+        "peak": 79273
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          1537
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4025,
+      "counts": {
+        "allocations": 472,
+        "reallocations": 69,
+        "moved": 52,
+        "frees": 471,
+        "bytes": 69040015,
+        "live": 64,
+        "peak": 34361215
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 290,
+        "reallocations": 48,
+        "moved": 36,
+        "frees": 289,
+        "bytes": 123249,
+        "live": 64,
+        "peak": 72804
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1479,
+          1504
+        ],
+        [
+          221,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3388,
+      "counts": {
+        "allocations": 425,
+        "reallocations": 62,
+        "moved": 46,
+        "frees": 424,
+        "bytes": 68884419,
+        "live": 64,
+        "peak": 34332186
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 321,
+        "reallocations": 59,
+        "moved": 45,
+        "frees": 318,
+        "bytes": 151383,
+        "live": 272,
+        "peak": 82842
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 501,
+        "reallocations": 72,
+        "moved": 55,
+        "frees": 500,
+        "bytes": 69191981,
+        "live": 64,
+        "peak": 34366577
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 293,
+        "reallocations": 52,
+        "moved": 38,
+        "frees": 292,
+        "bytes": 134312,
+        "live": 64,
+        "peak": 78559
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2090
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3956,
+      "counts": {
+        "allocations": 385,
+        "reallocations": 59,
+        "moved": 43,
+        "frees": 384,
+        "bytes": 34654316,
+        "live": 64,
+        "peak": 34353585
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 305,
+        "reallocations": 56,
+        "moved": 45,
+        "frees": 304,
+        "bytes": 139772,
+        "live": 64,
+        "peak": 78929
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1473,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4013,
+      "counts": {
+        "allocations": 400,
+        "reallocations": 63,
+        "moved": 51,
+        "frees": 399,
+        "bytes": 34661747,
+        "live": 64,
+        "peak": 34360620
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 48,
+        "moved": 37,
+        "frees": 278,
+        "bytes": 122797,
+        "live": 64,
+        "peak": 72484
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": false,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1479,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3355,
+      "counts": {
+        "allocations": 284,
+        "reallocations": 49,
+        "moved": 39,
+        "frees": 283,
+        "bytes": 123968,
+        "live": 64,
+        "peak": 72512
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 315,
+        "reallocations": 59,
+        "moved": 46,
+        "frees": 314,
+        "bytes": 157543,
+        "live": 64,
+        "peak": 90282
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 497,
+        "reallocations": 72,
+        "moved": 58,
+        "frees": 496,
+        "bytes": 69198361,
+        "live": 64,
+        "peak": 34374305
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 292,
+        "reallocations": 51,
+        "moved": 39,
+        "frees": 291,
+        "bytes": 141850,
+        "live": 64,
+        "peak": 86247
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2099
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3965,
+      "counts": {
+        "allocations": 387,
+        "reallocations": 59,
+        "moved": 46,
+        "frees": 386,
+        "bytes": 34662077,
+        "live": 64,
+        "peak": 34361081
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 302,
+        "reallocations": 56,
+        "moved": 44,
+        "frees": 301,
+        "bytes": 146152,
+        "live": 64,
+        "peak": 86601
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4004,
+      "counts": {
+        "allocations": 392,
+        "reallocations": 64,
+        "moved": 53,
+        "frees": 391,
+        "bytes": 34667664,
+        "live": 64,
+        "peak": 34368220
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 279,
+        "reallocations": 48,
+        "moved": 36,
+        "frees": 278,
+        "bytes": 130497,
+        "live": 64,
+        "peak": 80020
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": false,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1492
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3355,
+      "counts": {
+        "allocations": 282,
+        "reallocations": 49,
+        "moved": 41,
+        "frees": 281,
+        "bytes": 131084,
+        "live": 64,
+        "peak": 80021
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1458,
+          2623
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 5608,
+      "counts": {
+        "allocations": 307,
+        "reallocations": 58,
+        "moved": 46,
+        "frees": 306,
+        "bytes": 158193,
+        "live": 64,
+        "peak": 89938
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        1
+      ],
+      "flights": [
+        [
+          1467,
+          2132
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4614,
+      "counts": {
+        "allocations": 488,
+        "reallocations": 73,
+        "moved": 63,
+        "frees": 487,
+        "bytes": 69199161,
+        "live": 64,
+        "peak": 34373881
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          2590
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4447,
+      "counts": {
+        "allocations": 281,
+        "reallocations": 51,
+        "moved": 41,
+        "frees": 280,
+        "bytes": 141460,
+        "live": 64,
+        "peak": 85927
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": false,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        1
+      ],
+      "flights": [
+        [
+          1473,
+          2090
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3956,
+      "counts": {
+        "allocations": 373,
+        "reallocations": 58,
+        "moved": 45,
+        "frees": 372,
+        "bytes": 34661374,
+        "live": 64,
+        "peak": 34360761
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1516
+        ],
+        [
+          1343,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4507,
+      "counts": {
+        "allocations": 294,
+        "reallocations": 57,
+        "moved": 43,
+        "frees": 293,
+        "bytes": 147108,
+        "live": 64,
+        "peak": 86257
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": false,
+      "offer": true,
+      "compressions": [
+        1,
+        0
+      ],
+      "flights": [
+        [
+          1464,
+          1525
+        ],
+        [
+          831,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 4004,
+      "counts": {
+        "allocations": 384,
+        "reallocations": 63,
+        "moved": 54,
+        "frees": 383,
+        "bytes": 34668300,
+        "live": 64,
+        "peak": 34367876
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": false,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 268,
+        "reallocations": 49,
+        "moved": 43,
+        "frees": 267,
+        "bytes": 130181,
+        "live": 64,
+        "peak": 79700
+      }
+    },
+    {
+      "policy": "both",
+      "new_client": true,
+      "new_server": true,
+      "server_rpk": true,
+      "client_rpk": true,
+      "offer": true,
+      "compressions": [
+        0,
+        0
+      ],
+      "flights": [
+        [
+          1470,
+          1483
+        ],
+        [
+          209,
+          184
+        ]
+      ],
+      "encrypted_tls_bytes": 3346,
+      "counts": {
+        "allocations": 269,
+        "reallocations": 48,
+        "moved": 41,
+        "frees": 268,
+        "bytes": 130447,
+        "live": 64,
+        "peak": 79692
+      }
+    }
+  ],
+  "x509_wire_equivalence": true,
+  "limits": "Single sans-I/O samples; Rust allocations include config/drop/wire fixture; C/kernel/UDP not measured."
+}

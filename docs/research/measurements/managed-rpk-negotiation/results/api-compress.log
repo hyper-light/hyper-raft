@@ -1,0 +1,16 @@
+   Compiling hyper-tls v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls)
+    Finished `release` profile [optimized] target(s) in 18.49s
+     Running tests/runners/api.rs (/home/adalundhe/managed-certificate-target/release/deps/api-4120c06ea9374493)
+
+running 8 tests
+test tests_with_aws_lc_rs::tests::test_cert_decompression_by_client_produces_invalid_cert_payload ... ok
+test tests_with_aws_lc_rs::tests::test_cert_decompression_by_server_fails ... ok
+test tests_with_aws_lc_rs::tests::test_cert_decompression_by_server_produces_invalid_cert_payload ... ok
+test tests_with_aws_lc_rs::tests::test_cert_decompression_by_server_would_result_in_excessively_large_cert ... ok
+test tests_with_aws_lc_rs::tests::test_client_uses_uncompressed_certificate_if_compression_fails ... ok
+test tests_with_aws_lc_rs::tests::test_server_can_opt_out_of_compression_cache ... ok
+test tests_with_aws_lc_rs::tests::test_server_uses_cached_compressed_certificates ... ok
+test tests_with_aws_lc_rs::tests::test_server_uses_uncompressed_certificate_if_compression_fails ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 224 filtered out; finished in 0.08s
+

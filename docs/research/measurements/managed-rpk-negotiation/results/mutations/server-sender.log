@@ -1,0 +1,24 @@
+   Compiling hyper-tls v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls)
+   Compiling rustls-test v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls/tests/support/rustls-test)
+    Finished `release` profile [optimized] target(s) in 28.67s
+     Running tests/rpk_compression_policy.rs (/home/adalundhe/managed-certificate-target/release/deps/rpk_compression_policy-8cd429e4dc45534b)
+
+running 1 test
+test rpk_senders_avoid_compression_with_older_offering_peers ... case new_client=true new_server=false server_rpk=true client_rpk=true offer=true compressions=(0, 0) flights=[(1470, 1492), (209, 184)] cost=Cost { usage: Some(Usage { user_ns: 20000000, system_ns: 0, instructions: None, cycles: None, energy_nj: None, wakeups: None, disk_written: Some(0), footprint: Some(7135232), peak_footprint: Some(7135232) }), counts: Counts { allocations: 284, reallocations: 48, moved: 21, frees: 281, bytes: 131132, live: 272, peak: 80229 } }
+case new_client=false new_server=true server_rpk=true client_rpk=true offer=true compressions=(0, 1) flights=[(1479, 1495), (209, 184)] cost=Cost { usage: Some(Usage { user_ns: 0, system_ns: 0, instructions: None, cycles: None, energy_nj: None, wakeups: None, disk_written: Some(0), footprint: Some(8052736), peak_footprint: Some(8052736) }), counts: Counts { allocations: 347, reallocations: 54, moved: 35, frees: 346, bytes: 34502710, live: 64, peak: 34331036 } }
+
+thread 'rpk_senders_avoid_compression_with_older_offering_peers' (488548) panicked at crates/hyper-tls/tests/rpk_compression_policy.rs:562:5:
+assertion `left == right` failed
+  left: (0, 1)
+ right: (0, 0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    rpk_senders_avoid_compression_with_older_offering_peers
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p hyper-tls --test rpk_compression_policy`

@@ -1,0 +1,1 @@
+timeout 120 cargo test --locked -j4 --release -p hyper-tls --test rpk_compression_policy rpk_senders_avoid_compression_with_older_offering_peers -- --exact --test-threads=1 --nocapture

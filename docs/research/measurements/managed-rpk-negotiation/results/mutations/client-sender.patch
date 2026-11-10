@@ -1,0 +1,12 @@
+diff --git a/crates/hyper-tls/src/client/tls13.rs b/crates/hyper-tls/src/client/tls13.rs
+index 1816474..eaa5d4e 100644
+--- a/crates/hyper-tls/src/client/tls13.rs
++++ b/crates/hyper-tls/src/client/tls13.rs
+@@ -879,7 +879,6 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
+             .as_deref()
+             // This resolver is also the validated client certificate type.
+             // RPKs use ordinary Certificate messages (VENDORED.md §10).
+-            .filter(|_| !cx.config.client_auth_cert_resolver.only_raw_public_keys())
+             .and_then(|offered| {
+                 cx.config
+                     .cert_compressors

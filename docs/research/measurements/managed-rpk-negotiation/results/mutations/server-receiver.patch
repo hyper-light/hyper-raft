@@ -1,0 +1,12 @@
+diff --git a/crates/hyper-tls/src/server/tls13.rs b/crates/hyper-tls/src/server/tls13.rs
+index 3dd735c..853dc4f 100644
+--- a/crates/hyper-tls/src/server/tls13.rs
++++ b/crates/hyper-tls/src/server/tls13.rs
+@@ -863,7 +863,6 @@ mod client_hello {
+                 signature_algorithms: Some(config.verifier.supported_verify_schemes()),
+                 // RPK receivers do not request optional compression (VENDORED.md §10).
+                 certificate_compression_algorithms: match config.cert_decompressors.as_slice() {
+-                    _ if config.verifier.requires_raw_public_keys() => None,
+                     &[] => None,
+                     decomps => Some(decomps.iter().map(|decomp| decomp.algorithm()).collect()),
+                 },

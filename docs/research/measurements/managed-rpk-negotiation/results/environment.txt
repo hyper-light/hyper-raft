@@ -1,0 +1,10 @@
+Linux fedora.attlocal.net 6.19.10-300.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Mar 25 18:23:49 UTC 2026 x86_64 GNU/Linux
+rustc 1.98.1 (48a229cea 2026-09-01)
+binary: rustc
+commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985
+commit-date: 2026-09-01
+host: x86_64-unknown-linux-gnu
+release: 1.98.1
+LLVM version: 22.1.8
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+4b0a0226234e19528fd71ed343b7da9cdab79d3a38e3506006f50061d179fbc9  /home/adalundhe/managed-certificate-target/release/deps/rpk_compression_policy-8cd429e4dc45534b

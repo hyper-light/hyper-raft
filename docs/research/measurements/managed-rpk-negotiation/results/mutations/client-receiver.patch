@@ -1,0 +1,13 @@
+diff --git a/crates/hyper-tls/src/client/hs.rs b/crates/hyper-tls/src/client/hs.rs
+index 14d8e2e..428cf03 100644
+--- a/crates/hyper-tls/src/client/hs.rs
++++ b/crates/hyper-tls/src/client/hs.rs
+@@ -496,7 +496,7 @@ fn offer_tls13_extensions(
+             });
+ 
+     // RPK receivers do not request optional compression (VENDORED.md §10).
+-    if !config.verifier.requires_raw_public_keys() && !config.cert_decompressors.is_empty() {
++    if !config.cert_decompressors.is_empty() {
+         exts.certificate_compression_algorithms = Some(
+             config
+                 .cert_decompressors

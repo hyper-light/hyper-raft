@@ -1,0 +1,24 @@
+   Compiling hyper-tls v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls)
+   Compiling hyper-rt v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-rt)
+   Compiling hyper-measure v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-measure)
+   Compiling rustls-test v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls/tests/support/rustls-test)
+error[E0616]: field `client_auth_cert_resolver` of struct `ClientSettings` is private
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:187:20
+    |
+187 |             config.client_auth_cert_resolver = Box::new(
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+
+error[E0624]: method `bytes_for` is private
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:262:38
+    |
+262 |                     KeyType::Ed25519.bytes_for("ca.cert"),
+    |                                      ^^^^^^^^^ private method
+    |
+   ::: crates/hyper-tls/tests/support/rustls-test/src/lib.rs:623:5
+    |
+623 |     fn bytes_for(&self, part: &str) -> &'static [u8] {
+    |     ------------------------------------------------ private method defined here
+
+Some errors have detailed explanations: E0616, E0624.
+For more information about an error, try `rustc --explain E0616`.
+error: could not compile `hyper-tls` (test "rpk_compression_policy") due to 2 previous errors

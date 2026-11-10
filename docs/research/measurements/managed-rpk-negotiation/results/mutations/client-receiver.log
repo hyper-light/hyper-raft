@@ -1,0 +1,23 @@
+   Compiling hyper-tls v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls)
+   Compiling rustls-test v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls/tests/support/rustls-test)
+    Finished `release` profile [optimized] target(s) in 28.90s
+     Running tests/rpk_compression_policy.rs (/home/adalundhe/managed-certificate-target/release/deps/rpk_compression_policy-8cd429e4dc45534b)
+
+running 1 test
+test rpk_senders_avoid_compression_with_older_offering_peers ... case new_client=true new_server=false server_rpk=true client_rpk=true offer=true compressions=(0, 1) flights=[(1479, 1504), (209, 184)] cost=Cost { usage: Some(Usage { user_ns: 30000000, system_ns: 0, instructions: None, cycles: None, energy_nj: None, wakeups: None, disk_written: Some(0), footprint: Some(8302592), peak_footprint: Some(8302592) }), counts: Counts { allocations: 352, reallocations: 55, moved: 23, frees: 349, bytes: 34511017, live: 272, peak: 34338828 } }
+
+thread 'rpk_senders_avoid_compression_with_older_offering_peers' (889886) panicked at crates/hyper-tls/tests/rpk_compression_policy.rs:561:5:
+assertion `left == right` failed
+  left: (0, 1)
+ right: (0, 0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    rpk_senders_avoid_compression_with_older_offering_peers
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p hyper-tls --test rpk_compression_policy`

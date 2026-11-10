@@ -1,0 +1,195 @@
+    Checking memchr v2.8.3
+    Checking zeroize v1.9.0
+    Checking powerfmt v0.2.0
+    Checking time-core v0.1.9
+    Checking deranged v0.5.8
+    Checking num-conv v0.2.2
+    Checking rustls-pki-types v1.15.1
+    Checking num-traits v0.2.19
+    Checking aws-lc-sys v0.45.0
+    Checking minimal-lexical v0.2.1
+    Checking alloc-no-stdlib v2.0.4
+    Checking alloc-stdlib v0.2.4
+    Checking nom v7.1.3
+    Checking log v0.4.34
+    Checking aws-lc-rs v1.18.1
+    Checking thiserror v2.0.20
+    Checking time v0.3.55
+    Checking brotli-decompressor v5.0.3
+    Checking aho-corasick v1.1.5
+    Checking rusticata-macros v4.1.0
+    Checking untrusted v0.9.0
+    Checking regex-syntax v0.8.11
+    Checking rustls-webpki v0.103.15
+    Checking brotli v8.0.4
+    Checking num-integer v0.1.47
+    Checking asn1-rs v0.7.2
+    Checking zlib-rs v0.6.8
+    Checking regex-automata v0.4.18
+    Checking utf8parse v0.2.2
+    Checking subtle v2.6.1
+    Checking once_cell v1.21.4
+    Checking anstyle-parse v1.0.0
+    Checking libc v0.2.189
+    Checking num-bigint v0.4.8
+    Checking serde_core v1.0.229
+    Checking regex v1.13.1
+    Checking jiff-core v0.1.1
+    Checking bitflags v2.13.1
+    Checking linux-raw-sys v0.12.1
+    Checking anstyle v1.0.14
+    Checking colorchoice v1.0.5
+    Checking base64 v0.23.1
+    Checking is_terminal_polyfill v1.70.2
+    Checking anstyle-query v1.1.5
+    Checking jiff v0.2.37
+    Checking anstream v1.0.0
+    Checking pem v4.0.0
+    Checking env_filter v2.0.0
+    Checking rustix v1.1.4
+    Checking hyper-tls v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls)
+    Checking der-parser v10.0.0
+    Checking crc32c v0.6.8
+    Checking oid-registry v0.8.1
+    Checking zmij v1.0.23
+    Checking yasna v0.6.0
+    Checking lazy_static v1.5.0
+    Checking pin-project-lite v0.2.17
+    Checking data-encoding v2.11.1
+    Checking itoa v1.0.18
+    Checking macro_rules_attribute v0.2.3
+    Checking x509-parser v0.17.0
+    Checking serde_json v1.0.151
+    Checking env_logger v0.11.11
+    Checking serde v1.0.229
+    Checking rcgen v0.14.10
+    Checking rustls v0.23.45
+    Checking rustls-test v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-tls/tests/support/rustls-test)
+    Checking hyper-measure v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-measure)
+    Checking webpki-roots v1.0.9
+    Checking hex v0.4.3
+    Checking base64 v0.22.1
+    Checking hyper-rt v0.1.0 (/home/adalundhe/.kiln/reach/e30189ea29182644fe5a4b2e06c7dac2/managed-rpk-negotiation-3f5de96dc3/crates/hyper-rt)
+error: used `panic!()` or assertion in a function that returns `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:453:5
+    |
+453 | /     fn receive(&mut self, mut input: &[u8]) -> Result<(), TlsError> {
+454 | |         while !input.is_empty() {
+455 | |             let n = match self {
+456 | |                 Self::NewClient(p) => p.read_tls(&mut input).unwrap(),
+...   |
+469 | |     }
+    | |_____^
+    |
+    = help: `panic!()` or assertions should not be used in a function that returns `Result` as `Result` is expected to return an error instead of crashing
+note: return Err() instead of panicking
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:461:13
+    |
+461 |             assert!(n > 0);
+    |             ^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#panic_in_result_fn
+    = note: requested on the command line with `-D clippy::panic-in-result-fn`
+
+error: `unwrap` used in a function that returns a `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:456:39
+    |
+456 |                 Self::NewClient(p) => p.read_tls(&mut input).unwrap(),
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: in this function signature
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:453:48
+    |
+453 |     fn receive(&mut self, mut input: &[u8]) -> Result<(), TlsError> {
+    |                                                ^^^^^^^^^^^^^^^^^^^^
+    = help: consider using the `?` operator or calling the `.map_err()` method
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unwrap_in_result
+    = note: requested on the command line with `-D clippy::unwrap-in-result`
+
+error: `unwrap` used in a function that returns a `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:457:39
+    |
+457 |                 Self::NewServer(p) => p.read_tls(&mut input).unwrap(),
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unwrap_in_result
+
+error: `unwrap` used in a function that returns a `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:458:39
+    |
+458 |                 Self::OldClient(p) => p.read_tls(&mut input).unwrap(),
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unwrap_in_result
+
+error: `unwrap` used in a function that returns a `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:459:39
+    |
+459 |                 Self::OldServer(p) => p.read_tls(&mut input).unwrap(),
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#unwrap_in_result
+
+error: used `panic!()` or assertion in a function that returns `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:487:1
+    |
+487 | / fn transfer(from: &mut Peer, to: &mut Peer) -> Result<usize, TlsError> {
+488 | |     let mut bytes = Vec::new();
+489 | |     while from.pending() {
+490 | |         assert!(from.write(&mut bytes) > 0);
+...   |
+496 | |     Ok(n)
+497 | | }
+    | |_^
+    |
+    = help: `panic!()` or assertions should not be used in a function that returns `Result` as `Result` is expected to return an error instead of crashing
+note: return Err() instead of panicking
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:490:9
+    |
+490 |         assert!(from.write(&mut bytes) > 0);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#panic_in_result_fn
+
+error: used `panic!()` or assertion in a function that returns `Result`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:498:1
+    |
+498 | / fn handshake(mut client: Peer, mut server: Peer) -> Result<Vec<(usize, usize)>, TlsError> {
+499 | |     let mut flights = Vec::new();
+500 | |     while client.handshaking() || server.handshaking() || client.pending() || server.pending() {
+501 | |         let up = transfer(&mut client, &mut server)?;
+...   |
+512 | |     Ok(flights)
+513 | | }
+    | |_^
+    |
+    = help: `panic!()` or assertions should not be used in a function that returns `Result` as `Result` is expected to return an error instead of crashing
+note: return Err() instead of panicking
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:503:9
+    |
+503 |         assert!(up + down > 0, "TLS handshake stopped making progress");
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+511 |     assert_eq!(got, payload);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#panic_in_result_fn
+
+error: the function has a cognitive complexity of (12/10)
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:576:4
+    |
+576 | fn certificate_type_and_old_peer_matrix() {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: you could split it up into multiple smaller functions
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#cognitive_complexity
+    = note: requested on the command line with `-D clippy::cognitive-complexity`
+
+error: use of a disallowed method `std::env::var`
+   --> crates/hyper-tls/tests/rpk_compression_policy.rs:578:18
+    |
+578 |     let policy = std::env::var("HYPER_MATRIX_EXPECT").unwrap_or_else(|_| "both".into());
+    |                  ^^^^^^^^^^^^^
+    |
+    = note: configuration is an input, not the environment (docs/sim.md §3.9).
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#disallowed_methods
+    = note: requested on the command line with `-D clippy::disallowed-methods`
+
+error: could not compile `hyper-tls` (test "rpk_compression_policy") due to 9 previous errors

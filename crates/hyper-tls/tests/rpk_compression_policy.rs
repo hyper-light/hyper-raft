@@ -168,31 +168,47 @@ mod new {
     ) -> rustls_test::TestClient {
         let kt = KeyType::Ed25519;
         let provider = Box::leak(Box::new(tls::crypto::aws_lc_rs::default_provider()));
-        let mut config = rustls_test::make_client_config_with_versions_with_auth(
-            kt,
-            &[&tls::version::TLS13],
-            provider,
-        );
-        if server_rpk {
-            config.dangerous().set_certificate_verifier(Box::new(Pin {
-                key: kt.get_spki().as_ref().to_vec(),
-                algorithms: provider.signature_verification_algorithms,
-            }));
-        }
-        if client_rpk {
+        let builder = tls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&tls::version::TLS13])
+            .unwrap();
+        let builder = if server_rpk {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Box::new(Pin {
+                    key: kt.get_spki().as_ref().to_vec(),
+                    algorithms: provider.signature_verification_algorithms,
+                }))
+        } else {
+            use tls::pki_types::pem::PemObject as _;
+            let mut roots = tls::RootCertStore::empty();
+            roots
+                .add(
+                    tls::pki_types::CertificateDer::from_pem_slice(include_bytes!(
+                        "../test-ca/eddsa/ca.cert"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            builder.with_root_certificates(roots)
+        };
+        let mut config = if client_rpk {
             let signing = provider
                 .key_provider
                 .load_private_key(kt.get_client_key())
                 .unwrap();
-            config.client_auth_cert_resolver = Box::new(
+            builder.with_client_cert_resolver(Box::new(
                 tls::client::AlwaysResolvesClientRawPublicKeys::new(tls::sign::CertifiedKey::new(
                     vec![tls::pki_types::CertificateDer::from(
                         kt.get_client_spki().as_ref().to_vec(),
                     )],
                     signing,
                 )),
-            );
-        }
+            ))
+        } else {
+            builder
+                .with_client_auth_cert(kt.get_client_chain(), kt.get_client_key())
+                .unwrap()
+        };
         config.cert_compressors = vec![&CLIENT];
         if !offer {
             config.cert_decompressors.clear();
@@ -258,9 +274,9 @@ mod old {
         let mut roots = tls::RootCertStore::empty();
         roots
             .add(
-                tls::pki_types::CertificateDer::from_pem_slice(
-                    KeyType::Ed25519.bytes_for("ca.cert"),
-                )
+                tls::pki_types::CertificateDer::from_pem_slice(include_bytes!(
+                    "../test-ca/eddsa/ca.cert"
+                ))
                 .unwrap(),
             )
             .unwrap();
@@ -495,6 +511,14 @@ fn rpk_senders_avoid_compression_with_older_offering_peers() {
 #[ignore = "explicit admitted complete certificate-type/new-old matrix"]
 fn certificate_type_and_old_peer_matrix() {
     assert!(alloc::installed());
+    let policy = std::env::var("HYPER_MATRIX_EXPECT").unwrap_or_else(|_| "both".into());
+    let sender = matches!(policy.as_str(), "sender" | "both");
+    let receiver = matches!(policy.as_str(), "receiver" | "both");
+    assert!(matches!(
+        policy.as_str(),
+        "baseline" | "sender" | "receiver" | "both"
+    ));
+    println!("expected_source_policy={policy}");
     for new_client in [false, true] {
         for new_server in [false, true] {
             for server_rpk in [false, true] {
@@ -502,10 +526,16 @@ fn certificate_type_and_old_peer_matrix() {
                     for offer in [false, true] {
                         let counts =
                             run_case(new_client, new_server, server_rpk, client_rpk, offer);
-                        let expect_client =
-                            usize::from(offer && (!client_rpk || (!new_client && !new_server)));
-                        let expect_server =
-                            usize::from(offer && (!server_rpk || (!new_client && !new_server)));
+                        let expect_client = usize::from(
+                            offer
+                                && !(client_rpk
+                                    && ((sender && new_client) || (receiver && new_server))),
+                        );
+                        let expect_server = usize::from(
+                            offer
+                                && !(server_rpk
+                                    && ((sender && new_server) || (receiver && new_client))),
+                        );
                         assert_eq!(counts, (expect_client, expect_server));
                     }
                 }

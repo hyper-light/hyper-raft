@@ -2443,6 +2443,32 @@ Tests (hyper-rt-transport `tests/held_still.rs`, real sockets, the hold the only
   side was polled first closed it.
 - hyper-rt `a_receive_is_whole_when_it_took_all_that_was_queued_as_it_began`.
 
+## 4aq. No endpoint offers to take QUIC DATAGRAM frames (2026-11-12, found by mantle)
+
+hyper-quic's default transport, upstream's, sets `datagram_receive_buffer_size` to
+`STREAM_RWND`, 1,250,000 bytes. Every connection an endpoint made or accepted therefore sent the
+`max_datagram_frame_size` transport parameter (RFC 9221 §3). That parameter tells the peer it may
+send DATAGRAM frames, up to that many bytes of them buffered unread, on every connection. No owner
+sends or reads one: the transport's messages travel on streams, and the plane's heartbeats on its
+own sealed socket (§4c). mantle's plan for its doors (Lean doors, step 8; mantle
+`docs/research/71-the-doors-costs.md`, "The candidates") found 0 allocations under hyper-quic's
+datagram code in every window it recorded. So the allowance held no memory: it was only a promise
+nobody used.
+
+`Limits::transport` now sets the receive buffer to `None`. No endpoint sends the parameter, and a
+peer that sends a DATAGRAM frame anyway is closed with PROTOCOL_VIOLATION, as RFC 9221 §3 requires
+of a receiver that did not advertise support (hyper-quic `Datagrams::received`). Nothing an owner
+sends changes.
+
+Tests (`tests/datagrams.rs`). Each reads the parameter as the peer received it, from a bare
+hyper-quic connection whose `datagrams().max_size()` is `None` exactly when the peer sent none:
+
+- `bare_hyper_quic_advertises_datagrams_so_the_reading_sees_them`: two bare connections on
+  hyper-quic's default each read the other's parameter, so the reading can see one.
+- `a_node_accepting_a_connection_advertises_no_datagrams` and
+  `a_node_dialing_a_connection_advertises_no_datagrams`: a node on either end sends none. Before:
+  both read `Some(1414)`, the path's room for one.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

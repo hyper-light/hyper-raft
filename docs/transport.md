@@ -470,7 +470,8 @@ never depends on it.
     drains the socket, fires the timers due, sends what the endpoint transmits, and parks on the
     socket and the timer. An event already queued is handed out with no system call.
   - `endpoint()` lends the endpoint for the owner's calls between events; `flush()` sends what
-    those calls queued without waiting; `stats()` counts datagrams, system calls and drops.
+    those calls queued without waiting; `stats()` counts datagrams and their payload bytes, system
+    calls and drops.
 - `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
   sends; `receive(plane, fence, deliver).await` opens a batch, its future `Send` (the owner's
   `Fence` is `Sync`, §4v); `receive_ready(plane, fence,

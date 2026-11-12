@@ -828,6 +828,10 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   the identity for a native process, whose arrivals are what they were to the bit
   (`machine::clock::MachTicks`, read once a process; `tests/udp_kernel_stamps.rs`, which CI's
   `translated` job runs under Rosetta 2).
+- **Payload counted where it moves.** A socket counts the payload bytes of the datagrams it hands the
+  kernel and of those it receives (`IoStats::sent_bytes`, `received_bytes`) beside the datagrams: an
+  owner's wire bytes, read where they are sent, so they never run backwards as a connection above
+  comes and goes (mantle's doors bench counts its native clients' wire by them).
 - **Drops told by the traffic.** On Linux a socket asks for `SO_RXQ_OVFL`: each datagram queued once the
   socket has dropped any for want of room carries the count since the socket was made, and the socket
   keeps the latest (`IoStats::drops`, `Some(0)` until a datagram says more, `None` where the kernel does

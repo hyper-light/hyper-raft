@@ -2469,6 +2469,28 @@ hyper-quic connection whose `datagrams().max_size()` is `None` exactly when the 
   `a_node_dialing_a_connection_advertises_no_datagrams`: a node on either end sends none. Before:
   both read `Some(1414)`, the path's room for one.
 
+## 4ar. A client's compressed certificate, decoded within its bound (2026-11-12, found by mantle)
+
+A node's server reads a client's certificate before the client has authenticated, and every
+node's CertificateRequest offers Brotli and zlib (RFC 8879), so the decoder takes a stranger's
+bytes. On Google's CVE-2026-111497 (an out-of-bounds write in its C decoder's block-type switch,
+fixed 2026-10-21) the owner decided: "Upgrade the decoder." hyper-tls decodes with
+brotli-decompressor 6.1.1, released that day, where it linked the Rust port's 5.0.3 through
+brotli 8.0.4. Both are safe Rust, so a bug of the C kind there is a panic; the decoder now runs
+inside an unwind boundary that makes it the handshake's typed refusal (alert bad_certificate,
+CRYPTO_ERROR 0x12a on QUIC, RFC 9001 §4.8), and the node serves on.
+
+cargo deny's advisory database names RUSTSEC-2026-0348 against the rustls this crate conforms:
+the decoder took Brotli's large-window extension, so five bytes could allocate 1 GiB. hyper-tls
+takes upstream 0.23.46's fix, a strict RFC 7932 decoder filling the certificate's buffer exactly.
+Strict decoding still sized its ring buffer to the window and metablock a header declares: four
+bytes took 16,780,366. The decoder's byte allocations are now bounded to what a stream decoding
+to the certificate's length takes: those four bytes 2,584, a whole 1 KiB certificate 38,835. The
+derivation, the measurements and the tests are hyper-tls `VENDORED.md` §11. Tests here:
+`certificates::a_certificate_that_does_not_decompress_is_refused_and_the_node_serves_on`, three
+malformed Brotli client certificates each closing its connection with 0x12a, then a client whose
+certificate is Brotli-compressed connected.
+
 ## 5. Consumers
 
 slates, focal and mantle each vendor a snapshot of the conformed crates, recording the hyper-raft revision

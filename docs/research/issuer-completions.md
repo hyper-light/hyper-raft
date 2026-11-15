@@ -201,11 +201,14 @@ to the floor, and a pod whose floor passed its 2 GiB limit at its threads refuse
 kind-cell, 2026-11-13). The depth's transfers cost no thread when the kernel holds them.
 
 `Issuer::start_device` is that issuer on Linux. Its thread is the issuer's own, and the device's
-depth is a set of lanes on it, each standing where a pool's worker stands: it holds its own
-duplicate of each file attached, is told a file's attach or detach before any transfer for it, and
-holds one task at a time, reported once. So the dispatcher's rules are the pool's, unchanged, and
-the kernel holds at most the lanes' transfers: one native AIO context of the depth (§2), each record
-on its lane's duplicate and tagged with its lane. A lane's news is applied at once; its transfer is
+depth is a set of lanes on it, each standing where a pool's worker stands for its transfers: it
+holds one task at a time, reported once. So the dispatcher's rules are the pool's, and the kernel
+holds at most the lanes' transfers: one native AIO context of the depth (§2), each record tagged
+with its lane. The files are that one thread's alone, so the lanes share one duplicate of each file
+attached, where a pool's workers, each a thread, hold one each: a deep device's issuer holds a
+descriptor a file, not one a transfer in flight. A file detached is retired once no transfer of it
+is out, and a transfer asked of it after the detach is refused, as a pool's worker refuses one
+once it has dropped its duplicate. A lane's news is applied at once; its transfer is
 checked as the file's own call checks it (alignment, offset) and handed to the kernel with every
 other lane's in one io_submit; its completion is reaped and reported, a transfer moved short issued
 again for the rest as the file's own call loops, one past the file's end a short read. Every record
@@ -232,8 +235,10 @@ reads through the lanes at 62.6 µs at the median against 107.2 µs through the 
 writes and their flush at 121.6 µs against 193.8 µs, cached reads at 26.2 µs against 60.5 µs, none
 allocating per operation. Tests: `tests/device_issuer.rs` (round trips over a direct and a buffered
 file, a short read, a misaligned transfer, submitters sharing the lanes, a batch past them, a refused
-file, an attacher moved across threads) and `tests/device_issuer_threads.rs` (issuers of depth 1, 64
-and 316 run one thread each, all their lanes holding a read).
+file, an attacher moved across threads), `tests/device_issuer_threads.rs` (issuers of depth 1, 64
+and 316 run one thread each, all their lanes holding a read) and
+`tests/device_issuer_descriptors.rs` (attaching a file to an issuer of any of those depths opens two
+descriptors, the issuer's one duplicate and the submitter's way to its bell).
 
 ## Sources
 

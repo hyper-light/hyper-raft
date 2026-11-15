@@ -637,8 +637,10 @@ dependencies = [
 name = "hyper-transport-compare"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "focal-wire",
  "hyper-measure",
+ "hyper-quic",
  "hyper-sim",
  "hyper-tokio",
  "hyper-transport",

@@ -10110,3 +10110,42 @@ allocations before, 758.0 after (4.49 and 4.50 reallocations, the space's queue 
 grown once a connection); p50 against upstream in the same process 1.172 and 1.174 before, 1.088
 and 1.139 after. `cargo bench -p hyper-rt-transport --bench connections`: 21.4 to 21.6 allocations
 an exchange before, 21.0 to 21.1 after, at every count of connections from 1 to 512.
+
+## hyper-block: a device issuer's lanes in the kernel (2026-11-14)
+
+`cargo bench -p hyper-block --bench reads -- DIR`, the reads bench with two rows more: the same
+four-page batch through a device issuer whose transfers are the kernel's (`Issuer::start_device`,
+`crates/hyper-block/src/issuer/kernel.rs`), its one thread submitting the batch to native AIO and
+reaping it, its completions ringing the same eventfd its submitter rings
+(`docs/research/issuer-completions.md` §9); and four durable writes and their flush through the
+issuer, its pool of workers (`Issuer::start`) and its kernel lanes. The **batched** rows are the
+pool's.
+
+Docker Desktop's Linux VM on adas-mac-studio-3 (Linux 6.12.65-linuxkit, 14 CPUs), ext4 on its
+virtio disk over the Mac's SSD (`nr_requests` 256), release build, 2,995 operations a row (Wilks'
+95 % bound on the p99.9), the host's one-minute load 4.6 to 7.0. Four runs, each row's p50 / p99 /
+max µs:
+
+| Row | run 1 | run 2 | run 3 | run 4 |
+|---|---|---|---|---|
+| direct, sequential | 91.96 / 156.92 / 252.67 | 131.96 / 181.96 / 282.71 | 132.50 / 192.46 / 376.54 | 135.17 / 189.71 / 262.62 |
+| direct, batched through the pool | 107.17 / 139.08 / 200.96 | 116.58 / 155.54 / 230.25 | 119.12 / 198.00 / 636.96 | 114.12 / 155.46 / 218.25 |
+| direct, kernel lanes | 62.58 / 96.46 / 3,512.25 | 83.25 / 116.62 / 216.33 | 84.96 / 118.58 / 476.71 | 83.33 / 114.75 / 183.17 |
+| direct, native AIO | 45.42 / 69.58 / 149.92 | 51.79 / 71.54 / 88.58 | 53.21 / 74.29 / 86.25 | 52.00 / 80.25 / 205.33 |
+| durable writes in place | 159.21 / 571.88 / 6,177.75 | 168.00 / 253.38 / 5,202.12 | 170.21 / 325.04 / 5,823.71 | 167.71 / 249.79 / 5,738.38 |
+| durable writes, pool | 193.79 / 251.88 / 5,410.08 | 200.12 / 269.38 / 5,777.04 | 186.00 / 257.58 / 6,455.67 | 201.12 / 265.25 / 5,315.92 |
+| durable writes, kernel lanes | 121.62 / 150.38 / 5,084.29 | 139.75 / 192.08 / 5,905.21 | 126.50 / 172.46 / 5,536.79 | 125.88 / 171.50 / 5,874.88 |
+| durable writes, native AIO | 96.42 / 125.38 / 12,241.79 | 105.67 / 140.54 / 5,494.38 | 105.96 / 146.79 / 3,232.88 | 106.00 / 141.04 / 2,874.50 |
+| cached, sequential | 2.25 / 3.08 / 10.17 | 2.42 / 3.04 / 19.29 | 2.38 / 2.92 / 14.00 | 2.38 / 2.88 / 15.04 |
+| cached, batched through the pool | 60.46 / 102.67 / 184.42 | 61.42 / 87.71 / 106.92 | 61.33 / 125.50 / 569.46 | 58.50 / 117.79 / 272.42 |
+| cached, kernel lanes | 26.17 / 37.46 / 88.83 | 26.67 / 39.12 / 79.62 | 34.71 / 40.88 / 81.25 | 34.96 / 40.12 / 99.79 |
+
+Every row of every run allocated nothing per operation and took no page fault. Through the kernel
+lanes, four direct reads take 0.58 to 0.73 times the pool's median, and their p99 0.60 to 0.75
+times; four durable writes and their flush 0.63 to 0.70 times its median and 0.60 to 0.71 times its
+p99; four cached reads 0.43 to 0.60 times its median and 0.33 to 0.45 times its p99, the kernel
+making each inside io_submit on the issuer's thread with no worker between. The lanes keep one
+hand-off each way, submitter to dispatcher and back, which native AIO from the calling thread does
+without, and which is the rest of the gap to it. Run 1's direct-lanes maximum, 3.5 ms, is one
+operation's; the other three runs' maxima were 183 to 477 µs. Not a bare-metal device; a run on one
+is owed.

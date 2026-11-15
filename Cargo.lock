@@ -959,9 +959,11 @@ name = "hyper-rt-transport"
 version = "0.1.0"
 dependencies = [
  "aws-lc-sys",
+ "bytes",
  "hyper-datagram",
  "hyper-heap",
  "hyper-measure",
+ "hyper-quic",
  "hyper-rt",
  "hyper-sim",
  "hyper-transport",
@@ -1058,8 +1060,10 @@ dependencies = [
 name = "hyper-tokio"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "hyper-datagram",
  "hyper-measure",
+ "hyper-quic",
  "hyper-sim",
  "hyper-transport",
  "libc",

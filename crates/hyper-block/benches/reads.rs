@@ -9,9 +9,12 @@
 //! `read_exact_at` after another. **batched** hands them to an issuer of `FAN_OUT` workers as one
 //! batch (`Attached::submit_reads`) and takes its answer. The batch's vector, its buffers and
 //! offsets, is the same each operation and goes back to the caller with the answer, so the count is
-//! the read path's own. **native AIO** hands the batch to the kernel from the calling thread
-//! (Linux, direct files). The **durable writes** rows write `FAN_OUT` pages at such offsets and
-//! flush them, in place or through native AIO.
+//! the read path's own. **kernel lanes** hands the same batch to a device issuer whose
+//! transfers are the kernel's (`Issuer::start_device`, Linux): one thread, its own, submits and
+//! reaps them through native AIO, its submitters and the kernel's completions ringing one bell.
+//! **native AIO** hands the batch to the kernel from the calling thread (Linux, direct files).
+//! The **durable writes** rows write `FAN_OUT` pages at such offsets and flush them, in place,
+//! through the issuer's pool, through its kernel lanes, or through native AIO.
 //!
 //! Each row takes Wilks' least sample for a one-sided 95 % bound on the p99.9, `n = ⌈ln 0.05 / ln
 //! 0.999⌉ = 2,995` operations [WILKS], after as many unmeasured. Allocator calls are counted across
@@ -170,6 +173,22 @@ fn rows(dir: &Path, n: usize, request: CachingRequest, label: &str) {
     });
     print(&format!("{label} batched"), &batched);
     drop(attached);
+    drop(issuer);
+    // The same batch through a device issuer whose transfers are the kernel's (Linux; elsewhere
+    // `start_device` is the pool again, and the row is not printed).
+    if cfg!(target_os = "linux") {
+        let issuer = Issuer::start_device(dir, FAN_OUT).unwrap();
+        let mut attached = issuer.attach(&file).unwrap();
+        let lanes = measure(n, |seed| {
+            let mut batch = reads.take().unwrap();
+            for (_, at) in &mut batch {
+                *at = offset(seed);
+            }
+            attached.submit_reads(batch).unwrap();
+            reads = Some(attached.answer().unwrap().1.unwrap());
+        });
+        print(&format!("{label} kernel lanes"), &lanes);
+    }
     // The same batch through the kernel's native AIO, issued and reaped on this thread (Linux,
     // direct files only; refused elsewhere, and the row is then not printed).
     if let Ok(mut aio) = AioFile::new(file, FAN_OUT, 1) {
@@ -206,9 +225,33 @@ fn write_rows(dir: &Path, n: usize) {
         file.sync_data().unwrap();
     });
     print("durable writes in place", &in_place);
+    let mut writes: Option<Vec<(AlignedBuf, u64)>> =
+        Some(bufs.drain(..).map(|buf| (buf, 0)).collect());
+    // Through a device's issuer: its pool's workers, then, on Linux, its kernel lanes; the batch's
+    // flush issued once its writes have all completed, on either.
+    let mut through = |issuer: Issuer, name: &str| {
+        let mut attached = issuer.attach(&file).unwrap();
+        let row = measure(n, |seed| {
+            let mut batch = writes.take().unwrap();
+            for (_, at) in &mut batch {
+                *at = offset(seed);
+            }
+            attached.submit(batch, true).unwrap();
+            writes = Some(attached.answer().unwrap().1.unwrap());
+        });
+        print(name, &row);
+    };
+    through(
+        Issuer::start(dir, FAN_OUT).unwrap(),
+        "durable writes issuer pool",
+    );
+    if cfg!(target_os = "linux") {
+        through(
+            Issuer::start_device(dir, FAN_OUT).unwrap(),
+            "durable writes kernel lanes",
+        );
+    }
     if let Ok(mut aio) = AioFile::new(file, FAN_OUT + 1, 1) {
-        let mut writes: Option<Vec<(AlignedBuf, u64)>> =
-            Some(bufs.drain(..).map(|buf| (buf, 0)).collect());
         let native = measure(n, |seed| {
             let mut batch = writes.take().unwrap();
             for (_, at) in &mut batch {

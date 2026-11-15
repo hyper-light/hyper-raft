@@ -531,3 +531,100 @@ openssl_interop -- --ignored`. slates ships the same group, checked against Open
 - **Oracle.** `compress::tests::brotli_window_holds_the_input_whole`,
   `brotli_under_the_inputs_window_compresses_as_under_the_default`, and the round trips of
   `test_brotli` at 16 to 16,384 bytes.
+
+## 11. Certificate decoding: brotli-decompressor 6.1.1, RFC 7932 only, bounded, behind an unwind boundary (2026-11-12)
+
+The owner's decision, on Google's CVE-2026-111497: "Upgrade the decoder." Nodes keep certificate
+compression, and a server reads a client's compressed certificate before the client has
+authenticated, since every node's CertificateRequest offers the decoders.
+
+- **The advisory.** Google Brotli 1.0.3 to 1.2.0: an out-of-bounds write in the block-type switch
+  handling of `c/dec/decode.c` on a crafted stream; fixed in 1.0.10, 1.1.1 and 1.2.1 (2026-10-21;
+  Red Hat's record, <https://access.redhat.com/security/cve/CVE-2026-111497>, rates it Important,
+  8.1). This crate linked the Rust port, not the C library: `brotli` 8.0.4 with
+  `brotli-decompressor` 5.0.3, both `#![forbid(unsafe_code)]`, so a logic bug of the same kind
+  there is a panic (a checked index) rather than a write.
+- **The decoder now.** `brotli-decompressor` `=6.1.1` (crates.io, published 2026-10-21T08:45:48Z,
+  the day of Google's fix; its repository at `fdfccff`), called directly. Its
+  `DecodeBlockTypeAndLength` reads the block-type and block-length trees at their own strides
+  (`BROTLI_HUFFMAN_MAX_SIZE_258` and `_26`, the C decoder's), where 5.0.3 read both at
+  `BROTLI_HUFFMAN_MAX_TABLE_SIZE` within allocations that stride covered; it sizes its ring buffer
+  on demand rather than to the whole window. No `brotli` release builds on 6.1.1 (9.0 takes
+  `~6.0`, 9.1 takes 6.2 or later), so the encoder stays at `brotli` 8.0.4, whose own
+  `brotli-decompressor` 5.0.3 no certificate reaches. 6.1.1 brings `alloc-no-stdlib` 3.0.0 and
+  `alloc-stdlib` 0.3.0 beside 8.0.4's 2.0.4 and 0.2.4.
+- **RFC 7932 only, filled exactly (RUSTSEC-2026-0348, upstream 0.23.46's fix,
+  rustls/rustls#3297).** `BrotliDecompress` took the large-window extension, so a five-byte
+  header could make the decoder allocate 1 GiB. The decoder is now a strict `BrotliState`
+  (`new_strict`) streamed straight into the certificate's buffer, refusing a stream that does not
+  fill it exactly or goes on past its end; zlib's likewise takes `Inflate` and refuses bytes after
+  the stream's end (`total_in`).
+- **Bounded to the certificate (new here).** Strict decoding still let a header name RFC 7932's
+  largest window and a stored metablock of 2^24 bytes, and 6.1.1 sized its ring buffer to that
+  before reading a byte of data: four bytes, `cf ff ff ff`, took 16,780,366 bytes. The decoder's
+  byte allocator (`Bytes`) refuses any allocation past the ring buffer a stream decoding to the
+  certificate's length takes (at least 1 KiB, `kRingBufferMinSize`; the least power of two holding
+  the length, 6.1.1's `BrotliCalculateRingBufferSize`; 566 bytes past it,
+  `kRingBufferAllocationSlack`) or a literal context map (64 × 256, RFC 7932 §7.3), whichever is
+  larger. 6.1.1 answers a short allocation with its own error and keeps its state
+  (`BrotliEnsureRingBuffer`, `DecodeContextMap`). Measured: every header in
+  `tests/certificate_decoding.rs` now peaks at 2,584 bytes, where a whole 1 KiB certificate takes
+  38,835; every stream a stock encoder makes (window 2^22, upstream rustls's, and this crate's own,
+  qualities 4 and 11, 1 to 65,535 bytes, compressible and not) decodes.
+- **The unwind boundary.** `compress::decompress_contained` runs every decoder, built-in or the
+  caller's, inside `catch_unwind`: an unwind is `DecompressionFailed`, the handshake's
+  `PeerMisbehaved::InvalidCertCompression` with the alert bad_certificate, and the configuration
+  serves the next connection. `compress_contained` does the same for an encoder, whose
+  `CompressionFailed` sends the certificate uncompressed, as before. A payload whose drop unwinds
+  again is leaked, as hyper-rt's `unwind::contained` does.
+- **Counts.** A TLS 1.3 handshake decoding the server's certificate: 286 to 281 allocations
+  (`tests/alloc_per_handshake.rs`, upstream 0.23.45 293), the decoder's two 4,096-byte staging
+  buffers and the cursor gone; mutual, 411 to 401. hyper-quic's full handshake 506 to 501, its
+  resumed 509 as before.
+- **Tests.** `compress::tests::test_brotli_rejects_large_window` and
+  `test_decompress_trailing_data` (upstream 0.23.46's); `tests/certificate_decoding.rs`
+  `a_peers_brotli_header_holds_the_decoder_to_a_certificates_cost` (16,780,366 bytes before the
+  bound) and `every_certificate_a_stock_encoder_sends_decodes`; `api.rs`
+  `a_decoder_that_panics_refuses_the_handshake_and_the_server_serves_on` and
+  `an_encoder_that_panics_sends_the_certificate_uncompressed` (each failing without the boundary),
+  `a_malformed_brotli_certificate_is_refused_and_the_server_serves_on`; hyper-transport
+  `tests/certificates.rs`, a node refusing three malformed client certificates, typed, then taking
+  a Brotli-compressed one.
+
+## 12. Three of upstream 0.23.46's advisory fixes, and the lock past its advisories (2026-11-13)
+
+cargo deny's advisory database names three more flaws of rustls 0.23.45 that this crate's code
+carries. Each takes upstream 0.23.46's change (rustls `f04804f`, read from its crates.io archive)
+and nothing else of that release; each test fails on the code before it.
+
+- **RUSTSEC-2026-0346** (rustls/rustls#3299): `ClientSessionCommon` and `ServerSessionValue`
+  derived `Debug`, printing the TLS 1.3 resumption PSK or the TLS 1.2 master secret to whatever
+  formatted a session. Each now has upstream's `Debug`, every field but the secret
+  (`msgs/persist.rs`). The session values that hold a `ClientSessionCommon` keep their derived
+  `Debug`, which now prints its redacted one. Tests: `msgs::persist::tests::serversessionvalue_is_debug`
+  (upstream's) and `clientsessioncommon_debug_leaves_the_secret_out`.
+- **RUSTSEC-2026-0347** (rustls/rustls#3300): a client whose ECH offer the server rejected started
+  traffic before it raised `ech_required`, so application data it wrote before the handshake ended
+  went to the server it reached, authenticated only for the ECH config's `public_name` (RFC 9849
+  §6.1.6 asks the client to abort "before sending any application data to the server").
+  `ExpectFinished` now checks the ECH status before `start_traffic` (`client/tls13.rs`). Test:
+  `api.rs` `a_rejected_ech_offer_sends_no_application_data_to_the_outer_server`, the outer server
+  receiving the plaintext before.
+- **RUSTSEC-2026-0349** (rustls/rustls#3355): the client kept the group a ServerHello chose as the
+  next ClientHello's key-share hint before the server was authenticated, so a network attacker
+  answering one attempt with a classical group held later ClientHellos to that name to a classical
+  share alone. The group rides the handshake's states (`kx_group`) and is kept once the server's
+  Finished is verified, beside `remove_tls12_session` (`client/tls13.rs`). Test: `api.rs`
+  `a_kx_hint_is_kept_only_from_an_authenticated_server`, a refused certificate leaving no hint
+  where it left one before, and a completed handshake leaving its group's.
+
+Not taken: 0.23.46's other changes (the key update before a write's last record, the ECH
+hello-retry acceptance check, the zlib and Brotli decoders' trailing-data checks being §11's
+already). `rustls-webpki` is required at 0.103.16 or later (RUSTSEC-2026-0382), and the
+workspace lock moves rustls-webpki to 0.103.17, webpki-roots to 1.0.12 (RUSTSEC-2026-0381), tokio
+to 1.54.1 (RUSTSEC-2026-0386) and rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486). The oracle,
+`upstream-rustls` pinned at 0.23.45, keeps its four advisories: it is the release this crate
+conforms and the allocation counts' comparison, a test dependency only.
+
+Counts unchanged (`tests/alloc_per_handshake.rs`): a TLS 1.3 handshake 281 allocations, mutual
+401, TLS 1.2 140, against upstream's 293, 419 and 142.

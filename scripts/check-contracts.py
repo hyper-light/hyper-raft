@@ -147,6 +147,15 @@ UNSAFE_ALLOWED = {
     "crates/hyper-measure/src/wait_windows.rs":
         "WSAPoll (the wait for a datagram every real-socket test and E2E member makes, on Windows, "
         "with no operation in flight past its return; tests and harnesses only)",
+    "crates/hyper-block/src/overlapped.rs":
+        "ReadFile and WriteFile at the offset of an OVERLAPPED block on a handle opened for "
+        "overlapped I/O, GetOverlappedResult's wait on a thread's own manual-reset event, and "
+        "CreateEventW and CloseHandle for that event, through windows-sys (a segmented file's "
+        "transfers on Windows, many threads on one handle)",
+    "crates/hyper-measure/src/descriptors.rs":
+        "proc_pidinfo(PROC_PIDLISTFDS) through a declaration of <libproc.h> (macOS) and "
+        "GetProcessHandleCount on the process's pseudo-handle through windows-sys (Windows): the "
+        "descriptors a process holds; measurement only",
     "crates/hyper-block/src/gather.rs":
         "WriteFileGather on a handle opened past the cache for overlapped I/O, its page-aligned "
         "FILE_SEGMENT_ELEMENT array and OVERLAPPED block, GetOverlappedResult, and GetSystemInfo's "

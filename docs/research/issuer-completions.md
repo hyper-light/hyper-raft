@@ -191,6 +191,50 @@ AIO"): four page writes and their flush in 311.7 µs at the median against 444.7
 521.6 µs against 870.9 µs, 0 allocations. The `fdatasync` fallback is not exercised by a kernel
 CI runs (6.x); it is the flush the in-place row makes. Still to build: Windows' IOCP (§3).
 
+## 9. As built: a device issuer's lanes in the kernel (2026-11-14)
+
+mantle's node counted, for each device holding volumes, a thread for every transfer the device was
+measured to take at once (the pool's workers) and reserved each one's 2 MiB stack in its memory
+floor. On CI runners the same disk measured depths of 1, 4 and 64 from one pod to the next
+(calibration's knee moves with the host's load), each unit of depth adding 2,097,152 bytes of stacks
+to the floor, and a pod whose floor passed its 2 GiB limit at its threads refused to start (mantle
+kind-cell, 2026-11-13). The depth's transfers cost no thread when the kernel holds them.
+
+`Issuer::start_device` is that issuer on Linux. Its thread is the issuer's own, and the device's
+depth is a set of lanes on it, each standing where a pool's worker stands: it holds its own
+duplicate of each file attached, is told a file's attach or detach before any transfer for it, and
+holds one task at a time, reported once. So the dispatcher's rules are the pool's, unchanged, and
+the kernel holds at most the lanes' transfers: one native AIO context of the depth (§2), each record
+on its lane's duplicate and tagged with its lane. A lane's news is applied at once; its transfer is
+checked as the file's own call checks it (alignment, offset) and handed to the kernel with every
+other lane's in one io_submit; its completion is reaped and reported, a transfer moved short issued
+again for the rest as the file's own call loops, one past the file's end a short read. Every record
+asks `IOCB_FLAG_RESFD` on an eventfd, the issuer's bell, which its submitters ring too, each through
+a descriptor of its own: the dispatcher's one wait, a read of the bell, ends at a completion or a
+hand-over, with no thread between it and the device. Reads ask no `RWF_NOWAIT`: the dispatcher is
+the only thread a read could be made on in place, and a read the device makes it wait for in
+io_submit waits there no longer than in place. A flush the kernel refuses as an opcode (Linux before
+4.18) is made in place, on that thread. Over a buffered file the kernel makes each transfer inside
+io_submit (§2), so there the lanes run one at a time, on that thread.
+
+This departs from §6's design, a context owned by each submitter, for mantle's: its volume reader
+is a hyper-rt task waiting on the issuer's channel, which a submitter-owned context would make wait
+on an eventfd in its shard's reactor instead; a bell on the dispatcher keeps every submitter as it
+is and takes the depth off threads, at the hand-offs the pool already makes.
+
+A file the kernel does not hold whole (`BlockFile::kernel_file` is none: one in memory, a simulated
+device, a segmented file) is refused at attach, before any duplicate is made; `Issuer::start`, the
+pool, takes those. macOS and Windows have `start_device` start the pool (§3, §4), and
+`Issuer::device_threads` says the threads either runs.
+
+Measured (docs/benchmarks.md, "hyper-block: a device issuer's lanes in the kernel"): four direct
+reads through the lanes at 62.6 µs at the median against 107.2 µs through the pool, four durable
+writes and their flush at 121.6 µs against 193.8 µs, cached reads at 26.2 µs against 60.5 µs, none
+allocating per operation. Tests: `tests/device_issuer.rs` (round trips over a direct and a buffered
+file, a short read, a misaligned transfer, submitters sharing the lanes, a batch past them, a refused
+file, an attacher moved across threads) and `tests/device_issuer_threads.rs` (issuers of depth 1, 64
+and 316 run one thread each, all their lanes holding a read).
+
 ## Sources
 
 - man-pages: io_setup(2), io_submit(2), io_getevents(2) (man7.org).

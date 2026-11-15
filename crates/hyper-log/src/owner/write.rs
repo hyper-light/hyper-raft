@@ -729,14 +729,16 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// segment can take it, refuses its updates `Full`. A frame no segment takes is laid again
     /// with what may take the room the log keeps for making room (`writer::target`): its sweep's
     /// copies and the updates that only free what their groups held, the rest waiting for the
-    /// next frame; and a frame that frees a segment, if that does not fit either, goes with its
-    /// copies alone, its updates waiting for the room it frees. Before, a frame was refused whole:
+    /// next frame; a frame that frees a segment, if that does not fit either, goes with its
+    /// copies alone, its updates waiting for the room it frees; and where even its copies do not
+    /// fit, its sweep waits too, and a frame of nothing names the tail past the segments emptied
+    /// since the last frame, if any were, which frees them. Before, a frame was refused whole:
     /// a compaction laid beside another group's entries, a sweep that made room, or the frame
     /// naming the tail past segments a compaction emptied, did not fit for the updates beside it
     /// while no segment was usable, and every write after was refused `Full` (found by mantle,
     /// 2026-11-14).
     fn place(&mut self, mut payload: Payload, mut laid: Laid<F>) {
-        let tail = match &laid.sweep {
+        let mut tail = match &laid.sweep {
             Some(s) => s.next_tail,
             None => self.state.tail_incarnation(),
         };
@@ -764,6 +766,21 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.hold(taken);
             payload.truncate(laid.copies.0);
             laid.records = laid.copies.1;
+            target = self.target_for(payload.len(), Room::Advances);
+        }
+        // A sweep that does not fit even alone waits where the frame names a later tail without
+        // it, past the segments emptied since the last frame, which that frame frees.
+        let emptied = self.state.tail_incarnation();
+        if matches!(target, Ok(None))
+            && !laid.whole
+            && laid.sweep.is_some()
+            && emptied > self.state.durable_tail
+        {
+            let taken = std::mem::take(&mut laid.taken);
+            self.hold(taken);
+            self.put_off_sweep(&mut laid);
+            payload.clear();
+            tail = emptied;
             target = self.target_for(payload.len(), Room::Advances);
         }
         match target {
@@ -838,6 +855,19 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
         self.hold(back);
         Ok(())
+    }
+
+    /// The frame's sweep is not written: its tail stays where it is, swept by a later frame, and
+    /// the sweep and its copies are not counted.
+    fn put_off_sweep(&mut self, laid: &mut Laid<F>) {
+        if laid.sweep.take().is_some() {
+            let tally = &mut self.tally;
+            tally.sweeps = tally.sweeps.saturating_sub(1);
+            let copied = u64::try_from(laid.copies.0).unwrap_or(u64::MAX);
+            tally.swept_bytes = tally.swept_bytes.saturating_sub(copied);
+        }
+        laid.copies = (0, 0);
+        laid.records = 0;
     }
 
     /// `taken`, updates laid into a frame, go back to wait for the next, ahead of everything held

@@ -111,9 +111,10 @@ fn unfit(f: Facts) -> Unfit {
 
 #[test]
 fn a_budget_under_the_least_file_is_refused_naming_both() {
-    // The persist area and three segments.
+    // The persist area, three working segments, and two for one largest entry as the file stores
+    // it (a segment counted at half its room).
     let config = Config::derive(&facts(1 << 20, 64, 1 << 28)).unwrap();
-    let least = 4 * config.segment_bytes;
+    let least = 6 * config.segment_bytes;
     assert_eq!(
         unfit(facts(1 << 20, 64, least - 1)),
         Unfit::Disk {
@@ -208,6 +209,38 @@ proptest! {
             }
             Err(LogError::Unfit(_)) => {}
             Err(other) => prop_assert!(false, "refused untyped: {other:?}"),
+        }
+    }
+}
+
+/// Do: derive on the budget `Config::disk_for` names for a node's groups, and on budgets under it.
+/// Expect: on it, every group keeps the bounds its checkpoint cadence asks (two cadences and what
+/// may be uncommitted); under it, the bounds are no larger, and still hold the largest entry.
+#[test]
+fn the_disk_for_every_groups_retention_keeps_the_cadences_bounds() {
+    for (largest, groups) in [(1usize << 10, 1usize), (1 << 16, 6), (1 << 20, 64)] {
+        let f = facts(largest, groups, 0);
+        let mut sized = f;
+        sized.disk_bytes = Config::disk_for(&f).unwrap();
+        let config = Config::derive(&sized).unwrap();
+        assert_eq!(
+            config.group_entries,
+            2 * 1024 + 256,
+            "{largest} B, {groups} groups"
+        );
+        assert_eq!(
+            config.group_bytes,
+            2 * (1 << 24) + (1 << 25),
+            "{largest} B, {groups} groups"
+        );
+        for share in [2u64, 4, 16] {
+            let mut smaller = sized;
+            smaller.disk_bytes = sized.disk_bytes / share;
+            if let Ok(held) = Config::derive(&smaller) {
+                assert!(held.group_entries <= config.group_entries);
+                assert!(held.group_bytes <= config.group_bytes);
+                assert!(held.group_bytes >= largest as u64);
+            }
         }
     }
 }

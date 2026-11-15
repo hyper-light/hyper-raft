@@ -335,13 +335,19 @@ pub(crate) fn sweepable(state: &State, p: &Params) -> Result<bool, LogError> {
         .and_then(|len| p.align.up_u64(len))
         .ok_or(LogError::Damaged("a frame past u64"))?;
     // The sweep makes room if the segment after the tail holds nothing live, so that the
-    // frame naming a later tail frees it too, or if its frame takes less than the
-    // tail's frames. A tail copied into a segment of its own, as large as its own frames,
-    // frees one segment and fills another: the writer once swept every segment in turn so,
-    // while the updates waiting never fitted beside the copies. And a small live record
-    // left in the oldest segment once held back every dead segment behind it: its copy was
-    // as large as its frame, so it was never swept, and no frame larger than the head's
-    // room went in again.
+    // frame naming a later tail frees it too, or if its frame takes less of the file than
+    // freeing the tail gives back. Freed, the tail's slot holds a whole segment's frames again,
+    // however few it held: frames go only at the head, so what a tail left unwritten (the head
+    // moved on when a frame did not fit its rest) is room only once the slot is freed. The
+    // frame takes its own bytes at the head, and the head's unwritten rest besides where it
+    // does not fit there and opens a segment. A tail copied into a segment of its own, as large
+    // as its own frames, frees one segment and fills another: the writer once swept every
+    // segment in turn so, while the updates waiting never fitted beside the copies. And a small
+    // live record left in the oldest segment once held back every dead segment behind it: its
+    // copy was as large as its frame, so it was never swept, and no frame larger than the
+    // head's room went in again. Weighed against the tail's frames rather than its slot, a tail
+    // of one block's frame holding one live piece held every segment behind it so, the file
+    // full of frames the sweep never reached (found by mantle, 2026-11-07).
     // The segment after the tail, unless it is the head, which takes the next frame.
     let dead_behind = state.segments.live.len() > 2
         && state
@@ -349,7 +355,21 @@ pub(crate) fn sweepable(state: &State, p: &Params) -> Result<bool, LogError> {
             .live
             .get(1)
             .is_some_and(|&slot| state.live.of(slot).0 == 0);
-    Ok(dead_behind || frame < state.live.used(tail))
+    let freed = p
+        .config
+        .segment_bytes
+        .checked_sub(block(p)?)
+        .ok_or(LogError::Config("a segment under its header's block"))?;
+    let head_end = slot_start(&p.config, state.head.slot)?
+        .checked_add(p.config.segment_bytes)
+        .ok_or(LogError::Damaged("an offset past u64"))?;
+    let head_rest = head_end.saturating_sub(state.head.offset);
+    let taken = if frame <= head_rest {
+        frame
+    } else {
+        frame.saturating_add(head_rest)
+    };
+    Ok(dead_behind || taken < freed)
 }
 
 /// What the device reads for a sweep: the tail's segment, from its first frame to its end, and
@@ -1100,7 +1120,6 @@ pub(crate) fn publish<F>(
     if target.opens {
         open_segment(state, target)?;
     }
-    state.live.wrote(target.slot, target.frame_len);
     let sequence = state.next_sequence;
     state.durable = sequence;
     state.durable_tail = tail;
@@ -1149,7 +1168,6 @@ fn open_segment(state: &mut State, target: &Target) -> Result<(), LogError> {
     if let Some(entry) = state.segments.nonce.get_mut(slot) {
         *entry = target.nonce;
     }
-    state.live.open(target.slot);
     state.segments.free.retain(|(s, _)| *s != target.slot);
     state.segments.live.push_back(target.slot);
     state.next_incarnation = state

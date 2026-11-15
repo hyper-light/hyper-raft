@@ -826,6 +826,39 @@ its threshold; the queue admits `GROUP_SUBMISSIONS` writes for every group the n
 never refuses a handle's write for count. Facts that give no configuration are refused, typed
 (`LogError::Unfit`), never clamped, and no caller copies the log's constants.
 
+A group's bound comes before the file's (2026-11-09, found by mantle). A group's bounds count
+entries and their payload, and the file holds frames: an update of one entry of a few hundred bytes
+written alone is a frame of a whole block, and once the sweep has packed the live records, each
+entry still takes its 16-byte header and a relocated record's 29 beside its payload. mantle's
+founder, its file sized for its groups' payload (135,503,872 bytes, `group_bytes` 4,667,697 for each
+of six groups), filled with 30,896 frames of about a block while no group was near its bound, and
+every write was refused `Full`. `Config::derive` now holds each group's bounds to what the file holds of that group as the file
+stores it: half the room of the segments past the three working ones (a frame goes whole into one
+segment, so two segments in a row hold more than one segment's room of frames, and an entry just
+past half a segment fills one alone), counting each entry's headers and the group's hard state,
+start and released mark. Where the cadence asks more, the payload bound is held to half that share,
+never under the largest entry, and the entries' bound to what the rest holds of their headers: an
+owner's cadence is its bytes, and a group of small entries reaches the entries' bound first. A
+group filling the file is then refused `Backlog`, its owner compacting, before the file is refused
+`Full`, whatever its updates' size, down to one entry an update. The share is the whole file's, not
+divided among the groups the node admits: an admission bound is the most groups a node may be
+placed, and divided, 4,096 groups on a GiB left each under one entry of 8 MiB. Every group filling
+at once is refused `Backlog` first on a budget of `Config::disk_for(facts)` or more, which names the
+bytes that hold every group's cadence retention at once as the file stores it, for an owner to size
+its file by. The least file grows by what one largest entry takes as stored, so that a group of the
+least file holds one, and `Unfit::Disk` names that budget (`tests/retention.rs`: sizes from one
+byte to the largest entry, one group on its payload's budget and four on `disk_for`'s).
+
+The sweep that makes room weighs what moving the oldest segment frees against what its copy takes
+(`writer::sweepable`). Freed, the oldest segment's slot holds a segment's room again however few
+frames it held (frames go only at the head, so what a segment left unwritten when a larger frame
+opened the next is room only once its slot is freed); the copy takes its frame at the head, and the
+head's unwritten rest besides where it does not fit there. Weighed against the oldest segment's
+frames instead, a segment of one block's frame holding one live record was never moved, and in a
+file of three segments, once the newest filled with records its group then let go, every write was
+refused `Full` for good: mantle's leader with its log compacted to one entry (start 286, last 287;
+`tests/retention.rs`, `a_least_file_whose_oldest_segment_holds_one_small_record_...`).
+
 `max_segments` bounds the file, and the volume it lives on may hold less. An owner that shares the
 volume with other writers hands the log a `hyper_log::Growth` (`Log::create_with`,
 `Log::open_with`), and the file grows only as it admits: before a frame opens a slot past the

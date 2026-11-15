@@ -739,9 +739,12 @@ is worked around.
   astray and read past: on both Windows runners the report makes the socket readable on its own,
   holds its place among the datagrams, and the receive future and the batched drain take the
   datagrams queued behind it with nothing more arriving (diag runs 40085130113 and 40085783959; in
-  240 of 240 rounds a drain racing a fresh report took every datagram).
-  `tests/udp_astray_reads_on.rs` keeps it so on Windows CI (`docs/runtime.md` §5.1, "Astray
-  reports"); the silence mantle saw is the entry above.
+  240 of 240 rounds a drain racing a fresh report took every datagram). The silence mantle saw is
+  the entry above. Since 6b5f176 (kiln's CP-T2.2 step 7) every Windows datagram socket hyper-rt makes
+  asks the report off (`SIO_UDP_CONNRESET` FALSE), so none comes; the Windows tests that held the
+  report's handling (`tests/udp_astray.rs`, `tests/udp_astray_reads_on.rs`) went with it, the first
+  having waited for good on every Windows gates job from 22d5037 on (`docs/runtime.md` §5.1, "Astray
+  reports").
 
 - **hyper-liveness: a node that heard no peer backed off unannounced, and the peers that heard it
   suspected it at every doubling (found 2026-10-24 in the simulation, looking into mantle's roll

@@ -846,19 +846,25 @@ the platform calls behind one seam per kind (`netsys`), Unix through `rustix`, W
   for the same datagram as its own and refuses it, counted (`Batched::send`, `UdpSocket::send_to_writable`).
   One unroutable destination held a socket's whole queue before (2026-10-10, found by focal: a connector
   that dialed a name's `::1` from an IPv4 socket stopped sending to every peer).
-  On Windows, measured on windows-2025 and windows-11-arm (2026-10-24, branch `hunt/udp-reset-windows`,
-  runs 40085130113 and 40085783959): a send to a closed port makes the socket readable on its own
-  within 0.1 ms; `FIONREAD` counts a lone report as one byte, and beside datagrams only their bytes;
-  the report keeps its place among the datagrams (one queued before it is read first) and is consumed
-  by the one receive that returns it, while a send meanwhile neither returns it nor takes it. The
-  receive future and the batched drain take the datagrams behind it with nothing more arriving
-  (`tests/udp_astray_reads_on.rs`). Asked off (`SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` set FALSE,
-  as Go's `net` does for every UDP socket, go.dev/issue/5834 and /68614), no report comes, as on an
-  unconnected Linux or XNU socket (Linux `v6.12` `__udp4_lib_err` tells only a connected socket
-  without `IP_RECVERR`; XNU's `udp_ctlinput` looks up only an exact four-tuple). They are left on:
-  reading past one costs a wake and a receive that moves no data, the count is the socket's own
-  record (`IoStats::astray`), and switching them off changed nothing measured (mantle's Windows
-  silences came as often either way: `docs/STATUS.md`, closed 2026-10-24).
+  On Windows every datagram socket hyper-rt makes asks the port-unreachable report off as it is made
+  (`SIO_UDP_CONNRESET` set FALSE, `netsys::set_no_connreset`, since 6b5f176, kiln's CP-T2.2 step 7),
+  as Go's `net` does for every UDP socket (go.dev/issue/5834 and /68614): a socket that sent to peers
+  that went away (a killed process's closed port) met the report again and again, and Quiver's
+  three-machine lab found a publisher's socket on Windows that never connected again once its peers
+  had been killed. So a send to a closed port comes back as nothing, as on an unconnected Linux or
+  XNU socket (Linux `v6.12` `__udp4_lib_err` tells only a connected socket without `IP_RECVERR`;
+  XNU's `udp_ctlinput` looks up only an exact four-tuple), and the socket goes on taking its peers'
+  datagrams (`tests/udp.rs`, `a_socket_that_sent_to_a_closed_port_on_windows_still_receives_from_its_peers`).
+  `SIO_UDP_NETRESET` (a datagram whose time to live ran out) is left on, its report read past as
+  above. While the port-unreachable report was on, measured on windows-2025 and windows-11-arm
+  (2026-10-24, branch `hunt/udp-reset-windows`, runs 40085130113 and 40085783959), a send to a closed
+  port made the socket readable on its own within 0.1 ms; `FIONREAD` counted a lone report as one
+  byte, and beside datagrams only their bytes; the report kept its place among the datagrams and was
+  consumed by the one receive that returned it, and the receive future and the batched drain took
+  the datagrams behind it with nothing more arriving. The two Windows tests that held those facts
+  (`tests/udp_astray.rs`, `tests/udp_astray_reads_on.rs`) went with the report: no socket hyper-rt
+  makes can draw one now, and the first waited for good on a readiness that never came (every
+  Windows gates job from 22d5037 to 045cf3f ran to its 124-minute bound there).
 - **Don't-fragment** set per OS, as slates does; a send the OS has no room for is `WouldBlock`, awaited on
   writability, never a lost path (slates' AUD-29-61).
 - **Socket activation** (`adopt`, `into_owned`) kept from slates, on Windows too.

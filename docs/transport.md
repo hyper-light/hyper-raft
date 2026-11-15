@@ -470,7 +470,8 @@ never depends on it.
     drains the socket, fires the timers due, sends what the endpoint transmits, and parks on the
     socket and the timer. An event already queued is handed out with no system call.
   - `endpoint()` lends the endpoint for the owner's calls between events; `flush()` sends what
-    those calls queued without waiting; `stats()` counts datagrams, system calls and drops.
+    those calls queued without waiting; `stats()` counts datagrams and their payload bytes, system
+    calls and drops.
 - `PlaneSocket`: a hyper-datagram `Plane`'s own socket. `flush(plane, route, refused)` seals and
   sends; `receive(plane, fence, deliver).await` opens a batch, its future `Send` (the owner's
   `Fence` is `Sync`, §4v); `receive_ready(plane, fence,
@@ -2441,6 +2442,54 @@ Tests (hyper-rt-transport `tests/held_still.rs`, real sockets, the hold the only
   both are held 5 s. Each takes the other's frame, and both keep the connection. Before: whichever
   side was polled first closed it.
 - hyper-rt `a_receive_is_whole_when_it_took_all_that_was_queued_as_it_began`.
+
+## 4aq. No endpoint offers to take QUIC DATAGRAM frames (2026-11-12, found by mantle)
+
+hyper-quic's default transport, upstream's, sets `datagram_receive_buffer_size` to
+`STREAM_RWND`, 1,250,000 bytes. Every connection an endpoint made or accepted therefore sent the
+`max_datagram_frame_size` transport parameter (RFC 9221 §3). That parameter tells the peer it may
+send DATAGRAM frames, up to that many bytes of them buffered unread, on every connection. No owner
+sends or reads one: the transport's messages travel on streams, and the plane's heartbeats on its
+own sealed socket (§4c). mantle's plan for its doors (Lean doors, step 8; mantle
+`docs/research/71-the-doors-costs.md`, "The candidates") found 0 allocations under hyper-quic's
+datagram code in every window it recorded. So the allowance held no memory: it was only a promise
+nobody used.
+
+`Limits::transport` now sets the receive buffer to `None`. No endpoint sends the parameter, and a
+peer that sends a DATAGRAM frame anyway is closed with PROTOCOL_VIOLATION, as RFC 9221 §3 requires
+of a receiver that did not advertise support (hyper-quic `Datagrams::received`). Nothing an owner
+sends changes.
+
+Tests (`tests/datagrams.rs`). Each reads the parameter as the peer received it, from a bare
+hyper-quic connection whose `datagrams().max_size()` is `None` exactly when the peer sent none:
+
+- `bare_hyper_quic_advertises_datagrams_so_the_reading_sees_them`: two bare connections on
+  hyper-quic's default each read the other's parameter, so the reading can see one.
+- `a_node_accepting_a_connection_advertises_no_datagrams` and
+  `a_node_dialing_a_connection_advertises_no_datagrams`: a node on either end sends none. Before:
+  both read `Some(1414)`, the path's room for one.
+
+## 4ar. A client's compressed certificate, decoded within its bound (2026-11-12, found by mantle)
+
+A node's server reads a client's certificate before the client has authenticated, and every
+node's CertificateRequest offers Brotli and zlib (RFC 8879), so the decoder takes a stranger's
+bytes. On Google's CVE-2026-111497 (an out-of-bounds write in its C decoder's block-type switch,
+fixed 2026-10-21) the owner decided: "Upgrade the decoder." hyper-tls decodes with
+brotli-decompressor 6.1.1, released that day, where it linked the Rust port's 5.0.3 through
+brotli 8.0.4. Both are safe Rust, so a bug of the C kind there is a panic; the decoder now runs
+inside an unwind boundary that makes it the handshake's typed refusal (alert bad_certificate,
+CRYPTO_ERROR 0x12a on QUIC, RFC 9001 §4.8), and the node serves on.
+
+cargo deny's advisory database names RUSTSEC-2026-0348 against the rustls this crate conforms:
+the decoder took Brotli's large-window extension, so five bytes could allocate 1 GiB. hyper-tls
+takes upstream 0.23.46's fix, a strict RFC 7932 decoder filling the certificate's buffer exactly.
+Strict decoding still sized its ring buffer to the window and metablock a header declares: four
+bytes took 16,780,366. The decoder's byte allocations are now bounded to what a stream decoding
+to the certificate's length takes: those four bytes 2,584, a whole 1 KiB certificate 38,835. The
+derivation, the measurements and the tests are hyper-tls `VENDORED.md` §11. Tests here:
+`certificates::a_certificate_that_does_not_decompress_is_refused_and_the_node_serves_on`, three
+malformed Brotli client certificates each closing its connection with 0x12a, then a client whose
+certificate is Brotli-compressed connected.
 
 ## 5. Consumers
 

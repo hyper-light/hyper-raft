@@ -7700,6 +7700,247 @@ fn test_cert_decompression_by_server_would_result_in_excessively_large_cert() {
     );
 }
 
+/// A client whose CompressedCertificate makes the server's decoder panic is refused, typed, as a
+/// certificate that does not decompress (the unwind boundary, VENDORED.md §11), and the server's
+/// configuration completes the next client's handshake, one that sends its certificate whole.
+#[test]
+fn a_decoder_that_panics_refuses_the_handshake_and_the_server_serves_on() {
+    let provider = provider::default_provider();
+    let mut server_config =
+        make_server_config_with_mandatory_client_auth(KeyType::Rsa2048, &provider);
+    server_config.cert_decompressors = vec![&PanickingDecompressor];
+    let server_config = Shared::new(server_config);
+    let mut client_config = make_client_config_with_auth(KeyType::Rsa2048, &provider);
+    client_config.cert_compressors = vec![&IdentityCompressor];
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config.clone());
+    assert_eq!(
+        do_handshake_until_error(&mut client, &mut server),
+        Err(ErrorFromPeer::Server(Error::PeerMisbehaved(
+            PeerMisbehaved::InvalidCertCompression
+        )))
+    );
+    transfer(&mut server, &mut client);
+    assert_eq!(
+        client.process_new_packets(),
+        Err(Error::AlertReceived(AlertDescription::BadCertificate))
+    );
+
+    let mut client_config = make_client_config_with_auth(KeyType::Rsa2048, &provider);
+    client_config.cert_compressors = vec![];
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    assert!(!client.is_handshaking() && !server.is_handshaking());
+}
+
+/// A Brotli CompressedCertificate that is not Brotli is refused by the shipped decoder, typed, and
+/// the server's configuration then takes a Brotli-compressed client certificate whole.
+#[test]
+fn a_malformed_brotli_certificate_is_refused_and_the_server_serves_on() {
+    let provider = provider::default_provider();
+    let server_config = Shared::new(make_server_config_with_mandatory_client_auth(
+        KeyType::Rsa2048,
+        &provider,
+    ));
+    for junk in [
+        &[0xffu8; 64][..],
+        &[0x00; 1024][..],
+        &[0x8b, 0x02, 0x80][..],
+    ] {
+        let mut client_config = make_client_config_with_auth(KeyType::Rsa2048, &provider);
+        client_config.cert_compressors = vec![Box::leak(Box::new(JunkBrotliCompressor(junk)))];
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config.clone());
+        assert_eq!(
+            do_handshake_until_error(&mut client, &mut server),
+            Err(ErrorFromPeer::Server(Error::PeerMisbehaved(
+                PeerMisbehaved::InvalidCertCompression
+            ))),
+            "{junk:?}"
+        );
+        transfer(&mut server, &mut client);
+        assert_eq!(
+            client.process_new_packets(),
+            Err(Error::AlertReceived(AlertDescription::BadCertificate))
+        );
+    }
+
+    let mut client_config = make_client_config_with_auth(KeyType::Rsa2048, &provider);
+    client_config.cert_compressors = vec![hyper_tls::compress::BROTLI_COMPRESSOR];
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    assert!(!client.is_handshaking() && !server.is_handshaking());
+}
+
+/// A server whose encoder panics sends its certificate uncompressed, as for any failed compression,
+/// and the handshake completes.
+#[test]
+fn an_encoder_that_panics_sends_the_certificate_uncompressed() {
+    let provider = provider::default_provider();
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider);
+    server_config.cert_compressors = vec![&PanickingCompressor];
+    let mut client_config = make_client_config(KeyType::Rsa2048, &provider);
+    client_config.cert_decompressors = vec![&PanickingDecompressor];
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    assert!(!client.is_handshaking() && !server.is_handshaking());
+}
+
+/// A client keeps the group a server chose as the next ClientHello's hint only once that server is
+/// authenticated: a ServerHello from a server whose certificate the client refuses leaves no hint
+/// (RUSTSEC-2026-0349), and a handshake that completes leaves its group's.
+#[test]
+fn a_kx_hint_is_kept_only_from_an_authenticated_server() {
+    let provider = provider::default_provider();
+    let storage = ClientStorage::new();
+    // The client trusts the ECDSA authority; the server presents an RSA chain, refused after its
+    // ServerHello was read.
+    let mut client_config = make_client_config(KeyType::EcdsaP256, &provider);
+    client_config.resumption = Resumption::store(Box::new(storage.clone()));
+    let server_config = make_server_config(KeyType::Rsa2048, &provider);
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    assert!(matches!(
+        do_handshake_until_error(&mut client, &mut server),
+        Err(ErrorFromPeer::Client(Error::InvalidCertificate(_)))
+    ));
+    let ops = storage.ops_and_reset();
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, ClientStorageOp::SetKxHint(..))),
+        "{ops:?}"
+    );
+
+    let mut client_config = make_client_config(KeyType::Rsa2048, &provider);
+    client_config.resumption = Resumption::store(Box::new(storage.clone()));
+    let server_config = make_server_config(KeyType::Rsa2048, &provider);
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    let ops = storage.ops();
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, ClientStorageOp::SetKxHint(..))),
+        "{ops:?}"
+    );
+}
+
+/// A client whose ECH offer the server rejects sends none of the application data it wrote before
+/// the handshake ended to the server it reached, authenticated only for the config's
+/// `public_name`: the handshake ends with the ech_required alert and nothing else (RUSTSEC-2026-0347,
+/// RFC 9849 §6.1.6).
+#[test]
+fn a_rejected_ech_offer_sends_no_application_data_to_the_outer_server() {
+    let provider = provider::default_provider();
+    let suite = ALL_SUPPORTED_SUITES[0];
+    let (public_key, _) = suite.generate_key_pair().unwrap();
+    let suite_id = suite.suite();
+    let config = EchConfigPayload::V18(EchConfigContents {
+        key_config: HpkeKeyConfig {
+            config_id: 10,
+            kem_id: suite_id.kem,
+            public_key: PayloadU16::new(public_key.0.clone()),
+            symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
+                kdf_id: suite_id.sym.kdf_id,
+                aead_id: suite_id.sym.aead_id,
+            }],
+        },
+        maximum_name_length: 0,
+        // The name the test server's certificate is valid for, so the outer handshake completes.
+        public_name: DnsName::try_from("localhost").unwrap(),
+        extensions: vec![],
+    });
+    let mut config_bytes = Vec::new();
+    vec![config].encode(&mut config_bytes);
+    let ech_config = EchConfig::new(EchConfigListBytes::from(config_bytes), &[suite]).unwrap();
+    let client_config = ClientConfig::builder_with_provider(static_provider(provider.clone()))
+        .with_ech(EchMode::Enable(ech_config))
+        .unwrap();
+    let client_config = finish_client_config(KeyType::Rsa2048, client_config);
+    let server_config = make_server_config(KeyType::Rsa2048, &provider);
+    let mut client = TestClient::new(
+        client_config,
+        ServerName::DnsName(DnsName::try_from("inner.example").unwrap()),
+    )
+    .unwrap();
+    let mut server = TestServer::new(server_config).unwrap();
+    client
+        .writer()
+        .write_all(b"meant for the inner server")
+        .unwrap();
+
+    assert_eq!(
+        do_handshake_until_error(&mut client, &mut server),
+        Err(ErrorFromPeer::Client(Error::PeerIncompatible(
+            PeerIncompatible::ServerRejectedEncryptedClientHello(None)
+        )))
+    );
+    transfer(&mut client, &mut server);
+    let processed = server.process_new_packets();
+    let mut received = Vec::new();
+    let _ = server.reader().read_to_end(&mut received);
+    assert!(
+        received.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&received)
+    );
+    assert_eq!(
+        processed,
+        Err(Error::AlertReceived(
+            AlertDescription::EncryptedClientHelloRequired
+        ))
+    );
+}
+
+#[derive(Debug)]
+struct PanickingDecompressor;
+
+impl hyper_tls::compress::CertDecompressor for PanickingDecompressor {
+    fn decompress(
+        &self,
+        _input: &[u8],
+        _output: &mut [u8],
+    ) -> Result<(), hyper_tls::compress::DecompressionFailed> {
+        panic!("a decoder's logic bug, reached by the peer's bytes")
+    }
+
+    fn algorithm(&self) -> hyper_tls::CertificateCompressionAlgorithm {
+        hyper_tls::CertificateCompressionAlgorithm::Zlib
+    }
+}
+
+#[derive(Debug)]
+struct PanickingCompressor;
+
+impl hyper_tls::compress::CertCompressor for PanickingCompressor {
+    fn compress(
+        &self,
+        _input: Vec<u8>,
+        _level: hyper_tls::compress::CompressionLevel,
+    ) -> Result<Vec<u8>, hyper_tls::compress::CompressionFailed> {
+        panic!("an encoder's logic bug")
+    }
+
+    fn algorithm(&self) -> hyper_tls::CertificateCompressionAlgorithm {
+        hyper_tls::CertificateCompressionAlgorithm::Zlib
+    }
+}
+
+/// Says it compresses with Brotli and sends its bytes whatever the certificate.
+#[derive(Debug)]
+struct JunkBrotliCompressor(&'static [u8]);
+
+impl hyper_tls::compress::CertCompressor for JunkBrotliCompressor {
+    fn compress(
+        &self,
+        _input: Vec<u8>,
+        _level: hyper_tls::compress::CompressionLevel,
+    ) -> Result<Vec<u8>, hyper_tls::compress::CompressionFailed> {
+        Ok(self.0.to_vec())
+    }
+
+    fn algorithm(&self) -> hyper_tls::CertificateCompressionAlgorithm {
+        hyper_tls::CertificateCompressionAlgorithm::Brotli
+    }
+}
+
 #[derive(Debug)]
 struct GarbageDecompressor;
 

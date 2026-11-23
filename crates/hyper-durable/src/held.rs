@@ -1,7 +1,7 @@
 //! The core's storage: the group's durable log as its [`LogStore`] answers for it, with what the
 //! replica keeps beside it — the configuration it opened at and the snapshot it prepared for
 //! members that lag behind the log's start.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use hyper_raft::proto::{ConfState, Entry, HardState, Snapshot};
 use hyper_raft::{InitialState, Storage, StorageError};
@@ -18,6 +18,9 @@ pub struct Held<L> {
     pub(crate) opened: HardState,
     /// The snapshot prepared for a member that needs entries the log no longer holds.
     pub(crate) snapshot: Option<Snapshot>,
+    /// Whether the core asked for a snapshot while none was prepared: a member that opened on a
+    /// compacted log prepares its image only once one is asked for (`Replica::drive`).
+    pub(crate) asked: Cell<bool>,
     /// The bytes of one page the core walks storage by: the store reads at most this much at a
     /// time when the core looks at entries without taking them.
     pub(crate) page: u64,
@@ -33,6 +36,7 @@ impl<L: LogStore> Held<L> {
             configuration,
             opened,
             snapshot: None,
+            asked: Cell::new(false),
             page,
             scratch: RefCell::new(Entry::default()),
         }
@@ -107,7 +111,11 @@ impl<L: LogStore> Storage for Held<L> {
             Some(snapshot) if hyper_raft::proto::snapshot_index(snapshot) >= request_index => {
                 Ok(snapshot.clone())
             }
-            _ => Err(StorageError::SnapshotTemporarilyUnavailable),
+            Some(_) => Err(StorageError::SnapshotTemporarilyUnavailable),
+            None => {
+                self.asked.set(true);
+                Err(StorageError::SnapshotTemporarilyUnavailable)
+            }
         }
     }
 }

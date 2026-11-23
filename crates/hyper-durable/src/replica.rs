@@ -559,18 +559,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             heir_since: None,
             slow_disks: Vec::new(),
         };
-        // A log compacted before the restart serves a lagging member only by snapshot, and its
-        // image is what the compaction rule weighs the log against; a log never compacted is
-        // weighed against the image of what the member opened with, as its machine states it.
-        replica.imaged = if view.start.index > 0 {
-            let prepared = replica.prepare().map_err(|e| match e {
-                ReplicaError::Fenced(Cause::Machine(fatal)) => OpenError::Machine(fatal),
-                _ => OpenError::Core(hyper_raft::Error::Invariant("a snapshot at open")),
-            })?;
-            Some(prepared)
-        } else {
-            replica.machine.image_bytes()
-        };
+        // The compaction rule weighs the log against the image of what the member opened with,
+        // as its machine states it without making it. A log compacted before the restart serves
+        // a lagging member only by snapshot, prepared once the core first asks for one
+        // (`Replica::prepare_asked`): opening never images the whole state machine.
+        replica.imaged = replica.machine.image_bytes();
         replica
             .count_applied(view.start.index)
             .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
@@ -1600,6 +1593,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
             }
+            r.prepare_asked()?;
             r.release_reads(out);
             r.keep();
             r.settle();
@@ -2540,6 +2534,22 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let imaged = bytes(snapshot.data.len());
         self.node.store_mut().snapshot = Some(snapshot);
         Ok(imaged)
+    }
+
+    /// Prepares the snapshot the core asked for while none was prepared: a member that opened on
+    /// a compacted log holds none until then, and the core asks again once it is ready (its
+    /// `SnapshotTemporarilyUnavailable`). A log never compacted holds every entry a member lacks.
+    fn prepare_asked(&mut self) -> Result<(), ReplicaError> {
+        let store = self.node.store();
+        if !store.asked.replace(false) || store.snapshot.is_some() {
+            return Ok(());
+        }
+        let start = store.log.bounds().map(|(start, _)| start.index);
+        let start = start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+        if start > 0 {
+            self.prepare()?;
+        }
+        Ok(())
     }
 
     /// Makes the state machine's applied state durable and lets the log free what is before it,

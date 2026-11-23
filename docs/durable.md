@@ -868,10 +868,13 @@ replica's budget, and give their room back by half once a quarter of it is used 
 contraction, Cormen et al., *Introduction to Algorithms*, §17.4). A compaction's start the log refuses changes nothing, and the log stays due
 for the owner to ask again (§2.4). The image is the one the shell made at its last compaction (the
 snapshot it serves members behind the start), the one it installed, or at open, the image of what
-the member opened with: the one it prepares when the log was compacted before, else the machine's
-word (`StateMachine::image_bytes`), so that a group formed holding state, as a range split from
-another is, is weighed against that state and not against nothing. A machine that keeps no image is
-never due.
+the member opened with, as its machine states it without making it (`StateMachine::image_bytes`),
+so that a group formed holding state, as a range split from another is, is weighed against that
+state and not against nothing. A log compacted before the open serves a lagging member only by
+snapshot, and the shell prepares it the first time the core asks for one (`Replica::prepare_asked`,
+the core asking again once it is ready): opening never images the whole state machine, which for a
+database of 10 GiB took 10 GiB of memory and its full read (Amphora's audit §7.6). A machine that
+keeps no image is never due.
 
 A leader waits while a member lacks what it applied, as long as the log holds no more than twice the
 threshold. slates measured a leader that compacted the moment a majority held its entries: it sent

@@ -2192,7 +2192,7 @@ fn a_member_that_reopens_counts_what_its_log_holds() {
         Unbounded,
     )
     .unwrap();
-    // Its log compacted, the member made an image at open, of everything applied.
+    // Its log compacted, it is weighed against the image of everything applied.
     let image = image_of(&mut r);
     r.campaign().unwrap();
     pump(&mut r);

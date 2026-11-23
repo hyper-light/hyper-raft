@@ -59,8 +59,8 @@ pub trait StateMachine {
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
 
     /// The bytes [`StateMachine::image`] would write now, or none for a machine that keeps no
-    /// image. Asked when a member opens on a log never compacted: the compaction rule weighs the
-    /// log against the image it was last compacted to ([`crate::Compaction`]), and before the
+    /// image, counted without making it. Asked when a member opens: the compaction rule weighs
+    /// the log against the image it was last compacted to ([`crate::Compaction`]), and before the
     /// first, against the state the member opened with, which a group formed with state (a range
     /// split from another) holds already. A machine that keeps none is never due.
     fn image_bytes(&self) -> Option<u64>;

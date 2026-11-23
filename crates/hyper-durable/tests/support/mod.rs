@@ -457,6 +457,8 @@ pub struct Kv {
     pub acted: Vec<u64>,
     /// Each change applied since the member opened, by index, with the context its entry stated.
     pub changes: Vec<(u64, Vec<u8>)>,
+    /// Every image made: what the owner paid for snapshots.
+    pub images: u64,
 }
 
 /// What a fenced entry's data begins with: a member acts on it at its next start.
@@ -478,6 +480,7 @@ impl Kv {
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
+            images: 0,
         }
     }
     /// What a crash leaves.
@@ -492,6 +495,7 @@ impl Kv {
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
+            images: 0,
         }
     }
 }
@@ -567,6 +571,7 @@ impl StateMachine for Kv {
         self.control || entry.data.starts_with(ACTS)
     }
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
+        self.images += 1;
         let state = if self.checkpoints {
             &self.durable
         } else {

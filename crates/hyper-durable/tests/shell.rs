@@ -2201,6 +2201,79 @@ fn a_member_that_reopens_counts_what_its_log_holds() {
     grow_until_due(&mut r, rule, held + entry_of(0), 2 * image);
 }
 
+/// A member that opens on a log compacted before the restart makes no image of its state machine
+/// at open; it makes one once its core first asks for a snapshot, and the member that lags behind
+/// the log's start is sent it (Amphora audit §7.6, `docs/durable.md`).
+#[test]
+fn a_member_that_opens_on_a_compacted_log_images_only_once_a_snapshot_is_asked_for() {
+    let mut r = sole(1, Unbounded, |_| {});
+    for data in [b"a", b"b", b"c"] {
+        r.propose(Vec::new(), data.to_vec()).unwrap();
+    }
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let compacted = r.applied();
+    r.machine_mut().persist().unwrap();
+    let disk = r.log_mut().disk.clone();
+    let mut machine = r.into_machine();
+    machine.images = 0;
+    let mut r: Sim = Replica::open(
+        &settings(1, 7),
+        SimStore::from_disk(disk, 1),
+        machine,
+        Unbounded,
+    )
+    .unwrap();
+    assert_eq!(r.machine().images, 0, "opening makes no image");
+    r.campaign().unwrap();
+    pump(&mut r);
+    assert!(r.is_leader());
+    r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 2))
+        .unwrap();
+    let probe = pump(&mut r)
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+        .expect("a probe of the learner");
+    assert_eq!(
+        r.machine().images,
+        0,
+        "no image before a snapshot is asked for"
+    );
+
+    r.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: probe.term,
+        index: probe.index,
+        reject: true,
+        reject_hint: 0,
+        ..Message::default()
+    })
+    .unwrap();
+    let to_learner = |out: Output<(u64, Vec<u8>)>| {
+        out.messages
+            .into_iter()
+            .find(|m| m.to == 2 && m.msg_type == MessageType::MsgSnapshot)
+    };
+    let sent = match to_learner(pump(&mut r)) {
+        Some(sent) => sent,
+        None => {
+            // The core asked while none was prepared: the snapshot is ready at its next send.
+            r.propose(Vec::new(), b"d".to_vec()).unwrap();
+            to_learner(pump(&mut r)).expect("a snapshot for the learner once one is prepared")
+        }
+    };
+    assert_eq!(r.machine().images, 1, "one image, made when asked for");
+    let metadata = sent.snapshot.unwrap().metadata.unwrap();
+    assert!(
+        metadata.index >= compacted.index,
+        "it covers what the log no longer holds"
+    );
+}
+
 /// A compaction counts what the log goes on holding past its new start once the start is durable,
 /// the entries a leader applied before its own write of them is durable among them (§4.2), which
 /// the store does not hold yet; while the start is out, the log is not due, for a compaction waits

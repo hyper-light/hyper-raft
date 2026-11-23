@@ -1710,7 +1710,7 @@ hunk keeps that call beside the change's `image_bytes()`.
 
 | consumer | how it pins hyper-raft | suite run | old | new | run |
 |---|---|---|---|---|---|
-| mantle | `vendor/`, at `5e40eb9` (`87ab09e1`) | `cargo test --workspace --locked --no-fail-fast` | in flight at 19:05Z; its first 8 test binaries ran, failing `a_silently_skipped_cli_upload_is_not_acknowledged`, `the_aws_cli_and_boto3_pass_against_a_cell_of_three` and `a_cell_filled_with_large_objects_refuses_the_next_through_both_doors_and_keeps_none_of_it` | queued behind the old run in `r1407`; the first run (`r1386`, stopping at the first failing binary) failed `a_silently_skipped_cli_upload_is_not_acknowledged` alike on both | `r1386`, `r1407` |
+| mantle | `vendor/`, at `5e40eb9` (`87ab09e1`) | `cargo test --workspace --locked --no-fail-fast` | 187 test binaries, 1625 pass, 8 ignored, 4 fail: `a_silently_skipped_cli_upload_is_not_acknowledged`, `the_aws_cli_and_boto3_pass_against_a_cell_of_three`, `a_cell_filled_with_large_objects_refuses_the_next_through_both_doors_and_keeps_none_of_it`, `the_small_set_and_large_objects_in_every_way_read_back_exactly` | the same: 187 binaries, 1625 pass, 8 ignored, the same 4 fail | `r1386`, `r1407` |
 | kiln (Quiver's copy too) | `vendor/hyper-raft` by `scripts/vendor.py`, at `e0613f5` (`fd5bd770`) | `cargo test -p kiln-cd -p kiln-obs`; `cargo test -p kiln --lib` | kiln-cd and kiln-obs pass (372, 229, 4); `--lib` building at 19:05Z (the first try stopped: kiln needs a newer rustc than mantle's 1.98.1) | the same 372, 229, 4 pass; queued behind it in `r1408` | `r1394`, `r1408` |
 | focal | `vendor/`, at `5007f44` (`dd5f80a3`) | `cargo test --locked -p focal-consensus` (hyper-durable's one user; not the 80-minute suite) | 162 + 3 pass | 162 + 3 pass | `r1397` |
 | slates | `vendor/hyper-raft`, at `aa82ada` | none: it vendors no hyper-durable, so its sources are the same on both | - | - | - |
@@ -1723,6 +1723,15 @@ that passed on the old. The change has had no test of its own: `u2/0008-open-bui
 core asks, and the learner behind the log's start is sent it), which passes on `main` and fails on
 `045cf3f`'s sources (`left: 1, right: 0`, "opening makes no image"); hyper-durable's suite, clippy and
 fmt pass on it (`r1405`).
+
+**Appended by Amphora's lane U3 (2026-11-23, 19:55Z).** mantle's full suite ended both ways in `r1407`
+(old 19:19Z, new 19:53Z): the same four tests fail on each, all four in mantle's stock clients
+(`stock_clients.rs`, `transfer/stock`) and transfer suite (`transfer.rs`), and fail without the change.
+kiln's `--lib` (`r1408`) was still on its old run at 19:55Z (36 failures there, before the change),
+its new run not yet started. focal's full suite (its CI's `cargo test --workspace --locked`, with
+`--no-fail-fast`, `--test-threads=4`, 4 cores held each) runs as `r1450` (old) and `r1451` (new),
+side by side, logs `~/.cache/hyper-raft-dependents/u3-focal-{old,new}.log` on adacachy2. Still no
+test has failed with the change that passed without it.
 
 ## What remains (2026-10-16)
 

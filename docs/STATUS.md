@@ -1691,6 +1691,15 @@ is worked around.
 | focal | every crate it takes vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`eb6ce081` on its main's `95294367`; focal's gate exit 0, 167 test binaries, 3469 passed, 31 ignored), three of its tests draining until a sole voter leads (I9), which its session lands under its own rules; its `main` vendors twelve at `5007f44` and hyper-transport at `81af6b3`, both on `main` since `3d86b42` | the core (step 1) and the transport (step 4: hyper-quic, hyper-transport and hyper-rt in place of quinn and tokio) switched; its storage on hyper-log and the shell (F-1, D-2) built behind `STORAGE_LEVEL`, its `CAPABILITY_LEVEL` still 2; timing and liveness (step 3) open, its shell electing on ticks |
 | slates | hyper-datagram, hyper-seal, hyper-swim and hyper-timing vendored at `80c1f82` on its branch `hr-vendor-80c1f82` (`5f2a76d4` on its main's head `b85b37ea`; fmt, its structural and literal checks, clippy on slates-cluster, its library's 213 tests and the member plane's 10 pass), one commit touching only `vendor/hyper-raft`, which its session lands on the owner's word; its main vendors them at `aa82ada`, their sources the same but for hyper-timing's `independent_interval`, which `43aec4a` removed and slates calls nowhere | SWIM (S-1) and the datagram plane (P-1) switched; its consensus onto hyper-raft (X-1) and its session plane onto hyper-transport (X-2) open, slates' runtime onto hyper-rt slates' own step |
 
+**A change to `main` announced (Amphora's lane U1, 2026-11-23, 18:10Z).** Branch
+`amphora/audit-7.6-image-on-ask` (`7d1c7be`, on `d5d5f8f`) merges into `main` as soon as
+hyper-raft's and hyper-durable's tests, clippy, fmt and contracts pass on it and on its merge with
+`main` (`amphora/audit-7.6-on-main`). It changes hyper-durable's `Replica::open` alone: a log
+compacted before the open no longer has its snapshot made at open; the first `Replica::drive` after
+the core asks for one makes it (`docs/durable.md`). No API changes. mantle, focal, kiln and Quiver
+take it when they next vendor `main`; a merge to `main` meanwhile merges with this branch rather
+than racing it. Amphora then pins `7d1c7be` and drops its patch 0008.
+
 ## What remains (2026-10-16)
 
 In the owner's order: red CI first; then every consumer on one revision of `main`; then the shared

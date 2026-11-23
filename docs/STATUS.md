@@ -1700,6 +1700,30 @@ changes. On `7d1c7be` and on `5b48547`, under 1.98.1 on adacachy2: contracts, `c
 test target of both crates pass. mantle, focal, kiln and Quiver take it when they next vendor
 `main`; none ran its suite on it (CLAUDE.md §3). Amphora pins `7d1c7be` and has dropped its patch 0008.
 
+**The consumers' suites on the §7.6 change (Amphora's lane U2, 2026-11-23, 18:30-19:05Z, appended to as runs end).** Each
+consumer's suite ran twice on adacachy2 (Linux x86-64, 8 cores held), from a scratch clone of its
+`main`: once as it stands (old) and once with `7d1c7be`'s change to `crates/hyper-durable/src` applied
+to its vendored hyper-durable (new), so the two runs differ by that change alone. mantle's and kiln's
+copies of the three files it touches were byte for byte `d5d5f8f`'s, and the change applied as it
+stands; focal's copy (`5007f44`) computes `compactable` with `compactable_after`, so its one conflicting
+hunk keeps that call beside the change's `image_bytes()`.
+
+| consumer | how it pins hyper-raft | suite run | old | new | run |
+|---|---|---|---|---|---|
+| mantle | `vendor/`, at `5e40eb9` (`87ab09e1`) | `cargo test --workspace --locked --no-fail-fast` | in flight at 19:05Z; its first 8 test binaries ran, failing `a_silently_skipped_cli_upload_is_not_acknowledged`, `the_aws_cli_and_boto3_pass_against_a_cell_of_three` and `a_cell_filled_with_large_objects_refuses_the_next_through_both_doors_and_keeps_none_of_it` | queued behind the old run in `r1407`; the first run (`r1386`, stopping at the first failing binary) failed `a_silently_skipped_cli_upload_is_not_acknowledged` alike on both | `r1386`, `r1407` |
+| kiln (Quiver's copy too) | `vendor/hyper-raft` by `scripts/vendor.py`, at `e0613f5` (`fd5bd770`) | `cargo test -p kiln-cd -p kiln-obs`; `cargo test -p kiln --lib` | kiln-cd and kiln-obs pass (372, 229, 4); `--lib` building at 19:05Z (the first try stopped: kiln needs a newer rustc than mantle's 1.98.1) | the same 372, 229, 4 pass; queued behind it in `r1408` | `r1394`, `r1408` |
+| focal | `vendor/`, at `5007f44` (`dd5f80a3`) | `cargo test --locked -p focal-consensus` (hyper-durable's one user; not the 80-minute suite) | 162 + 3 pass | 162 + 3 pass | `r1397` |
+| slates | `vendor/hyper-raft`, at `aa82ada` | none: it vendors no hyper-durable, so its sources are the same on both | - | - | - |
+
+mantle's failures so far are its stock clients' (the AWS CLI, boto3) and its transfer suite's, on the
+old run, before the change is applied; whether the new run fails the same, and kiln's `--lib`, are
+appended here when `r1407` and `r1408` end. Nothing was reverted: no suite has failed on the new run
+that passed on the old. The change has had no test of its own: `u2/0008-open-builds-no-image`
+(`d955df3`) adds one (a member reopened on a compacted log makes no image at open, then one when its
+core asks, and the learner behind the log's start is sent it), which passes on `main` and fails on
+`045cf3f`'s sources (`left: 1, right: 0`, "opening makes no image"); hyper-durable's suite, clippy and
+fmt pass on it (`r1405`).
+
 ## What remains (2026-10-16)
 
 In the owner's order: red CI first; then every consumer on one revision of `main`; then the shared
